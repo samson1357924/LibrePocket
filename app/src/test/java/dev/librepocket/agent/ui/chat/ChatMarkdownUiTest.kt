@@ -2034,10 +2034,9 @@ class ChatMarkdownUiTest {
         // unlike a per-card linear scan over all previous entries.
         //
         // Hardened: a single-shot timing on a small base can be dominated by CI/JIT/GC
-        // noise (foss CI observed ratio 13.44 with t1=1.26ms). Interleaved rounds measure
-        // both sides back to back so machine drift cancels; per-side medians and a larger
-        // repeat count stabilize the baseline. Bound 3.5 remains strictly inside (2, 4),
-        // preserving linear (~2) vs quadratic (~4) discrimination.
+        // noise. Interleaved rounds measure both sides back to back so machine drift
+        // cancels; per-side medians and warmup stabilize the baseline. Bound 3.5 remains
+        // strictly inside (2, 4), preserving linear (~2) vs quadratic (~4) discrimination.
         data class Case(
             val prev: List<String>,
             val prevIds: List<String>,
@@ -2093,8 +2092,12 @@ class ChatMarkdownUiTest {
         val t1 = samples1.sorted()[samples1.size / 2]
         val t2 = samples2.sorted()[samples2.size / 2]
         val ratio = t2.toDouble() / maxOf(1L, t1).toDouble()
+        // Linear scaling in K should stay near ~2x for a 2x input; O(K^2) trends to ~4x.
+        // Median-of-samples with warmup absorbs CI jitter, but the bound must stay
+        // strictly below quadratic so regressions cannot satisfy it.
         assertTrue(
-            "identity-only 2x-input ratio $ratio exceeds linear bound (t1=${t1}ns t2=${t2}ns)",
+            "identity-only 2x-input ratio $ratio exceeds strict linear-vs-quadratic bound " +
+                "(t1=${t1}ns t2=${t2}ns t1Samples=${samples1.toList()} t2Samples=${samples2.toList()})",
             ratio < 3.5,
         )
         // Correctness pin: all-different rewrite migrates nothing and prunes stale.

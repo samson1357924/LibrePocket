@@ -20,14 +20,18 @@ import org.junit.Test
 class ElevatedActivationContractTest {
 
     private val privateRoot = "/data/data/dev.librepocket.agent/files"
+    private var hermeticExec: HermeticExecFixture? = null
 
     @Before fun setUp() {
+        hermeticExec = HermeticExecFixture("act-contract", "id")
         ElevatedCleanupTracker.clearUnverified()
         ElevatedCleanupTracker.noteClean()
         pollActiveTo(0)
     }
 
     @After fun tearDown() {
+        hermeticExec?.close()
+        hermeticExec = null
         ElevatedCleanupTracker.clearUnverified()
         ElevatedCleanupTracker.noteClean()
         pollActiveTo(0)
@@ -45,6 +49,9 @@ class ElevatedActivationContractTest {
             },
             suBinary = "/system/bin/su",
             grantCheck = GrantFixtures.allowAlways,
+            execSearchDirs = hermeticExec!!.searchDirs,
+            execAllowedRoots = hermeticExec!!.allowedRoots,
+            execIsWritable = hermeticExec!!.systemOwned,
         )
         val r = runner.runBinary(ElevatedRequest(listOf("id"), "A4-T"), 2_000L)
         assertTrue("$r", r is ElevatedBinaryResult.Denied)
@@ -66,6 +73,9 @@ class ElevatedActivationContractTest {
             },
             suBinary = "/system/bin/su",
             grantCheck = GrantFixtures.allowAlways,
+            execSearchDirs = hermeticExec!!.searchDirs,
+            execAllowedRoots = hermeticExec!!.allowedRoots,
+            execIsWritable = hermeticExec!!.systemOwned,
         )
         val r = runner.runBinary(ElevatedRequest(listOf("id"), "A4-T"), 2_000L)
         assertTrue("$r", r is ElevatedBinaryResult.Ok)

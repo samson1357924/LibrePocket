@@ -53,7 +53,10 @@ class ElevatedRunnerPhaseFCancelBoundTest {
 
     private val privateRoot = "/data/data/files"
 
+    private var hermeticExec: HermeticExecFixture? = null
+
     @Before fun setUpIsolation() {
+        hermeticExec = HermeticExecFixture("phasef-hermetic", "id")
         ElevatedCleanupTracker.clearUnverified()
         ElevatedCleanupTracker.noteClean()
         pollOutstandingTo(0)
@@ -61,6 +64,8 @@ class ElevatedRunnerPhaseFCancelBoundTest {
     }
 
     @After fun tearDownIsolation() {
+        hermeticExec?.close()
+        hermeticExec = null
         pollOutstandingTo(0)
         pollActiveTo(0)
         ElevatedCleanupTracker.clearUnverified()
@@ -193,7 +198,10 @@ class ElevatedRunnerPhaseFCancelBoundTest {
             suBinary = "/system/bin/su",
             isCancelled = badHook,
             grantCheck = GrantFixtures.allowAlways,
-        )
+                execSearchDirs = hermeticExec!!.searchDirs,
+        execAllowedRoots = hermeticExec!!.allowedRoots,
+        execIsWritable = hermeticExec!!.systemOwned,
+)
         val shizuku = ShizukuShellRunner(
             privateRoot = privateRoot,
             bridgeGranted = GrantFixtures.bridgeOn,
@@ -206,7 +214,10 @@ class ElevatedRunnerPhaseFCancelBoundTest {
             status = { ShizukuStatus.Available(15) },
             isCancelled = badHook,
             grantCheck = GrantFixtures.allowAlways,
-        )
+                execSearchDirs = hermeticExec!!.searchDirs,
+        execAllowedRoots = hermeticExec!!.allowedRoots,
+        execIsWritable = hermeticExec!!.systemOwned,
+)
         // 24 caller 同時起跑（Root／Shizuku 交錯）：准入鎖內序列化，僅首個取席
         // （其門 worker 即唯一 elevated-supervisor），其餘 23 在准入處零線程拒絕。
         val n = 24
@@ -344,7 +355,10 @@ class ElevatedRunnerPhaseFCancelBoundTest {
                 suBinary = "/system/bin/su",
                 isCancelled = isCancelled,
                 grantCheck = GrantFixtures.allowAlways,
-            )
+                        execSearchDirs = hermeticExec!!.searchDirs,
+            execAllowedRoots = hermeticExec!!.allowedRoots,
+            execIsWritable = hermeticExec!!.systemOwned,
+)
         }
     }
 
@@ -365,7 +379,10 @@ class ElevatedRunnerPhaseFCancelBoundTest {
                 status = { ShizukuStatus.Available(15) },
                 isCancelled = isCancelled,
                 grantCheck = GrantFixtures.allowAlways,
-            )
+                        execSearchDirs = hermeticExec!!.searchDirs,
+            execAllowedRoots = hermeticExec!!.allowedRoots,
+            execIsWritable = hermeticExec!!.systemOwned,
+)
         }
     }
 
@@ -464,7 +481,10 @@ class ElevatedRunnerPhaseFCancelBoundTest {
                 suBinary = "/system/bin/su",
                 isCancelled = isCancelled,
                 grantCheck = GrantFixtures.allowAlways,
-            )
+                        execSearchDirs = hermeticExec!!.searchDirs,
+            execAllowedRoots = hermeticExec!!.allowedRoots,
+            execIsWritable = hermeticExec!!.systemOwned,
+)
         }
     }
 
@@ -482,7 +502,10 @@ class ElevatedRunnerPhaseFCancelBoundTest {
                 status = { ShizukuStatus.Available(15) },
                 isCancelled = isCancelled,
                 grantCheck = GrantFixtures.allowAlways,
-            )
+                        execSearchDirs = hermeticExec!!.searchDirs,
+            execAllowedRoots = hermeticExec!!.allowedRoots,
+            execIsWritable = hermeticExec!!.systemOwned,
+)
         }
     }
 
@@ -541,7 +564,10 @@ class ElevatedRunnerPhaseFCancelBoundTest {
                 suBinary = "/system/bin/su",
                 isCancelled = isCancelled,
                 grantCheck = GrantFixtures.allowAlways,
-            )
+                        execSearchDirs = hermeticExec!!.searchDirs,
+            execAllowedRoots = hermeticExec!!.allowedRoots,
+            execIsWritable = hermeticExec!!.systemOwned,
+)
         }
     }
 
@@ -564,7 +590,10 @@ class ElevatedRunnerPhaseFCancelBoundTest {
                 status = { ShizukuStatus.Available(15) },
                 isCancelled = isCancelled,
                 grantCheck = GrantFixtures.allowAlways,
-            )
+                        execSearchDirs = hermeticExec!!.searchDirs,
+            execAllowedRoots = hermeticExec!!.allowedRoots,
+            execIsWritable = hermeticExec!!.systemOwned,
+)
         }
     }
 
@@ -661,7 +690,10 @@ class ElevatedRunnerPhaseFCancelBoundTest {
                 suBinary = "/system/bin/su",
                 isCancelled = isCancelled,
                 grantCheck = GrantFixtures.allowAlways,
-            )
+                        execSearchDirs = hermeticExec!!.searchDirs,
+            execAllowedRoots = hermeticExec!!.allowedRoots,
+            execIsWritable = hermeticExec!!.systemOwned,
+)
         }
     }
 
@@ -680,7 +712,10 @@ class ElevatedRunnerPhaseFCancelBoundTest {
                 status = { ShizukuStatus.Available(15) },
                 isCancelled = isCancelled,
                 grantCheck = GrantFixtures.allowAlways,
-            )
+                        execSearchDirs = hermeticExec!!.searchDirs,
+            execAllowedRoots = hermeticExec!!.allowedRoots,
+            execIsWritable = hermeticExec!!.systemOwned,
+)
         }
     }
 
@@ -699,7 +734,10 @@ class ElevatedRunnerPhaseFCancelBoundTest {
             suBinary = "/system/bin/su",
             isCancelled = { false },
             grantCheck = GrantFixtures.allowAlways,
-        )
+                execSearchDirs = hermeticExec!!.searchDirs,
+        execAllowedRoots = hermeticExec!!.allowedRoots,
+        execIsWritable = hermeticExec!!.systemOwned,
+)
         val laneRef = AtomicReference<ElevatedBinaryResult?>()
         val laneBg = Thread {
             laneRef.set(lane.runBinary(ElevatedRequest(listOf("id"), "PF-LANE"), 10_000L))
@@ -729,7 +767,10 @@ class ElevatedRunnerPhaseFCancelBoundTest {
                     true
                 },
                 grantCheck = GrantFixtures.allowAlways,
-            )
+                        execSearchDirs = hermeticExec!!.searchDirs,
+            execAllowedRoots = hermeticExec!!.allowedRoots,
+            execIsWritable = hermeticExec!!.systemOwned,
+)
             val r = rejected.runBinary(ElevatedRequest(listOf("id"), "PF-PRIORITY"), 2_000L)
             // 准入拒絕先於取消判定：已取消 hook 仍回 Denied（QUOTA_EXCEEDED 系），
             // 且 hook 零求值（pre-admission 零 worker）。
@@ -763,7 +804,10 @@ class ElevatedRunnerPhaseFCancelBoundTest {
             suBinary = "/system/bin/su",
             isCancelled = { false },
             grantCheck = GrantFixtures.allowAlways,
-        )
+                execSearchDirs = hermeticExec!!.searchDirs,
+        execAllowedRoots = hermeticExec!!.allowedRoots,
+        execIsWritable = hermeticExec!!.systemOwned,
+)
         val laneBg = Thread {
             lane.runBinary(ElevatedRequest(listOf("id"), "PF-LANE"), 10_000L)
         }.also { it.isDaemon = true; it.start() }
@@ -789,7 +833,10 @@ class ElevatedRunnerPhaseFCancelBoundTest {
                 suBinary = "/system/bin/su",
                 isCancelled = { false },
                 grantCheck = GrantFixtures.allowAlways,
-            )
+                        execSearchDirs = hermeticExec!!.searchDirs,
+            execAllowedRoots = hermeticExec!!.allowedRoots,
+            execIsWritable = hermeticExec!!.systemOwned,
+)
             val r = rejected.runBinary(ElevatedRequest(listOf("id"), "PF-QUOTA"), 2_000L)
             assertTrue("saturated call must be Denied, got $r", r is ElevatedBinaryResult.Denied)
             assertEquals("admission rejection must not spawn", 0, spawns.get())
@@ -879,7 +926,10 @@ class ElevatedRunnerPhaseFCancelBoundTest {
                 suBinary = "/system/bin/su",
                 isCancelled = isCancelled,
                 grantCheck = GrantFixtures.allowAlways,
-            )
+                        execSearchDirs = hermeticExec!!.searchDirs,
+            execAllowedRoots = hermeticExec!!.allowedRoots,
+            execIsWritable = hermeticExec!!.systemOwned,
+)
         }
     }
 
@@ -900,7 +950,10 @@ class ElevatedRunnerPhaseFCancelBoundTest {
                 status = { ShizukuStatus.Available(15) },
                 isCancelled = isCancelled,
                 grantCheck = GrantFixtures.allowAlways,
-            )
+                        execSearchDirs = hermeticExec!!.searchDirs,
+            execAllowedRoots = hermeticExec!!.allowedRoots,
+            execIsWritable = hermeticExec!!.systemOwned,
+)
         }
     }
 

@@ -45,7 +45,7 @@ class ElevatedRunnerB2Test {
     private var hermeticExec: HermeticExecFixture? = null
 
     @Before fun setUpBreakerIsolation() {
-        hermeticExec = HermeticExecFixture("b2-hermetic", "screencap")
+        hermeticExec = HermeticExecFixture("b2-hermetic", "screencap", "id", "cat")
         ElevatedCleanupTracker.clearUnverified()
         ElevatedCleanupTracker.noteClean()
         pollOutstandingTo(0)
@@ -82,7 +82,10 @@ class ElevatedRunnerB2Test {
             },
             suBinary = "/system/bin/su",
             grantCheck = GrantFixtures.allowAlways,
-        )
+                execSearchDirs = hermeticExec!!.searchDirs,
+        execAllowedRoots = hermeticExec!!.allowedRoots,
+        execIsWritable = hermeticExec!!.systemOwned,
+)
         val r = runner.run(ElevatedRequest(listOf("id"), "B2-T"), 2_000L)
         assertTrue("$r", r is ShellResult.Failed)
         assertEquals(1, spawns)
@@ -100,7 +103,10 @@ class ElevatedRunnerB2Test {
             spawn = { FakeProcess("".toByteArray(), "E: something broke".toByteArray(), 2) },
             suBinary = "/system/bin/su",
             grantCheck = GrantFixtures.allowAlways,
-        )
+                execSearchDirs = hermeticExec!!.searchDirs,
+        execAllowedRoots = hermeticExec!!.allowedRoots,
+        execIsWritable = hermeticExec!!.systemOwned,
+)
         val r = runner.run(ElevatedRequest(listOf("id"), "B2-T"), 2_000L)
         assertTrue("$r", r is ShellResult.Failed)
     }
@@ -138,7 +144,10 @@ class ElevatedRunnerB2Test {
             spawn = { FakeProcess(ByteArray(0), secretStderr, 3) },
             suBinary = "/system/bin/su",
             grantCheck = GrantFixtures.allowAlways,
-        )
+                execSearchDirs = hermeticExec!!.searchDirs,
+        execAllowedRoots = hermeticExec!!.allowedRoots,
+        execIsWritable = hermeticExec!!.systemOwned,
+)
         val b = runner.runBinary(ElevatedRequest(listOf("id"), "B2-T"), 2_000L)
         assertTrue("$b", b is ElevatedBinaryResult.Failed)
         val msg = (b as ElevatedBinaryResult.Failed).message
@@ -155,7 +164,10 @@ class ElevatedRunnerB2Test {
             spawn = { FakeProcess("ok".toByteArray(), ByteArray(0), 0) },
             suBinary = "/system/bin/su",
             grantCheck = GrantFixtures.allowAlways,
-        )
+                execSearchDirs = hermeticExec!!.searchDirs,
+        execAllowedRoots = hermeticExec!!.allowedRoots,
+        execIsWritable = hermeticExec!!.systemOwned,
+)
         val r = runner.run(ElevatedRequest(listOf("id"), "B2-T"), 2_000L)
         assertTrue("$r", r is ShellResult.Ok)
         assertEquals(0, (r as ShellResult.Ok).exitCode)
@@ -170,7 +182,10 @@ class ElevatedRunnerB2Test {
             spawn = { FakeProcess("".toByteArray(), "boom".toByteArray(), 1) },
             status = { ShizukuStatus.Available(15) },
             grantCheck = GrantFixtures.allowAlways,
-        )
+                execSearchDirs = hermeticExec!!.searchDirs,
+        execAllowedRoots = hermeticExec!!.allowedRoots,
+        execIsWritable = hermeticExec!!.systemOwned,
+)
         val r = runner.run(ElevatedRequest(listOf("id"), "B2-T"), 2_000L)
         assertTrue("$r", r is ShellResult.Failed)
     }
@@ -194,8 +209,11 @@ class ElevatedRunnerB2Test {
                 it.destroy()
             },
             grantCheck = GrantFixtures.allowAlways,
-        )
-        val r = runner.run(ElevatedRequest(listOf("id"), "B2-T"), 120L)
+                execSearchDirs = hermeticExec!!.searchDirs,
+        execAllowedRoots = hermeticExec!!.allowedRoots,
+        execIsWritable = hermeticExec!!.systemOwned,
+)
+        val r = runner.run(ElevatedRequest(listOf("id"), "B2-T"), 500L)
         assertTrue("$r", r is ShellResult.TimedOut)
         assertEquals(1, kills)
         assertTrue((lastVictim as? FakeProcess)?.destroyed == true)
@@ -225,7 +243,10 @@ class ElevatedRunnerB2Test {
             },
             isCancelled = { true },
             grantCheck = GrantFixtures.allowAlways,
-        )
+                execSearchDirs = hermeticExec!!.searchDirs,
+        execAllowedRoots = hermeticExec!!.allowedRoots,
+        execIsWritable = hermeticExec!!.systemOwned,
+)
         val start = System.currentTimeMillis()
         val r = runner.run(ElevatedRequest(listOf("id"), "B2-T"), 10_000L)
         val elapsed = System.currentTimeMillis() - start
@@ -254,7 +275,10 @@ class ElevatedRunnerB2Test {
             },
             isCancelled = { ++polls > 4 },
             grantCheck = GrantFixtures.allowAlways,
-        )
+                execSearchDirs = hermeticExec!!.searchDirs,
+        execAllowedRoots = hermeticExec!!.allowedRoots,
+        execIsWritable = hermeticExec!!.systemOwned,
+)
         val start = System.currentTimeMillis()
         val r = runner.run(ElevatedRequest(listOf("id"), "B2-T"), 10_000L)
         val elapsed = System.currentTimeMillis() - start
@@ -380,7 +404,10 @@ class ElevatedRunnerB2Test {
             },
             suBinary = "/system/bin/su",
             grantCheck = GrantFixtures.allowAlways,
-        )
+                execSearchDirs = hermeticExec!!.searchDirs,
+        execAllowedRoots = hermeticExec!!.allowedRoots,
+        execIsWritable = hermeticExec!!.systemOwned,
+)
         assertTrue(runner.run(ElevatedRequest(listOf("id"), "B2-T"), 2_000L) is ShellResult.Ok)
         assertTrue(lastArgv.size == 3)
         assertEquals("/system/bin/su", lastArgv[0])
@@ -399,7 +426,10 @@ class ElevatedRunnerB2Test {
             },
             suExists = { it == "/system/xbin/su" },
             grantCheck = GrantFixtures.allowAlways,
-        )
+                execSearchDirs = hermeticExec!!.searchDirs,
+        execAllowedRoots = hermeticExec!!.allowedRoots,
+        execIsWritable = hermeticExec!!.systemOwned,
+)
         assertTrue(runner.run(ElevatedRequest(listOf("id"), "B2-T"), 2_000L) is ShellResult.Ok)
         assertEquals("/system/xbin/su", lastArgv[0])
     }
@@ -416,7 +446,10 @@ class ElevatedRunnerB2Test {
             },
             suExists = { false },
             grantCheck = GrantFixtures.allowAlways,
-        )
+                execSearchDirs = hermeticExec!!.searchDirs,
+        execAllowedRoots = hermeticExec!!.allowedRoots,
+        execIsWritable = hermeticExec!!.systemOwned,
+)
         val r = runner.run(ElevatedRequest(listOf("id"), "B2-T"), 2_000L)
         assertTrue("$r", r is ShellResult.Failed)
         assertEquals(0, spawns)
@@ -448,7 +481,10 @@ class ElevatedRunnerB2Test {
             },
             suExists = { throw SecurityException("denied") },
             grantCheck = GrantFixtures.allowAlways,
-        )
+                execSearchDirs = hermeticExec!!.searchDirs,
+        execAllowedRoots = hermeticExec!!.allowedRoots,
+        execIsWritable = hermeticExec!!.systemOwned,
+)
         val r = runner.run(ElevatedRequest(listOf("id"), "B2-T"), 2_000L)
         assertTrue("$r", r is ShellResult.Failed)
         assertEquals(0, spawns)
@@ -475,7 +511,10 @@ class ElevatedRunnerB2Test {
                 },
                 status = { status },
                 grantCheck = GrantFixtures.allowAlways,
-            )
+                        execSearchDirs = hermeticExec!!.searchDirs,
+            execAllowedRoots = hermeticExec!!.allowedRoots,
+            execIsWritable = hermeticExec!!.systemOwned,
+)
             val r = runner.run(ElevatedRequest(listOf("id"), "B2-T"), 2_000L)
             assertTrue("$status -> $r", r is ShellResult.Denied)
             assertEquals(0, spawns)
@@ -498,7 +537,10 @@ class ElevatedRunnerB2Test {
             },
             status = { ShizukuStatus.Available(15) },
             grantCheck = GrantFixtures.allowAlways,
-        )
+                execSearchDirs = hermeticExec!!.searchDirs,
+        execAllowedRoots = hermeticExec!!.allowedRoots,
+        execIsWritable = hermeticExec!!.systemOwned,
+)
         assertTrue(runner.run(ElevatedRequest(listOf("id"), "B2-T"), 2_000L) is ShellResult.Ok)
         assertEquals(1, spawns)
     }
@@ -514,7 +556,10 @@ class ElevatedRunnerB2Test {
             spawn = { FakeProcess(partial, ByteArray(0), 0, hang = true) },
             suBinary = "/system/bin/su",
             grantCheck = GrantFixtures.allowAlways,
-        )
+                execSearchDirs = hermeticExec!!.searchDirs,
+        execAllowedRoots = hermeticExec!!.allowedRoots,
+        execIsWritable = hermeticExec!!.systemOwned,
+)
         val b = runner.runBinary(ElevatedRequest(listOf("id"), "B2-T"), 120L)
         assertTrue("$b", b is ElevatedBinaryResult.TimedOut)
         val timedOut = b as ElevatedBinaryResult.TimedOut
@@ -601,7 +646,10 @@ class ElevatedRunnerB2Test {
                 it.destroy()
             },
             grantCheck = GrantFixtures.allowAlways,
-        )
+                execSearchDirs = hermeticExec!!.searchDirs,
+        execAllowedRoots = hermeticExec!!.allowedRoots,
+        execIsWritable = hermeticExec!!.systemOwned,
+)
         val b = runner.runBinary(ElevatedRequest(listOf("id"), "P3-T"), 150L)
         assertTrue("$b", b is ElevatedBinaryResult.TimedOut)
         assertEquals(1, kills)
@@ -632,7 +680,10 @@ class ElevatedRunnerB2Test {
             },
             isCancelled = { ++polls > 4 },
             grantCheck = GrantFixtures.allowAlways,
-        )
+                execSearchDirs = hermeticExec!!.searchDirs,
+        execAllowedRoots = hermeticExec!!.allowedRoots,
+        execIsWritable = hermeticExec!!.systemOwned,
+)
         val b = runner.runBinary(ElevatedRequest(listOf("id"), "P3-T"), 10_000L)
         assertTrue("$b", b is ElevatedBinaryResult.TimedOut)
         assertEquals(1, kills)
@@ -655,7 +706,10 @@ class ElevatedRunnerB2Test {
             status = { ShizukuStatus.Available(15) },
             isCancelled = { throw IllegalStateException("cancel boom") },
             grantCheck = GrantFixtures.allowAlways,
-        )
+                execSearchDirs = hermeticExec!!.searchDirs,
+        execAllowedRoots = hermeticExec!!.allowedRoots,
+        execIsWritable = hermeticExec!!.systemOwned,
+)
         val b = shizuku.runBinary(ElevatedRequest(listOf("id"), "P3-T"), 2_000L)
         assertTrue("$b", b is ElevatedBinaryResult.TimedOut)
         assertEquals(0, shizukuSpawns)
@@ -672,7 +726,10 @@ class ElevatedRunnerB2Test {
             suBinary = "/system/bin/su",
             isCancelled = { throw IllegalStateException("cancel boom") },
             grantCheck = GrantFixtures.allowAlways,
-        )
+                execSearchDirs = hermeticExec!!.searchDirs,
+        execAllowedRoots = hermeticExec!!.allowedRoots,
+        execIsWritable = hermeticExec!!.systemOwned,
+)
         val r = root.run(ElevatedRequest(listOf("id"), "P3-T"), 2_000L)
         assertTrue("$r", r is ShellResult.TimedOut)
         assertEquals(0, rootSpawns)
@@ -691,7 +748,10 @@ class ElevatedRunnerB2Test {
                 throw IllegalStateException("kill boom")
             },
             grantCheck = GrantFixtures.allowAlways,
-        )
+                execSearchDirs = hermeticExec!!.searchDirs,
+        execAllowedRoots = hermeticExec!!.allowedRoots,
+        execIsWritable = hermeticExec!!.systemOwned,
+)
         val b = runner.runBinary(ElevatedRequest(listOf("id"), "P3-T"), 150L)
         assertTrue("$b", b is ElevatedBinaryResult.TimedOut)
         assertEquals(1, kills)
@@ -712,7 +772,10 @@ class ElevatedRunnerB2Test {
             },
             suBinary = "/system/bin/su",
             grantCheck = GrantFixtures.allowAlways,
-        )
+                execSearchDirs = hermeticExec!!.searchDirs,
+        execAllowedRoots = hermeticExec!!.allowedRoots,
+        execIsWritable = hermeticExec!!.systemOwned,
+)
         val r = runner.run(ElevatedRequest(listOf("id"), "P3-T"), 2_000L)
         assertTrue("$r", r is ShellResult.Denied)
         assertEquals(ShellDeny.QUOTA_EXCEEDED, (r as ShellResult.Denied).reason)
@@ -736,7 +799,10 @@ class ElevatedRunnerB2Test {
                 },
                 suBinary = "/system/bin/su",
                 grantCheck = GrantFixtures.allowAlways,
-            )
+                        execSearchDirs = hermeticExec!!.searchDirs,
+            execAllowedRoots = hermeticExec!!.allowedRoots,
+            execIsWritable = hermeticExec!!.systemOwned,
+)
             val r = runner.run(ElevatedRequest(listOf("id"), reason), 2_000L)
             assertTrue("reason='$reason' -> $r", r is ShellResult.Denied)
             assertEquals(ShellDeny.BAD_ARGUMENT, (r as ShellResult.Denied).reason)
@@ -756,7 +822,10 @@ class ElevatedRunnerB2Test {
             },
             suBinary = "/system/bin/su",
             grantCheck = GrantFixtures.allowAlways,
-        )
+                execSearchDirs = hermeticExec!!.searchDirs,
+        execAllowedRoots = hermeticExec!!.allowedRoots,
+        execIsWritable = hermeticExec!!.systemOwned,
+)
         val r = runner.run(ElevatedRequest(emptyList(), "P3-T"), 2_000L)
         assertTrue("$r", r is ShellResult.Denied)
         assertEquals(0, spawns)
@@ -775,7 +844,10 @@ class ElevatedRunnerB2Test {
             spawn = { throw IllegalStateException(secret) },
             status = { ShizukuStatus.Available(15) },
             grantCheck = GrantFixtures.allowAlways,
-        )
+                execSearchDirs = hermeticExec!!.searchDirs,
+        execAllowedRoots = hermeticExec!!.allowedRoots,
+        execIsWritable = hermeticExec!!.systemOwned,
+)
         val b = runner.runBinary(ElevatedRequest(listOf("id"), "P3-T"), 2_000L)
         assertTrue("$b", b is ElevatedBinaryResult.Failed)
         val msg = (b as ElevatedBinaryResult.Failed).message
@@ -793,7 +865,10 @@ class ElevatedRunnerB2Test {
             spawn = { throw IllegalStateException(secret) },
             suBinary = "/system/bin/su",
             grantCheck = GrantFixtures.allowAlways,
-        )
+                execSearchDirs = hermeticExec!!.searchDirs,
+        execAllowedRoots = hermeticExec!!.allowedRoots,
+        execIsWritable = hermeticExec!!.systemOwned,
+)
         val b = runner.runBinary(ElevatedRequest(listOf("id"), "P3-T"), 2_000L)
         assertTrue("$b", b is ElevatedBinaryResult.Failed)
         val msg = (b as ElevatedBinaryResult.Failed).message
@@ -815,7 +890,10 @@ class ElevatedRunnerB2Test {
             },
             status = { throw IllegalStateException("status boom") },
             grantCheck = GrantFixtures.allowAlways,
-        )
+                execSearchDirs = hermeticExec!!.searchDirs,
+        execAllowedRoots = hermeticExec!!.allowedRoots,
+        execIsWritable = hermeticExec!!.systemOwned,
+)
         val r = runner.run(ElevatedRequest(listOf("id"), "P3-T"), 2_000L)
         assertTrue("$r", r is ShellResult.Denied)
         assertEquals(ShellDeny.NOT_WHITELISTED, (r as ShellResult.Denied).reason)
@@ -842,7 +920,10 @@ class ElevatedRunnerB2Test {
             },
             status = { ShizukuStatus.Available(15) },
             grantCheck = GrantFixtures.allowAlways,
-        )
+                execSearchDirs = hermeticExec!!.searchDirs,
+        execAllowedRoots = hermeticExec!!.allowedRoots,
+        execIsWritable = hermeticExec!!.systemOwned,
+)
         val sr = shizuku.run(ElevatedRequest(argv, "P3-T"), 2_000L)
         assertTrue("$sr", sr is ShellResult.Denied)
         assertEquals(0, shizukuSpawns)
@@ -859,7 +940,10 @@ class ElevatedRunnerB2Test {
             },
             suBinary = "/system/bin/su",
             grantCheck = GrantFixtures.allowAlways,
-        )
+                execSearchDirs = hermeticExec!!.searchDirs,
+        execAllowedRoots = hermeticExec!!.allowedRoots,
+        execIsWritable = hermeticExec!!.systemOwned,
+)
         val rr = root.run(ElevatedRequest(argv, "P3-T"), 2_000L)
         assertTrue("$rr", rr is ShellResult.Denied)
         assertEquals(0, rootSpawns)
@@ -880,7 +964,10 @@ class ElevatedRunnerB2Test {
             },
             status = { ShizukuStatus.Available(15) },
             grantCheck = GrantFixtures.allowAlways,
-        )
+                execSearchDirs = hermeticExec!!.searchDirs,
+        execAllowedRoots = hermeticExec!!.allowedRoots,
+        execIsWritable = hermeticExec!!.systemOwned,
+)
         val sr = shizuku.run(ElevatedRequest(argv, "P3-T"), 2_000L)
         assertTrue("$sr", sr is ShellResult.Denied)
         // Phase 1 註記：/sdcard 路徑先命中 validate 跨域拒（BLACKLISTED），未走到橋門；
@@ -899,7 +986,10 @@ class ElevatedRunnerB2Test {
             },
             suBinary = "/system/bin/su",
             grantCheck = GrantFixtures.allowAlways,
-        )
+                execSearchDirs = hermeticExec!!.searchDirs,
+        execAllowedRoots = hermeticExec!!.allowedRoots,
+        execIsWritable = hermeticExec!!.systemOwned,
+)
         val rr = root.run(ElevatedRequest(argv, "P3-T"), 2_000L)
         assertTrue("$rr", rr is ShellResult.Denied)
         assertEquals(0, rootSpawns)
@@ -917,7 +1007,10 @@ class ElevatedRunnerB2Test {
             },
             suBinary = "/tmp/evil/su",
             grantCheck = GrantFixtures.allowAlways,
-        )
+                execSearchDirs = hermeticExec!!.searchDirs,
+        execAllowedRoots = hermeticExec!!.allowedRoots,
+        execIsWritable = hermeticExec!!.systemOwned,
+)
         val r = runner.run(ElevatedRequest(listOf("id"), "P3-T"), 2_000L)
         assertTrue("$r", r is ShellResult.Failed)
         assertEquals(0, spawns)
@@ -938,7 +1031,10 @@ class ElevatedRunnerB2Test {
             },
             suExists = { it == "/system/bin/su" || it == "/sbin/su" },
             grantCheck = GrantFixtures.allowAlways,
-        )
+                execSearchDirs = hermeticExec!!.searchDirs,
+        execAllowedRoots = hermeticExec!!.allowedRoots,
+        execIsWritable = hermeticExec!!.systemOwned,
+)
         assertTrue(runner.run(ElevatedRequest(listOf("id"), "P3-T"), 2_000L) is ShellResult.Ok)
         assertEquals(RootSuProbe.SU_BINARIES[0], lastArgv[0])
         assertEquals("/system/bin/su", lastArgv[0])
@@ -960,7 +1056,10 @@ class ElevatedRunnerB2Test {
                 it.destroy()
             },
             grantCheck = GrantFixtures.allowAlways,
-        )
+                execSearchDirs = hermeticExec!!.searchDirs,
+        execAllowedRoots = hermeticExec!!.allowedRoots,
+        execIsWritable = hermeticExec!!.systemOwned,
+)
         val sb = shizuku.runBinary(ElevatedRequest(listOf("id"), "P3-T"), 0L)
         assertTrue("$sb", sb is ElevatedBinaryResult.TimedOut)
         // P1-3（PR140 Phase 2）：timeoutMs=0 即 budget 全無，入口 preflight 零 spawn
@@ -986,7 +1085,10 @@ class ElevatedRunnerB2Test {
                 it.destroy()
             },
             grantCheck = GrantFixtures.allowAlways,
-        )
+                execSearchDirs = hermeticExec!!.searchDirs,
+        execAllowedRoots = hermeticExec!!.allowedRoots,
+        execIsWritable = hermeticExec!!.systemOwned,
+)
         val rb = root.runBinary(ElevatedRequest(listOf("id"), "P3-T"), 0L)
         assertTrue("$rb", rb is ElevatedBinaryResult.TimedOut)
         // P1-3（同 shizuku 側）：零 spawn，kills==0，旗標 false。
@@ -1022,7 +1124,10 @@ class ElevatedRunnerB2Test {
                 !job.isActive
             },
             grantCheck = GrantFixtures.allowAlways,
-        )
+                execSearchDirs = hermeticExec!!.searchDirs,
+        execAllowedRoots = hermeticExec!!.allowedRoots,
+        execIsWritable = hermeticExec!!.systemOwned,
+)
         val b = runner.runBinary(ElevatedRequest(listOf("id"), "R3A-T"), 10_000L)
         assertTrue("$b", b is ElevatedBinaryResult.TimedOut)
         assertEquals(1, kills)
@@ -1050,7 +1155,10 @@ class ElevatedRunnerB2Test {
                 !shizukuJob.isActive
             },
             grantCheck = GrantFixtures.allowAlways,
-        )
+                execSearchDirs = hermeticExec!!.searchDirs,
+        execAllowedRoots = hermeticExec!!.allowedRoots,
+        execIsWritable = hermeticExec!!.systemOwned,
+)
         val sb = shizuku.runBinary(ElevatedRequest(listOf("id"), "R3A-T"), 10_000L)
         assertTrue("$sb", sb is ElevatedBinaryResult.TimedOut)
         assertEquals(1, shizukuKills)
@@ -1105,7 +1213,10 @@ class ElevatedRunnerB2Test {
                 killer = killer,
                 isCancelled = isCancelled,
                 grantCheck = GrantFixtures.allowAlways,
-            )
+                        execSearchDirs = hermeticExec!!.searchDirs,
+            execAllowedRoots = hermeticExec!!.allowedRoots,
+            execIsWritable = hermeticExec!!.systemOwned,
+)
         }
         runOneRound { killer, isCancelled ->
             ShizukuShellRunner(
@@ -1118,7 +1229,10 @@ class ElevatedRunnerB2Test {
                 killer = killer,
                 isCancelled = isCancelled,
                 grantCheck = GrantFixtures.allowAlways,
-            )
+                        execSearchDirs = hermeticExec!!.searchDirs,
+            execAllowedRoots = hermeticExec!!.allowedRoots,
+            execIsWritable = hermeticExec!!.systemOwned,
+)
         }
     }
 

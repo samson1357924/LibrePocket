@@ -38,9 +38,11 @@ class DdgsSearchProvider(
         const val BOT_MARKER_2 = "challenge-form"
     }
 
-    override suspend fun probe(): WebProbe =
-        if (buildUrl("probe") == null) WebProbe.NotReady(WebUnavailableReason.MISSING_URL)
-        else WebProbe.Ready
+    override suspend fun probe(): WebProbe = when {
+        endpoint.isBlank() -> WebProbe.NotReady(WebUnavailableReason.MISSING_URL)
+        parseHttpBaseUri(endpoint) == null -> WebProbe.NotReady(WebUnavailableReason.INVALID_URL)
+        else -> WebProbe.Ready
+    }
 
     override suspend fun search(query: String, count: Int): WebSearchOutcome {
         if (query.isBlank()) return WebSearchOutcome.Unavailable(WebUnavailableReason.EMPTY_QUERY)
@@ -80,41 +82,20 @@ class DdgsSearchProvider(
      * Raw (encoded) path is used so equivalent-decoding paths (e.g. `%2F` vs `/`,
      * `%41` vs `A`) stay isolated (safe direction: extra upstream, never cross-hit)。
      */
-    private fun normalizedEndpoint(): String {
-        val raw = endpoint.trim().trimEnd('/')
-        return try {
-            val uri = java.net.URI(raw)
-            val scheme = uri.scheme?.lowercase() ?: return raw
-            val host = uri.host?.lowercase() ?: return raw
-            val port = if (uri.port != -1) ":${uri.port}" else ""
-            val path = uri.rawPath.orEmpty()
-            "$scheme://$host$port$path"
-        } catch (_: Exception) {
-            raw
-        }
-    }
+    private fun normalizedEndpoint(): String =
+        normalizeHttpOrigin(endpoint) ?: endpoint.trim().trimEnd('/')
 
     /**
      * Endpoint URL 組裝（scheme 非 http/https、缺 host、解析失敗 → null → `PROTOCOL`）。
      *
-     * 含 userinfo／query／fragment 的 base 視為形狀錯誤一律拒絕（→ null → `PROTOCOL`），
+     * 含 userinfo／query／fragment／控制字元的 base 視為形狀錯誤一律拒絕（→ null → `PROTOCOL`），
      * 保持 raw-string concat 形狀以縮小 blast radius（不做 URI-builder 重構）。
      * http 仍接受（cleartext 由 release NetworkSecurityConfig 管控，見 class KDoc）。
      * Query 以 form encoding（`+` 表空格）編碼，適用於 query component。
      */
     internal fun buildUrl(query: String): String? {
-        val base = endpoint.trim()
-        if (base.isEmpty()) return null
-        return try {
-            val uri = java.net.URI(base)
-            val scheme = uri.scheme?.lowercase()
-            if (scheme != "http" && scheme != "https") return null
-            if (uri.host.isNullOrBlank()) return null
-            if (uri.userInfo != null || uri.query != null || uri.fragment != null) return null
-            base.trimEnd('/') + "/?q=" + URLEncoder.encode(query.trim(), Charsets.UTF_8)
-        } catch (_: Exception) {
-            null
-        }
+        val base = normalizeHttpOrigin(endpoint) ?: return null
+        return "$base/?q=${URLEncoder.encode(query.trim(), Charsets.UTF_8)}"
     }
 
     internal fun isBotWall(body: String): Boolean =

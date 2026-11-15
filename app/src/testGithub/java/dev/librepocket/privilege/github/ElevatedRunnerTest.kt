@@ -220,7 +220,10 @@ class ElevatedRunnerTest {
             // 假狀態直接給不可達，不碰真實 binder。
             status = { ShizukuStatus.BinderUnreachable(ShizukuStatus.REASON_BINDER_DOWN) },
             grantCheck = GrantFixtures.allowAlways,
-        )
+                execSearchDirs = hermeticExec!!.searchDirs,
+        execAllowedRoots = hermeticExec!!.allowedRoots,
+        execIsWritable = hermeticExec!!.systemOwned,
+)
         val r = runner.run(ElevatedRequest(listOf("id"), reasonCode = "D09-T"))
         assertTrue("$r", r is ShellResult.Denied)
         assertEquals(ShellDeny.NOT_WHITELISTED, (r as ShellResult.Denied).reason)

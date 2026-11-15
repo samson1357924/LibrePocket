@@ -40,12 +40,17 @@ class ElevatedRunnerP1B2Test {
 
     private val privateRoot = "/data/data/files"
 
+    private var hermeticExec: HermeticExecFixture? = null
+
     @Before fun setUpIsolation() {
+        hermeticExec = HermeticExecFixture("p1b2-hermetic", "id")
         ElevatedCleanupTracker.clearUnverified()
         ElevatedCleanupTracker.noteClean()
     }
 
     @After fun tearDownIsolation() {
+        hermeticExec?.close()
+        hermeticExec = null
         ElevatedCleanupTracker.clearUnverified()
         ElevatedCleanupTracker.noteClean()
     }
@@ -75,7 +80,10 @@ class ElevatedRunnerP1B2Test {
         killer = killer,
         isCancelled = isCancelled,
         grantCheck = GrantFixtures.allowAlways,
-    )
+        execSearchDirs = hermeticExec!!.searchDirs,
+    execAllowedRoots = hermeticExec!!.allowedRoots,
+    execIsWritable = hermeticExec!!.systemOwned,
+)
 
     private fun makeShizuku(
         spawn: (List<String>) -> Process,
@@ -91,7 +99,10 @@ class ElevatedRunnerP1B2Test {
         killer = killer,
         isCancelled = isCancelled,
         grantCheck = GrantFixtures.allowAlways,
-    )
+        execSearchDirs = hermeticExec!!.searchDirs,
+    execAllowedRoots = hermeticExec!!.allowedRoots,
+    execIsWritable = hermeticExec!!.systemOwned,
+)
 
     // ---- P1-3 假件（立即回，不睡 grace） ----
 
@@ -510,7 +521,10 @@ class ElevatedRunnerP1B2Test {
             },
             isCancelled = { cancelled.get() },
             grantCheck = GrantFixtures.allowAlways,
-        )
+                execSearchDirs = hermeticExec!!.searchDirs,
+        execAllowedRoots = hermeticExec!!.allowedRoots,
+        execIsWritable = hermeticExec!!.systemOwned,
+)
         var result: ElevatedBinaryResult? = null
         val bg = Thread { result = runner.runBinary(ElevatedRequest(listOf("id"), "P1-4-T"), 10_000L) }
             .also { it.isDaemon = true; it.start() }
@@ -549,7 +563,10 @@ class ElevatedRunnerP1B2Test {
             },
             isCancelled = { cancelled.get() },
             grantCheck = GrantFixtures.allowAlways,
-        )
+                execSearchDirs = hermeticExec!!.searchDirs,
+        execAllowedRoots = hermeticExec!!.allowedRoots,
+        execIsWritable = hermeticExec!!.systemOwned,
+)
         var result: ElevatedBinaryResult? = null
         val bg = Thread { result = runner.runBinary(ElevatedRequest(listOf("id"), "P1-4-T"), 10_000L) }
             .also { it.isDaemon = true; it.start() }

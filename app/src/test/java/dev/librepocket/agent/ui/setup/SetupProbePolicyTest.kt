@@ -23,6 +23,8 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.emptyFlow
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.test.UnconfinedTestDispatcher
 import kotlinx.coroutines.test.resetMain
 import kotlinx.coroutines.test.setMain
@@ -100,8 +102,17 @@ class SetupProbePolicyTest {
 
     @After
     fun tearDown() {
-        Dispatchers.resetMain()
         scopes.forEach { it.cancel() }
+        scopes.forEach { scope ->
+            val job = scope.coroutineContext[kotlinx.coroutines.Job]
+            runBlocking {
+                kotlinx.coroutines.withTimeout(5_000) {
+                    job?.join()
+                }
+            }
+        }
+        Dispatchers.resetMain()
+        scopes.clear()
         tmpDirs.forEach { it.deleteRecursively() }
     }
 

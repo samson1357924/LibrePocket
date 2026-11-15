@@ -39,7 +39,10 @@ class ElevatedRunnerPhaseCTest {
 
     private val privateRoot = "/data/data/files"
 
+    private var hermeticExec: HermeticExecFixture? = null
+
     @Before fun setUpIsolation() {
+        hermeticExec = HermeticExecFixture("phasec-hermetic", "id")
         ElevatedCleanupTracker.clearUnverified()
         ElevatedCleanupTracker.noteClean()
         pollOutstandingTo(0)
@@ -47,6 +50,8 @@ class ElevatedRunnerPhaseCTest {
     }
 
     @After fun tearDownIsolation() {
+        hermeticExec?.close()
+        hermeticExec = null
         pollOutstandingTo(0)
         pollActiveTo(0)
         ElevatedCleanupTracker.clearUnverified()
@@ -202,7 +207,10 @@ class ElevatedRunnerPhaseCTest {
                 suBinary = "/system/bin/su",
                 isCancelled = isCancelled,
                 grantCheck = GrantFixtures.allowAlways,
-            )
+                        execSearchDirs = hermeticExec!!.searchDirs,
+            execAllowedRoots = hermeticExec!!.allowedRoots,
+            execIsWritable = hermeticExec!!.systemOwned,
+)
         }
     }
 
@@ -220,7 +228,10 @@ class ElevatedRunnerPhaseCTest {
                 status = { ShizukuStatus.Available(15) },
                 isCancelled = isCancelled,
                 grantCheck = GrantFixtures.allowAlways,
-            )
+                        execSearchDirs = hermeticExec!!.searchDirs,
+            execAllowedRoots = hermeticExec!!.allowedRoots,
+            execIsWritable = hermeticExec!!.systemOwned,
+)
         }
     }
 
@@ -284,7 +295,10 @@ class ElevatedRunnerPhaseCTest {
                 suBinary = "/system/bin/su",
                 isCancelled = isCancelled,
                 grantCheck = GrantFixtures.allowAlways,
-            )
+                        execSearchDirs = hermeticExec!!.searchDirs,
+            execAllowedRoots = hermeticExec!!.allowedRoots,
+            execIsWritable = hermeticExec!!.systemOwned,
+)
         }
     }
 
@@ -302,7 +316,10 @@ class ElevatedRunnerPhaseCTest {
                 status = { ShizukuStatus.Available(15) },
                 isCancelled = isCancelled,
                 grantCheck = GrantFixtures.allowAlways,
-            )
+                        execSearchDirs = hermeticExec!!.searchDirs,
+            execAllowedRoots = hermeticExec!!.allowedRoots,
+            execIsWritable = hermeticExec!!.systemOwned,
+)
         }
     }
 
@@ -388,7 +405,10 @@ class ElevatedRunnerPhaseCTest {
                 suBinary = "/system/bin/su",
                 isCancelled = isCancelled,
                 grantCheck = GrantFixtures.allowAlways,
-            )
+                        execSearchDirs = hermeticExec!!.searchDirs,
+            execAllowedRoots = hermeticExec!!.allowedRoots,
+            execIsWritable = hermeticExec!!.systemOwned,
+)
         }
     }
 
@@ -403,7 +423,10 @@ class ElevatedRunnerPhaseCTest {
                 status = { ShizukuStatus.Available(15) },
                 isCancelled = isCancelled,
                 grantCheck = GrantFixtures.allowAlways,
-            )
+                        execSearchDirs = hermeticExec!!.searchDirs,
+            execAllowedRoots = hermeticExec!!.allowedRoots,
+            execIsWritable = hermeticExec!!.systemOwned,
+)
         }
     }
 }

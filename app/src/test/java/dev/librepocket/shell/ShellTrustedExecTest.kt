@@ -1140,6 +1140,79 @@ class ShellTrustedExecTest {
         }
     }
 
+
+    @Test fun unusableSearchDir_isDirectoryFiltering_skipsWithoutTaint_andWritableSymlinkTargetStillTaints() {
+        val clean = tempDir("s5-unusable-clean")
+        val writableTarget = tempDir("s5-unusable-writable-target")
+        val parent = tempDir("s5-unusable-parent")
+        try {
+            val tool = executable(clean, "ls")
+            val cleanReal = clean.canonicalPath
+            val writableReal = writableTarget.canonicalPath
+            val roots = listOf(cleanReal, writableReal)
+            val splitWritable: (java.nio.file.Path) -> Boolean = { p ->
+                val s = p.toString()
+                s == writableReal || s.startsWith("$writableReal/")
+            }
+
+            // (a) Missing earlier entry does not shadow a safe later candidate.
+            val missing = File(parent, "missing-dir").absolutePath
+            val okMissing = ShellExecutables.resolveDetailed(
+                "ls",
+                listOf(missing, clean.absolutePath),
+                allowedRoots = roots,
+                isWritable = splitWritable,
+            )
+            assertTrue("expected Ok, got $okMissing", okMissing is ShellExecutables.ResolveOutcome.Ok)
+            assertEquals(tool.canonicalPath, (okMissing as ShellExecutables.ResolveOutcome.Ok).exec.path)
+
+            // (a) Dangling symlink search-dir entry (follows to missing target) is unusable, not tainting.
+            val danglingDirLink = File(parent, "dangling-searchdir")
+            Files.createSymbolicLink(danglingDirLink.toPath(), File(parent, "no-such-target-dir").toPath())
+            val okDangling = ShellExecutables.resolveDetailed(
+                "ls",
+                listOf(danglingDirLink.absolutePath, clean.absolutePath),
+                allowedRoots = roots,
+                isWritable = splitWritable,
+            )
+            assertTrue("expected Ok, got $okDangling", okDangling is ShellExecutables.ResolveOutcome.Ok)
+            assertEquals(tool.canonicalPath, (okDangling as ShellExecutables.ResolveOutcome.Ok).exec.path)
+
+            // (b) Genuinely existing writable earlier directory taints later hit.
+            val tainted = ShellExecutables.resolveDetailed(
+                "ls",
+                listOf(writableTarget.absolutePath, clean.absolutePath),
+                allowedRoots = roots,
+                isWritable = splitWritable,
+            )
+            assertTrue(
+                "expected SEARCH_DIR_UNTRUSTED, got $tainted",
+                tainted is ShellExecutables.ResolveOutcome.Denied &&
+                    tainted.reason == ShellExecutables.ResolveDeny.SEARCH_DIR_UNTRUSTED,
+            )
+
+            // (c) Symlink to existing writable directory is a directory (follow-links): must not be
+            // treated as absent; it must be evaluated and taint the later hit.
+            val writableLink = File(parent, "writable-searchdir-link")
+            Files.createSymbolicLink(writableLink.toPath(), writableTarget.toPath())
+            val taintedBySymlink = ShellExecutables.resolveDetailed(
+                "ls",
+                listOf(writableLink.absolutePath, clean.absolutePath),
+                allowedRoots = roots,
+                isWritable = splitWritable,
+            )
+            assertTrue(
+                "expected SEARCH_DIR_UNTRUSTED for symlink-to-writable-dir, got $taintedBySymlink",
+                taintedBySymlink is ShellExecutables.ResolveOutcome.Denied &&
+                    taintedBySymlink.reason == ShellExecutables.ResolveDeny.SEARCH_DIR_UNTRUSTED,
+            )
+        } finally {
+            clean.deleteRecursively()
+            writableTarget.deleteRecursively()
+            parent.deleteRecursively()
+        }
+    }
+
     @Test fun searchDirParentWritable_rejectedBareAndAbsolute() {
         // Stage2 Finding B：searchDir 本體乾淨但 parent 可寫，整目錄可被
         // rename/replace（`ls -> sysbin/sh`，real 乾淨但非 allowlisted）。

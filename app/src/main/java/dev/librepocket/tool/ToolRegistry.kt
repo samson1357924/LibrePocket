@@ -369,7 +369,7 @@ object ToolRegistry {
         ),
         ToolDef(
             name = WebSearchLocal.TOOL_NAME,
-            description = "Local web search {query, count} via a configured supplier; distinct from the server-side hosted web_search passthrough.",
+            description = "Local web search {query, count} via a configured supplier; distinct from the server-side hosted web_search passthrough. SCAFFOLD: projection-only in this PR, executionReady=false, no product Chat dispatcher wiring yet.",
             jsonSchema = schema(
                 prop("query", "string", "Search keywords"),
                 prop("count", "integer", "Max results, 1-10"),

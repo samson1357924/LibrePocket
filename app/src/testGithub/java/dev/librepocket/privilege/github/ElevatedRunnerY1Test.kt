@@ -194,6 +194,50 @@ class ElevatedRunnerY1Test {
         }
     }
 
+    private var hermeticExec: HermeticExecFixture? = null
+
+    @org.junit.Before fun setUpExec() {
+        hermeticExec = HermeticExecFixture("y1-hermetic", "id")
+        ElevatedCleanupTracker.clearUnverified()
+        ElevatedCleanupTracker.noteClean()
+        pollOutstandingTo(0)
+        pollActiveTo(0)
+    }
+
+    @org.junit.After fun tearDownExec() {
+        Thread.interrupted()
+        ElevatedCleanupTracker.clearUnverified()
+        ElevatedCleanupTracker.noteClean()
+        pollOutstandingTo(0)
+        pollActiveTo(0)
+        hermeticExec?.close()
+        hermeticExec = null
+    }
+
+    private fun pollOutstandingTo(expected: Int, boundMs: Long = 10_000L) {
+        val deadline = System.currentTimeMillis() + boundMs
+        while (ElevatedCleanupTracker.outstanding() != expected) {
+            if (System.currentTimeMillis() >= deadline) {
+                throw AssertionError(
+                    "outstanding=${ElevatedCleanupTracker.outstanding()} expected=$expected",
+                )
+            }
+            Thread.sleep(50L)
+        }
+    }
+
+    private fun pollActiveTo(expected: Int, boundMs: Long = 10_000L) {
+        val deadline = System.currentTimeMillis() + boundMs
+        while (ElevatedCleanupTracker.activeCalls() != expected) {
+            if (System.currentTimeMillis() >= deadline) {
+                throw AssertionError(
+                    "active=${ElevatedCleanupTracker.activeCalls()} expected=$expected",
+                )
+            }
+            Thread.sleep(20L)
+        }
+    }
+
     private fun makeRoot(spawn: (List<String>) -> Process): BinaryElevatedRunner = RootSuRunner(
         privateRoot = privateRoot,
         bridgeGranted = GrantFixtures.bridgeOn,
@@ -201,6 +245,9 @@ class ElevatedRunnerY1Test {
         spawn = spawn,
         suBinary = "/system/bin/su",
         grantCheck = GrantFixtures.allowAlways,
+        execSearchDirs = hermeticExec!!.searchDirs,
+        execAllowedRoots = hermeticExec!!.allowedRoots,
+        execIsWritable = hermeticExec!!.systemOwned,
     )
 
     private fun makeShizuku(spawn: (List<String>) -> Process): BinaryElevatedRunner =
@@ -212,6 +259,9 @@ class ElevatedRunnerY1Test {
             spawn = spawn,
             status = { ShizukuStatus.Available(15) },
             grantCheck = GrantFixtures.allowAlways,
+            execSearchDirs = hermeticExec!!.searchDirs,
+            execAllowedRoots = hermeticExec!!.allowedRoots,
+            execIsWritable = hermeticExec!!.systemOwned,
         )
 
     private fun awaitNoElevatedThreads(boundMs: Long = 5_000L) {

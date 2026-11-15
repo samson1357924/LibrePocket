@@ -38,7 +38,10 @@ class ElevatedRunnerPhaseEQuarantineTest {
 
     private val privateRoot = "/data/data/files"
 
+    private var hermeticExec: HermeticExecFixture? = null
+
     @Before fun setUpIsolation() {
+        hermeticExec = HermeticExecFixture("phasee-hermetic", "id")
         ElevatedCleanupTracker.clearUnverified()
         ElevatedCleanupTracker.noteClean()
         pollOutstandingTo(0)
@@ -46,6 +49,8 @@ class ElevatedRunnerPhaseEQuarantineTest {
     }
 
     @After fun tearDownIsolation() {
+        hermeticExec?.close()
+        hermeticExec = null
         ElevatedCleanupTracker.clearUnverified()
         repeat(8) { ElevatedCleanupTracker.releaseSlot() }
         repeat(8) { ElevatedCleanupTracker.leaveCall() }
@@ -225,7 +230,10 @@ class ElevatedRunnerPhaseEQuarantineTest {
         killer = killer,
         isCancelled = isCancelled,
         grantCheck = GrantFixtures.allowAlways,
-    )
+        execSearchDirs = hermeticExec!!.searchDirs,
+    execAllowedRoots = hermeticExec!!.allowedRoots,
+    execIsWritable = hermeticExec!!.systemOwned,
+)
 
     private fun shizukuRunner(
         spawn: (List<String>) -> Process,
@@ -241,7 +249,10 @@ class ElevatedRunnerPhaseEQuarantineTest {
         killer = killer,
         isCancelled = isCancelled,
         grantCheck = GrantFixtures.allowAlways,
-    )
+        execSearchDirs = hermeticExec!!.searchDirs,
+    execAllowedRoots = hermeticExec!!.allowedRoots,
+    execIsWritable = hermeticExec!!.systemOwned,
+)
 
     private fun assertQuarantineDenied(
         denied: ElevatedBinaryResult,

@@ -275,23 +275,31 @@ class ElevatedRunnerPhase4Test {
     // ---- F8: single Failed form ----
 
     @Test fun suFailureMessageIsSingleFormRegardlessOfStderr() {
-        for (stderr in listOf(
-            "su: permission denied".toByteArray(),
-            "boom".toByteArray(),
-        )) {
-            val runner = RootSuRunner(
-                privateRoot = privateRoot,
-                bridgeGranted = GrantFixtures.bridgeOn,
-                activationCheck = GrantFixtures.activationOn,
-                spawn = { FakeProcess(ByteArray(0), stderr, 1) },
-                suBinary = "/system/bin/su",
-                grantCheck = GrantFixtures.allowAlways,
-            )
-            val b = runner.runBinary(ElevatedRequest(listOf("id"), "P4-F8"), 2_000L)
-            assertTrue("$b", b is ElevatedBinaryResult.Failed)
-            val message = (b as ElevatedBinaryResult.Failed).message
-            assertTrue("message=$message", message.startsWith("su failed exit=1: "))
-            assertFalse("message=$message", message.contains("possible denial"))
+        val exec = HermeticExecFixture("p4-f8", "id")
+        try {
+            for (stderr in listOf(
+                "su: permission denied".toByteArray(),
+                "boom".toByteArray(),
+            )) {
+                val runner = RootSuRunner(
+                    privateRoot = privateRoot,
+                    bridgeGranted = GrantFixtures.bridgeOn,
+                    activationCheck = GrantFixtures.activationOn,
+                    spawn = { FakeProcess(ByteArray(0), stderr, 1) },
+                    suBinary = "/system/bin/su",
+                    grantCheck = GrantFixtures.allowAlways,
+                    execSearchDirs = exec.searchDirs,
+                    execAllowedRoots = exec.allowedRoots,
+                    execIsWritable = exec.systemOwned,
+                )
+                val b = runner.runBinary(ElevatedRequest(listOf("id"), "P4-F8"), 2_000L)
+                assertTrue("$b", b is ElevatedBinaryResult.Failed)
+                val message = (b as ElevatedBinaryResult.Failed).message
+                assertTrue("message=$message", message.startsWith("su failed exit=1: "))
+                assertFalse("message=$message", message.contains("possible denial"))
+            }
+        } finally {
+            exec.close()
         }
     }
 }

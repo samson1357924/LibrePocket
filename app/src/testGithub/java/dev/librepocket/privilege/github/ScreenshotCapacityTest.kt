@@ -22,6 +22,8 @@ class ScreenshotCapacityTest {
 
     private val privateRoot = "/data/data/dev.librepocket.agent/files"
 
+    private var hermeticExec: HermeticExecFixture? = null
+
     private fun shizukuRunner(spawn: (List<String>) -> Process) = ShizukuShellRunner(
         privateRoot = privateRoot,
         bridgeGranted = GrantFixtures.bridgeOn,
@@ -30,6 +32,9 @@ class ScreenshotCapacityTest {
         spawn = spawn,
         status = { ShizukuStatus.Available(15) },
         grantCheck = GrantFixtures.allowAlways,
+        execSearchDirs = hermeticExec!!.searchDirs,
+        execAllowedRoots = hermeticExec!!.allowedRoots,
+        execIsWritable = hermeticExec!!.systemOwned,
     )
 
     private fun rootRunner(spawn: (List<String>) -> Process) = RootSuRunner(
@@ -39,10 +44,14 @@ class ScreenshotCapacityTest {
         spawn = spawn,
         suBinary = "/system/bin/su",
         grantCheck = GrantFixtures.allowAlways,
+        execSearchDirs = hermeticExec!!.searchDirs,
+        execAllowedRoots = hermeticExec!!.allowedRoots,
+        execIsWritable = hermeticExec!!.systemOwned,
     )
 
     /** 終審殘留隔離：防同 JVM 內先行不清創用例遺留熔斷（本用例只斷成功截斷）。 */
     @Before fun setUpBreakerIsolation() {
+        hermeticExec = HermeticExecFixture("screenshot-capacity", "cat")
         ElevatedCleanupTracker.clearUnverified()
         ElevatedCleanupTracker.noteClean()
         pollOutstandingTo(0)
@@ -54,6 +63,8 @@ class ScreenshotCapacityTest {
         ElevatedCleanupTracker.noteClean()
         pollOutstandingTo(0)
         pollActiveTo(0)
+        hermeticExec?.close()
+        hermeticExec = null
     }
 
     private fun pollOutstandingTo(expected: Int, boundMs: Long = 10_000L) {

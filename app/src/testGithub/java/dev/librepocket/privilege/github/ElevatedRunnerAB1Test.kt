@@ -116,6 +116,17 @@ class ElevatedRunnerAB1Test {
         }
     }
 
+    private var hermeticExec: HermeticExecFixture? = null
+
+    @org.junit.Before fun setUpExec() {
+        hermeticExec = HermeticExecFixture("ab1-hermetic", "id")
+    }
+
+    @org.junit.After fun tearDownExec() {
+        hermeticExec?.close()
+        hermeticExec = null
+    }
+
     private fun makeRoot(spawn: (List<String>) -> Process): RootSuRunner = RootSuRunner(
         privateRoot = privateRoot,
         bridgeGranted = GrantFixtures.bridgeOn,
@@ -123,6 +134,9 @@ class ElevatedRunnerAB1Test {
         spawn = spawn,
         suBinary = "/system/bin/su",
         grantCheck = GrantFixtures.allowAlways,
+        execSearchDirs = hermeticExec!!.searchDirs,
+        execAllowedRoots = hermeticExec!!.allowedRoots,
+        execIsWritable = hermeticExec!!.systemOwned,
     )
 
     private fun makeShizuku(spawn: (List<String>) -> Process): ShizukuShellRunner =
@@ -134,6 +148,9 @@ class ElevatedRunnerAB1Test {
             spawn = spawn,
             status = { ShizukuStatus.Available(15) },
             grantCheck = GrantFixtures.allowAlways,
+            execSearchDirs = hermeticExec!!.searchDirs,
+            execAllowedRoots = hermeticExec!!.allowedRoots,
+            execIsWritable = hermeticExec!!.systemOwned,
         )
 
     private fun pollOutstandingTo(expected: Int, boundMs: Long = 10_000L) {

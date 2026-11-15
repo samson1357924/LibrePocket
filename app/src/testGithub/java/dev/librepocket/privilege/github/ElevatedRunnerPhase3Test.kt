@@ -38,6 +38,8 @@ class ElevatedRunnerPhase3Test {
 
     private val privateRoot = "/data/data/dev.librepocket.agent/files"
 
+    private var hermeticExec: HermeticExecFixture? = null
+
     private fun request() = ElevatedRequest(listOf("id"), reasonCode = "P3-TOCTOU-T")
 
     private fun runInBackground(
@@ -49,6 +51,15 @@ class ElevatedRunnerPhase3Test {
     }
 
     // ---- Root：慢 suExists 阻塞中翻轉 grant/bridge ----
+
+    @org.junit.Before fun setUpHermeticExec() {
+        hermeticExec = HermeticExecFixture("phase3-hermetic", "id")
+    }
+
+    @org.junit.After fun tearDownHermeticExec() {
+        hermeticExec?.close()
+        hermeticExec = null
+    }
 
     @Test fun rootPreSpawnGrantFlipDuringSlowSuExistsDeniesWithoutSpawn() {
         val entered = CountDownLatch(1)
@@ -69,7 +80,10 @@ class ElevatedRunnerPhase3Test {
                 if (grantValid.get()) GrantCheck.Valid
                 else GrantCheck.Invalid(ShizukuGrantPolicy.REASON_ENDPOINT_CHANGED)
             },
-        )
+                execSearchDirs = hermeticExec!!.searchDirs,
+        execAllowedRoots = hermeticExec!!.allowedRoots,
+        execIsWritable = hermeticExec!!.systemOwned,
+)
         val (bg, get) = runInBackground { runner.runBinary(request(), 10_000L) }
         assertTrue(entered.await(10, TimeUnit.SECONDS))
         // 早段 grant 已過（Valid），慢 suExists 阻塞中翻轉；spawn 前重求值須拒。
@@ -100,7 +114,10 @@ class ElevatedRunnerPhase3Test {
                 true
             },
             grantCheck = GrantFixtures.allowAlways,
-        )
+                execSearchDirs = hermeticExec!!.searchDirs,
+        execAllowedRoots = hermeticExec!!.allowedRoots,
+        execIsWritable = hermeticExec!!.systemOwned,
+)
         val (bg, get) = runInBackground { runner.runBinary(request(), 10_000L) }
         assertTrue(entered.await(10, TimeUnit.SECONDS))
         bridged.set(false)
@@ -130,7 +147,10 @@ class ElevatedRunnerPhase3Test {
                 true
             },
             grantCheck = GrantFixtures.allowAlways,
-        )
+                execSearchDirs = hermeticExec!!.searchDirs,
+        execAllowedRoots = hermeticExec!!.allowedRoots,
+        execIsWritable = hermeticExec!!.systemOwned,
+)
         val (bg, get) = runInBackground { runner.runBinary(request(), 10_000L) }
         assertTrue(entered.await(10, TimeUnit.SECONDS))
         // 早段 activation 已過（true），慢 suExists 阻塞中翻轉；spawn 前重求值須拒。
@@ -158,7 +178,10 @@ class ElevatedRunnerPhase3Test {
             // resolve 時首 call 回 true（命中首候選），spawn 前重驗回 false。
             suExists = { calls.incrementAndGet() <= 1 },
             grantCheck = GrantFixtures.allowAlways,
-        )
+                execSearchDirs = hermeticExec!!.searchDirs,
+        execAllowedRoots = hermeticExec!!.allowedRoots,
+        execIsWritable = hermeticExec!!.systemOwned,
+)
         val r = runner.runBinary(request(), 2_000L)
         check(r is ElevatedBinaryResult.Failed) { "$r" }
         assertTrue("$r", r.message.contains("su unavailable"))
@@ -188,7 +211,10 @@ class ElevatedRunnerPhase3Test {
                 if (grantValid.get()) GrantCheck.Valid
                 else GrantCheck.Invalid(ShizukuGrantPolicy.REASON_NEVER_GRANTED)
             },
-        )
+                execSearchDirs = hermeticExec!!.searchDirs,
+        execAllowedRoots = hermeticExec!!.allowedRoots,
+        execIsWritable = hermeticExec!!.systemOwned,
+)
         val (bg, get) = runInBackground { runner.runBinary(request(), 10_000L) }
         assertTrue(entered.await(10, TimeUnit.SECONDS))
         grantValid.set(false)
@@ -219,7 +245,10 @@ class ElevatedRunnerPhase3Test {
                 ShizukuStatus.Available(15)
             },
             grantCheck = GrantFixtures.allowAlways,
-        )
+                execSearchDirs = hermeticExec!!.searchDirs,
+        execAllowedRoots = hermeticExec!!.allowedRoots,
+        execIsWritable = hermeticExec!!.systemOwned,
+)
         val (bg, get) = runInBackground { runner.runBinary(request(), 10_000L) }
         assertTrue(entered.await(10, TimeUnit.SECONDS))
         bridged.set(false)
@@ -250,7 +279,10 @@ class ElevatedRunnerPhase3Test {
                 ShizukuStatus.Available(15)
             },
             grantCheck = GrantFixtures.allowAlways,
-        )
+                execSearchDirs = hermeticExec!!.searchDirs,
+        execAllowedRoots = hermeticExec!!.allowedRoots,
+        execIsWritable = hermeticExec!!.systemOwned,
+)
         val (bg, get) = runInBackground { runner.runBinary(request(), 10_000L) }
         assertTrue(entered.await(10, TimeUnit.SECONDS))
         // 早段 activation 已過（true），慢 status 阻塞中翻轉；spawn 前重求值須拒。
@@ -289,7 +321,10 @@ class ElevatedRunnerPhase3Test {
                 }
             },
             grantCheck = GrantFixtures.allowAlways,
-        )
+                execSearchDirs = hermeticExec!!.searchDirs,
+        execAllowedRoots = hermeticExec!!.allowedRoots,
+        execIsWritable = hermeticExec!!.systemOwned,
+)
         val (bg, get) = runInBackground { runner.runBinary(request(), 10_000L) }
         assertTrue(entered.await(10, TimeUnit.SECONDS))
         binderAlive.set(false)
@@ -331,7 +366,10 @@ class ElevatedRunnerPhase3Test {
                 if (grantValid.get()) GrantCheck.Valid
                 else GrantCheck.Invalid(ShizukuGrantPolicy.REASON_ENDPOINT_CHANGED)
             },
-        )
+                execSearchDirs = hermeticExec!!.searchDirs,
+        execAllowedRoots = hermeticExec!!.allowedRoots,
+        execIsWritable = hermeticExec!!.systemOwned,
+)
         val (bg, get) = runInBackground { denyRunner.runBinary(request(), 10_000L) }
         assertTrue(entered.await(10, TimeUnit.SECONDS))
         grantValid.set(false)
@@ -357,7 +395,10 @@ class ElevatedRunnerPhase3Test {
             spawn = spawn2::spawn,
             suBinary = "/system/bin/su",
             grantCheck = GrantFixtures.allowAlways,
-        )
+                execSearchDirs = hermeticExec!!.searchDirs,
+        execAllowedRoots = hermeticExec!!.allowedRoots,
+        execIsWritable = hermeticExec!!.systemOwned,
+)
         val ok = okRunner.runBinary(request(), 2_000L)
         check(ok is ElevatedBinaryResult.Ok) { "$ok" }
         assertEquals(1, spawn2.calls)
@@ -380,7 +421,10 @@ class ElevatedRunnerPhase3Test {
             suBinary = "/data/local/tmp/su-evil",
             suExists = { existsCalls++; true },
             grantCheck = GrantFixtures.allowAlways,
-        )
+                execSearchDirs = hermeticExec!!.searchDirs,
+        execAllowedRoots = hermeticExec!!.allowedRoots,
+        execIsWritable = hermeticExec!!.systemOwned,
+)
         val r = runner.runBinary(request(), 2_000L)
         check(r is ElevatedBinaryResult.Failed) { "$r" }
         assertTrue("$r", r.message.contains("untrusted"))

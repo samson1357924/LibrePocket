@@ -499,4 +499,142 @@ class ElevatedRunnerP1ElevatedExecTest {
             scope.deleteRecursively()
         }
     }
+
+    // ---- P2 regression (Re-review #9): production policy must never synthesize Ok ----
+
+    @Test fun resolveForSnapshot_defaultSearchDirs_searchDirUntrustedNeverBecomesOk() {
+        // Explicitly mark all existing search dirs untrusted; on hosts lacking /system/bin this
+        // previously triggered a synthetic Ok fallback (P2 boundary regression). Fallback removed:
+        // policy must remain fail-closed (Denied, never Ok) regardless of host /system/bin presence.
+        val outcome = ElevatedExecPolicy.resolveForSnapshot(
+            snapshotArgv0 = "id",
+            searchDirs = dev.librepocket.shell.ShellExecutables.TRUSTED_BIN_DIRS,
+            allowedRoots = null,
+            isWritable = { _ -> true },
+        )
+        assertTrue(
+            "SEARCH_DIR_UNTRUSTED/default search dirs must never become Ok, got $outcome",
+            outcome is dev.librepocket.shell.ShellExecutables.ResolveOutcome.Denied,
+        )
+    }
+
+    @Test fun resolveForSnapshot_explicitCopyOfDefaultSearchDirs_neverBecomesOk() {
+        // Equality to default list must not be used to synthesize success (fallback removed);
+        // explicit copy with untrusted dirs must still be denied.
+        val copy = ArrayList(dev.librepocket.shell.ShellExecutables.TRUSTED_BIN_DIRS)
+        val outcome = ElevatedExecPolicy.resolveForSnapshot(
+            snapshotArgv0 = "id",
+            searchDirs = copy,
+            allowedRoots = null,
+            isWritable = { _ -> true },
+        )
+        assertTrue("explicit copy of default search dirs must never become Ok, got $outcome",
+            outcome is dev.librepocket.shell.ShellExecutables.ResolveOutcome.Denied)
+    }
+
+    @Test fun resolveForSnapshot_realWritableEntryWritablePathEscape_neverOk() {
+        val trusted = tempDir("p2-realw-trusted")
+        val outside = tempDir("p2-escape-outside")
+        try {
+            val tool = executable(trusted, "id")
+            val trustedReal = trusted.canonicalPath
+            val roots = listOf(trustedReal)
+
+            // REAL_WRITABLE: search dir/entry chain trusted, but real target reported writable => denied.
+            val realTarget = tool.canonicalPath
+            val realWritable = ElevatedExecPolicy.resolveForSnapshot(
+                snapshotArgv0 = "id",
+                searchDirs = listOf(trusted.absolutePath),
+                allowedRoots = roots,
+                isWritable = { path ->
+                    val s = path.toString()
+                    s == realTarget || s.startsWith("$realTarget/")
+                },
+            )
+            assertTrue("REAL_WRITABLE must never become Ok, got $realWritable",
+                realWritable is dev.librepocket.shell.ShellExecutables.ResolveOutcome.Denied)
+            assertEquals(
+                dev.librepocket.shell.ShellExecutables.ResolveDeny.REAL_WRITABLE,
+                (realWritable as dev.librepocket.shell.ShellExecutables.ResolveOutcome.Denied).reason,
+            )
+
+            // ENTRY_WRITABLE: lexical entry/dir writable (search dir itself writable in this fixture model).
+            val entryWritable = ElevatedExecPolicy.resolveForSnapshot(
+                snapshotArgv0 = "id",
+                searchDirs = listOf(trusted.absolutePath),
+                allowedRoots = roots,
+                isWritable = { path ->
+                    val s = path.toString()
+                    s == trustedReal || s.startsWith("$trustedReal/")
+                },
+            )
+            assertTrue("ENTRY_WRITABLE/SEARCH_DIR_UNTRUSTED must never become Ok, got $entryWritable",
+                entryWritable is dev.librepocket.shell.ShellExecutables.ResolveOutcome.Denied)
+
+            // Path escape: customResolver returns target outside allowed roots => OUTSIDE_ROOTS denied.
+            val outsideTool = executable(outside, "id")
+            val escaped = ElevatedExecPolicy.resolveForSnapshot(
+                snapshotArgv0 = "id",
+                searchDirs = listOf(trusted.absolutePath),
+                allowedRoots = roots,
+                isWritable = systemOwned,
+                customResolver = { dev.librepocket.shell.ShellExecutables.ResolvedExec(outsideTool.absolutePath, null) },
+            )
+            assertTrue("path escape must never become Ok, got $escaped",
+                escaped is dev.librepocket.shell.ShellExecutables.ResolveOutcome.Denied)
+            assertEquals(
+                dev.librepocket.shell.ShellExecutables.ResolveDeny.OUTSIDE_ROOTS,
+                (escaped as dev.librepocket.shell.ShellExecutables.ResolveOutcome.Denied).reason,
+            )
+        } finally {
+            trusted.deleteRecursively()
+            outside.deleteRecursively()
+        }
+    }
+
+    @Test fun rootRunner_defaultSearchDirUntrusted_neverSpawns_neverOk() {
+        // Runner-level: even if underlying resolution would be denied as SEARCH_DIR_UNTRUSTED on
+        // default dirs, production policy must not synthesize Ok/spawn. Use isWritable={true} via
+        // a policy call path is not injectable here; instead verify explicit custom untrusted
+        // search dir (default-like taint class) denies with zero spawn through runner.
+        val (scope, target) = scopeWithFile("p2-runner-search-taint")
+        val writableEmpty = tempDir("p2-runner-writable")
+        val clean = tempDir("p2-runner-clean")
+        try {
+            executable(clean, "cat")
+            val cleanReal = clean.canonicalPath
+            val writableReal = writableEmpty.canonicalPath
+            val split: (java.nio.file.Path) -> Boolean = { p ->
+                val s = p.toString()
+                s == writableReal || s.startsWith("$writableReal/")
+            }
+            var spawns = 0
+            val runner = RootSuRunner(
+                privateRoot = scope.absolutePath,
+                bridgeGranted = GrantFixtures.bridgeOn,
+                activationCheck = GrantFixtures.activationOn,
+                spawn = {
+                    spawns++
+                    FakeProcess("ok".toByteArray())
+                },
+                suBinary = "/system/bin/su",
+                grantCheck = GrantFixtures.allowAlways,
+                execSearchDirs = listOf(writableEmpty.absolutePath, clean.absolutePath),
+                execAllowedRoots = listOf(cleanReal),
+                execIsWritable = split,
+            )
+            val r = runner.runBinary(
+                ElevatedRequest(listOf("cat", target.absolutePath), "P2-SEARCH-UNTRUSTED"),
+                2_000L,
+            )
+            assertTrue("$r", r is ElevatedBinaryResult.Denied)
+            assertEquals(ShellDeny.BLACKLISTED, (r as ElevatedBinaryResult.Denied).reason)
+            assertTrue("reason=${r.message}", r.message.contains("SEARCH_DIR_UNTRUSTED"))
+            assertEquals(0, spawns)
+        } finally {
+            scope.deleteRecursively()
+            writableEmpty.deleteRecursively()
+            clean.deleteRecursively()
+        }
+    }
 }

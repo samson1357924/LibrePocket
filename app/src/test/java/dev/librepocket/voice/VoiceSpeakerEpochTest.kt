@@ -10,6 +10,8 @@ import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.resetMain
 import kotlinx.coroutines.test.setMain
@@ -79,6 +81,11 @@ class VoiceSpeakerEpochTest {
     @After
     fun tearDown() {
         uiScope.cancel()
+        runBlocking {
+            withTimeout(5_000) {
+                uiScope.coroutineContext[kotlinx.coroutines.Job]?.join()
+            }
+        }
         Dispatchers.resetMain()
     }
 

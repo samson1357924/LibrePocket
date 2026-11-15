@@ -279,7 +279,10 @@ class ElevatedRunnerP2Test {
             suBinary = "/system/bin/su",
             isCancelled = { throw IllegalStateException("cancel boom") },
             grantCheck = GrantFixtures.allowAlways,
-        )
+                execSearchDirs = hermeticExec!!.searchDirs,
+        execAllowedRoots = hermeticExec!!.allowedRoots,
+        execIsWritable = hermeticExec!!.systemOwned,
+)
         val b = runner.runBinary(ElevatedRequest(listOf("id"), "P2-T"), 2_000L)
         assertTrue("$b", b is ElevatedBinaryResult.TimedOut)
         assertEquals(0, spawns)
@@ -324,7 +327,10 @@ class ElevatedRunnerP2Test {
                 throw IllegalStateException("kill boom")
             },
             grantCheck = GrantFixtures.allowAlways,
-        )
+                execSearchDirs = hermeticExec!!.searchDirs,
+        execAllowedRoots = hermeticExec!!.allowedRoots,
+        execIsWritable = hermeticExec!!.systemOwned,
+)
         // 用 throwingRunner 跑一次（hang＋恒抛 killer）：killer 抛即吞計數，仍 TimedOut。
         val b = throwingRunner.runBinary(ElevatedRequest(listOf("id"), "P2-T"), 300L)
         assertTrue("$b", b is ElevatedBinaryResult.TimedOut)
@@ -361,7 +367,10 @@ class ElevatedRunnerP2Test {
             spawn = null,
             suExists = { throw AssertionError("must not touch FS") },
             grantCheck = GrantFixtures.allowAlways,
-        )
+                execSearchDirs = hermeticExec!!.searchDirs,
+        execAllowedRoots = hermeticExec!!.allowedRoots,
+        execIsWritable = hermeticExec!!.systemOwned,
+)
         val b = runner.runBinary(ElevatedRequest(listOf("id"), "P2-T"), 2_000L)
         assertTrue("$b", b is ElevatedBinaryResult.Denied)
         assertTrue((b as ElevatedBinaryResult.Denied).message.contains("github-only"))
@@ -376,7 +385,10 @@ class ElevatedRunnerP2Test {
             spawn = null,
             suExists = { throw AssertionError("must not touch FS") },
             grantCheck = GrantFixtures.allowAlways,
-        )
+                execSearchDirs = hermeticExec!!.searchDirs,
+        execAllowedRoots = hermeticExec!!.allowedRoots,
+        execIsWritable = hermeticExec!!.systemOwned,
+)
         val b = runner.runBinary(ElevatedRequest(listOf(""), "P2-T"), 2_000L)
         // 空 argv 即 validate 拒（不觸 suExists）；另測 blank reason。
         assertTrue("$b", b is ElevatedBinaryResult.Denied)
@@ -395,7 +407,10 @@ class ElevatedRunnerP2Test {
             spawn = null,
             status = { throw AssertionError("must not touch Binder") },
             grantCheck = GrantFixtures.allowAlways,
-        )
+                execSearchDirs = hermeticExec!!.searchDirs,
+        execAllowedRoots = hermeticExec!!.allowedRoots,
+        execIsWritable = hermeticExec!!.systemOwned,
+)
         val b = runner.runBinary(ElevatedRequest(listOf("id"), "P2-T"), 2_000L)
         assertTrue("$b", b is ElevatedBinaryResult.Denied)
         assertTrue((b as ElevatedBinaryResult.Denied).message.contains("github-only"))
@@ -411,7 +426,10 @@ class ElevatedRunnerP2Test {
             spawn = null,
             status = { throw AssertionError("must not touch Binder") },
             grantCheck = GrantFixtures.allowAlways,
-        )
+                execSearchDirs = hermeticExec!!.searchDirs,
+        execAllowedRoots = hermeticExec!!.allowedRoots,
+        execIsWritable = hermeticExec!!.systemOwned,
+)
         val b = runner.runBinary(ElevatedRequest(listOf("id"), "   "), 2_000L)
         assertTrue("$b", b is ElevatedBinaryResult.Denied)
         assertEquals(ShellDeny.BAD_ARGUMENT, (b as ElevatedBinaryResult.Denied).reason)

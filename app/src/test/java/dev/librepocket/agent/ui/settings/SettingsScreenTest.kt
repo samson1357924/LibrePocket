@@ -20,10 +20,12 @@ import androidx.compose.ui.test.junit4.StateRestorationTester
 import androidx.compose.ui.test.onAllNodesWithContentDescription
 import androidx.compose.ui.test.onAllNodesWithText
 import androidx.compose.ui.test.onNodeWithContentDescription
+import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performScrollTo
 import androidx.compose.ui.unit.dp
+import dev.librepocket.agent.assistant.AssistantSettingsState
 import dev.librepocket.agent.ui.chat.ExportUiState
 import dev.librepocket.agent.ui.chat.ImportUiState
 import dev.librepocket.agent.ui.setup.EndpointConfig
@@ -242,6 +244,8 @@ class SettingsScreenTest {
         var retryCalls = 0
         var dismissed = 0
         var a11yClicks = 0
+        var resetClicks = 0
+        var assistantClicks = 0
         composeRule.setContent {
             SettingsScreen(
                 padding = PaddingValues(0.dp),
@@ -251,23 +255,41 @@ class SettingsScreenTest {
                     serviceGranted = false,
                     effective = false,
                 ),
+                web = WebSearchSettingsState(
+                    masterEnabled = true,
+                    ddgsOptIn = true,
+                    searxngUrl = "https://custom.example",
+                    canReset = true,
+                ),
+                assistant = AssistantSettingsState(
+                    roleHeld = false,
+                    roleAvailable = true,
+                ),
                 logoutErrorCode = "LOGOUT_CLEAR_FAILED",
                 onRetryLogout = { retryCalls++ },
                 onDismissLogoutError = { dismissed++ },
                 onOpenSystemA11y = { a11yClicks++ },
+                onWebResetSettings = { resetClicks++ },
+                onRequestAssistantRole = { assistantClicks++ },
             )
         }
-        // 三入口皆 displayed（經產品容器 scrollTo 滾入）；取消無。
+        // 入口皆 displayed（經產品容器 scrollTo 滾入）；取消無。
         // Stage R5：無身份時關閉可達（最高棧仍須可滾入可點）。
         onLogoutArea("前往系統無障礙設定").assertIsDisplayed()
+        onLogoutArea("設為預設助理").assertIsDisplayed()
+        onLogoutArea("重設所有設定").assertIsDisplayed()
         onLogoutArea("重試清除").assertIsDisplayed()
         onLogoutArea("關閉").assertIsDisplayed()
         composeRule.onAllNodesWithText("取消").assertCountEquals(0)
-        // 三入口皆可點。
+        // 入口皆可點。
         onLogoutArea("前往系統無障礙設定").performClick()
+        onLogoutArea("設為預設助理").performClick()
+        onLogoutArea("重設所有設定").performClick()
         onLogoutArea("重試清除").performClick()
         onLogoutArea("關閉").performClick()
         assertEquals(1, a11yClicks)
+        assertEquals(1, assistantClicks)
+        assertEquals(1, resetClicks)
         assertEquals(1, retryCalls)
         assertEquals(1, dismissed)
     }
@@ -282,6 +304,8 @@ class SettingsScreenTest {
         var retryCalls = 0
         var dismissed = 0
         var a11yClicks = 0
+        var resetClicks = 0
+        var assistantClicks = 0
         composeRule.setContent {
             SettingsScreen(
                 padding = PaddingValues(0.dp),
@@ -291,20 +315,38 @@ class SettingsScreenTest {
                     serviceGranted = false,
                     effective = false,
                 ),
+                web = WebSearchSettingsState(
+                    masterEnabled = true,
+                    ddgsOptIn = true,
+                    searxngUrl = "https://custom.example",
+                    canReset = true,
+                ),
+                assistant = AssistantSettingsState(
+                    roleHeld = false,
+                    roleAvailable = true,
+                ),
                 logoutErrorCode = "LOGOUT_CLEAR_FAILED",
                 onRetryLogout = { retryCalls++ },
                 onDismissLogoutError = { dismissed++ },
                 onOpenSystemA11y = { a11yClicks++ },
+                onWebResetSettings = { resetClicks++ },
+                onRequestAssistantRole = { assistantClicks++ },
             )
         }
         onLogoutArea("前往系統無障礙設定").assertIsDisplayed()
+        onLogoutArea("設為預設助理").assertIsDisplayed()
+        onLogoutArea("重設所有設定").assertIsDisplayed()
         onLogoutArea("重試清除").assertIsDisplayed()
         onLogoutArea("關閉").assertIsDisplayed()
         composeRule.onAllNodesWithText("取消").assertCountEquals(0)
         onLogoutArea("前往系統無障礙設定").performClick()
+        onLogoutArea("設為預設助理").performClick()
+        onLogoutArea("重設所有設定").performClick()
         onLogoutArea("重試清除").performClick()
         onLogoutArea("關閉").performClick()
         assertEquals(1, a11yClicks)
+        assertEquals(1, assistantClicks)
+        assertEquals(1, resetClicks)
         assertEquals(1, retryCalls)
         assertEquals(1, dismissed)
     }
@@ -598,5 +640,65 @@ class SettingsScreenTest {
         assertTrue(dismissedExport)
         dismissButtons[1].performScrollTo().performClick()
         assertTrue(dismissedImport)
+    }
+
+    @Test
+    fun webSearchCardDisplayedInNoEndpointWhenWebNotNull() {
+        composeRule.setContent {
+            SettingsScreen(
+                padding = PaddingValues(0.dp),
+                gate = EndpointGate.NoEndpoint,
+                web = WebSearchSettingsState(masterEnabled = false, ddgsOptIn = false),
+            )
+        }
+        composeRule.onNodeWithTag("webSearchCard").performScrollTo().assertIsDisplayed()
+        composeRule.onNodeWithTag("webMasterSwitch").performScrollTo().assertIsDisplayed()
+    }
+
+    @Test
+    fun webSearchCardDisplayedInReadFailureWhenWebNotNull() {
+        composeRule.setContent {
+            SettingsScreen(
+                padding = PaddingValues(0.dp),
+                gate = EndpointGate.ReadFailure,
+                web = WebSearchSettingsState(masterEnabled = false, ddgsOptIn = false),
+            )
+        }
+        composeRule.onNodeWithTag("webSearchCard").performScrollTo().assertIsDisplayed()
+        composeRule.onNodeWithTag("webMasterSwitch").performScrollTo().assertIsDisplayed()
+    }
+
+    @Test
+    fun webSearchCardHiddenWhenGateIsLoading() {
+        composeRule.setContent {
+            SettingsScreen(
+                padding = PaddingValues(0.dp),
+                gate = EndpointGate.Loading,
+                web = WebSearchSettingsState(masterEnabled = false, ddgsOptIn = false),
+            )
+        }
+        composeRule.onNodeWithTag("webSearchCard").assertDoesNotExist()
+    }
+
+    @Test
+    fun logoutInFlightDisablesWebSwitches() {
+        composeRule.setContent {
+            SettingsScreen(
+                padding = PaddingValues(0.dp),
+                gate = readyGate(),
+                web = WebSearchSettingsState(
+                    masterEnabled = true,
+                    ddgsOptIn = false,
+                    switchesEnabled = true,
+                    urlEditable = true,
+                    canReset = true,
+                ),
+                logoutInFlight = true,
+            )
+        }
+        composeRule.onNodeWithTag("webMasterSwitch").performScrollTo().assertIsNotEnabled()
+        composeRule.onNodeWithTag("webDdgsSwitch").performScrollTo().assertIsNotEnabled()
+        composeRule.onNodeWithTag("webSearxngUrl").performScrollTo().assertIsNotEnabled()
+        composeRule.onNodeWithTag("webResetButton").performScrollTo().assertIsNotEnabled()
     }
 }

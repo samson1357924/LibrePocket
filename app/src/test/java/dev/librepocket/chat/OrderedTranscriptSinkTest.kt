@@ -5,6 +5,7 @@ import java.util.Collections
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.NonCancellable
@@ -816,6 +817,249 @@ class OrderedTranscriptSinkTest {
       assertEquals(1, notices.get())
       assertFalse("non-VM fatal in a best-effort entry must not seal", sink.isSealed())
       assertFalse(sink.hasDurableFailures())
+    } finally {
+      exec.shutdown()
+    }
+  }
+
+  @Test fun bestEffortVmFatalWithNoWaiter_reportsAndSealsWithoutDurablePoison() {
+    val exec = Executors.newSingleThreadExecutor()
+    try {
+      val dispatcher = exec.asCoroutineDispatcher()
+      val entered = CompletableDeferred<Unit>()
+      val release = CompletableDeferred<Unit>()
+      val reported = AtomicReference<Throwable?>()
+      val reportCount = AtomicInteger(0)
+      val fatal = OutOfMemoryError("simulated best-effort VM fatal without waiter")
+      val delegate = object : SinkProbe() {
+        override suspend fun flushBufferedUsageBestEffort(runId: String) {
+          entered.complete(Unit)
+          release.await()
+          throw fatal
+        }
+      }
+      val sink = OrderedTranscriptSink(
+        delegate = delegate,
+        dispatcher = dispatcher,
+        capacity = 8,
+        terminalFatalReporter = { t ->
+          reported.set(t)
+          reportCount.incrementAndGet()
+        },
+      )
+      runBlocking {
+        try {
+          withTimeout(10_000) {
+            // Ackless best-effort notice: no flush waiter/ack observes this entry.
+            sink.flushBufferedUsageBestEffort("r1")
+            entered.await()
+            release.complete(Unit)
+            withTimeout(5_000) { while (!sink.isSealed()) delay(10) }
+          }
+        } finally {
+          release.complete(Unit)
+        }
+      }
+      val seen = reported.get()
+      assertTrue(
+        "best-effort VM-fatal without waiter must be reported observably, got $seen",
+        seen is OutOfMemoryError && seen.message == fatal.message,
+      )
+      assertEquals("VM-fatal must be reported exactly once", 1, reportCount.get())
+      assertTrue("VM-fatal must seal the writer", sink.isSealed())
+      assertTrue("no core write admitted, so no interrupted runIds: ${sink.interruptedRunIds()}", sink.interruptedRunIds().isEmpty())
+      assertTrue(sink.pendingRunIds().isEmpty())
+      assertFalse("best-effort notice must not poison durable core failures", sink.hasDurableFailures())
+    } finally {
+      exec.shutdown()
+    }
+  }
+
+  @Test fun coreVmFatalWithDurableWaiter_reportsExactlyOnceAndSeals() {
+    val exec = Executors.newSingleThreadExecutor()
+    try {
+      val dispatcher = exec.asCoroutineDispatcher()
+      val entered = CompletableDeferred<Unit>()
+      val release = CompletableDeferred<Unit>()
+      val reported = AtomicReference<Throwable?>()
+      val reportCount = AtomicInteger(0)
+      val fatal = OutOfMemoryError("simulated core VM fatal with durable waiter")
+      val delegate = object : SinkProbe() {
+        override suspend fun onTurnStarted(runId: String, text: String) {
+          entered.complete(Unit)
+          release.await()
+          throw fatal
+        }
+      }
+      val sink = OrderedTranscriptSink(
+        delegate = delegate,
+        dispatcher = dispatcher,
+        capacity = 8,
+        terminalFatalReporter = { t ->
+          reported.set(t)
+          reportCount.incrementAndGet()
+        },
+      )
+      runBlocking {
+        try {
+          val started = async { runCatching { sink.onTurnStarted("run-fatal", "hi") } }
+          entered.await()
+          release.complete(Unit)
+          withTimeout(10_000) {
+            val result = started.await()
+            val err = result.exceptionOrNull()
+            assertTrue("fatal Error must not ack as durable, got $err", err is OutOfMemoryError)
+            assertEquals(fatal.message, (err as OutOfMemoryError).message)
+            withTimeout(5_000) { while (!sink.isSealed()) delay(10) }
+          }
+        } finally {
+          release.complete(Unit)
+        }
+      }
+      val seen = reported.get()
+      assertTrue(
+        "core VM-fatal with durable waiter must be reported observably, got $seen",
+        seen is OutOfMemoryError && seen.message == fatal.message,
+      )
+      assertEquals("VM-fatal must be reported exactly once", 1, reportCount.get())
+      assertTrue("VM-fatal must seal the writer", sink.isSealed())
+      assertTrue(sink.interruptedRunIds().contains("run-fatal"))
+      assertTrue(sink.pendingRunIds().isEmpty())
+      assertTrue(sink.hasDurableFailures())
+    } finally {
+      exec.shutdown()
+    }
+  }
+
+  @Test fun distinctTerminalVmFatals_writerAndShutdownSettle_bothReportedOnce() {
+    val exec = Executors.newSingleThreadExecutor()
+    try {
+      val dispatcher = exec.asCoroutineDispatcher()
+      val entered = CompletableDeferred<Unit>()
+      val release = CompletableDeferred<Unit>()
+      val reports = java.util.Collections.synchronizedList(mutableListOf<Throwable>())
+      val fatalA = OutOfMemoryError("writer fatal A")
+      val fatalB = OutOfMemoryError("settle fatal B")
+      val delegate = object : SinkProbe() {
+        override suspend fun onTurnStarted(runId: String, text: String) {
+          entered.complete(Unit)
+          release.await()
+          throw fatalA
+        }
+      }
+      val sink = OrderedTranscriptSink(
+        delegate = delegate,
+        dispatcher = dispatcher,
+        capacity = 8,
+        terminalFatalReporter = { t -> reports.add(t) },
+      )
+      runBlocking {
+        try {
+          val started = async { runCatching { sink.onTurnStarted("run-fatal-distinct", "hi") } }
+          entered.await()
+          release.complete(Unit)
+          withTimeout(10_000) {
+            started.await()
+            withTimeout(5_000) { while (!sink.isSealed()) delay(10) }
+            val job = checkNotNull(
+              sink.shutdown(
+                drainTimeoutMs = 200L,
+                settle = { throw fatalB },
+              ),
+            ) { "shutdown must return job" }
+            val causeSignal = CompletableDeferred<Throwable?>()
+            job.invokeOnCompletion { causeSignal.complete(it) }
+            val cause = causeSignal.await()
+            assertTrue(
+              "shutdown settle fatal must propagate as completion cause, got $cause",
+              cause is OutOfMemoryError && cause.message == fatalB.message,
+            )
+          }
+        } finally {
+          release.complete(Unit)
+        }
+      }
+      assertEquals("distinct VM-fatals must both be reported, got=${reports.map { it.message }}", 2, reports.size)
+      assertTrue("writer fatal must be reported, got=${reports.map { it.message }}", reports.any { it.message == fatalA.message })
+      assertTrue(
+        "shutdown settle fatal must be reported, got=${reports.map { it.message }}",
+        reports.any { it.message == fatalB.message },
+      )
+      assertEquals("same instances must not be duplicated", reports.toSet().size, reports.size)
+    } finally {
+      exec.shutdown()
+    }
+  }
+
+  @Test fun terminalVmFatalDedupe_usesStrictIdentity_notEquals() {
+    class EqualOome(msg: String) : OutOfMemoryError(msg) {
+      override fun equals(other: Any?): Boolean = other is EqualOome
+      override fun hashCode(): Int = 1
+    }
+
+    val exec = Executors.newSingleThreadExecutor()
+    try {
+      val dispatcher = exec.asCoroutineDispatcher()
+      val entered = CompletableDeferred<Unit>()
+      val release = CompletableDeferred<Unit>()
+      val release2 = CompletableDeferred<Unit>()
+      val reports = java.util.Collections.synchronizedList(mutableListOf<Throwable>())
+      val t1 = EqualOome("same-equals")
+      val t2 = EqualOome("same-equals")
+      val toggle = AtomicInteger(0)
+      val delegate = object : SinkProbe() {
+        override suspend fun onTurnStarted(runId: String, text: String) {
+          val n = toggle.incrementAndGet()
+          entered.complete(Unit)
+          if (n == 1) {
+            release.await()
+            throw t1
+          } else {
+            release2.await()
+            throw t2
+          }
+        }
+      }
+      val sink = OrderedTranscriptSink(
+        delegate = delegate,
+        dispatcher = dispatcher,
+        capacity = 8,
+        terminalFatalReporter = { t -> reports.add(t) },
+      )
+      runBlocking {
+        try {
+          // First distinct instance.
+          val first = async { runCatching { sink.onTurnStarted("r1", "hi") } }
+          entered.await()
+          release.complete(Unit)
+          withTimeout(10_000) {
+            first.await()
+            withTimeout(5_000) { while (!sink.isSealed()) delay(10) }
+          }
+          assertEquals("distinct equal-by-equals instances must both be reportable; first failed", 1, reports.size)
+
+          // Second distinct instance reported through shutdown-settle path.
+          val job = checkNotNull(
+            sink.shutdown(drainTimeoutMs = 200L, settle = { throw t2 }),
+          ) { "shutdown must return job" }
+          val causeSignal = CompletableDeferred<Throwable?>()
+          job.invokeOnCompletion { causeSignal.complete(it) }
+          val cause = causeSignal.await()
+          assertTrue("shutdown should propagate a VM fatal, got $cause", cause is OutOfMemoryError)
+          assertEquals("distinct instances with overridden equals must both be reported", 2, reports.size)
+          assertTrue("writer instance must be reported", reports.any { it === t1 })
+          assertTrue(
+            "shutdown instance must be reported as a distinct instance",
+            reports.any { it !== t1 && it is OutOfMemoryError && it.message == t2.message },
+          )
+
+          // Same instance again must not duplicate.
+          // (re-report path not directly invokable; covered by existing exactly-once tests)
+        } finally {
+          release.complete(Unit)
+          release2.complete(Unit)
+        }
+      }
     } finally {
       exec.shutdown()
     }

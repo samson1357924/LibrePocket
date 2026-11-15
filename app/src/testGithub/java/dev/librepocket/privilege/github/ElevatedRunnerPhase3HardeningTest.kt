@@ -43,7 +43,10 @@ class ElevatedRunnerPhase3HardeningTest {
 
     private val privateRoot = "/data/data/files"
 
+    private var hermeticExec: HermeticExecFixture? = null
+
     @Before fun setUpIsolation() {
+        hermeticExec = HermeticExecFixture("phase3hard-hermetic", "id")
         ElevatedCleanupTracker.clearUnverified()
         ElevatedCleanupTracker.noteClean()
         pollOutstandingTo(0)
@@ -52,6 +55,8 @@ class ElevatedRunnerPhase3HardeningTest {
     }
 
     @After fun tearDownIsolation() {
+        hermeticExec?.close()
+        hermeticExec = null
         repeat(8) { ElevatedCleanupTracker.releaseSlot() }
         repeat(8) { ElevatedCleanupTracker.leaveCall() }
         pollOutstandingTo(0)
@@ -279,7 +284,10 @@ class ElevatedRunnerPhase3HardeningTest {
                 it.destroy()
             },
             grantCheck = GrantFixtures.allowAlways,
-        )
+                execSearchDirs = hermeticExec!!.searchDirs,
+        execAllowedRoots = hermeticExec!!.allowedRoots,
+        execIsWritable = hermeticExec!!.systemOwned,
+)
         try {
             val resultRef = AtomicReference<ElevatedBinaryResult?>()
             val start = System.currentTimeMillis()
@@ -355,7 +363,10 @@ class ElevatedRunnerPhase3HardeningTest {
                 it.destroy()
             },
             grantCheck = GrantFixtures.allowAlways,
-        )
+                execSearchDirs = hermeticExec!!.searchDirs,
+        execAllowedRoots = hermeticExec!!.allowedRoots,
+        execIsWritable = hermeticExec!!.systemOwned,
+)
         try {
             val resultRef = AtomicReference<ElevatedBinaryResult?>()
             val start = System.currentTimeMillis()
@@ -445,7 +456,10 @@ class ElevatedRunnerPhase3HardeningTest {
                 spawn = spawn,
                 suBinary = "/system/bin/su",
                 grantCheck = GrantFixtures.allowAlways,
-            )
+                        execSearchDirs = hermeticExec!!.searchDirs,
+            execAllowedRoots = hermeticExec!!.allowedRoots,
+            execIsWritable = hermeticExec!!.systemOwned,
+)
         }
     }
 
@@ -459,7 +473,10 @@ class ElevatedRunnerPhase3HardeningTest {
                 spawn = spawn,
                 status = { ShizukuStatus.Available(15) },
                 grantCheck = GrantFixtures.allowAlways,
-            )
+                        execSearchDirs = hermeticExec!!.searchDirs,
+            execAllowedRoots = hermeticExec!!.allowedRoots,
+            execIsWritable = hermeticExec!!.systemOwned,
+)
         }
     }
 
@@ -512,7 +529,10 @@ class ElevatedRunnerPhase3HardeningTest {
                 suBinary = "/system/bin/su",
                 isCancelled = isCancelled,
                 grantCheck = GrantFixtures.allowAlways,
-            )
+                        execSearchDirs = hermeticExec!!.searchDirs,
+            execAllowedRoots = hermeticExec!!.allowedRoots,
+            execIsWritable = hermeticExec!!.systemOwned,
+)
         }
     }
 
@@ -527,7 +547,10 @@ class ElevatedRunnerPhase3HardeningTest {
                 status = { ShizukuStatus.Available(15) },
                 isCancelled = isCancelled,
                 grantCheck = GrantFixtures.allowAlways,
-            )
+                        execSearchDirs = hermeticExec!!.searchDirs,
+            execAllowedRoots = hermeticExec!!.allowedRoots,
+            execIsWritable = hermeticExec!!.systemOwned,
+)
         }
     }
 
@@ -585,7 +608,10 @@ class ElevatedRunnerPhase3HardeningTest {
                 suBinary = "/system/bin/su",
                 grantCheck = GrantFixtures.allowAlways,
                 validateFn = validateFn,
-            )
+                        execSearchDirs = hermeticExec!!.searchDirs,
+            execAllowedRoots = hermeticExec!!.allowedRoots,
+            execIsWritable = hermeticExec!!.systemOwned,
+)
         }
     }
 
@@ -603,7 +629,10 @@ class ElevatedRunnerPhase3HardeningTest {
                 status = { ShizukuStatus.Available(15) },
                 grantCheck = GrantFixtures.allowAlways,
                 validateFn = validateFn,
-            )
+                        execSearchDirs = hermeticExec!!.searchDirs,
+            execAllowedRoots = hermeticExec!!.allowedRoots,
+            execIsWritable = hermeticExec!!.systemOwned,
+)
         }
     }
 
@@ -623,7 +652,10 @@ class ElevatedRunnerPhase3HardeningTest {
             suBinary = "/system/bin/su",
             grantCheck = GrantFixtures.allowAlways,
             validateFn = { _, _ -> Validation.Denied(ShellDeny.BLACKLISTED, "nono") },
-        )
+                execSearchDirs = hermeticExec!!.searchDirs,
+        execAllowedRoots = hermeticExec!!.allowedRoots,
+        execIsWritable = hermeticExec!!.systemOwned,
+)
         val r = runner.runBinary(ElevatedRequest(listOf("id"), "P3-VAL"), 2_000L)
         assertTrue("$r", r is ElevatedBinaryResult.Denied)
         assertEquals(0, spawns.get())

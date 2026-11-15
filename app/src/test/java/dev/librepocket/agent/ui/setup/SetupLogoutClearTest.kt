@@ -207,8 +207,19 @@ class SetupLogoutClearTest {
 
     @After
     fun tearDown() {
-        Dispatchers.resetMain()
+        // Harden teardown ordering: cancel tracked scopes and await completion before
+        // resetting Main to reduce Dispatchers.Main-after-reset pollution risk.
         scopes.forEach { it.cancel() }
+        scopes.forEach { scope ->
+            val job = scope.coroutineContext[kotlinx.coroutines.Job]
+            runBlocking {
+                withTimeout(5_000) {
+                    job?.join()
+                }
+            }
+        }
+        Dispatchers.resetMain()
+        scopes.clear()
         tmpDirs.forEach { it.deleteRecursively() }
     }
 

@@ -36,11 +36,14 @@ class ElevatedRunnerPhase2LateSpawnTest {
 
     private val privateRoot = "/data/data/files"
 
+    private var hermeticExec: HermeticExecFixture? = null
+
     /**
      * 終審殘留隔離（Phase 1 P1-1 風格）：每用例首尾歸零 consecutive＋輪詢收斂
      * outstanding/active，避免同 JVM 內熔斷污染後測。
      */
     @Before fun setUpBreakerIsolation() {
+        hermeticExec = HermeticExecFixture("phase2late-hermetic", "id")
         ElevatedCleanupTracker.clearUnverified()
         ElevatedCleanupTracker.noteClean()
         pollOutstandingTo(0)
@@ -48,6 +51,8 @@ class ElevatedRunnerPhase2LateSpawnTest {
     }
 
     @After fun tearDownBreakerIsolation() {
+        hermeticExec?.close()
+        hermeticExec = null
         ElevatedCleanupTracker.clearUnverified()
         ElevatedCleanupTracker.noteClean()
         pollOutstandingTo(0)
@@ -147,7 +152,10 @@ class ElevatedRunnerPhase2LateSpawnTest {
         suBinary = "/system/bin/su",
         killer = killer,
         grantCheck = GrantFixtures.allowAlways,
-    )
+        execSearchDirs = hermeticExec!!.searchDirs,
+    execAllowedRoots = hermeticExec!!.allowedRoots,
+    execIsWritable = hermeticExec!!.systemOwned,
+)
 
     private fun shizukuRunner(
         spawn: (List<String>) -> Process,
@@ -161,7 +169,10 @@ class ElevatedRunnerPhase2LateSpawnTest {
         status = { ShizukuStatus.Available(15) },
         killer = killer,
         grantCheck = GrantFixtures.allowAlways,
-    )
+        execSearchDirs = hermeticExec!!.searchDirs,
+    execAllowedRoots = hermeticExec!!.allowedRoots,
+    execIsWritable = hermeticExec!!.systemOwned,
+)
 
     // ---- P1-2：先 timeout、後交付的 late Process 必補償（Root／Shizuku） ----
 

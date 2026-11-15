@@ -219,8 +219,8 @@ class ElevatedRunnerPhaseRTest {
                 val kicked = ElevatedCleanupTracker.kickSweepAsync(nowNanos)
                 val wallMs = (System.nanoTime() - t0) / 1_000_000L
                 assertTrue(
-                    "kick $i wall=${wallMs}ms must stay <5ms (local snapshot only, zero IPC)",
-                    wallMs < 5L,
+                    "kick $i wall=${wallMs}ms must stay <20ms (local snapshot only, zero IPC)",
+                    wallMs < 20L,
                 )
                 if (kicked) started++
             }

@@ -144,9 +144,12 @@ import java.util.concurrent.TimeUnit
  * - 殘留 gobbler／stdin-closer 計數（啟動不預佔；join 超界仍存活即 interrupt＋grace，
  *   仍存活即 [ElevatedCleanupTracker.markLingering]：每執行緒三態
  *   [AtomicInteger]（0=init／1=held／2=done）＋僅未計數時佔槽，
- *   執行緒本體 finally 釋放；清理 worker 不自釋——Stage 3b slot-ownership
- *   transfer：槽位跨 post-kill verify 由 drain 呼叫方持有，verify 結果已知後
- *   釋放一次（見 [runCleanupBounded]））；
+ *   執行緒本體 finally 釋放；清理 worker 的槽 custody 走 Stage 3c 雙持有者
+ *   （AA1-slot）規則：正常路徑——槽位跨 post-kill verify 由 drain 呼叫方持有，
+ *   verify 結果已知後於 [releaseCleanupSlotAfterVerify] 釋放一次；stall 路徑——
+ *   post-grace 線性化點把 custody 轉移給 worker 本體，worker finally 釋放
+ *   （admission 於彼時前 fail-closed）。詳見 [runCleanupBounded] KDoc AA1-slot
+ *   段及 [releaseCleanupSlotAfterVerify]（唯一 caller 側釋放點））；
  * - linger 成功走 [ElevatedCleanupTracker.noteUnclean]（finished／kill 統一終審
  *   `if (cleanupIncomplete) noteUnclean() else if (outstanding()==0) noteClean()`；
  *   cleanupIncomplete 含殘留 gobbler／stdin；正常完成且全域無殘留仍 noteClean，
@@ -1059,10 +1062,13 @@ internal object ElevatedCleanupTracker {
     }
 
     /**
-     * 釋一槽（Stage 3b slot-ownership transfer 後，`runCleanupBounded` 不自釋放：
-     * 已佔槽經 `slotHeldOut` 移交 drain 呼叫方，呼叫方在 post-kill verify 結果已知後
-     * 調用——verify 窗口內 slot 始終由呼叫方持有，live victim 於驗證完成前始終被
-     * 追蹤——或殘留執行緒本體 finally 調用）。
+     * 釋一槽（Stage 3c 雙持有者規則後，`runCleanupBounded` 不自釋放：已佔槽經
+     * `slotHeldOut` 移交 drain 呼叫方——custody 要麼由呼叫方持有跨 post-kill verify
+     * （正常路徑：verify 結果已知後調用本函數恰好釋放一次，verify 窗口內 live victim
+     * 始終被追蹤），要麼已於 post-grace 線性化點轉移給 stalled worker 本體（stall
+     * 路徑：呼叫方 `releaseCleanupSlotAfterVerify` 為 no-op，本函數改由 worker 本體
+     * finally 調用——admission 於 worker 退出前維持 fail-closed）；或殘留執行緒
+     * 本體 finally 調用）。
      *
      * floor 觸發即 bug（未佔而釋）：產品保持 floor 不變負，但經
      * [releaseFloorHits] 計數上報（測用不断言，僅供診斷；正常三態機制下永不觸發）。
@@ -2691,10 +2697,13 @@ internal object ElevatedProcessIo {
         }
         if (preflightExpired) {
             var preIncomplete = false
-            // Stage 3b：清理槽所有權移交——runCleanupBounded 正常返回且已佔槽即
-            // slotHeldOut=true；caller 持至 post-kill verify 結果已知後（quarantine
-            // 先行、release 殿後，順序不變）恰好釋放一次；slot 跨 verify 持有，
-            // live victim 在 verify 有界窗口內始終被 tracker 追蹤。
+            // Stage 3b／3c（雙持有者規則）：清理槽所有權移交——正常路徑：
+            // runCleanupBounded 正常返回且已佔槽即 slotHeldOut=true，custody 由
+            // caller 持有跨 post-kill verify 有界窗口（live victim 始終被追蹤），
+            // verify 結果已知後恰好釋放一次（quarantine 先行、release 殿後，
+            // 順序不變）；stall 路徑：post-grace 已把 custody 轉移給 worker 本體、
+            // slotHeldOut=false——本處 releaseCleanupSlotAfterVerify 為 no-op，
+            // release 於 worker 退出時發生（admission 於彼時前維持 fail-closed）。
             val cleanupSlotHeld = AtomicBoolean(false)
             val preOk = try {
                 runCleanupBounded(CLEANUP_MIN_MS, process, untrackedResidual, startThread, cleanupSlotHeld) {
@@ -2721,8 +2730,11 @@ internal object ElevatedProcessIo {
                 // 不靠 breaker 計數）。登記改由 [releaseCleanupSlotAfterVerify] 執行
                 // （quarantine 先行、release 殿後，順序不變；登記拋出則槽保留 fail-closed）。
             }
-            // Stage 3b：slot 僅在 verify 結果已知後釋放（unconditional of outcome；
-            // quarantine 先行、release 殿後，順序不變）。
+            // Stage 3c 雙持有者規則：正常路徑——custody 由 caller 持有跨 verify，verify
+            // 結果已知後於下方恰好釋放一次（quarantine 先行、release 殿後，順序不變）；
+            // stall 路徑——post-grace 已把 custody 轉移給 worker，本次呼叫對
+            // releaseCleanupSlotAfterVerify 為 no-op（slotHeldOut==false），release
+            // 於 worker 退出時發生（admission 於彼時前維持 fail-closed）。
             releaseCleanupSlotAfterVerify(process, preVerified, cleanupSlotHeld.get())
             if (preIncomplete) {
                 ElevatedCleanupTracker.noteUnclean()
@@ -2837,9 +2849,12 @@ internal object ElevatedProcessIo {
                 0L
             }
             val cleanupBudgetMs = minOf(maxOf(cleanupRemainMs, CLEANUP_MIN_MS), CLEANUP_JOIN_MS)
-            // Stage 3b：清理槽所有權移交——slot 持有跨 post-kill verify 有界窗口
-            // （live victim 始終被追蹤）；verify 結果已知後恰好釋放一次（quarantine
-            // 先行、release 殿後，順序不變）。
+            // Stage 3c 雙持有者規則：清理槽所有權移交——正常路徑：slot 持有跨
+            // post-kill verify 有界窗口（live victim 始終被追蹤），custody 由 caller
+            // 持有，verify 結果已知後恰好釋放一次（quarantine 先行、release 殿後，
+            // 順序不變）；stall 路徑：post-grace 已把 custody 轉移給 worker 本體、
+            // slotHeldOut=false——下方 releaseCleanupSlotAfterVerify 為 no-op，
+            // release 於 worker 退出時發生（admission 於彼時前維持 fail-closed）。
             val cleanupSlotHeld = AtomicBoolean(false)
             val cleanupOk = try {
                 runCleanupBounded(cleanupBudgetMs, process, untrackedResidual, startThread, cleanupSlotHeld) {
@@ -2866,8 +2881,11 @@ internal object ElevatedProcessIo {
                 // [releaseCleanupSlotAfterVerify] 執行（quarantine 先行、release 殿後，
                 // 順序不變；登記拋出則槽保留 fail-closed）。
             }
-            // Stage 3b：slot 僅在 verify 結果已知後釋放（unconditional of outcome；
-            // quarantine 先行、release 殿後，順序不變）。
+            // Stage 3c 雙持有者規則：正常路徑——custody 由 caller 持有跨 verify，verify
+            // 結果已知後於下方恰好釋放一次（quarantine 先行、release 殿後，順序不變）；
+            // stall 路徑——post-grace 已把 custody 轉移給 worker，本次呼叫對
+            // releaseCleanupSlotAfterVerify 為 no-op（slotHeldOut==false），release
+            // 於 worker 退出時發生（admission 於彼時前維持 fail-closed）。
             releaseCleanupSlotAfterVerify(process, verified, cleanupSlotHeld.get())
             if (startedOut != null && (outStarted || startedOut.isAlive)) {
                 runCatching { startedOut.interrupt() }
@@ -3178,9 +3196,12 @@ internal object ElevatedProcessIo {
                 0L
             }
             val cleanupBudgetMs = minOf(maxOf(cleanupRemainMs, CLEANUP_MIN_MS), CLEANUP_JOIN_MS)
-            // Stage 3b：清理槽所有權移交——slot 持有跨 post-kill verify 有界窗口
-            // （live victim 始終被追蹤）；verify 結果已知後恰好釋放一次（quarantine
-            // 先行、release 殿後，順序不變）。
+            // Stage 3c 雙持有者規則：清理槽所有權移交——正常路徑：slot 持有跨
+            // post-kill verify 有界窗口（live victim 始終被追蹤），custody 由 caller
+            // 持有，verify 結果已知後恰好釋放一次（quarantine 先行、release 殿後，
+            // 順序不變）；stall 路徑：post-grace 已把 custody 轉移給 worker 本體、
+            // slotHeldOut=false——下方 releaseCleanupSlotAfterVerify 為 no-op，
+            // release 於 worker 退出時發生（admission 於彼時前維持 fail-closed）。
             val cleanupSlotHeld = AtomicBoolean(false)
             val cleanupOk = try {
                 runCleanupBounded(cleanupBudgetMs, process, untrackedResidual, startThread, cleanupSlotHeld) {
@@ -3226,8 +3247,11 @@ internal object ElevatedProcessIo {
             if (!verified) {
                 cleanupIncomplete = true
             }
-            // Stage 3b：slot 僅在 verify 結果已知後釋放（unconditional of outcome；
-            // quarantine 先行、release 殿後，順序不變）。
+            // Stage 3c 雙持有者規則：正常路徑——custody 由 caller 持有跨 verify，verify
+            // 結果已知後於下方恰好釋放一次（quarantine 先行、release 殿後，順序不變）；
+            // stall 路徑——post-grace 已把 custody 轉移給 worker，本次呼叫對
+            // releaseCleanupSlotAfterVerify 為 no-op（slotHeldOut==false），release
+            // 於 worker 退出時發生（admission 於彼時前維持 fail-closed）。
             releaseCleanupSlotAfterVerify(process, verified, cleanupSlotHeld.get())
             // 超時/cancel 路徑保留有界 join：gobbler 仍可能卡住，避免無限等。
             // join 中斷必須 restore 中斷旗標（不吞 InterruptedException）。
@@ -3596,8 +3620,10 @@ internal object ElevatedProcessIo {
      * - **worker 未 outlive grace 窗口**（正常完結或已死）：custody 留在呼叫方——
      *   呼叫方在 `verifyParentStoppedBounded` 返回（結果 true／false 皆同）後依
      *   `slotHeldOut==true` 恰好釋放一次；quarantine 一律先於釋放（呼叫方既有
-     *   quarantine-before-release 順序不變）。理由：runCleanupBounded 返回時
-     *   cleanup worker 已退出並已讓出 tracker slot，若在 verify 前釋放，一個
+     *   quarantine-before-release 順序不變）。理由：正常路徑（三態 0→2，無 worker
+     *   release）worker **從不自釋**——worker finally 僅見三態 1 才釋放，正常完結
+     *   僅置 2；custody 留在呼叫方（state 0→2 未伴隨 worker 釋放，槽始終由
+     *   caller 持有）。若在 verify 前釋放，一個
      *   真正存活的 victim 將在 verify 窗口內變成 untracked
      *   （outstanding==0 && quarantine 空 ⇒ `tryEnterReserved` OK），admission
      *   密封缺口。持有跨越 verify 保證：live victim 在 verify 有界窗口內始終被
@@ -3617,8 +3643,10 @@ internal object ElevatedProcessIo {
      *   三態 2 無動作。
      *   已知取捨（誠實記錄）：永久不可中斷的 stall 自此將**釘住 admission 關閉
      *   （outstanding≥1 直至 worker 退出）**，而非僅 stall 期間殘留計數——此為
-     *   刻意 fail-closed；與 gobbler／stdin-closer linger 語義一致，並由
-     *   #136-B3 alert wiring 接管告警恢復。
+     *   刻意 fail-closed；與 gobbler／stdin-closer linger 語義一致。今日唯一可見
+     *   訊號是 `cleanupWorkerStalledAfterVerifyCount()`（現僅測試消費），恢復管道
+     *   僅 app／process 重啟；#136-B3 alert wiring 及任何恢復自動化均為**待辦、
+     *   本 PR 未實作**，不得據此誤讀為已接線。
      * 飽和（未佔槽）路徑 `slotHeldOut` 保持 false（呼叫方零釋放義務）。
      * 起線程失敗 arm（`start()` 抛）：登記成功當下即釋放已佔槽並置
      * `slotHeldOut=false`（呼叫方不重複釋放）；登記拋出（罕見，如 OOM）時槽**保留**
@@ -3704,6 +3732,14 @@ internal object ElevatedProcessIo {
         // 自此以 QUARANTINE 拒新 spawn，直到 verify-only sweep 有界驗證自然死亡
         // 才解除（恢復管道同晚補償路徑）。飽和仍不起新佔槽，但仍起 worker 嘗試
         // killer（永不跳過；admission 密封≠跳過 kill）。
+        // AA1-slot 三態（Stage 3c，thread-bound custody；語義同 markLingering 三態）：
+        // 0=交接前（worker 未完結、custody 未轉移）、1=custody 已移交 worker 本體
+        // （post-grace 重讀仍存活即在此線性化點轉移）、2=終態（worker finally 已跑／
+        // 飽和未佔槽無動作）。線性化點＝synchronized(cleanupSlotState)；worker finally
+        // 與 post-grace 轉移段皆在同一鎖內原子判定，恰好一次。
+        // 提前於 slot 取得前建立（Stage 1 review）：線程體／post-grace 轉移段始終
+        // 引用同一 cell，且 slot 取得與 try 之間不存在可令 custody 歧義的語句。
+        val cleanupSlotState = AtomicInteger(0)
         // 入口拒絕由兩 runner 資源門承擔，此處不拒絕 killer 嘗試，只記賬；
         // 無槽（acquireSlotOrQuarantine 回 false）仍嘗試，但回 false 保守記不完整
         // （見本函數 P1-4 段）。
@@ -3720,12 +3756,6 @@ internal object ElevatedProcessIo {
             untrackedOut?.set(false)
             return false
         }
-        // AA1-slot 三態（Stage 3c，thread-bound custody；語義同 markLingering 三態）：
-        // 0=交接前（worker 未完結、custody 未轉移）、1=custody 已移交 worker 本體
-        // （post-grace 重讀仍存活即在此線性化點轉移）、2=終態（worker finally 已跑／
-        // 飽和未佔槽無動作）。線性化點＝synchronized(cleanupSlotState)；worker finally
-        // 與 post-grace 轉移段皆在同一鎖內原子判定，恰好一次。
-        val cleanupSlotState = AtomicInteger(0)
         val t = try {
             Thread({
                 try {
@@ -3804,25 +3834,31 @@ internal object ElevatedProcessIo {
                 Thread.currentThread().interrupt()
             }
         }
-        // B3 telemetry（不接 admission／verdict）：槽 carrying 的清理 worker 在最終
-        // post-grace `isAlive` 重讀仍存活（不可中斷 stall）——計數一次；saturation
-        // 無槽（acquired==false）不計（untracked 已另計）。
-        // Stage 3c：同一 post-grace 檢查點為 custody 轉移的線性化點——worker 仍存活
-        // 即原子轉移 slot 所有權給 worker 本體：synchronized(cleanupSlotState) 內
-        // 0→1 並 `slotHeldOut.set(false)`（本函數返回前生效）；worker finally 見 1
-        // 即置 2 並 releaseSlot（worker 為槽的最後持有者）。caller 於 verify 臂見
-        // slotHeldOut==false 即不再釋放（verified=true 臂無動作），admission 續見
-        // outstanding>=1 直至 worker 退出——fail-closed。worker finally 已先跑
-        // （state==2）則不轉移，caller 保有槽並於 verify 釋放——exactly-once 不變。
+        // B3 telemetry（不接 admission／verdict）＋Stage 3c custody 轉移：槽 carrying
+        // 的清理 worker 在最終 post-grace `isAlive` 重讀仍存活（不可中斷 stall）。
+        // transfer-first、telemetry-second（Stage 1 review）：先於同一線性化點內
+        // 原子轉移 slot 所有權給 worker 本體（0→1 並 `slotHeldOut.set(false)`，本函數
+        // 返回前生效；worker finally 見 1 即置 2 並 releaseSlot），僅當轉移實際發生
+        // （worker finally 尚未先跑，state!=2）才計 telemetry 一次；worker finally 已
+        // 搶先（state==2）不轉移亦不計——避免把「worker 已退出」誤計為 stall。
+        // telemetry 以 runCatching 包裹：安全移交不因計數異常而受阻。
+        // saturation 無槽（acquired==false）不計（untracked 已另計）。
+        // caller 於 verify 臂見 slotHeldOut==false 即不再釋放（verified=true 臂無動作），
+        // admission 續見 outstanding>=1 直至 worker 退出——fail-closed。
         // 本 synchronized 區塊即線性化點（同 markLingering 紀律），不設區外第二次
         // isAlive 重讀，避免雙重移交。
         if (acquired && t.isAlive) {
-            ElevatedCleanupTracker.noteCleanupWorkerStalledAfterVerify()
-            synchronized(cleanupSlotState) {
+            val transferred = synchronized(cleanupSlotState) {
                 if (cleanupSlotState.get() == 0) {
                     cleanupSlotState.set(1)
                     slotHeldOut.set(false)
+                    true
+                } else {
+                    false
                 }
+            }
+            if (transferred) {
+                runCatching { ElevatedCleanupTracker.noteCleanupWorkerStalledAfterVerify() }
             }
         }
         // P1-4 飽和即拒：未佔槽（acquired==false）即回 false（上已嘗試 killer，

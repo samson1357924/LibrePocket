@@ -2864,6 +2864,7 @@ class ElevatedRunnerP1B2Test {
         ElevatedCleanupTracker.noteClean()
         pollOutstandingTo(0)
         val floorBefore = ElevatedCleanupTracker.releaseFloorHits()
+        val stalledBefore = ElevatedCleanupTracker.cleanupWorkerStalledAfterVerifyCount()
         val stallLatch = CountDownLatch(1)
         fun awaitUninterruptibly(latch: CountDownLatch) {
             while (true) {
@@ -2908,11 +2909,9 @@ class ElevatedRunnerP1B2Test {
                 1,
                 ElevatedCleanupTracker.outstanding(),
             )
-            assertEquals(
-                "stalled cleanup must keep admission fail-closed",
-                ElevatedCleanupTracker.Admission.BACKLOG_FULL,
-                ElevatedCleanupTracker.tryEnterReserved(),
-            )
+            val admission = ElevatedCleanupTracker.tryEnterReserved()
+            if (admission == ElevatedCleanupTracker.Admission.OK) { ElevatedCleanupTracker.leaveCall() }
+            assertEquals(ElevatedCleanupTracker.Admission.BACKLOG_FULL, admission)
             assertEquals(
                 "stalled cleanup must not leak active-call seats",
                 0,
@@ -2922,6 +2921,13 @@ class ElevatedRunnerP1B2Test {
                 "verify=true registers nothing (quarantine untouched)",
                 0,
                 ElevatedCleanupTracker.quarantinedCount(),
+            )
+            // Stage 1 review（pin stall telemetry）：drain 返回、latch 尚未放開前——
+            // post-grace 線性化點確已轉移 custody，且 telemetry 已恰好計一次。
+            assertEquals(
+                "stall telemetry must be pinned to exactly one count for the drain",
+                stalledBefore + 1,
+                ElevatedCleanupTracker.cleanupWorkerStalledAfterVerifyCount(),
             )
         } finally {
             stallLatch.countDown()

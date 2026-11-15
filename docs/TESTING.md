@@ -120,7 +120,9 @@ preflight, the pinned, hash-checked `PyYAML==6.0.3` install from
 harness, plus the always-on `Pins-absence tripwire (Issue #12)` step that
 runs `CommittedPinsAbsenceControl` on every PR — with a five-minute timeout.
 The control rejects tracked paths with a `signer_pins`/`signer-pins` path
-component (marker-path predicate, filename-agnostic beyond those markers) and
+component (marker-path predicate, filename-agnostic beyond those markers), with
+the single byte-exact exemption of the canonical `scripts/release_signer_pins.example.json`
+placeholder (the checked-in negative control), and
 additionally content-scans every non-symlink tracked file of at most 64 KiB whose raw
 bytes are UTF-8 JSON objects (first non-whitespace byte `{`, with a UTF-8 BOM
 peeled first) for registry-shaped `play`/`foss`/`github` entries — exactly

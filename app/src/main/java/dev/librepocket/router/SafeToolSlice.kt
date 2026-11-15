@@ -218,6 +218,9 @@ class SafeToolSlice(
          * Scans by code point so supplementary-plane format characters
          * (surrogate pairs whose individual halves report SURROGATE) are
          * properly recognized.
+         *
+         * Mirrored by hand in [FastDispatch] (`containsFormatCodePoint` copy) —
+         * edit the two implementations together.
          */
         internal fun containsFormatCodePoint(s: String): Boolean {
             var i = 0
@@ -251,6 +254,9 @@ class SafeToolSlice(
          * walk back can only extend it, never split a pair that was not
          * already malformed. Work is bounded by `[cap]` (≤ `cap+1` in the
          * split case counting the marker afterwards).
+         *
+         * Mirrored by hand in [FastDispatch] (`cappedTake` copy) — edit the
+         * two implementations together.
          */
         internal fun cappedTake(value: String, cap: Int): String {
             if (value.length <= cap) return value
@@ -288,6 +294,9 @@ class SafeToolSlice(
          * one pairing key (which would silently drop the second execution).
          * The 128-bit suffix keeps collision probability negligible even for
          * adversarial inputs. The result never exceeds [MAX_STRING_CHARS].
+         *
+         * Mirrored by hand in [FastDispatch] (`boundedCallId` port) — edit the
+         * two implementations together.
          */
         internal fun boundedRedactedId(callId: String): String {
             val redacted = dev.librepocket.redact.Redactor.redact(callId).text
@@ -448,7 +457,11 @@ class SafeToolSlice(
          *  even inspected (its shape must not influence the output). */
         private fun secretValueReceipt(): JsonElement = JsonPrimitive(SECRET_VALUE_RECEIPT)
 
-        /** Computes max JSON nesting depth while ignoring string contents. */
+        /**
+         * Computes max JSON nesting depth while ignoring string contents.
+         * Mirrored by hand in [FastDispatch] (`jsonNestingDepth` copy) —
+         * edit the two implementations together.
+         */
         private fun jsonNestingDepth(s: String): Int {
             var depth = 0
             var max = 0
@@ -997,6 +1010,9 @@ class SafeToolSlice(
      * Filesystem-shaped scope input only — the model-controlled
      * `query` deliberately keeps its own narrower check (a search string may
      * contain `..`/`%`/`:` and stays allowed).
+     *
+     * Mirrored by hand in [FastDispatch] (`isSafeInput` copy) — edit the
+     * two implementations together.
      */
     private fun isSafeInput(v: String): Boolean {
         if (v.contains("..")) return false
@@ -1053,6 +1069,10 @@ class SafeToolSlice(
         return ToolResult(call.id, call.name, json, denied = true, denyCode = code)
     }
 
+    /**
+     * Mirrored by hand in [FastDispatch] (`cappedEcho` copy) — edit the two
+     * implementations together.
+     */
     private fun cappedEcho(value: String): String =
         if (value.length > MAX_STRING_CHARS) {
             cappedTake(value, MAX_STRING_CHARS) + "…[truncated ${value.length}→$MAX_STRING_CHARS]"
@@ -1068,7 +1088,10 @@ class SafeToolSlice(
      *  omitted length is MODEL/BACKEND-controlled information, and echoing it
      *  back tells the model how much data it fed in — a free side channel
      *  (and an unnecessary leak) on a receipt whose only job is to say
-     *  "something was dropped here". */
+     *  "something was dropped here".
+     *
+     *  Mirrored by hand in [FastDispatch] (`boundedRawBackendField` copy) —
+     *  edit the two implementations together. */
     private fun boundedRawBackendField(value: String): String =
         if (value.length <= RAW_BACKEND_FIELD_MAX_CHARS) value
         else "[backend field omitted]"

@@ -11,8 +11,11 @@ import java.util.concurrent.atomic.AtomicLong
  * Fast lane: deterministic intent-template routing (ARCHITECTURE §9.1/§9.3).
  *
  * Rule engine first: an intent matching a known template goes FAST with a
- * schema-checked [ToolCall]; a match whose projection is UNAVAILABLE is
- * denied with the projection reason code; anything else is DENIED as
+ * schema-checked [ToolCall]; a match whose projection is not NATIVE is
+ * denied with the projection reason code (DEGRADED tools never execute on
+ * the fast lane, mirroring the slice's NATIVE-only rule — `lsp.symbols`
+ * projects NATIVE once its switch is on, so the pinned suite is
+ * unaffected); anything else is DENIED as
  * no-match with manual guidance. Every outcome carries a [TranscriptHeader]
  * with the decision, the projection snapshot and the model-visible snapshot.
  *
@@ -114,7 +117,7 @@ class FastRouter(
                 header = header(RouteKind.DENIED, match.toolName, null),
             )
         val projection = projections.getValue(tool.name)
-        if (projection.level == CapabilityLevel.UNAVAILABLE) {
+        if (projection.level != CapabilityLevel.NATIVE) {
             val reason = projection.reason ?: dev.librepocket.tool.DenyReason.USER_DISABLED
             return RouteDecision(
                 route = RouteKind.DENIED,
@@ -127,8 +130,9 @@ class FastRouter(
         // Stage1 guess-rejection (no new execution path): negated or
         // under-specified intents become NEED_CLARIFICATION (audit-distinct
         // from USER_DISABLED wiring/switch-off) with a 補參 question.
-        // Projection UNAVAILABLE stays first so FLAVOR/NO_PRIVILEGE mask
-        // clarification; wiring USER_DISABLED stays after so missing args
+        // Projection not NATIVE stays first so FLAVOR/NO_PRIVILEGE mask
+        // clarification (DEGRADED tools never execute on the fast lane);
+        // wiring USER_DISABLED stays after so missing args
         // are never masked as "not wired".
         val trimmed = intentText.trim()
         if (isNegated(trimmed)) {

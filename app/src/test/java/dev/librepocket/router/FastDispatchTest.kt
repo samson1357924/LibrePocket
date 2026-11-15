@@ -6,11 +6,21 @@ import dev.librepocket.tool.ProjectionContext
 import dev.librepocket.tool.ToolDef
 import dev.librepocket.tool.ToolRegistry
 import java.util.concurrent.atomic.AtomicInteger
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.TimeoutCancellationException
+import kotlinx.coroutines.async
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.runBlocking
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -33,8 +43,15 @@ import org.junit.Test
 class FastDispatchTest {
 
     private val lspOn = ProjectionContext(userSwitches = mapOf("lsp" to true))
+    // listener:notification 授權讓 notification.read 投影 NATIVE（無授權時 DEGRADED，
+    // Phase 2 起非 NATIVE 投影在 projection gate 即 DENIED + NO_PRIVILEGE，
+    // 否定句探針測不到 NEGATION closure）；calendar probe 用 READ_CALENDAR。
+    // 明確聲明：listener:notification 授權存在的唯一目的，是讓
+    // genericNegationClarifiesForEveryTemplatedTool 的 notification.read 探針在
+    // NATIVE-only router gate 下維持在 clarification 路徑（其餘探針原本即為
+    // NATIVE；calendar.create 探針由 READ_CALENDAR 負責）。
     private val lspOnCalendarGranted = lspOn.copy(
-        grantedPermissions = setOf("android.permission.READ_CALENDAR"),
+        grantedPermissions = setOf("android.permission.READ_CALENDAR", "listener:notification"),
     )
 
     private class CountingBackend : LspTools.Backend {
@@ -743,4 +760,458 @@ class FastDispatchTest {
         skippedOf(out, "blank-query FAST")
         assertEquals(0, backend.invocations.get())
     }
+
+    // ---- Phase 2 (#19 B3)：FastDispatch 硬化驗證 ----
+
+    @Test fun degradedProjectionDeniedBeforeToolsRun() = runBlocking {
+        // notification.read：開關開著、無 listener grant → DEGRADED + NO_PRIVILEGE。
+        val ctx = ProjectionContext(userSwitches = mapOf("notification" to true))
+        val d = decide("未讀通知有哪些", ctx)
+        assertEquals(RouteKind.DENIED, d.route)
+        assertEquals(DenyReason.NO_PRIVILEGE, d.reasonCode)
+
+        // dispatch 端：ready-copy 也必須在 gate 3（NATIVE-only）fail-closed。
+        val readyCopy: (String) -> ToolDef? = { name ->
+            ToolRegistry.find(name)?.let { if (name == "notification.read") it.copy(executionReady = true) else it }
+        }
+        val fake = CountingFake("notification.read")
+        val synthetic = fastDecision("notification.read", "{\"limit\": 10}", "call-deg")
+        val out = FastDispatcher(mapOf("notification.read" to fake), lookup = readyCopy).dispatch(synthetic, ctx)
+        val skipped = skippedOf(out, "degraded projection")
+        assertEquals(DenyReason.NO_PRIVILEGE, skipped.reasonCode)
+        assertEquals(0, fake.invocations.get())
+    }
+
+    // 替代測試（誠實標註）：registry 無 PLAY-only 工具（僅 FOSS/GITHUB-only 或預設三味皆有），
+    // 原規劃的 PLAY-only ready-copy 案例不成立、依指示略過；改以 gui.automate
+    // （FOSS/GITHUB-only 慢速通道描述符）在 PLAY flavor 上驗證 FLAVOR_BLOCKED 同一 gate。
+    @Test fun flavorBlockedProjectionDenied() = runBlocking {
+        val ctx = ProjectionContext(flavor = dev.librepocket.tool.Flavor.PLAY)
+        val readyCopy: (String) -> ToolDef? = { name ->
+            ToolRegistry.find(name)?.let { if (name == ToolRegistry.SLOW_TOOL_NAME) it.copy(executionReady = true) else it }
+        }
+        val fake = CountingFake(ToolRegistry.SLOW_TOOL_NAME)
+        val synthetic = fastDecision(ToolRegistry.SLOW_TOOL_NAME, "{\"goal\": \"x\"}", "call-flavor")
+        val out = FastDispatcher(mapOf(ToolRegistry.SLOW_TOOL_NAME to fake), lookup = readyCopy).dispatch(synthetic, ctx)
+        val skipped = skippedOf(out, "flavor blocked projection")
+        assertEquals(DenyReason.FLAVOR_BLOCKED, skipped.reasonCode)
+        assertEquals(0, fake.invocations.get())
+    }
+
+    @Test fun writeReadyCopyRefusesExecute() = runBlocking {
+        // gate 5（READ-only）：WRITE ready-copy 也絕不執行。
+        val readyCopy: (String) -> ToolDef? = { name ->
+            ToolRegistry.find(name)?.let { if (name == "alarm.create") it.copy(executionReady = true) else it }
+        }
+        val fake = CountingFake("alarm.create")
+        val synthetic = fastDecision("alarm.create", "{\"hour\": 7, \"minute\": 30}", "call-write")
+        val out = FastDispatcher(mapOf("alarm.create" to fake), lookup = readyCopy).dispatch(synthetic, lspOn)
+        val skipped = skippedOf(out, "write tool")
+        assertEquals(DenyReason.USER_DISABLED, skipped.reasonCode)
+        assertEquals(0, fake.invocations.get())
+    }
+
+    @Test fun executorToolNameMismatchNeverExecutes() = runBlocking {
+        // 執行器自述身分（"phone.dial"）與註冊的 key（"lsp.symbols"）不符：
+        // 先於任何執行 fail-closed，fake 零呼叫。
+        val fake = CountingFake("phone.dial")
+        val dispatcher = FastDispatcher(mapOf(LspTools.SYMBOLS_NAME to fake))
+        val d = decide("幫我查 Foo 這個符號")
+        assertEquals(RouteKind.FAST, d.route)
+        val out = dispatcher.dispatch(d, lspOn)
+        val skipped = skippedOf(out, "executor identity mismatch")
+        assertEquals("EXECUTOR_IDENTITY_MISMATCH", skipped.denyCode)
+        assertEquals(0, fake.invocations.get())
+    }
+
+    @Test fun resultToolNameMismatchFailsClosed() = runBlocking {
+        val d = decide("幫我查 Foo 這個符號")
+        assertEquals(RouteKind.FAST, d.route)
+        val call = d.toolCall!!
+        // result.toolName 與 call 不符 → 零傳播。
+        val wrongTool = object : FastToolExecutor {
+            override val toolName: String = LspTools.SYMBOLS_NAME
+            override suspend fun execute(call: ToolCall, ctx: ProjectionContext): FastExecResult =
+                FastExecResult("other.tool", call.callId, "{}")
+        }
+        val out1 = FastDispatcher(mapOf(LspTools.SYMBOLS_NAME to wrongTool)).dispatch(d, lspOn)
+        val skipped1 = skippedOf(out1, "result toolName mismatch")
+        assertEquals("RESULT_IDENTITY_MISMATCH", skipped1.denyCode)
+        // result.callId 與 call 不符（偽造）→ 零傳播。
+        val wrongCallId = object : FastToolExecutor {
+            override val toolName: String = LspTools.SYMBOLS_NAME
+            override suspend fun execute(call: ToolCall, ctx: ProjectionContext): FastExecResult =
+                FastExecResult(LspTools.SYMBOLS_NAME, "forged", "{}")
+        }
+        val out2 = FastDispatcher(mapOf(LspTools.SYMBOLS_NAME to wrongCallId)).dispatch(d, lspOn)
+        val skipped2 = skippedOf(out2, "result callId mismatch")
+        assertEquals("RESULT_IDENTITY_MISMATCH", skipped2.denyCode)
+    }
+
+    @Test fun lookupThrowingFailsClosed() = runBlocking {
+        // lookup 自身拋出（非取消）→ typed skip，永不拋、永不回音例外訊息。
+        val dispatcher = FastDispatcher(lookup = { throw IllegalStateException("lookup-boom") })
+        val d = decide("幫我查 Foo 這個符號")
+        val out = dispatcher.dispatch(d, lspOn)
+        val skipped = skippedOf(out, "lookup throwing")
+        assertEquals("LOOKUP_ERROR", skipped.denyCode)
+        assertFalse(skipped.fallbackMessage!!.contains("lookup-boom"))
+    }
+
+    @Test fun executorDeniedMapsTypedOutcome() = runBlocking {
+        val d = decide("幫我查 Foo 這個符號")
+        // SCHEMA_INVALID → NEED_CLARIFICATION；resultJson 永不放行。
+        val schemaDenied = executorReturning(
+            FastExecResult(LspTools.SYMBOLS_NAME, d.toolCall!!.callId, """{"secret":"marker-should-not-ride"}""", denied = true, denyCode = "SCHEMA_INVALID"),
+        )
+        val out1 = FastDispatcher(mapOf(LspTools.SYMBOLS_NAME to schemaDenied)).dispatch(d, lspOn)
+        val skipped1 = skippedOf(out1, "schema denied")
+        assertEquals(DenyReason.NEED_CLARIFICATION, skipped1.reasonCode)
+        assertEquals("SCHEMA_INVALID", skipped1.denyCode)
+        assertFalse(skipped1.fallbackMessage!!.contains("marker-should-not-ride"))
+        // UNAVAILABLE（及其他任何 denyCode）→ USER_DISABLED；resultJson 永不放行。
+        val unavailable = executorReturning(
+            FastExecResult(LspTools.SYMBOLS_NAME, d.toolCall!!.callId, """{"secret":"marker-should-not-ride"}""", denied = true, denyCode = "UNAVAILABLE"),
+        )
+        val out2 = FastDispatcher(mapOf(LspTools.SYMBOLS_NAME to unavailable)).dispatch(d, lspOn)
+        val skipped2 = skippedOf(out2, "unavailable denied")
+        assertEquals(DenyReason.USER_DISABLED, skipped2.reasonCode)
+        assertEquals("UNAVAILABLE", skipped2.denyCode)
+        assertFalse(skipped2.fallbackMessage!!.contains("marker-should-not-ride"))
+    }
+
+    @Test fun timeoutFailsClosed() = runBlocking {
+        // per-call budget：ready-copy 把 timeoutMs 壓到 50ms；fake executor 跑 10s
+        // → 型別化 TIMEOUT skip（非取消外拋）。
+        val readyCopy: (String) -> ToolDef? = { name ->
+            ToolRegistry.find(name)?.let {
+                if (name == LspTools.SYMBOLS_NAME) it.copy(annotations = it.annotations.copy(timeoutMs = 50)) else it
+            }
+        }
+        val entered = AtomicInteger(0)
+        val slow = object : FastToolExecutor {
+            override val toolName: String = LspTools.SYMBOLS_NAME
+            override suspend fun execute(call: ToolCall, ctx: ProjectionContext): FastExecResult {
+                entered.incrementAndGet()
+                delay(10_000)
+                return FastExecResult(toolName, call.callId, """{"ok":true}""")
+            }
+        }
+        val d = decide("幫我查 Foo 這個符號")
+        val out = FastDispatcher(mapOf(LspTools.SYMBOLS_NAME to slow), lookup = readyCopy).dispatch(d, lspOn)
+        val skipped = skippedOf(out, "timeout")
+        assertEquals("TIMEOUT", skipped.denyCode)
+        assertNull(skipped.reasonCode)
+        assertEquals("executor entered once but must be timed out", 1, entered.get())
+    }
+
+    @Test fun timeoutZeroBudgetIsFailClosed() = runBlocking {
+        // 非正 budget（0）直接 fail-closed：typed TIMEOUT skip，零 backend 呼叫、
+        // executor 零呼叫（即使同名 fake 註冊於 dispatcher 下）。
+        val readyCopy: (String) -> ToolDef? = { name ->
+            ToolRegistry.find(name)?.let {
+                if (name == LspTools.SYMBOLS_NAME) it.copy(annotations = it.annotations.copy(timeoutMs = 0)) else it
+            }
+        }
+        val backend = CountingBackend()
+        val fake = CountingFake(LspTools.SYMBOLS_NAME)
+        // 同名 fake 覆蓋 LspSymbolsExecutor：零 budget 必須在觸碰任何 executor/backend 前 fail-closed。
+        val dispatcher = FastDispatcher(
+            mapOf(LspTools.SYMBOLS_NAME to LspSymbolsExecutor(backend)) + mapOf(LspTools.SYMBOLS_NAME to fake),
+            lookup = readyCopy,
+        )
+        val d = decide("幫我查 Foo 這個符號")
+        assertEquals(RouteKind.FAST, d.route)
+        val out = dispatcher.dispatch(d, lspOn)
+        val skipped = skippedOf(out, "zero timeout budget")
+        assertEquals("TIMEOUT", skipped.denyCode)
+        assertEquals("fake executor must never be entered", 0, fake.invocations.get())
+        assertEquals("backend must never be invoked", 0, backend.invocations.get())
+    }
+
+    @Test fun externalCancelRacingTimeoutWins() = runBlocking {
+        // 外部取消與 withTimeout 競爭：呼叫端先取消 → CancellationException 外拋
+        // （不得映射為 TIMEOUT Skipped，亦不得是 TimeoutCancellationException——
+        // 父 scope 無 deadline，withTimeout 不會自行到期）。
+        val readyCopy: (String) -> ToolDef? = { name ->
+            ToolRegistry.find(name)?.let {
+                if (name == LspTools.SYMBOLS_NAME) it.copy(annotations = it.annotations.copy(timeoutMs = 10_000)) else it
+            }
+        }
+        val slow = object : FastToolExecutor {
+            override val toolName: String = LspTools.SYMBOLS_NAME
+            override suspend fun execute(call: ToolCall, ctx: ProjectionContext): FastExecResult {
+                delay(10_000)
+                return FastExecResult(toolName, call.callId, """{"ok":true}""")
+            }
+        }
+        val d = decide("幫我查 Foo 這個符號")
+        val dispatcher = FastDispatcher(mapOf(LspTools.SYMBOLS_NAME to slow), lookup = readyCopy)
+        val deferred = async { dispatcher.dispatch(d, lspOn) }
+        delay(50)
+        deferred.cancel()
+        val thrown = try {
+            withTimeout(5_000) { deferred.await() }
+            null
+        } catch (e: CancellationException) {
+            e
+        }
+        assertNotNull("external cancel must propagate as CancellationException, not a skipped outcome", thrown)
+        assertTrue(
+            "must be a plain external cancellation, not a withTimeout expiry: $thrown",
+            thrown !is TimeoutCancellationException,
+        )
+    }
+
+    @Test fun executorSelfThrownTimeoutMapsToTimeoutSkip() = runBlocking {
+        // misbehaving executor 自拋 TimeoutCancellationException：刻意映射為
+        // TIMEOUT typed skip（fail-closed、typed），不外拋。
+        // （public API 不允許直接 new：此處以 withTimeout 到期自拋真實
+        // TimeoutCancellationException，與 slice 測試同一手法。）
+        val selfThrown = object : FastToolExecutor {
+            override val toolName: String = LspTools.SYMBOLS_NAME
+            override suspend fun execute(call: ToolCall, ctx: ProjectionContext): FastExecResult {
+                withTimeout(1) { delay(60_000) }
+                return FastExecResult(toolName, call.callId, """{"ok":true}""")
+            }
+        }
+        val d = decide("幫我查 Foo 這個符號")
+        val out = FastDispatcher(mapOf(LspTools.SYMBOLS_NAME to selfThrown)).dispatch(d, lspOn)
+        val skipped = skippedOf(out, "self-thrown timeout")
+        assertEquals("TIMEOUT", skipped.denyCode)
+    }
+
+    @Test fun executorDeniedWeirdDenyCodeIsMappedToExecError() = runBlocking {
+        val d = decide("幫我查 Foo 這個符號")
+        val call = d.toolCall!!
+        // 不符 allowlist（^[A-Z0-9_]{1,64}$）的 denyCode → EXEC_ERROR。
+        val weird = executorReturning(
+            FastExecResult(LspTools.SYMBOLS_NAME, call.callId, """{"denied":true}""", denied = true, denyCode = "weird code\n!!"),
+        )
+        val out1 = FastDispatcher(mapOf(LspTools.SYMBOLS_NAME to weird)).dispatch(d, lspOn)
+        val skipped1 = skippedOf(out1, "weird denyCode")
+        assertEquals("EXEC_ERROR", skipped1.denyCode)
+        assertEquals(DenyReason.USER_DISABLED, skipped1.reasonCode)
+        // 合法 allowlist 碼（SCHEMA_INVALID）仍原樣放行 → NEED_CLARIFICATION。
+        val schema = executorReturning(
+            FastExecResult(LspTools.SYMBOLS_NAME, call.callId, """{"denied":true}""", denied = true, denyCode = "SCHEMA_INVALID"),
+        )
+        val out2 = FastDispatcher(mapOf(LspTools.SYMBOLS_NAME to schema)).dispatch(d, lspOn)
+        val skipped2 = skippedOf(out2, "schema denyCode passthrough")
+        assertEquals("SCHEMA_INVALID", skipped2.denyCode)
+        assertEquals(DenyReason.NEED_CLARIFICATION, skipped2.reasonCode)
+    }
+
+    @Test fun executedOversizeResultIsRejected() = runBlocking {
+        // misbehaving executor 回傳超預算 resultJson（21_000 > MAX_RESULT_CHARS=20_000）：
+        // 縱深防禦 → Skipped EXEC_ERROR；Executed 永不放行。
+        val d = decide("幫我查 Foo 這個符號")
+        val call = d.toolCall!!
+        val oversized = executorReturning(
+            FastExecResult(LspTools.SYMBOLS_NAME, call.callId, "x".repeat(21_000)),
+        )
+        val out = FastDispatcher(mapOf(LspTools.SYMBOLS_NAME to oversized)).dispatch(d, lspOn)
+        val skipped = skippedOf(out, "oversized result")
+        assertEquals("EXEC_ERROR", skipped.denyCode)
+    }
+
+    @Test fun schemaInvalidReceiptCallIdIsBoundedWithHash() = runBlocking {
+        // 超長 callId（>500 chars）→ 有界 deny receipt：callId 長度 ≤500、結尾為
+        // `#` + 32 位小寫 hex（full redacted string 的 SHA-256-128）。
+        val backend = CountingBackend()
+        val executor = LspSymbolsExecutor(backend)
+        val longId = "c1-" + "a".repeat(2000)
+        val r = executor.execute(ToolCall(LspTools.SYMBOLS_NAME, """{"query": "   "}""", longId), lspOn)
+        assertTrue(r.denied)
+        assertEquals("SCHEMA_INVALID", r.denyCode)
+        assertEquals(0, backend.invocations.get())
+        val receipt = Json.parseToJsonElement(r.resultJson).jsonObject["callId"]!!.jsonPrimitive.content
+        assertTrue("receipt callId must be ≤500 chars: ${receipt.length}", receipt.length <= 500)
+        assertTrue(
+            "receipt callId must end with # + 32 lowercase hex: $receipt",
+            Regex("#[0-9a-f]{32}$").containsMatchIn(receipt),
+        )
+    }
+
+    @Test fun cancellationPropagates() {
+        runBlocking {
+        val d = decide("幫我查 Foo 這個符號")
+        // (a) pre-cancelled coroutine：外拋 CancellationException，executor 零呼叫。
+        val fakeA = CountingFake(LspTools.SYMBOLS_NAME)
+        val dispatcherA = FastDispatcher(mapOf(LspTools.SYMBOLS_NAME to fakeA))
+        val cancelledJob = Job().apply { cancel() }
+        val deferred = async(cancelledJob) { dispatcherA.dispatch(d, lspOn) }
+        assertThrows(CancellationException::class.java) { runBlocking { deferred.await() } }
+        assertEquals(0, fakeA.invocations.get())
+
+        // (b) executor 拋 CancellationException → 外拋（不得映射為 Skipped）。
+        val cancelB = object : FastToolExecutor {
+            override val toolName: String = LspTools.SYMBOLS_NAME
+            override suspend fun execute(call: ToolCall, ctx: ProjectionContext): FastExecResult =
+                throw CancellationException("executor-cancel-marker")
+        }
+        val dispatcherB = FastDispatcher(mapOf(LspTools.SYMBOLS_NAME to cancelB))
+        assertThrows(CancellationException::class.java) { runBlocking { dispatcherB.dispatch(d, lspOn) } }
+        }
+    }
+
+    @Test fun schemaInvalidMatrixDeniesWithZeroBackend() = runBlocking {
+        val backend = CountingBackend()
+        val executor = LspSymbolsExecutor(backend)
+        val payloads = listOf(
+            """{"query":123}""",
+            """{"query":["Foo"]}""",
+            """{"query":{"n":"x"}}""",
+            """{"query":""}""",
+            """{"query":"   "}""",
+            """{"query":"Foo","limit":"5"}""",
+            """{"query":"Foo","limit":3.9}""",
+            """not-json""",
+            """[1,2,3]""",
+            """{"query":"Foo","pathPrefix":123}""",
+        )
+        for (payload in payloads) {
+            val r = executor.execute(ToolCall(LspTools.SYMBOLS_NAME, payload, "c-schema"), lspOn)
+            assertTrue("payload must be denied: $payload", r.denied)
+            assertEquals("SCHEMA_INVALID", r.denyCode)
+        }
+        assertEquals(0, backend.invocations.get())
+    }
+
+    @Test fun pathPrefixTraversalMatrix() = runBlocking {
+        val backend = CountingBackend()
+        val executor = LspSymbolsExecutor(backend)
+        val payloads = listOf(
+            """{"query":"Foo","pathPrefix":"../x"}""",
+            """{"query":"Foo","pathPrefix":"/etc"}""",
+            """{"query":"Foo","pathPrefix":"file:/etc"}""",
+            """{"query":"Foo","pathPrefix":"%2e%2e"}""",
+            """{"query":"Foo","pathPrefix":"C:\\Users"}""",
+            // U+0007（JSON escape 形式）
+            "{\"query\":\"Foo\",\"pathPrefix\":\"a\\u0007b\"}",
+            // FORMAT 碼點 U+200B（raw）
+            "{\"query\":\"Foo\",\"pathPrefix\":\"a\u200Bb\"}",
+            // NFKC 不穩定："／"（U+FF0F FULLWIDTH SOLIDUS）
+            "{\"query\":\"Foo\",\"pathPrefix\":\"\uFF0Fetc\"}",
+        )
+        for (payload in payloads) {
+            val r = executor.execute(ToolCall(LspTools.SYMBOLS_NAME, payload, "c-path"), lspOn)
+            assertTrue("payload must be denied: $payload", r.denied)
+            assertEquals("SCHEMA_INVALID", r.denyCode)
+        }
+        assertEquals(0, backend.invocations.get())
+    }
+
+    @Test fun grossOversizeArgsDenied() = runBlocking {
+        val backend = CountingBackend()
+        val executor = LspSymbolsExecutor(backend)
+        // query 5000 字元（> MAX_INPUT_CHARS）
+        val bigQuery = "{\"query\":\"" + "a".repeat(5000) + "\"}"
+        // argumentsJson 20000 字元（> MAX_GROSS_ARGS_CHARS=16384；塞進未知 pad 欄位，
+        // 逐項 query/limit/pathPrefix 檢查皆會通過，僅 gross gate 擋下）
+        val padded = "{\"query\":\"ok\",\"pad\":\"" + "a".repeat(20_000) + "\"}"
+        // 深巢狀：40 層 array 包一個 object（> MAX_NESTING_DEPTH=32）
+        val deep = "[".repeat(40) + "{\"query\":\"Foo\"}" + "]".repeat(40)
+        for (payload in listOf(bigQuery, padded, deep)) {
+            val r = executor.execute(ToolCall(LspTools.SYMBOLS_NAME, payload, "c-gross"), lspOn)
+            assertTrue("payload length=${payload.length} must be denied", r.denied)
+            assertEquals("SCHEMA_INVALID", r.denyCode)
+        }
+        assertEquals(0, backend.invocations.get())
+    }
+
+    @Test fun nulQueryDenied() = runBlocking {
+        val backend = CountingBackend()
+        val executor = LspSymbolsExecutor(backend)
+        val r = executor.execute(
+            ToolCall(LspTools.SYMBOLS_NAME, "{\"query\":\"Foo\\u0000Bar\"}", "c-nul"),
+            lspOn,
+        )
+        assertTrue(r.denied)
+        assertEquals("SCHEMA_INVALID", r.denyCode)
+        assertEquals(0, backend.invocations.get())
+    }
+
+    @Test fun backendBloatedOutputIsCapped() = runBlocking {
+        // 後端超給 300 symbols（超過 MAX_LIMIT=200）：輸出必須 ≤ 20000 字元、
+        // 含 returnedCount/omittedCount、truncated=true。
+        val bloat = object : LspTools.Backend {
+            override suspend fun symbols(query: String, pathPrefix: String?, limit: Int): List<LspTools.Symbol> =
+                (1..300).map { i ->
+                    LspTools.Symbol(
+                        "name-" + "x".repeat(100) + i,
+                        "function",
+                        "app/src/" + "y".repeat(60) + "/F" + i + ".kt",
+                        i,
+                    )
+                }
+            override suspend fun diagnostics(path: String): List<LspTools.Diagnostic> = emptyList()
+        }
+        val r = LspSymbolsExecutor(bloat)
+            .execute(ToolCall(LspTools.SYMBOLS_NAME, """{"query":"Foo"}""", "c-bloat"), lspOn)
+        assertFalse(r.denied)
+        assertTrue("resultJson must fit budget: ${r.resultJson.length}", r.resultJson.length <= 20_000)
+        assertTrue(r.resultJson.contains("\"returnedCount\":"))
+        assertTrue(r.resultJson.contains("\"omittedCount\":"))
+        assertTrue(r.resultJson.contains("\"truncated\":true"))
+
+        // 後端回傳含 email 的 symbol：redaction 後不得出現明文。
+        val emailBackend = object : LspTools.Backend {
+            override suspend fun symbols(query: String, pathPrefix: String?, limit: Int): List<LspTools.Symbol> =
+                listOf(LspTools.Symbol("alice@example.com", "function", "app/Example.kt", 1))
+            override suspend fun diagnostics(path: String): List<LspTools.Diagnostic> = emptyList()
+        }
+        val r2 = LspSymbolsExecutor(emailBackend)
+            .execute(ToolCall(LspTools.SYMBOLS_NAME, """{"query":"Foo"}""", "c-email"), lspOn)
+        assertFalse(r2.denied)
+        assertFalse(r2.resultJson.contains("alice@example.com"))
+        assertTrue(r2.resultJson.contains("REDACTED"))
+    }
+
+    @Test fun executorsDefensiveCopyPinned() = runBlocking {
+        // construction-time snapshot：建構後呼叫端移除 executor，dispatcher 仍看得到。
+        val fake = CountingFake(LspTools.SYMBOLS_NAME)
+        val mutable: MutableMap<String, FastToolExecutor> =
+            mutableMapOf(LspTools.SYMBOLS_NAME to fake)
+        val dispatcher = FastDispatcher(mutable)
+        mutable.remove(LspTools.SYMBOLS_NAME)
+        val d = decide("幫我查 Foo 這個符號")
+        val out = dispatcher.dispatch(d, lspOn)
+        val executed = out as? FastDispatchOutcome.Executed
+        assertNotNull("construction-time snapshot must survive caller mutation (got $out)", executed)
+        assertEquals(1, fake.invocations.get())
+    }
+
+    @Test fun gate2UnknownToolFixedMessage() = runBlocking {
+        // 未知工具：UNKNOWN_TOOL；fallbackMessage 為固定話術，不回音工具名。
+        val synthetic = fastDecision("flight.book", "{}", "call-unk")
+        val out = FastDispatcher(lookup = { null }).dispatch(synthetic, lspOn)
+        val skipped = skippedOf(out, "unknown tool")
+        assertEquals("UNKNOWN_TOOL", skipped.denyCode)
+        assertNull(skipped.reasonCode)
+        assertNotNull(skipped.fallbackMessage)
+        assertFalse(skipped.fallbackMessage!!.contains("flight.book"))
+    }
+
+    private fun fastDecision(toolName: String, argumentsJson: String, callId: String): RouteDecision =
+        RouteDecision(
+            route = RouteKind.FAST,
+            toolCall = ToolCall(toolName, argumentsJson, callId),
+            reasonCode = null,
+            fallbackMessage = null,
+            header = TranscriptHeader(
+                sessionId = "s1",
+                turnIndex = 1,
+                route = RouteKind.FAST,
+                toolName = toolName,
+                reasonCode = null,
+                visibleTools = emptyList(),
+            ),
+        )
+
+    private fun executorReturning(result: FastExecResult): FastToolExecutor =
+        object : FastToolExecutor {
+            override val toolName: String = LspTools.SYMBOLS_NAME
+            override suspend fun execute(call: ToolCall, ctx: ProjectionContext): FastExecResult = result
+        }
 }

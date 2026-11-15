@@ -1809,10 +1809,16 @@ internal object HtmlExtract {
                 tag = "style"
             }
             sb.append(input, i, open)
+            // 先以引號感知 findTagEnd 算出「開始標籤的結尾」，closeMark 搜尋必須從
+            // open 標籤的 `>` 之後開始——引號屬性值內的 `</script>`/`</style>` 不得算收尾
+            //（否則屬性內砂/假 closeMark 會把實際標籤 JS/CSS 本文剩餘漏進模型可見體）。
+            // 開始標籤未閉合（findTagEnd == -1）→ strip 至輸入結尾。
+            val openEnd = findTagEnd(lower, open, deadlineNs, checking)
+            val searchFrom = if (openEnd < 0) open else openEnd + 1
             val closeMark = "</$tag>"
             // indexOf 為原生掃描、不可 weave；線性且受 input cap 約束，接受此剩餘。
-            val close = lower.indexOf(closeMark, open)
-            val end = if (close < 0) input.length else close + closeMark.length
+            val close = lower.indexOf(closeMark, searchFrom)
+            val end = if (openEnd < 0 || close < 0) input.length else close + closeMark.length
             i = end
         }
         return sb.toString()

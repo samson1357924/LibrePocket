@@ -977,9 +977,10 @@ class WebExtractD4Test {
         val dns = HostResolver { _ ->
             if (dnsCalls.getAndIncrement() == 0) {
                 entered.countDown()
-                // 30ms 上限：避免 invalidate 路徑損壞時死鎖（逾時照樣返回第一個答案，
-                // 由 epoch-namespaced election 丟棄該輪、走重試）。
-                release.await(30, TimeUnit.MILLISECONDS)
+                // 2s 上限：避免 invalidate 路徑損壞時死鎖（逾時照樣返回第一個答案，
+                // 由 epoch-namespaced election 丟棄該輪、走重試；如此即使負載極高，
+                // 斷言也不會在 30ms 的排程窗內被意外超時殺掉）。
+                release.await(2_000, TimeUnit.MILLISECONDS)
                 listOf(InetAddress.getByName("10.0.0.11"))
             } else {
                 listOf(InetAddress.getByName("10.0.0.12"))
@@ -2021,6 +2022,38 @@ class WebExtractD4Test {
         assertEquals("清空後任何查詢必須 miss", null, cache.getByKey(k))
         cache.put("https://e.com/r1", WebExtract.DEFAULT_MAX_BYTES, WebExtract.DEFAULT_MODEL_CHARS, optIn, fixtureAddresses(), byteCacheOk("fresh generation content", "envelope2"))
         assertTrue("post-invalidate 之新世代條目必須可讀回", cache.getByKey(k, cache.currentGeneration) != null)
+    }
+
+    @Test fun scriptCloseMarkInsideOwnQuotedAttributeNotLeaked() = runBlocking {
+        // 開始標籤引號屬性值內的 `</script>` / `</style>` 不得提早截斷 strip：
+        // closeMark 搜尋自 open 標籤的 `>` 之後開始；屬性內假 closeMark 不生效。
+        val docScript = """<html><head><title>T</title></head><body><div>Before<script data-x="</script>">SECRET_JS_BODY</script>VisibleAfter</div></body></html>"""
+        val dns = publicDns("example.com")
+        val http = FakeExtract { url ->
+            when {
+                url.contains("/ownCloseMarkS") -> okResp(docScript)
+                else -> okResp("""<html><head><title>T</title></head><body><div>Before<style data-x="</style>">SECRET_CSS_BODY</style>VisibleAfterStyle</div></body></html>""")
+            }
+        }
+        val svc = WebExtractService(http)
+        val outS = svc.extract("https://example.com/ownCloseMarkS", resolver = dns) as WebExtractOutcome.Ok
+        assertFalse("script 引號屬性值內的假 closeMark 不得提早截斷 strip；內文不得漏進 snippet", outS.content.snippet.contains("SECRET_JS_BODY"))
+        assertTrue("真正的 closeMark 之後內文必須保留", outS.content.snippet.contains("VisibleAfter"))
+        val outC = svc.extract("https://example.com/ownCloseMarkC", resolver = dns) as WebExtractOutcome.Ok
+        assertFalse("style 引號屬性值內的假 closeMark 不得提早截斷 strip；內文不得漏進 snippet", outC.content.snippet.contains("SECRET_CSS_BODY"))
+        assertTrue("真正的 closeMark 之後內文必須保留", outC.content.snippet.contains("VisibleAfterStyle"))
+    }
+
+    @Test fun scriptCloseMarkInsideOwnQuotedAttributeNotLeakedBefore() = runBlocking {
+        // 與上測試互補：引號屬性值內含假 closeMark 時，實際的 JS 內文必須整段剝除，
+        // 不因屬性值提前報到而洩漏。
+        val doc = """<html><head><title>T</title></head><body><script type="text/javascript" data-note="</script>">const SECRET_MARK = 1;</script>Tail</body></html>"""
+        val dns = publicDns("example.com")
+        val http = FakeExtract { okResp(doc) }
+        val svc = WebExtractService(http)
+        val out = svc.extract("https://example.com/ownCloseBefore", resolver = dns) as WebExtractOutcome.Ok
+        assertFalse("內文不得漏進 snippet", out.content.snippet.contains("SECRET_MARK"))
+        assertTrue("剝除後尾隨內文必須保留", out.content.snippet.contains("Tail"))
     }
 
     @Test fun invalidateMakesPreRevokeContentUnreachable() = runBlocking {

@@ -809,6 +809,29 @@ class SafeToolSliceTest {
         assertEquals(1, body["symbols"]!!.jsonArray.size)
     }
 
+    @Test fun defaultLimitClampsOverDelivery() = runBlocking {
+        // 未帶 limit（預設 DEFAULT_LIMIT）時，後端 over-delivery 仍須以請求的
+        // limit 截斷：returnedCount=50、omittedCount=250、truncated=true，
+        // 後端收到的 limit==LspTools.DEFAULT_LIMIT。
+        val all = List(300) { LspTools.Symbol("S$it", "k", "p", it) }
+        val over = object : LspTools.Backend {
+            var lastLimit: Int = -1
+                private set
+            override suspend fun symbols(query: String, pathPrefix: String?, limit: Int): List<LspTools.Symbol> {
+                lastLimit = limit
+                return all
+            }
+            override suspend fun diagnostics(path: String): List<LspTools.Diagnostic> = emptyList()
+        }
+        val r = slice(backend = over).execute(listOf(call(args = """{"query":"Foo"}"""))).single()
+        assertFalse(r.denied)
+        val body = Json.parseToJsonElement(r.resultJson).jsonObject
+        assertEquals("50", body["returnedCount"]!!.jsonPrimitive.content)
+        assertEquals("250", body["omittedCount"]!!.jsonPrimitive.content)
+        assertEquals("true", body["truncated"]!!.jsonPrimitive.content)
+        assertEquals(LspTools.DEFAULT_LIMIT, over.lastLimit)
+    }
+
     @Test fun limitDefaultsToFiftyWhenOmitted() = runBlocking {
         val backend = CountingBackend()
         val r = slice(backend = backend).execute(listOf(call())).single()

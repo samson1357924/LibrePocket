@@ -283,7 +283,7 @@ class FastRouter(
          * 本表相對 [NEGATION_MARKERS] 的獨有載荷 = `取消`/`停止`/`禁止`/`算了` 四個通用禁止詞
          * ——中文複合詞的每條子串皆含不/未/別等單顆粒，實為 MARKERS 的子集合；與 MARKERS
          * 英文集重複的 11 個 \b 詞）；
-         * [NEGATION_MARKERS] 收單一顆粒集（不 沒 没 別 别 勿 莫 嫑 否 無 无 免）＋英文 \b 集。
+         * [NEGATION_MARKERS] 收單一顆粒集（不 沒 没 別 别 勿 莫 嫑 否 無 无 免 未 毋 休）＋英文 \b 集。
          * [isNegated] 將兩表 OR 同命三個文本：否定詞片語是開放集合，
          * 封閉表不可能完整，故不猜——命中即澄清（過度澄清為 fail-safe 方向）。
          * 「特別找」必澄清（先前即如此釘住）；「特別」/「别人」後接任意模板動詞
@@ -343,6 +343,9 @@ class FastRouter(
          *   `什麼是符號`、`為什麼要用符號`、`符號是什麼`、`符號的意思`、
          *   `符號有哪些種類`、bare `symbols`、`What is a symbol?`、`Explain symbols`
          *   （A2：不問模板語意，只問 lookup intent 的兩段式）。
+         * - `查 find 符號`/`查 search 符號` 等：EN lookup 動詞同為剝離詞，
+         *   符號名恰為 find/search/lookup/locate 者剝空 → clarify（pinned by
+         *   `englishLookupMarkerStripped`）。
          */
         private val NEGATION_HINTS = listOf(
             r("不要"), r("不用"), r("不需要"), r("不必"), r("不需"), r("勿"),
@@ -390,7 +393,7 @@ class FastRouter(
         // Conservative negation/uncertainty gate: ANY presence of a negation word
         // clarifies — phrases are open-ended, so a closed verb table cannot be complete.
         // The two tables are COMPLEMENTARY: [NEGATION_MARKERS]
-        // holds the single-particle set （不 沒 没 別 别 勿 莫 嫑 否 無 无 免） plus the
+        // holds the single-particle set （不 沒 没 別 别 勿 莫 嫑 否 無 无 免 未 毋 休） plus the
         // English \b set; [NEGATION_HINTS]
         // holds the multi-verb compound negations plus general forbiddens, whose unique
         // load-bearing contribution is {取消,停止,禁止,算了} (its Chinese compounds and EN
@@ -406,7 +409,9 @@ class FastRouter(
             r("不"), r("沒"), r("没"), r("別"), r("别"), r("勿"), r("莫"), r("嫑"), r("否"),
             // 無/无（無法＝unable）與 免（免查＝refrain/avoid）亦為否定語氣顆粒，
             // 保守閘必須收錄（否則「無法查 Foo 符號」「免查 Foo 符號」會落 FAST）。
-            r("無"), r("无"), r("免"),
+            // 未（尚未查＝not yet）、毋（毋查＝do not, literary）、休（休查＝desist, literary）同為
+            // 否定語氣顆粒——「尚未查 Foo 符號」「未曾查 Foo 符號」「毋查 Foo 符號」「休查 Foo 符號」皆須澄清。
+            r("無"), r("无"), r("免"), r("未"), r("毋"), r("休"),
             r("\\bno\\b"), r("\\bnot\\b"), r("\\bnever\\b"), r("\\bdon'?t\\b"), r("\\bdo not\\b"),
             r("\\bstop\\b"), r("\\bcancel\\b"), r("\\brefus\\w*\\b"), r("\\bavoid\\w*\\b"),
             r("\\bskip\\w*\\b"), r("\\bwithout\\b"),
@@ -593,7 +598,8 @@ class FastRouter(
          * alternative matches as a plain substring, so CJK names embedding hint
          * chars are over-stripped too — a known residual, e.g. 「查理」 → 「理」
          * (accepted, pinned by test; a READ-only echo mis-query is harmless).
-         * Latin tokens are word-anchored (`\bsymbols?\b`, `\blsp\b`), so
+         * Latin tokens are word-anchored (`\b(find|search|lookup|locate)\b`,
+         * `\bsymbols?\b`, `\blsp\b`), so
          * `SymbolTable` / `getSymbol` / `LSPClient` survive intact (an
          * unanchored `symbol` would shred the `Symbol` inside `getSymbol`).
          * Meta-question tokens (什麼/什么/為什麼/为什么/是什麼/是什么/怎麼/怎么/如何/意思/嗎/吗/呢)
@@ -622,7 +628,7 @@ class FastRouter(
          * clarifies (fail-safe direction).
          */
         private val SYMBOL_QUERY_STRIP =
-            Regex("幫我|這個|那個|一下|請|查|找|尋|搜|詢|符號|符号|函式|函数|為什麼|为什么|是什麼|是什么|什麼|什么|怎麼|怎么|如何|意思|嗎|吗|呢|是|的|要|用|\\bsymbols?\\b|\\blsp\\b|[\\s，。、？?！!：:「」『』\"'（）(),.;]", RegexOption.IGNORE_CASE)
+            Regex("幫我|這個|那個|一下|請|查|找|尋|搜|詢|符號|符号|函式|函数|為什麼|为什么|是什麼|是什么|什麼|什么|怎麼|怎么|如何|意思|嗎|吗|呢|是|的|要|用|\\b(find|search|lookup|locate)\\b|\\bsymbols?\\b|\\blsp\\b|[\\s，。、？?！!：:「」『』\"'（）(),.;]", RegexOption.IGNORE_CASE)
 
         private fun extractSymbolQuery(text: String): String =
             SYMBOL_QUERY_STRIP.replace(text, "").trim()
@@ -707,7 +713,7 @@ class FastRouter(
          */
         // [isNegated] 同命三個文本（raw / NFKCremoved / NFKCspaced）；A1 保守否定閘。
         // 兩表互補（COMPLEMENTARY），不得刪除單顆粒集或四個通用禁止詞：[NEGATION_MARKERS]
-        // 收單一顆粒集（不 沒 没 別 别 勿 莫 嫑 否 無 无 免）＋英文 \b 集；[NEGATION_HINTS]
+        // 收單一顆粒集（不 沒 没 別 别 勿 莫 嫑 否 無 无 免 未 毋 休）＋英文 \b 集；[NEGATION_HINTS]
         // 收多動詞複合否定與通用禁止詞，其獨有載荷 = {取消,停止,禁止,算了}（中文複合詞與英文集
         // 實為 MARKERS 的子集合/重複，可清理但非必須）。
         // 兩表皆 OR 同命同文本——任何否定詞/不確定詞存在即澄清，絕不執行（封閉表不

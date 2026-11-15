@@ -232,6 +232,74 @@ class FastDispatchTest {
         val t7 = decide("symbolize")
         assertEquals(RouteKind.DENIED, t7.route)
         assertNull(t7.toolCall)
+
+        // EN lookup verbs strip from the query (word-anchored, case-insensitive).
+        val t8 = decide("Search SYMBOL Foo")
+        assertEquals(RouteKind.FAST, t8.route)
+        assertTrue("query must be Foo: ${t8.toolCall!!.argumentsJson}", t8.toolCall!!.argumentsJson.contains("\"query\": \"Foo\""))
+
+        // Marker-only remainder clarifies (empty query after the EN verb strip).
+        val t9 = decide("find symbol")
+        assertEquals(RouteKind.DENIED, t9.route)
+        assertEquals(DenyReason.NEED_CLARIFICATION, t9.reasonCode)
+    }
+
+    @Test fun englishLookupMarkerStripped() {
+        // EN lookup verbs strip from the query (word-anchored, case-insensitive);
+        // the bare marker with an empty remainder clarifies, and the command
+        // form without a lookup verb still routes FAST.
+        for (text in listOf(
+            "find symbol Foo",
+            "Search SYMBOL Foo",
+        )) {
+            val d = decide(text)
+            assertEquals(text, RouteKind.FAST, d.route)
+            assertTrue("query must be Foo: ${d.toolCall!!.argumentsJson}", d.toolCall!!.argumentsJson.contains("\"query\": \"Foo\""))
+        }
+        val bare = decide("find symbols")
+        assertEquals(RouteKind.DENIED, bare.route)
+        assertEquals(DenyReason.NEED_CLARIFICATION, bare.reasonCode)
+        val cmd = decide("Symbols Foo")
+        assertEquals(RouteKind.FAST, cmd.route)
+        assertTrue("query must be Foo: ${cmd.toolCall!!.argumentsJson}", cmd.toolCall!!.argumentsJson.contains("\"query\": \"Foo\""))
+    }
+
+    @Test fun englishLookupMarkersRouteFast() {
+        // EN word-anchored lookup verbs (find/search/lookup/locate) are lookup
+        // markers: symbol template matches ⇒ FAST with the stripped query.
+        for (text in listOf(
+            "find symbols Foo",
+            "search symbols Foo",
+            "lookup symbols Foo",
+            "locate symbols Foo",
+        )) {
+            val d = decide(text)
+            assertEquals(text, RouteKind.FAST, d.route)
+            assertTrue("query must be Foo: ${d.toolCall!!.argumentsJson}", d.toolCall!!.argumentsJson.contains("\"query\": \"Foo\""))
+        }
+        // `where` is deliberately NOT a lookup marker (A2): no-match
+        // DENIED, reasonCode null, toolCall null.
+        val d = decide("where is symbol Foo")
+        assertEquals(RouteKind.DENIED, d.route)
+        assertNull(d.reasonCode)
+        assertNull(d.toolCall)
+    }
+
+    @Test fun letterNumberSplittersStillDeny() = runBlocking {
+        // Ⅱ（U+2161，ROMAN NUMERAL TWO，Nl 字母數字）作為否定詞拆分器：
+        // 此字 NFKC 折疊為 ASCII `II`，removed pass 以 [A-Za-z0-9]+ 分支剝離，
+        // `別Ⅱ查` 接合回 `別查` ⇒ 模板成立後否定閘轉 NEED_CLARIFICATION。
+        // （NFKC-stable Nl 如 U+2180，則由 \p{Nl}+ 分支剝離。）
+        // 絕不 FAST、絕不進 executor、後端零呼叫。
+        val backend = CountingBackend()
+        val dispatcher = lspDispatcher(backend)
+        val text = "別Ⅱ查 Foo 符號"
+        val d = decide(text)
+        assertEquals(RouteKind.DENIED, d.route)
+        assertEquals(DenyReason.NEED_CLARIFICATION, d.reasonCode)
+        assertNull(d.toolCall)
+        skippedOf(dispatcher.dispatch(d, lspOn), text)
+        assertEquals(0, backend.invocations.get())
     }
 
     @Test fun negatedSymbolVerbsNeverExecuteForDispatch() = runBlocking {
@@ -308,6 +376,7 @@ class FastDispatchTest {
         val out = FastDispatcher(emptyMap()).dispatch(d, lspOn)
         val skipped = skippedOf(out, "unregistered executor")
         assertEquals(DenyReason.USER_DISABLED, skipped.reasonCode)
+        assertFalse("no executor registered — nothing was entered", skipped.attempted)
         assertTrue(skipped.fallbackMessage!!.contains("lsp.symbols"))
     }
 
@@ -334,6 +403,7 @@ class FastDispatchTest {
         val out = FastDispatcher(mapOf("navigate" to fake)).dispatch(decision, lspOn)
         val skipped = skippedOf(out, "not-ready tool")
         assertEquals(DenyReason.USER_DISABLED, skipped.reasonCode)
+        assertFalse("not-ready tool fails at the projection gate — executor never entered", skipped.attempted)
         assertEquals(0, fake.invocations.get())
     }
 
@@ -892,6 +962,7 @@ class FastDispatchTest {
         val out = FastDispatcher(mapOf("alarm.create" to fake), lookup = readyCopy).dispatch(synthetic, lspOn)
         val skipped = skippedOf(out, "write tool")
         assertEquals(DenyReason.USER_DISABLED, skipped.reasonCode)
+        assertFalse("WRITE-ready copy fails at the READ-only gate — executor never entered", skipped.attempted)
         assertEquals(0, fake.invocations.get())
     }
 
@@ -930,6 +1001,7 @@ class FastDispatchTest {
         val out2 = FastDispatcher(mapOf(LspTools.SYMBOLS_NAME to wrongCallId)).dispatch(d, lspOn)
         val skipped2 = skippedOf(out2, "result callId mismatch")
         assertEquals("RESULT_IDENTITY_MISMATCH", skipped2.denyCode)
+        assertTrue("executor was entered before its forged callId was rejected", skipped2.attempted)
     }
 
     @Test fun lookupThrowingFailsClosed() = runBlocking {
@@ -1009,6 +1081,7 @@ class FastDispatchTest {
         val out = dispatcher.dispatch(d, lspOn)
         val skipped = skippedOf(out, "zero timeout budget")
         assertEquals("TIMEOUT", skipped.denyCode)
+        assertFalse("zero budget fails before the executor is entered", skipped.attempted)
         assertEquals("fake executor must never be entered", 0, fake.invocations.get())
         assertEquals("backend must never be invoked", 0, backend.invocations.get())
     }
@@ -1063,6 +1136,7 @@ class FastDispatchTest {
         val out = FastDispatcher(mapOf(LspTools.SYMBOLS_NAME to selfThrown)).dispatch(d, lspOn)
         val skipped = skippedOf(out, "self-thrown timeout")
         assertEquals("TIMEOUT", skipped.denyCode)
+        assertTrue("self-thrown timeout comes from the entered executor", skipped.attempted)
     }
 
     @Test fun executorDeniedWeirdDenyCodeIsMappedToExecError() = runBlocking {
@@ -1097,6 +1171,7 @@ class FastDispatchTest {
         val out = FastDispatcher(mapOf(LspTools.SYMBOLS_NAME to oversized)).dispatch(d, lspOn)
         val skipped = skippedOf(out, "oversized result")
         assertEquals("EXEC_ERROR", skipped.denyCode)
+        assertTrue("oversized result comes from the entered executor", skipped.attempted)
     }
 
     @Test fun schemaInvalidReceiptCallIdIsBoundedWithHash() = runBlocking {
@@ -1272,6 +1347,7 @@ class FastDispatchTest {
         val out = FastDispatcher(lookup = { null }).dispatch(synthetic, lspOn)
         val skipped = skippedOf(out, "unknown tool")
         assertEquals("UNKNOWN_TOOL", skipped.denyCode)
+        assertFalse("unknown tool fails before any executor is entered", skipped.attempted)
         assertNull(skipped.reasonCode)
         assertNotNull(skipped.fallbackMessage)
         assertFalse(skipped.fallbackMessage!!.contains("flight.book"))
@@ -1296,6 +1372,7 @@ class FastDispatchTest {
         val out = FastDispatcher(mapOf(LspTools.SYMBOLS_NAME to thrower)).dispatch(d, lspOn)
         val skipped = skippedOf(out, "executor threw")
         assertEquals("EXEC_ERROR", skipped.denyCode)
+        assertTrue("executor was entered before it threw", skipped.attempted)
         assertFalse(skipped.fallbackMessage!!.contains("marker-should-not-ride"))
         assertEquals("executor must be entered exactly once", 1, entered.get())
     }
@@ -1385,6 +1462,8 @@ class FastDispatchTest {
         // 群組一：含 lookup marker（查/找）的否定句 ⇒ 模板成立後否定閘轉
         // NEED_CLARIFICATION（marker 命中模板，否定詞命中否定閘 → 澄清而非 no-match）。
         // 涵蓋 無/无（無法＝unable）與 免（免查＝refrain/avoid）。
+        // 未（尚未／未曾＝not yet）、毋（毋查＝do not）、休（休查＝desist）同組：
+        // 「我 沒 辦 法 查」為多空白 沒 辦 法（spaced pass 接合回 沒法→含 沒 顆粒）。
         val markerProbes = listOf(
             "我不想查 Foo 符號",
             "先別再查 Foo 符號",
@@ -1401,6 +1480,12 @@ class FastDispatchTest {
             "無法查 Foo 符號",
             "无法查 Foo 符号",
             "免查 Foo 符號",
+            "未查 Foo 符號",
+            "尚未查 Foo 符號",
+            "未曾查 Foo 符號",
+            "毋查 Foo 符號",
+            "休查 Foo 符號",
+            "我 沒 辦 法 查 Foo 符號",
         )
         for (text in markerProbes) {
             val d = decide(text)
@@ -1455,6 +1540,9 @@ class FastDispatchTest {
             "symbols",
             "符號是Foo嗎",
             "how do symbols work",
+            // A2 全形 pin：fullwidth ｓｅａｒｃｈ 不匹配 EN lookup marker（raw 文本檢測，
+            // 非 NFKC 折疊後）⇒ 無 lookup intent ⇒ no-match DENIED（reasonCode null），絕不 clarify。
+            "ｓｅａｒｃｈ Foo 符號",
         )) {
             val d = decide(text)
             assertEquals(text, RouteKind.DENIED, d.route)

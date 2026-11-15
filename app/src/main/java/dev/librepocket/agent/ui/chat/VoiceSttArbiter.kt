@@ -28,7 +28,10 @@ import androidx.annotation.VisibleForTesting
  * Watchdog: a launch whose result callback never fires would otherwise hold the single-flight
  * slot forever (voice would decide [VoiceSttDecision.Idle] indefinitely). The watchdog bounds
  * that pathological case: a launch with no result for [RECOGNIZER_WATCHDOG_NANOS] (2 minutes,
- * generous vs OEM recognizers) is treated as settled and the slot is released. Both release
+ * generous vs OEM recognizers) is treated as settled and the slot is released. A negative delta
+ * ([clockNanos] reading earlier than the recorded admit time — only reachable via a restored/
+ * crafted far-future admittedAtNanos, since production clocks are monotonic within a boot) is
+ * treated the same: the launch is evicted, not trusted. Both release
  * paths release the slot WITHOUT consuming any arm. The watchdog is lazy: it fires only at the
  * next decision evaluation ([decide] checks it first). The Compose shell additionally installs
  * a one-shot timer effect that forces exactly one decision evaluation at expiry (by dropping the
@@ -44,6 +47,19 @@ import androidx.annotation.VisibleForTesting
  * (generation N+1) — [onResultSettled] for the stale generation is a no-op. [onLaunchReported]
  * applies the same generation pairing to its `launched = false` release (see its KDoc).
  * [reset] resets [currentGeneration] to 0 as well.
+ *
+ * Restore semantics (process death / Activity recreation): the arbiter can be constructed with
+ * [initialAdmitGeneration] / [initialInFlight] / [initialAdmittedAtNanos] restored from a persisted
+ * snapshot (see `SttLaunchState`). The generation watermark NEVER resets below the restored value —
+ * the next admit mints `initialAdmitGeneration + 1`, so a restored generation still pairs exactly
+ * with its launch and a pre-recreation result remains attributable. Restored [initialInFlight] is
+ * accepted as-is (trusted snapshot); the watchdog stays armed from [initialAdmittedAtNanos], so a
+ * restored launch whose recognizer never reports is evicted at the next [decide] as usual — this
+ * covers a restored [initialAdmittedAtNanos] that lies in the future relative to the clock (a
+ * negative delta), which is treated as expired rather than trusted. 0L is
+ * never minted as a generation by production admits (every admit increments from a non-negative
+ * watermark), which is what lets the shell treat 0L as "unattributable" (see
+ * `isUnattributedVoiceResult`).
  *
  * Not Android-aware on purpose (pure Kotlin) so the decision table is JVM-unit-testable
  * (see `VoiceSttArbiterTest`). A retrigger arm is derived from its one-shot token by the
@@ -72,24 +88,41 @@ internal fun isRetriggerArmed(token: Long): Boolean = token != 0L
 
 internal class VoiceSttArbiter(
     internal val clockNanos: () -> Long = System::nanoTime,
+    initialAdmitGeneration: Long = 0L,
+    initialInFlight: VoiceSttArmKind? = null,
+    initialAdmittedAtNanos: Long = 0L,
 ) {
-    private var inFlight: VoiceSttArmKind? = null
+    /**
+     * Restored as-is from the snapshot (trusted input); when no snapshot exists the defaults
+     * (null / 0L) reproduce the fresh-construction behaviour.
+     */
+    private var inFlight: VoiceSttArmKind? = initialInFlight
 
-    /** Monotonic timestamp (clock source: [clockNanos]) at which the current in-flight arm was admitted; 0 is only a sentinel for unadmitted (nanoTime may legitimately return any sign). */
-    private var admittedAtNanos: Long = 0L
+    /** Monotonic timestamp (clock source: [clockNanos]) at which the current in-flight arm was admitted; 0 is only a sentinel for unadmitted (clock nanos may legitimately return any sign). */
+    private var admittedAtNanos: Long = initialAdmittedAtNanos
 
     /**
      * Generation counter, bumped on every admit (one generation per admit). Never decreases
      * during the object lifetime except via [reset]. The result callback pairs itself with the
      * admitting generation via [onResultSettled]; a stale callback from a pre-watchdog launch
-     * cannot release a successor that was admitted afterwards.
+     * cannot release a successor that was admitted afterwards. When constructed with
+     * [initialAdmitGeneration] (restore path), the watermark starts there and only moves up.
      */
-    private var admitGeneration: Long = 0L
+    private var admitGeneration: Long = initialAdmitGeneration
 
     val currentInFlight: VoiceSttArmKind? get() = inFlight
 
     /** Generation of the most recent admit; 0 when nothing has ever been admitted (or after [reset]). */
     internal val currentGeneration: Long get() = admitGeneration
+
+    /**
+     * Timestamp (clock source: [clockNanos]) of the admit that paired with the current in-flight
+     * arm — the value a restore snapshot persists (see `SttLaunchState`). 0 when no arm is in flight.
+     * Invariant: 0L exactly when [currentInFlight] is null — every gate-clear path (watchdog in
+     * [decide], [onResultSettled], [onLaunchReported], [reset]) zeroes it, so a snapshot captured
+     * at any such moment satisfies the saveable invariant.
+     */
+    internal val admittedAtNanosSnapshot: Long get() = admittedAtNanos
 
     /**
      * Drop the in-flight marker without touching anything else.
@@ -113,7 +146,10 @@ internal class VoiceSttArbiter(
      * treated as settled — the in-flight marker is cleared (consuming no arm and minting no
      * new generation) and the pending arms stay armed (no arm is consumed by the watchdog
      * itself); the decision then proceeds with the normal evaluation, so the caller
-     * effectively re-decides in the same call.
+     * effectively re-decides in the same call. A negative delta (clock moved backwards —
+     * only reachable via a restored/crafted far-future [initialAdmittedAtNanos], since
+     * production clocks are monotonic within a boot) is likewise treated as expired and
+     * evicted the same way.
      */
     fun decide(
         initialRequested: Boolean,
@@ -122,8 +158,10 @@ internal class VoiceSttArbiter(
         switchesLoaded: Boolean,
     ): VoiceSttDecision {
         val now = clockNanos()
-        if (inFlight != null && now - admittedAtNanos > RECOGNIZER_WATCHDOG_NANOS) {
-            // Watchdog fired: treat the unresponsive recognizer as settled. Consumes nothing.
+        val delta = now - admittedAtNanos
+        if (inFlight != null && (delta > RECOGNIZER_WATCHDOG_NANOS || delta < 0)) {
+            // Watchdog fired (too long since admit, or a negative delta — i.e. a restored/crafted
+            // far-future admittedAtNanos): treat the recognizer as settled. Consumes nothing.
             inFlight = null
             admittedAtNanos = 0L
         }
@@ -191,6 +229,7 @@ internal class VoiceSttArbiter(
 /** True iff a result belonging to [gen] (a launch's admission generation) is stale by the time it
  *  is delivered — watchdog-released arms minted no generation, so a stale late result can carry the
  *  pre-eviction admitting generation; successor arms mint a new one. Anything equal to 0L is
- *  conservative-fresh (direct callers/tests must not regress). */
+ *  conservative-fresh (direct callers/tests must not regress); the shell filters 0L upstream via
+ *  `isUnattributedVoiceResult`, so 0L never reaches this predicate in production. */
 internal fun isStaleVoiceResult(gen: Long, admitGeneration: Long, inFlight: VoiceSttArmKind?): Boolean =
     gen != 0L && (gen != admitGeneration || inFlight == null)

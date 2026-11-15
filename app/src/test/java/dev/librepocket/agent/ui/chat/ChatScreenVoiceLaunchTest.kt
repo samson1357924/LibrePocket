@@ -17,6 +17,8 @@ import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.ui.test.ExperimentalTestApi
+import androidx.compose.ui.test.junit4.StateRestorationTester
 import androidx.compose.ui.test.assertCountEquals
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.junit4.v2.createComposeRule
@@ -76,7 +78,7 @@ private class VoiceLaunchFakeProvider : LlmProvider {
     override suspend fun listModels(): List<String> = emptyList()
 }
 
-@OptIn(ExperimentalCoroutinesApi::class)
+@OptIn(ExperimentalCoroutinesApi::class, ExperimentalTestApi::class)
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [33])
 class ChatScreenVoiceLaunchTest {
@@ -1711,6 +1713,341 @@ class ChatScreenVoiceLaunchTest {
         composeRule.waitForIdle()
         assertEquals(listOf(42L, 43L), consumedRetrigger)
         assertEquals(2, registry.launchedIntents.size)
+        assertEquals(0, provider.streamCalls)
+    }
+
+    @Test
+    fun bootstrapRestoredSlotStaysOccupied_micLaunchesOnOtherSlot() {
+        registerRecognitionService()
+        val provider = VoiceLaunchFakeProvider()
+        val vm = newVm(provider)
+        val registry = RecordingRegistry()
+        val owner = object : ActivityResultRegistryOwner {
+            override val activityResultRegistry: ActivityResultRegistry = registry
+        }
+        val now = VoiceSttArbiter.RECOGNIZER_WATCHDOG_NANOS + 10_000L
+        // Simulates the saved-bundle snapshot after Activity recreation: slot 0 wedged by a
+        // pre-recreation INITIAL launch (gen 3), gate watermark at 3. admittedAtNanos is stale
+        // vs the clock, so the first decision evicts the restored launch (slot stays wedged).
+        val bootstrap = SttLaunchState(
+            slotBusy = listOf(true, false),
+            slotGen = listOf(3L, 0L),
+            admitGeneration = 3L,
+            inFlightName = "INITIAL",
+            admittedAtNanos = 1_000L,
+        )
+
+        composeRule.setContent {
+            CompositionLocalProvider(
+                LocalActivityResultRegistryOwner provides owner,
+                LocalVoiceSttArbiterClock provides { now },
+                LocalSttLaunchStateBootstrap provides bootstrap,
+            ) {
+                ChatScreen(
+                    padding = PaddingValues(0.dp),
+                    viewModel = vm,
+                    userSwitches = mapOf(VoiceTools.SWITCH_INPUT to true),
+                    voiceSwitchesLoaded = true,
+                )
+            }
+        }
+        composeRule.waitForIdle()
+        assertTrue(registry.launchedIntents.isEmpty())
+
+        composeRule.onNodeWithContentDescription("語音輸入").performClick()
+        composeRule.waitForIdle()
+
+        // Restored slot 0 stays occupied: exactly one recognizer launches (via the other slot).
+        assertEquals(1, registry.launchedIntents.size)
+        assertEquals(RecognizerIntent.ACTION_RECOGNIZE_SPEECH, registry.launchedIntents.single().action)
+        // No result dispatched yet: the draft must be untouched.
+        assertEquals("", vm.input.value)
+        assertEquals(0, provider.streamCalls)
+
+        // Both slots are now occupied (slot 0 wedged by the pre-recreation INITIAL launch, slot 1
+        // held by the fresh USER arm in flight). A second mic click queues behind the busy gate:
+        // no additional recognizer is launched and no degrade notice fires at this point —
+        // degradation with both slots wedged requires the gate to be free, which is covered by
+        // bootstrapRestoredBothSlotsBusy_micDegradesToNoService (and by the StateRestorationTester
+        // end-to-end variant in this file). Slot count pins occupancy, not launch eligibility.
+        composeRule.onNodeWithContentDescription("語音輸入").performClick()
+        composeRule.waitForIdle()
+        assertEquals(1, registry.launchedIntents.size)
+
+        // The launch rides the post-restore generation watermark (4 > 3): its result is NOT
+        // mistaken for a stale pre-recreation delivery and prefills the draft.
+        val freshResult = Intent().putStringArrayListExtra(
+            RecognizerIntent.EXTRA_RESULTS,
+            arrayListOf("你好"),
+        )
+        composeRule.runOnIdle {
+            registry.dispatchResult(
+                registry.launchedRequestCodes[0],
+                ActivityResult(Activity.RESULT_OK, freshResult),
+            )
+        }
+        composeRule.waitForIdle()
+        assertEquals("你好", vm.input.value)
+        // The settle frees the gate; the queued mic click then admits after the dispatch and
+        // launches on the FREED slot 1 — the wedged bootstrap slot 0 is never recycled. This pins
+        // slot identity end to end: slot 0 stays wedged, slot 1 carries both the fresh admit and
+        // its attribution.
+        assertEquals(2, registry.launchedIntents.size)
+    }
+
+    @Test
+    fun bootstrapRestoredBothSlotsBusy_micDegradesToNoService() {
+        registerRecognitionService()
+        val provider = VoiceLaunchFakeProvider()
+        val vm = newVm(provider)
+        val registry = RecordingRegistry()
+        val owner = object : ActivityResultRegistryOwner {
+            override val activityResultRegistry: ActivityResultRegistry = registry
+        }
+        val now = VoiceSttArbiter.RECOGNIZER_WATCHDOG_NANOS + 10_000L
+        // Both slots wedged by pre-recreation launches; admittedAtNanos stale so the restored
+        // gate is watchdog-evicted at the first decision — the degrade comes from the wedged
+        // slots, not from a busy gate.
+        val bootstrap = SttLaunchState(
+            slotBusy = listOf(true, true),
+            slotGen = listOf(3L, 4L),
+            admitGeneration = 4L,
+            inFlightName = "INITIAL",
+            admittedAtNanos = 1_000L,
+        )
+
+        composeRule.setContent {
+            CompositionLocalProvider(
+                LocalActivityResultRegistryOwner provides owner,
+                LocalVoiceSttArbiterClock provides { now },
+                LocalSttLaunchStateBootstrap provides bootstrap,
+            ) {
+                ChatScreen(
+                    padding = PaddingValues(0.dp),
+                    viewModel = vm,
+                    userSwitches = mapOf(VoiceTools.SWITCH_INPUT to true),
+                    voiceSwitchesLoaded = true,
+                )
+            }
+        }
+        composeRule.waitForIdle()
+
+        composeRule.onNodeWithContentDescription("語音輸入").performClick()
+        composeRule.waitForIdle()
+
+        // No slot is free: no recognizer is launched, the DETAIL_NO_SERVICE fallback is shown,
+        // and the draft is untouched.
+        assertTrue(registry.launchedIntents.isEmpty())
+        composeRule.onNodeWithText(
+            VoiceStt.fallbackMessage(DenyReason.NO_PRIVILEGE, VoiceStt.DETAIL_NO_SERVICE),
+        ).assertIsDisplayed()
+        assertEquals("", vm.input.value)
+        assertEquals(0, provider.streamCalls)
+    }
+
+    @Test
+    fun recreationDuringOutstandingStt_preRecreationResultDeliveredToRestoredComposition() {
+        registerRecognitionService()
+        val provider = VoiceLaunchFakeProvider()
+        val vm = newVm(provider)
+        val registry = RecordingRegistry()
+        val owner = object : ActivityResultRegistryOwner {
+            override val activityResultRegistry: ActivityResultRegistry = registry
+        }
+        var now = 1_000_000_000L
+
+        val tester = StateRestorationTester(composeRule)
+        tester.setContent {
+            CompositionLocalProvider(
+                LocalActivityResultRegistryOwner provides owner,
+                LocalVoiceSttArbiterClock provides { now },
+            ) {
+                ChatScreen(
+                    padding = PaddingValues(0.dp),
+                    viewModel = vm,
+                    userSwitches = mapOf(VoiceTools.SWITCH_INPUT to true),
+                    voiceSwitchesLoaded = true,
+                )
+            }
+        }
+        composeRule.waitForIdle()
+
+        // Mic tap: the fresh composition admits a USER arm (gen 1) and launches on slot 0; the
+        // recognizer never reports before recreation.
+        composeRule.onNodeWithContentDescription("語音輸入").performClick()
+        composeRule.waitForIdle()
+        assertEquals(1, registry.launchedIntents.size)
+
+        // Activity recreation: rememberSaveable round-trips the slot table + arbiter watermark/gate
+        // + launch key through the real (Parcel-backed) saveable path.
+        tester.emulateSavedInstanceStateRestore()
+        composeRule.waitForIdle()
+
+        // The pre-recreation recognizer result is delivered to the restored composition on the
+        // same launch rc (the rc survives the restore through the registry).
+        val preRecreationRc = registry.launchedRequestCodes[0]
+        val recognized = Intent().putStringArrayListExtra(
+            RecognizerIntent.EXTRA_RESULTS,
+            arrayListOf("你好"),
+        )
+        composeRule.runOnIdle {
+            registry.dispatchResult(
+                preRecreationRc,
+                ActivityResult(Activity.RESULT_OK, recognized),
+            )
+        }
+        composeRule.waitForIdle()
+
+        // Restored attribution: the result is paired (slot 0 / gen 1 / watermark 1) and prefilled —
+        // not dropped as unattributed (gen 0) or stale.
+        assertEquals("你好", vm.input.value)
+
+        // Slot 0 freed by the settle: a subsequent mic click launches again on a free slot.
+        // (A non-blank draft hides the mic behind the send button, so clear it through the same
+        // onInputChange entry point the TextField uses.)
+        composeRule.runOnIdle { vm.onInputChange("") }
+        composeRule.waitForIdle()
+        composeRule.onNodeWithContentDescription("語音輸入").performClick()
+        composeRule.waitForIdle()
+        assertEquals(2, registry.launchedIntents.size)
+        assertEquals(0, provider.streamCalls)
+    }
+
+    @Test
+    fun recreationDuringOutstandingStt_successorSupersedesPreRecreationResult() {
+        registerRecognitionService()
+        val provider = VoiceLaunchFakeProvider()
+        val vm = newVm(provider)
+        val registry = RecordingRegistry()
+        val owner = object : ActivityResultRegistryOwner {
+            override val activityResultRegistry: ActivityResultRegistry = registry
+        }
+        var now = 1_000_000_000L
+
+        val tester = StateRestorationTester(composeRule)
+        tester.setContent {
+            CompositionLocalProvider(
+                LocalActivityResultRegistryOwner provides owner,
+                LocalVoiceSttArbiterClock provides { now },
+            ) {
+                ChatScreen(
+                    padding = PaddingValues(0.dp),
+                    viewModel = vm,
+                    userSwitches = mapOf(VoiceTools.SWITCH_INPUT to true),
+                    voiceSwitchesLoaded = true,
+                )
+            }
+        }
+        composeRule.waitForIdle()
+
+        // Hanging pre-recreation launch #1 (USER, gen 1, slot 0) — never returns.
+        composeRule.onNodeWithContentDescription("語音輸入").performClick()
+        composeRule.waitForIdle()
+        assertEquals(1, registry.launchedIntents.size)
+        val staleRc = registry.launchedRequestCodes[0]
+
+        // Activity recreation through the real saveable round-trip.
+        tester.emulateSavedInstanceStateRestore()
+        composeRule.waitForIdle()
+
+        // Watchdog-evict the restored gen-1 arm, then tap mic: the USER successor is admitted
+        // (gen 2) and launches on the free slot 1 (slot 0 stays wedged from the pre-recreation
+        // launch).
+        composeRule.runOnIdle { now += VoiceSttArbiter.RECOGNIZER_WATCHDOG_NANOS + 1_000L }
+        composeRule.onNodeWithContentDescription("語音輸入").performClick()
+        composeRule.waitForIdle()
+        assertEquals(2, registry.launchedIntents.size)
+        val successorRc = registry.launchedRequestCodes[1]
+
+        // The pre-recreation result arrives late: gen 1 is stale vs the successor's admit
+        // generation (gen 2) — the draft is NOT overwritten, and the successor's gate is not
+        // settled by the stale callback.
+        val staleIntent = Intent().putStringArrayListExtra(
+            RecognizerIntent.EXTRA_RESULTS,
+            arrayListOf("stale-old-transcript"),
+        )
+        composeRule.runOnIdle {
+            registry.dispatchResult(
+                staleRc,
+                ActivityResult(Activity.RESULT_OK, staleIntent),
+            )
+        }
+        composeRule.waitForIdle()
+        assertEquals("", vm.input.value)
+
+        // Successor gate unaffected: its own result is fresh and prefills the draft.
+        val successorIntent = Intent().putStringArrayListExtra(
+            RecognizerIntent.EXTRA_RESULTS,
+            arrayListOf("successor-text"),
+        )
+        composeRule.runOnIdle {
+            registry.dispatchResult(
+                successorRc,
+                ActivityResult(Activity.RESULT_OK, successorIntent),
+            )
+        }
+        composeRule.waitForIdle()
+        assertEquals("successor-text", vm.input.value)
+        assertEquals(2, registry.launchedIntents.size)
+        assertEquals(0, provider.streamCalls)
+    }
+
+    @Test
+    fun saverRestore_bothSlotsWedged_throughRealSaveableRoundTrip() {
+        registerRecognitionService()
+        val provider = VoiceLaunchFakeProvider()
+        val vm = newVm(provider)
+        val registry = RecordingRegistry()
+        val owner = object : ActivityResultRegistryOwner {
+            override val activityResultRegistry: ActivityResultRegistry = registry
+        }
+        var now = 1_000_000_000L
+
+        val tester = StateRestorationTester(composeRule)
+        tester.setContent {
+            CompositionLocalProvider(
+                LocalActivityResultRegistryOwner provides owner,
+                LocalVoiceSttArbiterClock provides { now },
+            ) {
+                ChatScreen(
+                    padding = PaddingValues(0.dp),
+                    viewModel = vm,
+                    userSwitches = mapOf(VoiceTools.SWITCH_INPUT to true),
+                    voiceSwitchesLoaded = true,
+                )
+            }
+        }
+        composeRule.waitForIdle()
+
+        // Hanging launch #1 (USER, gen 1, slot 0) — never returns.
+        composeRule.onNodeWithContentDescription("語音輸入").performClick()
+        composeRule.waitForIdle()
+        assertEquals(1, registry.launchedIntents.size)
+
+        // Watchdog-evict the in-flight arm and admit the USER successor (gen 2): hanging
+        // launch #2 launches on slot 1. Both slots are now wedged.
+        composeRule.runOnIdle { now += VoiceSttArbiter.RECOGNIZER_WATCHDOG_NANOS + 1_000L }
+        composeRule.onNodeWithContentDescription("語音輸入").performClick()
+        composeRule.waitForIdle()
+        assertEquals(2, registry.launchedIntents.size)
+
+        // Activity recreation through the real saveable round-trip: both wedged slots and the
+        // in-flight (USER, gen 2) gate round-trip into the restored composition.
+        tester.emulateSavedInstanceStateRestore()
+        composeRule.waitForIdle()
+
+        // Watchdog-evict the restored launch, then tap mic: the gate is free but both slots are
+        // wedged by pre-recreation launches — no recognizer is launched; the DETAIL_NO_SERVICE
+        // fallback is shown and the gate releases.
+        composeRule.runOnIdle { now += VoiceSttArbiter.RECOGNIZER_WATCHDOG_NANOS + 1_000L }
+        composeRule.onNodeWithContentDescription("語音輸入").performClick()
+        composeRule.waitForIdle()
+
+        assertEquals(2, registry.launchedIntents.size)
+        composeRule.onNodeWithText(
+            VoiceStt.fallbackMessage(DenyReason.NO_PRIVILEGE, VoiceStt.DETAIL_NO_SERVICE),
+        ).assertIsDisplayed()
+        assertEquals("", vm.input.value)
         assertEquals(0, provider.streamCalls)
     }
 }

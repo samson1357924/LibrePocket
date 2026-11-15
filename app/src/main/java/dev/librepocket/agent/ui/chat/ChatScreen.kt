@@ -3,6 +3,7 @@ package dev.librepocket.agent.ui.chat
 import android.app.Activity
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.os.SystemClock
 import android.speech.RecognizerIntent
 import android.util.Log
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -60,6 +61,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.staticCompositionLocalOf
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
@@ -90,8 +92,8 @@ import kotlinx.coroutines.launch
 
 private const val TAG = "ChatScreen"
 
-/** Test seam: supplies the STT arbiter's clock (monotonic nanos); production uses [System.nanoTime]. */
-internal val LocalVoiceSttArbiterClock = staticCompositionLocalOf<() -> Long> { System::nanoTime }
+/** Test seam: supplies the STT arbiter's clock (monotonic nanos); production uses [SystemClock.elapsedRealtimeNanos]. */
+internal val LocalVoiceSttArbiterClock = staticCompositionLocalOf<() -> Long> { { SystemClock.elapsedRealtimeNanos() } }
 
 /** User-visible text for a chat notice code; unknown codes fall through raw. */
 internal fun chatNoticeText(code: String): String =
@@ -324,19 +326,49 @@ fun ChatScreen(
     // sttArbiterState 為 currentInFlight 的 compose 鏡像（arm 承認／result settle 時翻轉，
     // 重觸發上方統一決策效應續行下一 arm）；userVoiceArmed 為 mic 鈕的一次態 arm
     //（閘忙時按住佇列一次，settle 後續行）。
+    // 活動重建（recreation）後，ActivityResultRegistry 可能把重建前 launch 的結果重新投遞給
+    // 重建後的 composition；此時 remembered 記憶體狀態是全新的，必須先還原 launch 歸屬快照
+    // （slot 身分 + arbiter generation 水位），重建前的 in-flight launch 才能被精確歸屬。
+    // SttLaunchStateSaver 還原時 fail-closed 驗證，bundle 形狀不合一律退回 fresh()。
+    // arbiter 時鐘來源為 elapsedRealtimeNanos（monotonic、含 deep sleep、跨 process 一致、
+    // 可跨 recreation 還原；wall-clock 會隨牆鐘跳變、nanoTime 無法跨 recreation 比較）。
     val arbiterClock = LocalVoiceSttArbiterClock.current
-    val sttArbiter = remember { VoiceSttArbiter(clockNanos = arbiterClock) }
-    var sttArbiterState by remember { mutableStateOf<VoiceSttArmKind?>(null) }
+    val sttLaunchBootstrap = LocalSttLaunchStateBootstrap.current
+    var sttLaunchSnapshot by rememberSaveable(stateSaver = SttLaunchStateSaver) {
+        mutableStateOf(sttLaunchBootstrap ?: SttLaunchState.fresh())
+    }
+    val sttArbiter = remember {
+        VoiceSttArbiter(
+            clockNanos = arbiterClock,
+            initialAdmitGeneration = sttLaunchSnapshot.admitGeneration,
+            initialInFlight = sttLaunchSnapshot.inFlightName?.let(VoiceSttArmKind::valueOf),
+            initialAdmittedAtNanos = sttLaunchSnapshot.admittedAtNanos,
+        )
+    }
+    // 鏡像初始值取自還原快照：閘還原後鏡像立即一致（不等首次效應），之後仍由效應翻轉覆寫。
+    var sttArbiterState by remember { mutableStateOf(sttLaunchSnapshot.inFlightName?.let(VoiceSttArmKind::valueOf)) }
     // 每枚進行中 launch 各自佔一個回呼 slot（共 2 枚）：slotBusy 標記佔用、slotGen 記錄該 slot 對應的
     // admit generation（launch 時自 currentGeneration 讀取，即剛承認的那一枚 arm 的 generation）。
     // result callback 以 slot 歸屬配對——每枚 pending launch 各自佔 slot、歸屬精確，不受回傳順序影響
     // （先回哪一枚都命中自己的 slot）；never-deliver 的 launch 會留 busy slot，於其最終回傳時釋放，
     // 或經 watchdog 釋放後由 successor 重新承認（successor 佔另一 slot）；兩 slot 全忙（僅 watchdog
-    // 釋放 successor 後的殘餘 wedge）時，新 launch 降級 launched=false、閘立即釋放。plain remembered
-    // arrays（非 compose state），供 non-compose 回呼與 launchSystemStt() 直接讀寫。
+    // 釋放 successor 後的殘餘 wedge）時，新 launch 降級 launched=false、閘立即釋放。slot 表經
+    // rememberSaveable 快照還原（activity 重建後仍可歸屬重建前 launch），供 non-compose 回呼與
+    // launchSystemStt() 直接讀寫。
     /** 兩 slot：watchdog 釋放後懸掛的 launch 與其 successor 並存，各佔一枚；slot 不主動回收——提前歸還會破壞 late return 的結果歸屬，僅由各自 late return 釋放。 */
-    val slotBusy = remember { booleanArrayOf(false, false) }
-    val slotGen = remember { longArrayOf(0L, 0L) }
+    val slotBusy = remember { booleanArrayOf(sttLaunchSnapshot.slotBusy[0], sttLaunchSnapshot.slotBusy[1]) }
+    val slotGen = remember { longArrayOf(sttLaunchSnapshot.slotGen[0], sttLaunchSnapshot.slotGen[1]) }
+    // 狀態快照寫入 rememberSaveable：admit／降級／settle／watchdog 釋放後皆更新，
+    // 使 activity 重建時能還原 slot 歸屬與閘的 in-flight／generation 水位。
+    fun persistLaunchState() {
+        sttLaunchSnapshot = SttLaunchState(
+            slotBusy = slotBusy.toList(),
+            slotGen = slotGen.toList(),
+            admitGeneration = sttArbiter.currentGeneration,
+            inFlightName = sttArbiter.currentInFlight?.name,
+            admittedAtNanos = sttArbiter.admittedAtNanosSnapshot,
+        )
+    }
     var userVoiceArmed by remember { mutableStateOf(false) }
     fun handleSttResult(slot: Int, result: ActivityResult) {
         // STT 結果回呼一律先結算單飛閘：以該 slot 登記的 admit generation 配對
@@ -345,23 +377,32 @@ fun ChatScreen(
         // ——stale callback 不得在 successor 仍持有閘時把鏡像清掉；release 簿記不因下方 stale
         // 判定而跳過。本 slot 隨即釋放。
         val gen = slotGen[slot]
+        // fail-closed：gen == 0L 代表這枚結果無法歸屬於任何 launch——registry 可能在 activity
+        // 重建後重新投遞重建前的結果，而重建後的 slot 表是全新的（slotGen 全 0L）。production
+        // 每枚 launch 都登記非 0 generation，故 0L 一律不可歸屬：直接丟棄，不做任何簿記
+        // （不 prefill、不動 slot、不結算閘），避免污染重建後的新狀態。
+        if (isUnattributedVoiceResult(gen)) {
+            Log.w(TAG, "dropping unattributed STT result (slot=$slot): post-recreation delivery")
+            return
+        }
         // 「gate 仍歸屬本次啟動」必須在下方 settle 之前擷取：新鮮結果由 settle 釋放 slot
         // （currentInFlight 隨即為 null），若於 bookkeeping 後才讀取，會把新鮮結果誤判為
         // stale 而不寫入草稿；這正是 stale（watchdog 釋放、無 successor、generation 不動）
         // 與 fresh（settle 剛釋放）的分歧點。
         val stillAdmitting = !isStaleVoiceResult(gen, sttArbiter.currentGeneration, sttArbiter.currentInFlight)
-        if (gen != 0L) sttArbiter.onResultSettled(gen)
+        sttArbiter.onResultSettled(gen)
         slotBusy[slot] = false
         slotGen[slot] = 0L
         sttArbiterState = sttArbiter.currentInFlight
+        persistLaunchState()
         // stale 判定（isStaleVoiceResult，VoiceSttArbiter.kt）：slot generation 落後於當代
         // admitGeneration（successor 已承認超越），或回呼進入當下 gate 已不歸屬本次啟動
-        // （watchdog 釋放後無 successor——generation 不動、slot 已空）。gen == 0L（本檔每次
-        // launch 皆登記，故不會走入；保守視為 fresh）→ 正常路徑。
-        // STALE-SPECIMENS: stale-result 案例（S3-style watchdog 驅逐、successor 超越、gen==0L 保守 fresh）
-        // 釘在 VoiceSttArbiterTest／isStaleVoiceResult 純述詞層；Compose 層 stale 模擬亦可經
+        // （watchdog 釋放後無 successor——generation 不動、slot 已空）。gen == 0L 已於函式頂端
+        // fail-closed 丟棄（重建後 registry 重新投遞重建前結果、slot 表全新時），此處必非 0L。
+        // STALE-SPECIMENS: stale-result 案例（S3-style watchdog 驅逐、successor 超越、gen==0L fail-closed drop）
+        // 釘在 VoiceSttArbiterTest／isStaleVoiceResult 純述詞層／SttLaunchStateTest；Compose 層 stale 模擬亦可經
         // LocalVoiceSttArbiterClock 注入假時鐘（見 ChatScreenVoiceLaunchTest）。
-        if (gen != 0L && !stillAdmitting) {
+        if (!stillAdmitting) {
             // stale result from a watchdog-evicted launch: release bookkeeping happened already
             // (slot freed above); never let a 2-minute-old transcript overwrite the draft.
             return
@@ -438,6 +479,7 @@ fun ChatScreen(
         }
         slotBusy[slotIndex] = true
         slotGen[slotIndex] = sttArbiter.currentGeneration
+        persistLaunchState()
         return try {
             if (slotIndex == 0) {
                 slot0Launcher.launch(intent)
@@ -448,6 +490,7 @@ fun ChatScreen(
         } catch (_: Exception) {
             slotBusy[slotIndex] = false
             slotGen[slotIndex] = 0L
+            persistLaunchState()
             voiceErrors.onSttFailure(VoiceStt.fallbackMessage(DenyReason.NO_PRIVILEGE, VoiceStt.DETAIL_NO_SERVICE))
             false
         }
@@ -469,7 +512,11 @@ fun ChatScreen(
                 userRequested = userArmed,
                 switchesLoaded = voiceSwitchesLoaded,
             )) {
-                VoiceSttDecision.Wait, VoiceSttDecision.Idle -> break
+                VoiceSttDecision.Wait, VoiceSttDecision.Idle -> {
+                    // 閘表可能因 watchdog 驅逐而改變（decide 內部清除 in-flight）：收尾前落一次快照。
+                    persistLaunchState()
+                    break
+                }
                 is VoiceSttDecision.Admit -> {
                     val arm = decision.arm
                     // 任何例外（消費回呼／launchSystemStt 內部未捕捉等，含 CancellationException）
@@ -528,10 +575,16 @@ fun ChatScreen(
                         }
                         sttArbiter.onLaunchReported(arm, launched = false, sttArbiter.currentGeneration)
                         sttArbiterState = sttArbiter.currentInFlight
-                        if (t is CancellationException || t is Error) throw t
+                        if (t is CancellationException || t is Error) {
+                            // rethrow 路徑跳過下方的統一快照：閘剛釋放，鏡像與快照必須一致。
+                            persistLaunchState()
+                            throw t
+                        }
                         Log.w(TAG, "unexpected throwable in STT arm; gate released, degrading", t)
                         voiceErrors.onSttFailure(VoiceStt.fallbackMessage(DenyReason.NO_PRIVILEGE, VoiceStt.DETAIL_NO_SERVICE))
                     }
+                    // admit／false 路徑（含 watchdog 驅逐）收尾：落快照供 activity 重建還原。
+                    persistLaunchState()
                 }
             }
         }

@@ -23,7 +23,10 @@ import org.junit.Test
  *                          onLaunchReported applies the same pairing to its launched = false release;
  * - zero retrigger token → absent ([isRetriggerArmed]);
  * - isStaleVoiceResult   → pure predicate mirror of the result-callback stale判定; watchdog-evicted
- *                          late results are stale, fresh results are not (predicate only, no behavior asserted).
+ *                          late results are stale, fresh results are not (predicate only, no behavior asserted);
+ * - restore              → a snapshot-restored arbiter continues the generation watermark (never resets
+ *                          below the restored value), honours the watchdog against the restored
+ *                          admittedAtNanos, and blocks admission until the restored launch settles/evicts.
  */
 class VoiceSttArbiterTest {
 
@@ -518,5 +521,154 @@ class VoiceSttArbiterTest {
         arbiter.onResultSettled(gen4)
         assertNull(arbiter.currentInFlight)
         assertSame(VoiceSttDecision.Idle, decideLoaded(arbiter))
+    }
+
+    @Test
+    fun `restored watermark continues generations and stale settle is a no-op`() {
+        var now = 1_000_000_000L
+        val arbiter = VoiceSttArbiter(
+            clockNanos = { now },
+            initialAdmitGeneration = 5L,
+            initialInFlight = null,
+            initialAdmittedAtNanos = 0L,
+        )
+        assertEquals(5L, arbiter.currentGeneration)
+        assertEquals(0L, arbiter.admittedAtNanosSnapshot)
+        // The next admit mints above the restored watermark (never resets to 1).
+        assertEquals(
+            VoiceSttDecision.Admit(VoiceSttArmKind.USER),
+            decideLoaded(arbiter, user = true),
+        )
+        assertEquals(6L, arbiter.currentGeneration)
+        assertEquals(now, arbiter.admittedAtNanosSnapshot)
+        // A stale settle carrying the restored (pre-admit) generation is a no-op.
+        arbiter.onResultSettled(5L)
+        assertEquals(VoiceSttArmKind.USER, arbiter.currentInFlight)
+        // The admitting generation releases exactly once.
+        arbiter.onResultSettled(6L)
+        assertNull(arbiter.currentInFlight)
+        assertEquals(0L, arbiter.admittedAtNanosSnapshot)
+    }
+
+    @Test
+    fun `restored inFlight is watchdog-evicted when admittedAtNanos is stale vs clock`() {
+        // Restored snapshot: INITIAL was in flight, admitted long ago (admittedAtNanos=1).
+        val now = VoiceSttArbiter.RECOGNIZER_WATCHDOG_NANOS + 1_000L
+        val arbiter = VoiceSttArbiter(
+            clockNanos = { now },
+            initialAdmitGeneration = 3L,
+            initialInFlight = VoiceSttArmKind.INITIAL,
+            initialAdmittedAtNanos = 1L,
+        )
+        assertEquals(3L, arbiter.currentGeneration)
+        assertEquals(1L, arbiter.admittedAtNanosSnapshot)
+        assertEquals(VoiceSttArmKind.INITIAL, arbiter.currentInFlight)
+        // decide() checks the watchdog first: the restored launch is treated as settled;
+        // no arm is consumed and the watermark does not move.
+        assertEquals(
+            VoiceSttDecision.Admit(VoiceSttArmKind.USER),
+            decideLoaded(arbiter, user = true),
+        )
+        assertEquals(4L, arbiter.currentGeneration)
+        assertEquals(VoiceSttArmKind.USER, arbiter.currentInFlight)
+        assertEquals(now, arbiter.admittedAtNanosSnapshot)
+    }
+
+    @Test
+    fun `restored gate blocks admission until the restored launch settles`() {
+        var now = 1_000_000_000L
+        val arbiter = VoiceSttArbiter(
+            clockNanos = { now },
+            initialAdmitGeneration = 7L,
+            initialInFlight = VoiceSttArmKind.RETRIGGER,
+            initialAdmittedAtNanos = 1_000_000_000L,
+        )
+        // Within the watchdog window the restored launch still holds the gate.
+        assertSame(VoiceSttDecision.Idle, decideLoaded(arbiter, initial = true, user = true))
+        assertEquals(VoiceSttArmKind.RETRIGGER, arbiter.currentInFlight)
+        assertEquals(7L, arbiter.currentGeneration)
+        // Settlement of the restored generation releases the gate; the next admit mints 8.
+        arbiter.onResultSettled(7L)
+        assertNull(arbiter.currentInFlight)
+        assertEquals(
+            VoiceSttDecision.Admit(VoiceSttArmKind.USER),
+            decideLoaded(arbiter, user = true),
+        )
+        assertEquals(8L, arbiter.currentGeneration)
+    }
+
+    @Test
+    fun `restored inFlight with future admittedAtNanos is evicted at next decide`() {
+        // Pin for the negative-delta watchdog semantics: a restored far-future admittedAtNanos
+        // (delta < 0 vs the fake clock) is treated as expired, never trusted, and evicted at the
+        // next decide without minting a generation.
+        val now = 1_000_000_000L
+        val arbiter = VoiceSttArbiter(
+            clockNanos = { now },
+            initialAdmitGeneration = 3L,
+            initialInFlight = VoiceSttArmKind.INITIAL,
+            initialAdmittedAtNanos = now + VoiceSttArbiter.RECOGNIZER_WATCHDOG_NANOS + 1_000L,
+        )
+        assertEquals(3L, arbiter.currentGeneration)
+        assertEquals(VoiceSttArmKind.INITIAL, arbiter.currentInFlight)
+        assertEquals(
+            now + VoiceSttArbiter.RECOGNIZER_WATCHDOG_NANOS + 1_000L,
+            arbiter.admittedAtNanosSnapshot,
+        )
+        // decide() sees delta < 0: the crafted future timestamp is evicted (no arm consumed,
+        // no generation minted); with nothing armed the result is Idle.
+        assertSame(VoiceSttDecision.Idle, decideLoaded(arbiter))
+        assertNull(arbiter.currentInFlight)
+        assertEquals(0L, arbiter.admittedAtNanosSnapshot)
+        assertEquals(3L, arbiter.currentGeneration)
+        // The next admit proceeds above the restored watermark.
+        assertEquals(
+            VoiceSttDecision.Admit(VoiceSttArmKind.USER),
+            decideLoaded(arbiter, user = true),
+        )
+        assertEquals(4L, arbiter.currentGeneration)
+        assertEquals(now, arbiter.admittedAtNanosSnapshot)
+    }
+
+    @Test
+    fun `restored inFlight pairs onLaunchReported false with the restored generation`() {
+        val arbiter = VoiceSttArbiter(
+            clockNanos = { 1_000_000_000L },
+            initialAdmitGeneration = 3L,
+            initialInFlight = VoiceSttArmKind.INITIAL,
+            initialAdmittedAtNanos = 1_000_000_000L,
+        )
+        // Mismatched kind does not release, even with the restored generation.
+        arbiter.onLaunchReported(VoiceSttArmKind.USER, launched = false, generation = 3L)
+        assertEquals(VoiceSttArmKind.INITIAL, arbiter.currentInFlight)
+        // Mismatched generation does not release, even with the matching kind.
+        arbiter.onLaunchReported(VoiceSttArmKind.INITIAL, launched = false, generation = 2L)
+        assertEquals(VoiceSttArmKind.INITIAL, arbiter.currentInFlight)
+        // Matching kind + the restored generation releases the restored in-flight gate.
+        arbiter.onLaunchReported(VoiceSttArmKind.INITIAL, launched = false, generation = 3L)
+        assertNull(arbiter.currentInFlight)
+        assertEquals(0L, arbiter.admittedAtNanosSnapshot)
+    }
+
+    @Test
+    fun `restored inFlight survives until watchdog eviction when never settled`() {
+        var now = 1_000_000_000L
+        val arbiter = VoiceSttArbiter(
+            clockNanos = { now },
+            initialAdmitGeneration = 2L,
+            initialInFlight = VoiceSttArmKind.USER,
+            initialAdmittedAtNanos = now,
+        )
+        // Construction-time watermark equals the restored value (no reset below it).
+        assertEquals(2L, arbiter.currentGeneration)
+        // Not yet past the watchdog: gate held.
+        assertSame(VoiceSttDecision.Idle, decideLoaded(arbiter, user = true))
+        now += VoiceSttArbiter.RECOGNIZER_WATCHDOG_NANOS + 1
+        assertEquals(
+            VoiceSttDecision.Admit(VoiceSttArmKind.INITIAL),
+            decideLoaded(arbiter, initial = true),
+        )
+        // Watchdog mints no generation; the successor mints above the restored watermark.
+        assertEquals(3L, arbiter.currentGeneration)
     }
 }

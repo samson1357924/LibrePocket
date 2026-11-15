@@ -118,6 +118,37 @@ class ElevatedCleanupTrackerRegistrationFailureTest {
         override fun destroyForcibly(): Process = this
     }
 
+    /**
+     * 記錄型假件（preflight 臂判別子）：getInputStream/getErrorStream/getOutputStream
+     * 只記錄 requested-ness（三個旗標，不擲出）；destroy no-op；waitFor(任一 timeout) false。
+     * preflight 臂不起線程、永不觸碰流；kill 路徑必經 gobbler（getInputStream／getErrorStream）
+     * ＋stdin-closer（getOutputStream）——drain 返回前兩 gobbler 已 join，故若臂選擇
+     * 迴歸至 kill 路徑，三旗標必為 true（本測試斷言其全為 false，即為正向判別）。
+     * （NoOpHangProcess 保留供 kill-path 測試用。）
+     */
+    private class StreamRecordingProcess : Process() {
+        @Volatile var inputRequested = false
+        @Volatile var errorRequested = false
+        @Volatile var outputRequested = false
+        override fun getOutputStream(): OutputStream {
+            outputRequested = true
+            return ByteArrayOutputStream()
+        }
+        override fun getInputStream(): InputStream {
+            inputRequested = true
+            return ByteArrayInputStream(ByteArray(0))
+        }
+        override fun getErrorStream(): InputStream {
+            errorRequested = true
+            return ByteArrayInputStream(ByteArray(0))
+        }
+        override fun waitFor(): Int = 0
+        override fun waitFor(timeout: Long, unit: TimeUnit): Boolean = false
+        override fun exitValue(): Int = 0
+        override fun destroy() = Unit
+        override fun destroyForcibly(): Process = this
+    }
+
     // ---- (a) verified=false＋registrar 拋 → 槽保留、計數 +1、准入 BACKLOG_FULL ----
 
     @Test fun registrationFailureKeepsSlotAndCountsRuntimeException() {
@@ -315,7 +346,7 @@ class ElevatedCleanupTrackerRegistrationFailureTest {
         // timeoutMs=0L：computeDeadlineNanos(0L, now)==now，isExpired 以
         // (deadline - nowNanos()).coerceAtLeast(0L) <= 0L 判定——入口即過期，
         // 確定性選中 preflight 臂（不靠時間窗口猜調度）。
-        val hanger = NoOpHangProcess()
+        val hanger = StreamRecordingProcess()
         val before = ElevatedCleanupTracker.quarantineRegistrationFailedCount()
         try {
             ElevatedProcessIo.quarantineRegistrar = { throw RuntimeException("registrar boom") }
@@ -325,6 +356,12 @@ class ElevatedCleanupTrackerRegistrationFailureTest {
                 killer = { it.destroy() },
                 isCancelled = { false },
             )
+            // preflight 臂不起線程、永不觸碰流：三旗標必 false（正向判別子——
+            // 若臂選擇迴歸至 kill 路徑，gobbler／stdin-closer 必經三個 getter，
+            // 旗標必 true）。
+            assertFalse("preflight must not request input stream", hanger.inputRequested)
+            assertFalse("preflight must not request error stream", hanger.errorRequested)
+            assertFalse("preflight must not request output stream", hanger.outputRequested)
             // preflight 臂 post-kill verify=false → helper 登記拋 ⇒ +1、槽保留；
             // preflight 固定回 timedOut=true。
             assertEquals(before + 1, ElevatedCleanupTracker.quarantineRegistrationFailedCount())
@@ -377,13 +414,14 @@ class ElevatedCleanupTrackerRegistrationFailureTest {
                 },
             )
             // Inner 臂實值（非 drainFailClosedDrained 兜底）：timedOut=false、readFailed=true、
-            // tailIncomplete=true、cleanupIncomplete=true；untrackedResidual 僅由
-            // saturation（acquireSlotOrQuarantine 敗）置 true——此處未飽和 ⇒ false。
+            // tailIncomplete=true、cleanupIncomplete=true；Inner 臂內，untrackedResidual 現由
+            // saturation（acquireSlotOrQuarantine 敗）／起線程失敗／acquire 拋三臂同置 true——
+            // 此 drain 的 elevated-cleanup 照常佔槽起動 ⇒ false（fallback `drainFailClosedDrained` 無條件置 true，該兜底此處不成立）。
             assertTrue("aborted arm must flag cleanupIncomplete", d.cleanupIncomplete)
             assertFalse("aborted arm is local resource exhaustion, not budget ⇒ timedOut=false", d.timedOut)
             assertTrue("aborted arm must flag readFailed", d.readFailed)
             assertTrue("aborted arm must flag tailIncomplete", d.tailIncomplete)
-            assertFalse("inner arm only sets untrackedResidual on saturation", d.untrackedResidual)
+            assertFalse("untrackedResidual stays false when cleanup worker acquires its slot", d.untrackedResidual)
             assertEquals(before + 1, ElevatedCleanupTracker.quarantineRegistrationFailedCount())
             assertEquals(1, ElevatedCleanupTracker.outstanding())
             assertEquals(0, ElevatedCleanupTracker.quarantinedCount())

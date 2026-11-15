@@ -49,6 +49,7 @@ class ElevatedRunnerPhaseBLateCompensationTest {
             PrivilegeActivation.ELEVATED_RUNNERS_READY,
         )
         floorBefore = ElevatedCleanupTracker.releaseFloorHits()
+        ElevatedProcessIo.quarantineRegistrar = { ElevatedCleanupTracker.quarantineUnverified(it) }
         ElevatedCleanupTracker.clearUnverified()
         ElevatedCleanupTracker.noteClean()
         pollOutstandingTo(0)
@@ -633,7 +634,7 @@ class ElevatedRunnerPhaseBLateCompensationTest {
      * 不重試起線程）。確定性 barrier：spawn 發佈後 worker 立即退出（expired=false
      * 不認領）；caller 等 `countLive("elevated-supervisor")==1`（僅 watcher 卡
      * cancelGate）後才放行取消門，保證 caller 側 CAS 認領成功。
-     * ARMED harness：late Process 為 latch 阻塞 destroy（teardown 才放），注入
+     * ARMED harness：late Process 為 destroyForcibly 阻塞於 latch 的假件（teardown 才放），注入
      * killer 亦記數後 latch 阻塞——任何終止嘗試要麼被計數、要麼卡死 detached
      * 線程，必然被零 kill 斷言抓住（detached-kill 迴歸確定性 turn red）。
      */
@@ -772,8 +773,8 @@ class ElevatedRunnerPhaseBLateCompensationTest {
      * `releaseCleanupSlotAfterVerify(v, verified=false, slotHeld=true)`；registrar 拋 ⇒
      * 登記不落地：`quarantineRegistrationFailedCount` +1、槽保留（outstanding==1）、
      * quarantine 空——fail-closed。確定性 barrier 結構與 (b) 完全相同（spawn→worker
-     * 退出→cancelGate 放行→expireWorker 認領），registrar 注入於 try/finally 內還原。
-     * ARMED harness：late Process 為 latch 阻塞 destroy（teardown 才放），注入 killer
+     * 退出→cancelGate 放行→expireWorker 認領），registrar 於 try 前注入、於 finally 還原（@Before 亦統一還原預設）。
+     * ARMED harness：late Process 為 destroyForcibly 阻塞於 latch 的假件（teardown 才放），注入 killer
      * 亦記數後 latch 阻塞。
      */
     @Test fun lateSpawnDaemonThreadStartFailureWithThrowingRegistrarKeepsSlotFailClosed() {

@@ -589,8 +589,12 @@ class WebExtractService(
      *   CancellationException → 映射為 `Unavailable(DETAIL_CANCELLED, null)`
      *   （never cached）；follower 自身的取消仍以 `ensureActive()` 優先透傳。
      * - invalidate() 之後之新呼叫走完整 policy／DNS cycle（含 cache 重驗），
-     *   不得重用 invalidate 前之 in-flight 或 cache 結果；cache／follower
-     *   路徑不可能洩漏撤權限內容（世代守衛）。
+     *   不得重用 invalidate 前之 cache 結果（read-side 世代守衛：陳舊條目
+     *   直接 miss 並重打 upstream）；cache 路徑不可能洩漏撤權限內容。
+     *   in-flight 路徑依 detached 語義處理：已 join 之 follower 於 drain 前
+     *   收到 leader 已完成之 Ok（leader 自身 caller 同理）；drain 時仍 pending
+     *   者收到 `CancellationException("web.extract invalidated")` → 映射
+     *   `Unavailable(DETAIL_CANCELLED, null)`（never cached）。
      * - leader 於 drain 之後完成者：其 `Ok` 仍正常返回給它自己的 caller，
      *   但 cache 寫入被 epoch guard 抑制；follower 因 `m.complete(outcome)`
      *   對已例外完成的 deferred 無效而只見 CancellationException。
@@ -698,7 +702,7 @@ class WebExtractService(
                 }
             }
             lateHit?.let { return it }
-            val m = mine ?: error("extract() invariant violated: no epoch for in-flight entry")
+            val m = mine ?: error("extract() invariant violated: no in-flight entry elected")
             if (!leader) {
                 try {
                     // per-follower deadline：以整體預算為界包住 await；

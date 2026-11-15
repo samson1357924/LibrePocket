@@ -42,7 +42,12 @@ import kotlin.coroutines.coroutineContext
  *   reasonCode／flavor／投影開關（freeze 後的不可變有界拷貝）／grant 身份
  *   （grantProviderId／grantConfigRevision）；
  *   確認後 spawn 前重驗快照一致性（開關／flavor／已授權權限集合／grant 身份／policy 任一翻轉、
- *   argv 被竄改即作廢，零 spawn；reason 為不可變 String、入口凍結後只讀快照，不存在竄改面）；已授權權限集合比對兩份皆為我方
+ *   argv 被竄改即作廢，零 spawn；reason 為不可變 String、入口凍結後只讀快照，不存在竄改面）。
+ *   argv 受監督比對共兩個重驗點，任一點觀察到呼叫方原始 list 竄改即作廢（零 spawn）：
+ *   （1）重驗入口（freeze ctx2 之後、ctx 一致性比對之前）；
+ *   （2）grant2 最終有效性確認之後、dispatch 之前（最終防線，封閉「確認→改→spawn」缺口）。
+ *   dispatch 之後的竄改不在此保證（也無需）：runner 只吃不可變快照 argv，審計綁定 snapshot；
+ *   已授權權限集合比對兩份皆為我方
  *   unmodifiableSet，equals 安全有界，失敗→DENY；
  * - `ToolRegistry` 的 `shell.elevated` 維持 `executionReady=false`（B3 不翻旗——
  *   先接線形狀＋測試，翻旗是生產啟用決策，留待裝置 E2E 後；見接線測試 pin）。
@@ -134,6 +139,9 @@ object ElevatedWiring {
 
     /** fresh policy（前驗／重驗）的 1s 配合作式逾時（掛起點觸發；對永不掛起之實作不保證上界；超限視同 verdict=null → 非 ALLOW 拒）。 */
     private const val POLICY_TIMEOUT_MS: Long = 1_000L
+
+    /** [POLICY_TIMEOUT_MS] 的 monotonic deadline 對應值（System.nanoTime 口徑，見兩處 policy 評估的超限門）。 */
+    private const val POLICY_TIMEOUT_NANOS: Long = POLICY_TIMEOUT_MS * 1_000_000L
 
     /** freezeCtx 上限：userSwitches 筆數（超限即 fail-closed null）。 */
     private const val MAX_FROZEN_SWITCHES: Int = 64
@@ -272,14 +280,18 @@ object ElevatedWiring {
      *   （userSwitches／grantedPermissions）亦經同池有界凍結（freezeCtx），此後所有投影／
      *   比對皆讀我方不可變拷貝。
      * F7：重驗通過後以單一 frozen snapshot 委派 executeWithFrozen（避免二次凍結）；
-     *   argvMatchesSnapshot 的重凍結是第二次池拷貝（有界），用於重驗不受信 list——
+     *   argvMatchesSnapshot 於重驗入口與 grant2 後最終防線共兩次池拷貝（有界），用於不受信 list 的逐次比對——
      *   「single frozen snapshot」指執行用快照本體不二次凍結。
      * F8：快照已存在且未觸不可信 argv 的 deny，審計記錄 snapshot argv＋有界 reason 以保留關聯。
      * F5：最終阻塞 runner 執行於 Dispatchers.IO，並經 runInterruptible 轉為 worker 執行緒
      *   interrupt；runner 具 interrupt 感知即停止；runner 不感知時殘留至其 timeoutMs，
      *   與撤權/離開頁面無保證中止——KDoc 如實記載。
-     * F5b：`timeoutMs` 超限即夾至 [ShellPolicy.MAX_ELEVATED_TIMEOUT_MS]
-     *   （fail-safe clamp，不拒絕——拒絕超過上界的誤用須另立需求）；runner 永遠收到有界預算。
+     * F5b：`timeoutMs <= 0`（零／負預算）即 fail-closed 拒絕——回
+     *   `TimedOut`（empty partial、`cleanupIncomplete=false`，對齊 github runner 入口
+     *   `safeTimeoutMs<=0 → preSpawnExpired` 語義），零 spawn、恰一筆 `TIMEOUT` 審計，
+     *   不觸碰 argv 迭代／快照／投影／policy／gate／runner；僅 `timeoutMs` 為正數且超過上界
+     *   才夾至 [ShellPolicy.MAX_ELEVATED_TIMEOUT_MS]（fail-safe clamp，不拒絕——拒絕超過
+     *   上界的誤用須另立需求）。runner 永遠收到有界正預算。
      *
      * 殘餘 TOCTOU：重驗通過→spawn 之間仍有檢查→使用殘餘窗（revalidate 與 spawn 非原子）；
      * 由 github runner `awaitPreSpawn`＋`ELEVATED_RUNNERS_READY` 終門把關；本層不宣稱消除。
@@ -307,8 +319,25 @@ object ElevatedWiring {
         timeoutMs: Long = ShellPolicy.DEFAULT_TIMEOUT_MS,
     ): ShellResult {
         coroutineContext.ensureActive()
-        // fail-safe clamp（不拒絕——拒絕超過上界的誤用須另立需求）：runner 永遠收到有界預算。
-        val effectiveTimeoutMs = timeoutMs.coerceIn(1L, ShellPolicy.MAX_ELEVATED_TIMEOUT_MS)
+        // fail-closed（零預算＝零 spawn，對齊 github runner 入口 `safeTimeoutMs<=0 →
+        // preSpawnExpired`）：timeoutMs<=0 一律拒絕——TimedOut（empty partial、未 spawn、
+        // cleanupIncomplete=false），零 spawn、恰一筆 TIMEOUT 審計；不觸碰 argv 迭代／
+        // 快照／投影／policy／gate／runner。舊 coerceIn(1L, …) 會把 0/負值靜默提升為
+        // 1ms 正預算進入 spawn 路徑，違反零預算契約，已移除。
+        if (timeoutMs <= 0L) {
+            val timedOut = ShellResult.TimedOut(
+                partialStdout = "",
+                partialStderr = "",
+                timeoutMs = timeoutMs,
+                truncated = false,
+                cleanupIncomplete = false,
+            )
+            audit.record(emptyList(), safeReason(reasonCode), PrivilegeAuditLog.verdictName(timedOut))
+            return timedOut
+        }
+        // fail-safe clamp（僅正數超上界，不拒絕——拒絕超過上界的誤用須另立需求）：
+        // runner 永遠收到有界正預算。
+        val effectiveTimeoutMs = timeoutMs.coerceAtMost(ShellPolicy.MAX_ELEVATED_TIMEOUT_MS)
         // --- Cheap gates first (F6): no argv iteration/snapshot before these pass ---
         val tool = ToolRegistry.find(TOOL_NAME)
             ?: run {
@@ -401,7 +430,13 @@ object ElevatedWiring {
         // fresh policy（前驗）：僅 ALLOW 放行；ASK／DENY／異常／逾時一律拒（ASK 不變 ALLOW；CE 重拋）。
         // withTimeoutOrNull 是配合作式（掛起點觸發）：對永不掛起之實作不保證上界（產品以 DataStore 系為準）。
         // withTimeoutOrNull 回 null 且 block 未返回＝逾時 → verdict=TIMEOUT；block 返回 null（Java-null verdict）或任何例外／Error → verdict=ERROR。
+        // 永不掛起的實作仍可能在預算之後才回傳 ALLOW——故以 System.nanoTime() 量測的
+        // monotonic deadline 才是權威超限門：
+        // block 即使已 RETURN 且 verdict==ALLOW，elapsed 嚴格大於 POLICY_TIMEOUT_MS 一律
+        // 視為 TIMEOUT（阻塞中的工作可能殘留，但絕不可授權；等於預算仍視為在限內）。
+        // CE 語義不變（重拋、不寫審計）；Throwable→null 語義不變。
         var verdict1Timeout = false
+        val policyEvalStartNanos = System.nanoTime()
         val verdict1 = try {
             var blockReturned = false
             withTimeoutOrNull(POLICY_TIMEOUT_MS) {
@@ -415,10 +450,15 @@ object ElevatedWiring {
         } catch (_: Throwable) {
             null
         }
-        if (verdict1 != Verdict.ALLOW) {
+        val policyEvalElapsedNanos = System.nanoTime() - policyEvalStartNanos
+        // overdue-ALLOW：預算超限即使 block 已返回 ALLOW 亦視同逾時（monotonic，僅嚴格大於才算）。
+        if (verdict1 == Verdict.ALLOW && policyEvalElapsedNanos > POLICY_TIMEOUT_NANOS) {
+            verdict1Timeout = true
+        }
+        if (verdict1 != Verdict.ALLOW || verdict1Timeout) {
             val verdict1Label = when {
-                verdict1 != null -> verdict1.name
                 verdict1Timeout -> "TIMEOUT"
+                verdict1 != null -> verdict1.name
                 else -> "ERROR"
             }
             val denied = ShellResult.Denied(
@@ -548,7 +588,11 @@ object ElevatedWiring {
         // fresh policy（重驗）：僅 ALLOW 放行；異常／逾時一律拒（CE 重拋）。
         // withTimeoutOrNull 是配合作式（掛起點觸發）：對永不掛起之實作不保證上界（產品以 DataStore 系為準）。
         // withTimeoutOrNull 回 null 且 block 未返回＝逾時 → verdict=TIMEOUT；block 返回 null（Java-null verdict）或任何例外／Error → verdict=ERROR。
+        // monotonic deadline 同前驗：block 即使已返回 ALLOW，elapsed 嚴格大於
+        // POLICY_TIMEOUT_MS 一律視為 TIMEOUT（阻塞中的工作可能殘留，但絕不可授權）；
+        // CE 語義不變（重拋、不寫審計）；Throwable→null 語義不變。
         var verdict2Timeout = false
+        val policyEval2StartNanos = System.nanoTime()
         val verdict2 = try {
             var blockReturned = false
             withTimeoutOrNull(POLICY_TIMEOUT_MS) {
@@ -562,10 +606,15 @@ object ElevatedWiring {
         } catch (_: Throwable) {
             null
         }
-        if (verdict2 != Verdict.ALLOW) {
+        val policyEval2ElapsedNanos = System.nanoTime() - policyEval2StartNanos
+        // overdue-ALLOW：預算超限即使 block 已返回 ALLOW 亦視同逾時（monotonic，僅嚴格大於才算）。
+        if (verdict2 == Verdict.ALLOW && policyEval2ElapsedNanos > POLICY_TIMEOUT_NANOS) {
+            verdict2Timeout = true
+        }
+        if (verdict2 != Verdict.ALLOW || verdict2Timeout) {
             val verdict2Label = when {
-                verdict2 != null -> verdict2.name
                 verdict2Timeout -> "TIMEOUT"
+                verdict2 != null -> verdict2.name
                 else -> "ERROR"
             }
             val denied = ShellResult.Denied(
@@ -610,6 +659,23 @@ object ElevatedWiring {
                 ShellDeny.NOT_WHITELISTED,
                 "elevated grant identity changed after confirm (fail-closed, no spawn)",
             )
+            audit.record(snapshot.argv, safeReason(snapshot.reasonCode), PrivilegeAuditLog.verdictName(denied))
+            return denied
+        }
+        // 最終 argv 防線（grant2 最終有效性確認之後、dispatch 之前）：
+        // grantCheck／bridgeGranted supplier 可能於 grant2 評估期間竄改 caller 原始 argv——
+        // 再做一次受監督比對，封閉「確認→改→spawn」語義缺口。與重驗入口同形：CE 重拋；
+        // 其餘 Throwable→false（fail-closed，零 spawn）。runner 只吃不可變快照
+        // [ElevatedSnapshot.argv]，此比對針對呼叫方原始 list 的竄改面（見檔頂 KDoc 兩重驗點）。
+        val argvOkFinal = try {
+            argvMatchesSnapshot(argv, snapshot.argv)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Throwable) {
+            false
+        }
+        if (!argvOkFinal) {
+            val denied = ShellResult.Denied(ShellDeny.BLACKLISTED, "elevated args changed after confirm (final check, fail-closed, no spawn)")
             audit.record(snapshot.argv, safeReason(snapshot.reasonCode), PrivilegeAuditLog.verdictName(denied))
             return denied
         }

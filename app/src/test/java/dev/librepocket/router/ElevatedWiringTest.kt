@@ -885,6 +885,118 @@ class ElevatedWiringTest {
         assertEquals(mapOf("DENY" to 1), audit.countByVerdict())
     }
 
+    // --- T2-3：policy 超限 ALLOW 一律視為逾時（monotonic deadline 權威門；withTimeoutOrNull 為配合作式） ---
+
+    /** sleep>budget 後仍回傳 ALLOW 的非協作 policy（永不掛起；Blocking 體）。 */
+    private fun slowAllowPolicy(sleepMillis: Long): PolicyStore =
+        object : PolicyStore by allowPolicy() {
+            override suspend fun evaluateFresh(action: String, resource: String): PolicyDecision {
+                Thread.sleep(sleepMillis)
+                return PolicyDecision(Verdict.ALLOW, null, System.currentTimeMillis())
+            }
+        }
+
+    @Test fun policyPrecheckOverBudgetAllowDeniedAsTimeout() = runBlocking {
+        // 非協作 policy：永不掛起（Thread.sleep 1500ms > 1000ms budget）後仍回 ALLOW。
+        // withTimeoutOrNull 為配合作式，block 跑完才有返回值——超出 budget 的 ALLOW
+        // 不可信：monotonic deadline 權威門一律視為逾時 →
+        // Denied「policy denied (verdict=TIMEOUT…)」、零 spawn、恰一筆 DENY、verdict DENY。
+        val runner = SpawnCounter()
+        val audit = PrivilegeAuditLog()
+        val r = ElevatedWiring.execute(
+            argv = listOf("id"),
+            reasonCode = "B3-T",
+            confirmed = true,
+            ctxSupplier = { elevatedCtx() },
+            policyStore = slowAllowPolicy(1_500L),
+            runner = runner,
+            audit = audit,
+            grantCheck = { validGrant() },
+            bridgeGranted = { true },
+        )
+        assertTrue("$r", r is ShellResult.Denied)
+        assertTrue("$r", (r as ShellResult.Denied).message.contains("verdict=TIMEOUT"))
+        assertEquals(0, runner.calls)
+        assertEquals(1, audit.size())
+        assertEquals(mapOf("DENY" to 1), audit.countByVerdict())
+    }
+
+    @Test fun policyPrecheckUnderBudgetAllowPasses() = runBlocking {
+        // 上界內（sleep 50ms < 1000ms budget）回 ALLOW：Ok、恰一筆 OK 審計、runner 恰一次。
+        val runner = SpawnCounter()
+        val audit = PrivilegeAuditLog()
+        val r = ElevatedWiring.execute(
+            argv = listOf("id"),
+            reasonCode = "B3-T",
+            confirmed = true,
+            ctxSupplier = { elevatedCtx() },
+            policyStore = slowAllowPolicy(50L),
+            runner = runner,
+            audit = audit,
+            grantCheck = { validGrant() },
+            bridgeGranted = { true },
+        )
+        assertTrue("$r", r is ShellResult.Ok)
+        assertEquals(1, runner.calls)
+        assertEquals(mapOf("OK" to 1), audit.countByVerdict())
+    }
+
+    @Test fun policyReverifyOverBudgetAllowDeniedAsTimeout() = runBlocking {
+        // 重驗點（fresh policy 第二次呼叫）：前驗快速 ALLOW、重驗 sleep 1500ms 後仍回 ALLOW
+        // → 超出 budget 的 ALLOW 不可信 → Denied「policy denied on reverify (verdict=TIMEOUT…)」、
+        // 零 spawn、恰一筆 DENY、verdict DENY、審計 argv 為快照 argv。
+        val calls = java.util.concurrent.atomic.AtomicInteger(0)
+        val countingPolicy = object : PolicyStore by allowPolicy() {
+            override suspend fun evaluateFresh(action: String, resource: String): PolicyDecision {
+                if (calls.incrementAndGet() == 1) {
+                    return PolicyDecision(Verdict.ALLOW, null, System.currentTimeMillis())
+                }
+                Thread.sleep(1_500L)
+                return PolicyDecision(Verdict.ALLOW, null, System.currentTimeMillis())
+            }
+        }
+        val runner = SpawnCounter()
+        val audit = PrivilegeAuditLog()
+        val r = ElevatedWiring.execute(
+            argv = listOf("id"),
+            reasonCode = "B3-T",
+            confirmed = true,
+            ctxSupplier = { elevatedCtx() },
+            policyStore = countingPolicy,
+            runner = runner,
+            audit = audit,
+            grantCheck = { validGrant() },
+            bridgeGranted = { true },
+        )
+        assertTrue("$r", r is ShellResult.Denied)
+        assertTrue("$r", (r as ShellResult.Denied).message.contains("verdict=TIMEOUT"))
+        assertTrue("$r", r.message.contains("reverify"))
+        assertEquals(0, runner.calls)
+        assertEquals(1, audit.size())
+        assertEquals(mapOf("DENY" to 1), audit.countByVerdict())
+        val row = audit.snapshot().single()
+        assertEquals(PrivilegeAuditLog.argvHash(listOf("id")), row.argvHash)
+    }
+
+    @Test fun policyReverifyUnderBudgetAllowPasses() = runBlocking {
+        // 兩點皆在 budget 內（各 sleep 50ms）回 ALLOW：Ok、runner 恰一次。
+        val runner = SpawnCounter()
+        val audit = PrivilegeAuditLog()
+        val r = ElevatedWiring.execute(
+            argv = listOf("id"),
+            reasonCode = "B3-T",
+            confirmed = true,
+            ctxSupplier = { elevatedCtx() },
+            policyStore = slowAllowPolicy(50L),
+            runner = runner,
+            audit = audit,
+            grantCheck = { validGrant() },
+            bridgeGranted = { true },
+        )
+        assertTrue("$r", r is ShellResult.Ok)
+        assertEquals(1, runner.calls)
+    }
+
     // --- MINOR-1：供應池＋freezeCtx 直接單元測試（有界性釘住） ---
 
     @Test fun nonCooperativeContextSupplierFailsClosedBounded() = runBlocking {
@@ -2068,10 +2180,11 @@ class ElevatedWiringTest {
 
     // --- 重驗 grantCheck 期間竄改 caller mutable argv（clear） ---
 
-    @Test fun reverifyGrantRecheckMutationStillExecutesSnapshot() = runBlocking {
-        // 第二次 grantCheck（重驗）清空 caller 的 mutable argv：clear() 發生於
-        // argvMatchesSnapshot 之後（grant 重驗在 argv 重驗之後），且執行／審計用
-        // 快照 argv——空 argv 不構成誤判、result Ok、快照 argvHash 綁定。
+    @Test fun reverifyGrantRecheckMutationRejectedFinalCheck() = runBlocking {
+        // grant2（重驗）期間清空 caller 的 mutable argv：clear() 發生於重驗入口 argv
+        // 比對之後、且發生在最終 argv 防線之前——grant2 身份確認後、dispatch 前的最終
+        // 受監督比對捕捉竄改 → fail-closed Denied、零 spawn、恰一筆 DENY、零 Ok。
+        // （runner 只吃不可變快照；此封閉「確認→改→spawn」語義缺口，見檔頂 KDoc 兩重驗點。）
         val mutable = mutableListOf("id")
         var grantCalls = 0
         val grantCheck: () -> ElevatedWiring.ElevatedGrant = {
@@ -2092,25 +2205,23 @@ class ElevatedWiringTest {
             grantCheck = grantCheck,
             bridgeGranted = { true },
         )
-        assertTrue("$r", r is ShellResult.Ok)
+        assertTrue("$r", r is ShellResult.Denied)
+        assertEquals("elevated args changed after confirm (final check, fail-closed, no spawn)", (r as ShellResult.Denied).message)
         assertEquals(0, mutable.size) // 竄改確實發生（caller 保留的 list 已被清空）
-        assertEquals(1, runner.calls)
-        assertEquals(listOf("id"), runner.lastArgv)
+        assertEquals(0, runner.calls)
         assertEquals(1, audit.size())
-        assertEquals(mapOf("OK" to 1), audit.countByVerdict())
+        assertEquals(mapOf("DENY" to 1), audit.countByVerdict())
         val row = audit.snapshot().single()
         assertEquals(PrivilegeAuditLog.argvHash(listOf("id")), row.argvHash)
     }
-    // --- timeoutMs fail-safe clamp（#1：超限即夾至 MAX_ELEVATED_TIMEOUT_MS(60s)，不拒絕） ---
+    // --- timeoutMs 契約（#1：正數超上界即夾至 MAX_ELEVATED_TIMEOUT_MS(60s)；零／負預算 fail-closed 拒絕，不 spawn） ---
 
-    @Test fun timeoutMsClampedToMaxForRunner() = runBlocking {
-        // runner 收到的 timeoutMs：Long.MAX_VALUE → 60_000；0L／負值 → 1；合法值原樣透傳。
+    @Test fun timeoutMsPositiveClampedToMaxForRunner() = runBlocking {
+        // runner 收到的 timeoutMs：Long.MAX_VALUE → 60_000；合法值原樣透傳（僅正數 clamp，不拒絕）。
         // 斷言正常執行（Ok）＋每筆恰一筆審計。上界常量本身亦釘死（防 MAX 被調大而偵測不到）。
         assertEquals(60_000L, ShellPolicy.MAX_ELEVATED_TIMEOUT_MS)
         val cases = listOf(
             Long.MAX_VALUE to ShellPolicy.MAX_ELEVATED_TIMEOUT_MS,
-            0L to 1L,
-            -5L to 1L,
             5_000L to 5_000L,
         )
         for ((input, expected) in cases) {
@@ -2137,6 +2248,58 @@ class ElevatedWiringTest {
             assertTrue("input=$input -> $r", r is ShellResult.Ok)
             assertEquals("input=$input", expected, captured)
             assertEquals("input=$input", 1, audit.size())
+        }
+    }
+
+    @Test fun timeoutMsNonPositiveRejected() = runBlocking {
+        // 零／負預算：fail-closed 拒絕（對齊 github runner 入口 `safeTimeoutMs<=0 →
+        // preSpawnExpired` 語義）——TimedOut（empty partial、cleanupIncomplete=false），
+        // 零 runner invocation、恰一筆 TIMEOUT 審計、不觸碰 argv 迭代。
+        assertEquals(60_000L, ShellPolicy.MAX_ELEVATED_TIMEOUT_MS)
+        for (input in listOf(0L, -5L, Long.MIN_VALUE)) {
+            var touched = false
+            val argv = object : AbstractList<String>() {
+                override val size: Int get() { touched = true; return 1 }
+                override fun get(index: Int): String { touched = true; return "id" }
+                override fun iterator(): MutableIterator<String> {
+                    touched = true
+                    return mutableListOf("id").iterator()
+                }
+            }
+            var runnerCalls = 0
+            val runner = object : ElevatedShellRunner {
+                override fun run(request: ElevatedRequest, timeoutMs: Long): ShellResult {
+                    runnerCalls++
+                    return ShellResult.Ok("ok", "", 0, false)
+                }
+            }
+            val audit = PrivilegeAuditLog()
+            val r = ElevatedWiring.execute(
+                argv = argv,
+                reasonCode = "B3-T",
+                confirmed = true,
+                ctxSupplier = { elevatedCtx() },
+                policyStore = allowPolicy(),
+                runner = runner,
+                audit = audit,
+                grantCheck = { validGrant() },
+                bridgeGranted = { true },
+                timeoutMs = input,
+            )
+            assertTrue("input=$input -> $r", r is ShellResult.TimedOut)
+            val timedOut = r as ShellResult.TimedOut
+            assertEquals("input=$input", input, timedOut.timeoutMs)
+            assertEquals("input=$input", "", timedOut.partialStdout)
+            assertEquals("input=$input", "", timedOut.partialStderr)
+            assertEquals("input=$input", false, timedOut.truncated)
+            assertEquals("input=$input", false, timedOut.cleanupIncomplete)
+            assertEquals("input=$input must not spawn", 0, runnerCalls)
+            assertEquals("input=$input", false, touched)
+            assertEquals("input=$input", 1, audit.size())
+            assertEquals("input=$input", mapOf("TIMEOUT" to 1), audit.countByVerdict())
+            val row = audit.snapshot().single()
+            assertEquals("input=$input", PrivilegeAuditLog.argvHash(emptyList()), row.argvHash)
+            assertEquals("input=$input", PrivilegeAuditLog.sha256Hex("B3-T"), row.reasonHash)
         }
     }
 

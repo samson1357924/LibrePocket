@@ -1264,6 +1264,73 @@ class WebExtractD4Test {
         }
         val rssOut = WebExtractService(rssHttp).extract("https://example.com/rss", resolver = dns)
         assertTrue("+xml 後綴型別應允許", rssOut is WebExtractOutcome.Ok)
+        // 內容等值（raw-text 管線：不刪 tag、不 unescape）
+        val jsonOk = jsonOut as WebExtractOutcome.Ok
+        assertEquals("""{"key":"value"}""", jsonOk.content.snippet)
+        val rssOk = rssOut as WebExtractOutcome.Ok
+        assertTrue("rss+xml 應走 raw-text：tag 原樣保留，got ${rssOk.content.snippet}",
+            rssOk.content.snippet.contains("<title>Hello</title>"))
+    }
+
+    @Test fun textPlainRawPipelinePreservesGenericsAndRawAmpersand() = runBlocking {
+        val dns = publicDns("example.com")
+        val body = "List<String> & <T> raw; A &amp; B"
+        val http = FakeExtract {
+            WebExtractRawResponse(200, body.toByteArray(Charsets.UTF_8), mapOf("Content-Type" to "text/plain; charset=utf-8"))
+        }
+        val out = WebExtractService(http).extract("https://example.com/raw", resolver = dns) as WebExtractOutcome.Ok
+        assertTrue("snippet 應含 List<String>，got ${out.content.snippet}", out.content.snippet.contains("List<String>"))
+        assertTrue("snippet 應含 <T>，got ${out.content.snippet}", out.content.snippet.contains("<T>"))
+        assertTrue("raw entity 不得被 unescape，got ${out.content.snippet}", out.content.snippet.contains("A &amp; B"))
+        // raw-text 契約：title fallback URL、published=null、siteName=host
+        assertEquals("https://example.com/raw", out.content.title)
+        assertTrue(out.content.published == null)
+        assertEquals("example.com", out.content.siteName)
+    }
+
+    @Test fun applicationJsonRawPipelinePreservesGenerics() = runBlocking {
+        val dns = publicDns("example.com")
+        val body = """{"type":"List<String>"}"""
+        val http = FakeExtract {
+            WebExtractRawResponse(200, body.toByteArray(Charsets.UTF_8), mapOf("Content-Type" to "application/json"))
+        }
+        val out = WebExtractService(http).extract("https://example.com/j", resolver = dns) as WebExtractOutcome.Ok
+        assertTrue("snippet 應含 List<String>，got ${out.content.snippet}", out.content.snippet.contains("List<String>"))
+        assertTrue(out.content.published == null)
+    }
+
+    @Test fun textMarkdownRawPipelinePreservesMarkup() = runBlocking {
+        val dns = publicDns("example.com")
+        val body = "# Heading\n\nSome *emphasis* with `code` & <angle>"
+        val http = FakeExtract {
+            WebExtractRawResponse(200, body.toByteArray(Charsets.UTF_8), mapOf("Content-Type" to "text/markdown; charset=utf-8"))
+        }
+        val out = WebExtractService(http).extract("https://example.com/md", resolver = dns) as WebExtractOutcome.Ok
+        assertTrue("markdown 符號應原樣保留，got ${out.content.snippet}", out.content.snippet.contains("# Heading"))
+        assertTrue("raw angle 不得被當 tag 剝除，got ${out.content.snippet}", out.content.snippet.contains("<angle>"))
+        assertTrue("raw & 應原樣保留，got ${out.content.snippet}", out.content.snippet.contains("& <angle>"))
+    }
+
+    @Test fun atomXmlRawPipelinePreservesTags() = runBlocking {
+        val dns = publicDns("example.com")
+        val body = """<?xml version="1.0" encoding="utf-8"?><feed xmlns="http://www.w3.org/2005/Atom"><title>Feed T</title><entry><id>1</id></entry></feed>"""
+        val http = FakeExtract {
+            WebExtractRawResponse(200, body.toByteArray(Charsets.UTF_8), mapOf("Content-Type" to "application/atom+xml"))
+        }
+        val out = WebExtractService(http).extract("https://example.com/atom", resolver = dns) as WebExtractOutcome.Ok
+        assertTrue("atom+xml 應走 raw-text：tag 原樣保留，got ${out.content.snippet}",
+            out.content.snippet.contains("<feed"))
+        assertTrue(out.content.snippet.contains("Feed T"))
+        assertTrue(out.content.published == null)
+    }
+
+    @Test fun htmlScriptureNotTreatedAsScript() = runBlocking {
+        val dns = publicDns("example.com")
+        val doc = "<html><head><title>T</title></head><body><scripture>Visible</scripture></body></html>"
+        val http = FakeExtract { okResp(doc) }
+        val out = WebExtractService(http).extract("https://example.com/scripture", resolver = dns) as WebExtractOutcome.Ok
+        assertTrue("<scripture> 不得被當成 <script> 剝除，got ${out.content.snippet}",
+            out.content.snippet.contains("Visible"))
     }
 
     @Test fun caseMixedMarkerForgedStripped() = runBlocking {

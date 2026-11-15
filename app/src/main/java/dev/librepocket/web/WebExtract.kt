@@ -62,6 +62,9 @@ internal class DeadlineExceededException : RuntimeException()
  * - Content-Type（存在時）：僅 `text/` 開頭型別、`application/xhtml+xml`、
  *   `application/xml`、`application/json` 或 `+xml`／`+json` suffixed 型別；
  *   其餘 → `BAD_RESPONSE`；缺席該 header 放行（legacy）。
+ *   放行之後依 [pipelineOf] 分派：HTML-family（`text/html`／`application/xhtml+xml`）
+ *   走 HTML 管線（tag 剝除＋unescape）；其餘已放行型別走 raw-text 管線
+ *   （不刪 tag、不 unescape，raw `&` 原樣保留）。
  * - Gzip：解壓同樣受位元組上限約束
  *  （bomb：小壓縮、大解壓 → `TOO_LARGE` fail-closed）；非 gzip 卻標 gzip
  *   或解壓失敗 → `BAD_RESPONSE`。
@@ -89,8 +92,8 @@ internal class DeadlineExceededException : RuntimeException()
  *   follower 不得 out-fetch 已取消的 leader，不再進入單飛迴圈 refetch）；
  *   例外：leader 於取消前已完整產出 Ok（okForFollowers 路徑）者，follower
  *   收到該 Ok 而非 CANCELLED。
- * - 內容：`title/url/snippet/published/siteName` 正規化（見 [parseHtml]），
- *   全經 [WebContentEnvelope.cleanField]（`nfkc → strip → sanitize` 定點）清理；模型可見體為
+ * - 內容：`title/url/snippet/published/siteName` 正規化（見 [parseHtml]；
+ *   raw-text 型別見 [pipelineOf]），全經 [WebContentEnvelope.cleanField]（`nfkc → strip → sanitize` 定點）清理；模型可見體為
  *   [WebContentEnvelope.wrap] 單層 envelope；各欄位另受硬上限約束
  *  （title 500／siteName 253／url 2048／published 128，皆 surrogate 安全截斷）。
  * - 偽造 marker 定點清理：`title/snippet/published` 皆經
@@ -849,7 +852,7 @@ class WebExtractService(
 
             // Content-Type 閘（存在時）：僅允許 text/*、application/xhtml+xml、
             // application/xml、application/json 或 +xml／+json 後綴型別；
-            // 缺席該 header 放行（legacy）。
+            // 缺席該 header 放行（legacy）。分派至管線（[pipelineOf]）在閘之後進行。
             val contentType = headerLookup(response.headers, "content-type")
             if (contentType != null && !isAllowedContentType(contentType)) {
                 return WebExtractOutcome.Failed(WebExtract.DETAIL_BAD_RESPONSE)
@@ -882,8 +885,29 @@ class WebExtractService(
             if (decoded.isBlank()) {
                 return WebExtractOutcome.Failed(WebExtract.DETAIL_BAD_RESPONSE)
             }
-            val parsed = parseHtml(decoded, normalized, deadlineNs)
-                ?: return WebExtractOutcome.Failed(WebExtract.DETAIL_BAD_RESPONSE)
+            // 管線分派：HTML-family 走 parseHtml；其餘已放行 MIME 走 raw-text
+            // 管線（不刪 tag、不 unescape；raw `&` 原樣保留）。
+            val parsed = when (pipelineOf(contentType)) {
+                Pipeline.Html -> parseHtml(decoded, normalized, deadlineNs)
+                Pipeline.RawText -> {
+                    val snippet = HtmlExtract.Spaces.replace(
+                        WebContentEnvelope.cleanField(decoded, deadlineNs),
+                        " ",
+                    ).trim()
+                    if (snippet.isEmpty()) {
+                        // snippet 清成空白 → BAD_RESPONSE（鏡照 HTML 管線之契約）。
+                        null
+                    } else {
+                        WebExtractContent(
+                            title = normalized,
+                            url = normalized,
+                            snippet = snippet,
+                            published = null,
+                            siteName = hostOf(normalized),
+                        )
+                    }
+                }
+            } ?: return WebExtractOutcome.Failed(WebExtract.DETAIL_BAD_RESPONSE)
 
             // Model 可見截斷（定點清理後、截斷後、envelope 最外；見 cleanField）。
             val cleanSnippet = WebContentEnvelope.cleanField(parsed.snippet, deadlineNs)
@@ -976,6 +1000,32 @@ private fun downgradedOptInForRedirect(
     effectiveOptIn: EndpointNetworkOptIn,
 ): EndpointNetworkOptIn =
     if (sameOrigin(currentUrl, resolvedUrl)) effectiveOptIn else EndpointNetworkOptIn()
+
+/**
+ * MIME 分派管線：HTML-family 走 HTML 管線（[parseHtml]：stripScriptAndStyle →
+ * stripText → 空白收斂）；其餘已放行型別走 raw-text 管線
+ * （`decoded → cleanField → Spaces.replace → trim`；不刪 tag、不 unescape，
+ * raw `&` 原樣保留）。
+ */
+internal enum class Pipeline { Html, RawText }
+
+/**
+ * 依 Content-Type 分派抽取管線。
+ *
+ * HTML family：`text/html`、`application/xhtml+xml` → [Pipeline.Html]；
+ * 其餘已由 [isAllowedContentType] 放行的型別（`text/` 開頭非 html、`application/json`、
+ * `application/xml`、`+xml`／`+json` suffixed）→ [Pipeline.RawText]；
+ * header 缺席 → [Pipeline.Html]（legacy 行為）。型別比對大小寫不敏感、`;` 後參數忽略。
+ *
+ * [isAllowedContentType] 仍為位元組／型別閘（byte/type gate），不在此調整；
+ * 管線分派為下游關注點。
+ */
+internal fun pipelineOf(contentType: String?): Pipeline {
+    if (contentType == null) return Pipeline.Html
+    val ct = contentType.substringBefore(';').trim().lowercase()
+    if (ct.isEmpty()) return Pipeline.Html
+    return if (ct == "text/html" || ct == "application/xhtml+xml") Pipeline.Html else Pipeline.RawText
+}
 
 /**
  * Content-Type 閘：回傳 true 當型別可接受（缺 charset 無妨）。

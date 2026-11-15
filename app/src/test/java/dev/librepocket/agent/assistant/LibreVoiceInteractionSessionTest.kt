@@ -226,6 +226,18 @@ class LibreVoiceInteractionSessionTest {
     }
 
     @Test
+    fun freshCycle_publishesNoTokenBeforeTaskStarts() {
+        // A fresh voice cycle that has not started its task yet must not emit any retrigger
+        // token via peek; the debounced duplicate onShow must stay silent as well.
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val session = RecordingVoiceSession(context)
+
+        session.onShow(null, 0)
+        session.onShow(null, 0)
+        assertEquals(0L, AssistantVoiceHandoff.peek(context))
+    }
+
+    @Test
     fun onTaskFinished_forNonActiveTask_isIgnored() {
         val context = ApplicationProvider.getApplicationContext<Context>()
         val session = RecordingVoiceSession(context)

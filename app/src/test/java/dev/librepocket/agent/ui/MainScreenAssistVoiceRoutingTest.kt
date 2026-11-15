@@ -78,6 +78,7 @@ import kotlinx.coroutines.test.resetMain
 import kotlinx.coroutines.test.setMain
 import org.junit.After
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
@@ -1525,6 +1526,133 @@ class MainScreenAssistVoiceRoutingTest {
         assertEquals(1, h.retriggerConsumedCount)
         assertTrue(h.registry.launchedIntents.isEmpty())
         assertEquals(token, h.providerPending()?.token)
+    }
+
+    // ---- Stage 5: consume/drawer/navLoading pins ----
+
+    @Test
+    fun consumeVoiceRetrigger_tokenMismatch_returnsFalse_andPendingSurvives() {
+        val provider = RoutingFakeProvider()
+        val h = Harness(newChatViewModel(provider))
+        h.gate.value = EndpointGate.Ready(sampleEndpoint())
+        h.pending.value = true // navLoading == true: delivery holds, entry survives for the direct-call arms
+        h.voiceSwitchesLoaded.value = true
+        h.userSwitches.value = mapOf(VoiceTools.SWITCH_INPUT to true)
+
+        render(h)
+
+        var published = 0L
+        composeRule.runOnIdle {
+            published = h.publishRetrigger(targetTaskId = 10, sessionInstanceId = 7L)
+        }
+        val pending = h.providerPending()
+        val identity = VoiceTaskIdentity(taskId = 10, sessionInstanceId = 7L)
+        assertEquals(published, pending?.token)
+
+        // Token mismatch: false, entry preserved.
+        assertFalse(consumeVoiceRetrigger(0x7FFF_FFFFL, pending, identity, h.appContext))
+        assertEquals(published, h.providerPending()?.token)
+
+        // Null identity: false, entry preserved.
+        assertFalse(consumeVoiceRetrigger(published, pending, null, h.appContext))
+        assertEquals(published, h.providerPending()?.token)
+
+        // Null pending snapshot: false, entry preserved.
+        assertFalse(consumeVoiceRetrigger(published, null, identity, h.appContext))
+        assertEquals(published, h.providerPending()?.token)
+
+        // Matching token + identity: true, entry consumed.
+        assertTrue(consumeVoiceRetrigger(published, h.providerPending(), identity, h.appContext))
+        assertNull(h.providerPending())
+        // Positive control only wires the ChatScreen consumed-count; the direct production call
+        // above never reaches it, so pin the observable here instead (no STT launch happened):
+        assertTrue(h.registry.launchedIntents.isEmpty())
+    }
+
+    @Test
+    fun retrigger_deliveredWithOpenDrawer_userReopensDrawer_staysOpenAndNoRelaunch() {
+        val provider = RoutingFakeProvider()
+        val h = Harness(newChatViewModel(provider))
+        h.gate.value = EndpointGate.Ready(sampleEndpoint())
+        h.voiceSwitchesLoaded.value = true
+        h.userSwitches.value = mapOf(VoiceTools.SWITCH_INPUT to true)
+
+        render(h)
+        awaitRoute(h, Routes.CHAT)
+
+        composeRule.runOnIdle {
+            h.uiScope.launch { h.drawerState.open() }
+        }
+        composeRule.waitUntil(timeoutMillis = 10_000) { h.drawerState.isOpen }
+
+        composeRule.runOnIdle {
+            h.publishRetrigger(targetTaskId = 10, sessionInstanceId = 7L)
+        }
+        composeRule.waitUntil(timeoutMillis = 10_000) {
+            h.drawerState.isClosed && h.drawerState.targetValue == DrawerValue.Closed
+        }
+        composeRule.waitForIdle()
+
+        // Delivery converged exactly once: drawer closed, STT launched, token consumed.
+        assertEquals(1, h.registry.launchedIntents.size)
+        assertEquals(1, h.retriggerConsumedCount)
+        assertNull(h.providerPending())
+
+        // User re-opens the drawer after delivery: the coordinator must not reclaim the session —
+        // no second launch, no re-close — on this or any later state change.
+        composeRule.runOnIdle {
+            h.uiScope.launch { h.drawerState.open() }
+        }
+        composeRule.waitUntil(timeoutMillis = 10_000) { h.drawerState.isOpen }
+        composeRule.waitForIdle()
+        Thread.sleep(300) // settle: any erroneously re-keyed effect gets a chance to fire
+        composeRule.waitForIdle()
+
+        assertTrue(h.drawerState.isOpen)
+        assertEquals(1, h.registry.launchedIntents.size)
+        assertEquals(1, h.retriggerConsumedCount)
+    }
+
+    @Test
+    fun retrigger_staleToken_cleared_evenWithNavLoading() {
+        val provider = RoutingFakeProvider()
+        val h = Harness(newChatViewModel(provider))
+        h.gate.value = EndpointGate.Loading
+        h.pending.value = true // startup reconcile in-flight -> navLoading == true
+        h.voiceSwitchesLoaded.value = true
+        h.userSwitches.value = mapOf(VoiceTools.SWITCH_INPUT to true)
+
+        render(h)
+
+        // Stale entry published while navLoading == true: the stale-clear exemption from the
+        // navLoading hold must still converge it (RetriggerStaleClearEffect ignores navLoading
+        // for expired tokens).
+        composeRule.runOnIdle {
+            h.publishRetrigger(
+                targetTaskId = 10,
+                sessionInstanceId = 7L,
+                issuedElapsedRealtimeMs = SystemClock.elapsedRealtime() - 11_000L,
+            )
+        }
+        composeRule.waitForIdle()
+
+        assertNull("stale-clear must drop the token even while navLoading == true", h.providerPending())
+        assertEquals(0, h.retriggerConsumedCount)
+        assertTrue(h.registry.launchedIntents.isEmpty())
+
+        // Reconcile settles and the gate opens: the dropped token must not resurface or deliver.
+        composeRule.runOnIdle {
+            h.pending.value = false
+        }
+        composeRule.runOnIdle {
+            h.gate.value = EndpointGate.Ready(sampleEndpoint())
+        }
+        awaitRoute(h, Routes.CHAT)
+        composeRule.waitForIdle()
+
+        assertEquals(0, h.retriggerConsumedCount)
+        assertTrue(h.registry.launchedIntents.isEmpty())
+        assertNull(h.providerPending())
     }
 
     private fun gateDrawer(): DrawerState =

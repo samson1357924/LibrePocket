@@ -111,6 +111,34 @@ class AssistantVoiceHandoffTest {
         override fun update(uri: Uri, values: ContentValues?, selection: String?, selectionArgs: Array<out String>?): Int = 0
     }
 
+    /** Provider stub that records every (method, extras) call and answers with an ok ack bundle.
+     *  The ack is authoritative by design (same-UID trusted provider): ok=true does NOT imply the
+     *  remote side consumed anything — the facade trusts the ack, and the 880L pending pin in the
+     *  consuming test is what proves the LOCAL path was not run destructively. */
+    private class AckProvider(private val ok: Boolean) : ContentProvider() {
+        val calls = mutableListOf<Pair<String, Bundle?>>()
+
+        override fun onCreate(): Boolean = true
+
+        override fun call(method: String, arg: String?, extras: Bundle?): Bundle? {
+            calls += method to extras
+            return Bundle().apply { putBoolean(VoiceHandoffContract.KEY_OK, ok) }
+        }
+
+        override fun query(
+            uri: Uri,
+            projection: Array<out String>?,
+            selection: String?,
+            selectionArgs: Array<out String>?,
+            sortOrder: String?,
+        ): Cursor? = null
+
+        override fun getType(uri: Uri): String? = null
+        override fun insert(uri: Uri, values: ContentValues?): Uri? = null
+        override fun delete(uri: Uri, selection: String?, selectionArgs: Array<out String>?): Int = 0
+        override fun update(uri: Uri, values: ContentValues?, selection: String?, selectionArgs: Array<out String>?): Int = 0
+    }
+
     /** Provider stub whose call() throws for every method: simulates an IPC/publish failure. */
     private class ThrowingProvider : ContentProvider() {
         override fun onCreate(): Boolean = true
@@ -442,6 +470,103 @@ class AssistantVoiceHandoffTest {
             "provider must stamp the stored entry with its own clock (age ≈ 0)",
             pending!!.issuedElapsedRealtimeMs in before..after,
         )
+    }
+
+    // ---- Stage 5: IPC-fallback legs ----
+
+    @Test
+    fun currentPending_ipcThrows_returnsNull() {
+        // Local slot is empty; the IPC peek is the only source and it blows up -> fail-closed null.
+        VoiceHandoffProvider.resetForTest()
+
+        swapHandoffProvider(ThrowingProvider())
+        try {
+            assertNull(AssistantVoiceHandoff.currentPending(appContext))
+        } finally {
+            restoreManifestProvider()
+        }
+    }
+
+    @Test
+    fun consume_localMismatch_ipcReject_returnsFalse() {
+        // Local CAS refuses (identity mismatch) and the remote answers ok=false: the facade must
+        // report false, and must NOT touch the local entry either.
+        seedPending(token = 881L, issuedElapsedRealtimeMs = SystemClock.elapsedRealtime(), targetTaskId = 10, sessionInstanceId = 7L)
+        swapHandoffProvider(AckProvider(false))
+        try {
+            assertFalse(AssistantVoiceHandoff.consume(881L, appContext, targetTaskId = 11, sessionInstanceId = 7L))
+            assertEquals(881L, VoiceHandoffProvider.pending.value?.token)
+        } finally {
+            restoreManifestProvider()
+        }
+    }
+
+    @Test
+    fun consume_localMismatch_fallsBackToIpcAck() {
+        seedPending(token = 880L, issuedElapsedRealtimeMs = SystemClock.elapsedRealtime(), targetTaskId = 10, sessionInstanceId = 7L)
+
+        swapHandoffProvider(AckProvider(ok = true))
+        try {
+            // Local CAS must refuse (task axis 11 != 10); the cross-process consume answers ok=true.
+            assertTrue(AssistantVoiceHandoff.consume(880L, appContext, targetTaskId = 11, sessionInstanceId = 7L))
+            // Local CAS never ran destructively for this call: the local entry is still pending.
+            assertEquals(880L, VoiceHandoffProvider.pending.value?.token)
+        } finally {
+            restoreManifestProvider()
+        }
+    }
+
+    @Test
+    fun consume_ipcException_returnsFalse() {
+        seedPending(token = 880L, issuedElapsedRealtimeMs = SystemClock.elapsedRealtime(), targetTaskId = 10, sessionInstanceId = 7L)
+
+        swapHandoffProvider(ThrowingProvider())
+        try {
+            // Local CAS refuses (task axis 11 != 10); the IPC fallback throws -> fail-closed false.
+            assertFalse(AssistantVoiceHandoff.consume(880L, appContext, targetTaskId = 11, sessionInstanceId = 7L))
+            assertEquals(880L, VoiceHandoffProvider.pending.value?.token)
+        } finally {
+            restoreManifestProvider()
+        }
+    }
+
+    @Test
+    fun clear_tokenOnly_sendsTokenBundleWithoutIdentityKeys() {
+        val counting = CountingProvider()
+        swapHandoffProvider(counting)
+        try {
+            AssistantVoiceHandoff.clear(token = 42L, context = appContext)
+            val clearCall = counting.calls.last { it.first == VoiceHandoffContract.METHOD_CLEAR }
+            assertEquals(42L, clearCall.second?.getLong(VoiceHandoffContract.KEY_TOKEN))
+            assertFalse(clearCall.second!!.containsKey(VoiceHandoffContract.KEY_TARGET_TASK_ID))
+            assertFalse(clearCall.second!!.containsKey(VoiceHandoffContract.KEY_SESSION_INSTANCE_ID))
+        } finally {
+            restoreManifestProvider()
+        }
+    }
+
+    @Test
+    fun requestRetrigger_lostAck_issuesTokenMatchedIpcClear() {
+        // Pre-seed an older pending entry from the same session cycle (10/7L, different token);
+        // the lost-ack cleanup must not wipe it.
+        seedPending(token = 999L, issuedElapsedRealtimeMs = SystemClock.elapsedRealtime(), targetTaskId = 10, sessionInstanceId = 7L)
+
+        val counting = CountingProvider()
+        swapHandoffProvider(counting)
+        try {
+            val token = AssistantVoiceHandoff.requestRetrigger(appContext, targetTaskId = 10, sessionInstanceId = 7L)
+
+            // CountingProvider answers null for METHOD_PUBLISH -> lost ack -> 0L handed back.
+            assertEquals(0L, token)
+            // The just-minted token is exactly the one on the publish call the provider saw.
+            val publishedToken = counting.calls.last { it.first == VoiceHandoffContract.METHOD_PUBLISH }
+                .second!!.getLong(VoiceHandoffContract.KEY_TOKEN)
+            val clearCall = counting.calls.last { it.first == VoiceHandoffContract.METHOD_CLEAR }
+            assertEquals("failure cleanup must clear exactly the just-minted token", publishedToken, clearCall.second?.getLong(VoiceHandoffContract.KEY_TOKEN))
+            assertEquals("token-matched cleanup must not wipe an older pending token from the same session cycle", 999L, VoiceHandoffProvider.pending.value?.token)
+        } finally {
+            restoreManifestProvider()
+        }
     }
 
     // F3: the retrigger TTL is measured on monotonic elapsed realtime, which includes deep

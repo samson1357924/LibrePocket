@@ -16,6 +16,7 @@ import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.jsonObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
@@ -31,7 +32,7 @@ import org.junit.Test
  *   AUTH／PROTOCOL 不 fallback（不靜默換，不升 hosted）。
  * - keyId 綁定 providerId＋endpoint（建構期 fail-fast：任何非綁定 keyId 拋 IAE，
  *   含 foreign 命名空間／跨 provider／自訂 endpoint）。
- * - cache＋single-flight（經 [WebSearchService] 包裝；含 latch barrier 的
+ * - cache＋single-flight（經 [WebSearchService] 包裝；含 CompletableDeferred barrier 的
  *   single-flight 合流／leader·follower 取消語義測試）。
  * - keyed 路徑 CharArray 抹除（[TrackingVault]：getKey 直接參照回傳，
  *   成功／HTTP 500／timeout／blank key 皆驗 buffer 已 fill('\u0000')）。
@@ -531,6 +532,26 @@ class WebSearchD5Test {
                 assertFalse("$id/$status must not allow fallback", WebSearchSelector.mayFallback(null, out))
             }
         }
+        // 402/409/412/418/451（未分類 4xx）→ mapper else-branch → TRANSPORT（fallbackAllowed=true，mayFallback==true）。
+        for (status in listOf(402, 409, 412, 418, 451)) {
+            val vault = FakeVault()
+            for (id in listOf(
+                BraveSearchProvider.ID,
+                TavilySearchProvider.ID,
+                ExaSearchProvider.ID,
+                FirecrawlSearchProvider.ID,
+            )) {
+                vault.putKey(defaultKeyIdOf(id), "k".toCharArray())
+            }
+            val httpGet = FakeGet { ok(status, "{}") }
+            val httpPost = FakePost { _, _ -> ok(status, "{}") }
+            for ((id, p) in providers(vault, httpGet, httpPost)) {
+                val out = p.search("q", 5)
+                assertTrue("$id/$status must be Failed", out is WebSearchOutcome.Failed)
+                assertEquals("$id/$status", WebFailureReason.TRANSPORT, (out as WebSearchOutcome.Failed).reason)
+                assertTrue("$id/$status must allow fallback (untagged 4xx)", WebSearchSelector.mayFallback(null, out))
+            }
+        }
         // 302：未分類 → mapper else-branch → TRANSPORT（四家皆然）。
         run {
             val vault = FakeVault()
@@ -568,6 +589,10 @@ class WebSearchD5Test {
         assertFalse(WebSearchSelector.mayFallback("brave", missingKey))
         // 未 pin＋TRANSPORT（fallbackAllowed=true 的唯一其他可 fallback 類）。
         assertTrue(WebSearchSelector.mayFallback(null, WebSearchOutcome.Failed(WebFailureReason.TRANSPORT)))
+        // pinned＋Ok：fail-closed 組合。
+        assertFalse(WebSearchSelector.mayFallback("brave", ok))
+        // pinned＋TRANSPORT：fail-closed 組合。
+        assertFalse(WebSearchSelector.mayFallback("brave", WebSearchOutcome.Failed(WebFailureReason.TRANSPORT)))
     }
 
     @Test fun protocolNeverFallsBack() = runBlocking {
@@ -757,7 +782,7 @@ class WebSearchD5Test {
         svc.invalidate()
         http.calls.set(0)
         val jobs = List(8) { async { svc.search("kotlin", 5) } }
-        val outs = jobs.map { it.await() }
+        val outs = withTimeout(5_000) { jobs.map { it.await() } }
         assertTrue(outs.all { it is WebSearchOutcome.Ok })
         assertEquals(1, http.calls.get())
     }
@@ -1226,7 +1251,7 @@ class WebSearchD5Test {
         val job = launch { result.complete(svc.search("kotlin", 5)) }
         delay(50)
         job.cancel()
-        job.join()
+        withTimeout(5_000) { job.join() }
         assertFalse("吞取消 delegate 在 bypass 路徑不得回傳正常值（central ensureActive() 必須拋 CE）：$result", result.isCompleted)
     }
 
@@ -1254,7 +1279,7 @@ class WebSearchD5Test {
         val job = launch { result.complete(svc.search("kotlin", 5)) }
         delay(50)
         job.cancel()
-        job.join()
+        withTimeout(5_000) { job.join() }
         assertFalse("取消後 delegate 拋一般 Exception 不得映射 TRANSPORT（CE 必須透傳）：$result", result.isCompleted)
     }
 
@@ -1316,7 +1341,7 @@ class WebSearchD5Test {
 
     @Test fun hostedMarkerMirrorsServerTools() {
         assertEquals(WebSearchSelector.HOSTED_TOOL_NAME, ServerToolTranscript.WEB_SEARCH_NAME)
-        for (state in listOf("completed", "failed")) {
+        for (state in listOf("started", "searching", "completed", "update", "failed", "cancelled")) {
             assertEquals(
                 ServerToolTranscript.webSearchMarker(state),
                 WebSearchDispatch.hostedMarker(state),
@@ -1324,7 +1349,7 @@ class WebSearchD5Test {
         }
     }
 
-    // unknown/ill-formed 狀態字一律拒絕（enum allowlist：不在六字集合內＝拋 IAE；CR/LF 亦然）。
+    // unknown/ill-formed 狀態字一律拒絕（Set<String> allowlist：不在六字集合內＝拋 IAE；CR/LF 亦然）。
     @Test fun hostedMarkerRejectsInvalidStates() {
         val invalid = listOf(
             "",
@@ -1991,6 +2016,54 @@ class WebSearchD5Test {
         assertEquals(2, calls.get())
     }
 
+    @Test fun leaderThrowableCompletesFollowerExceptionallyAndPropagatesRaw() = runBlocking {
+        // Leader 在 delegate 內拋 Error（如 AssertionError）：leader 原樣拋出；follower 等待的 shared deferred
+        // 以該 Error 完成 → follower.await() 亦原樣拋出（不映射成 Failed、不 swallow）。
+        val entered = CompletableDeferred<Unit>()
+        val release = CompletableDeferred<Unit>()
+        val delegate = object : WebSearchProvider {
+            override val id: String = "keyed-error"
+            override val capabilities: Set<WebCapability> = setOf(WebCapability.REQUIRES_KEY)
+            override suspend fun probe(): WebProbe = WebProbe.Ready
+            override suspend fun search(query: String, count: Int): WebSearchOutcome =
+                WebSearchOutcome.Ok(emptyList()) // 防禦性保留（keyed 路徑走 searchWithSnapshot）
+            override suspend fun credentialState(): CredentialState =
+                CredentialState.Ready(CredentialSnapshot("key-A".toCharArray(), "fp-key-A"))
+            override suspend fun searchWithSnapshot(
+                snapshot: CredentialSnapshot,
+                query: String,
+                count: Int,
+            ): WebSearchOutcome {
+                entered.complete(Unit)
+                release.await()
+                throw AssertionError("boom")
+            }
+        }
+        val svc = WebSearchService(delegate, WebSearchCache())
+        // 子 coroutine 例外在 runBlocking 下會結構化上拋；以 try/catch 收斂的 coroutine 只為確定性計數。
+        val leader = async {
+            try {
+                svc.search("kotlin", 5)
+            } catch (e: AssertionError) {
+                e
+            }
+        }
+        withTimeout(5_000) { entered.await() }
+        // UNDISPATCHED：follower 於 leader 拋出前掛上 shared deferred；同樣以 try/catch 收斂。
+        val follower = async(start = CoroutineStart.UNDISPATCHED) {
+            try {
+                svc.search("kotlin", 5)
+            } catch (e: AssertionError) {
+                e
+            }
+        }
+        release.complete(Unit)
+        val le = withTimeout(5_000) { leader.await() } as? AssertionError
+        assertEquals("boom", le?.message)
+        val fe = withTimeout(5_000) { follower.await() } as? AssertionError
+        assertEquals("boom", fe?.message)
+    }
+
     // ---- F1：credentialState→fetch 快照一致性 ----
 
     @Test fun rotationBetweenProbeAndFetchServesConsistentSnapshot() = runBlocking {
@@ -2446,6 +2519,24 @@ class WebSearchD5Test {
         }
     }
 
+    @Test fun keyBoundaryPrintableAsciiAcceptedInteriorSpaceRejected() = runBlocking {
+        // Printable-ASCII 接受邊界：0x21 '!' 與 0x7E '~' 必須被接受（正常打上游）；
+        // 內嵌空白（0x20，trim 只正規化兩端）→ Unavailable、零網路。
+        for (variant in listOf("!", "~", "a!b", "a~b", "ab cd")) {
+            val vault = TrackingVault()
+            vault.putKey(BraveSearchProvider.DEFAULT_KEY_ID, variant.toCharArray())
+            val httpGet = FakeGet { ok(body = braveJson) }
+            val out = BraveSearchProvider(vault, httpGet).search("kotlin", 5)
+            if (variant == "ab cd") {
+                assertTrue("內嵌空白 key 必須 Unavailable：$out", out is WebSearchOutcome.Unavailable)
+                assertEquals(0, httpGet.calls.get())
+            } else {
+                assertTrue("可列印 ASCII 邊界 key 必須通過：$variant", out is WebSearchOutcome.Ok)
+                assertEquals(1, httpGet.calls.get())
+            }
+        }
+    }
+
     @Test fun whitespacePaddedKeyIsTrimmedForHttpAndCache() = runBlocking {
         // 前後空白 padding：HTTP header 收到 trim 後的 key；cache 身份綁定 trimmed 指紋
         //（第二次搜尋命中快取、只打一次上游）。
@@ -2600,6 +2691,34 @@ class WebSearchD5Test {
         assertEquals(WebFailureReason.BAD_RESPONSE, (out as WebSearchOutcome.Failed).reason)
     }
 
+    @Test fun maxBodyCharsZeroCoercedToOneAcrossPostProviders() = runBlocking {
+        // 同上 coerceAtLeast(1) 路徑，Tavily／Exa／Firecrawl（POST 三家）皆 fail-closed。
+        val resultsBody = """{"results":[{"title":"T","url":"https://example.com/"}]}"""
+        val firecrawlBody = """{"success":true,"data":{"web":[{"title":"T","url":"https://example.com/"}]}}"""
+        suspend fun check(id: String, p: WebSearchProvider) {
+            val out = p.search("q", 5)
+            assertTrue("$id maxBodyChars=0 必須 fail-closed：$out", out is WebSearchOutcome.Failed)
+            assertEquals("$id", WebFailureReason.BAD_RESPONSE, (out as WebSearchOutcome.Failed).reason)
+        }
+        for ((id, body) in listOf(
+            TavilySearchProvider.ID to resultsBody,
+            ExaSearchProvider.ID to resultsBody,
+            FirecrawlSearchProvider.ID to firecrawlBody,
+        )) {
+            val vault = FakeVault()
+            vault.putKey(defaultKeyIdOf(id), "k".toCharArray())
+            val httpPost = FakePost { _, _ -> ok(body = body) }
+            check(
+                id,
+                when (id) {
+                    TavilySearchProvider.ID -> TavilySearchProvider(vault, httpPost, maxBodyChars = 0)
+                    ExaSearchProvider.ID -> ExaSearchProvider(vault, httpPost, maxBodyChars = 0)
+                    else -> FirecrawlSearchProvider(vault, httpPost, maxBodyChars = 0)
+                },
+            )
+        }
+    }
+
     @Test fun firecrawlSupplierErrorIsFallbackAllowed() = runBlocking {
         val vault = FakeVault()
         vault.putKey(FirecrawlSearchProvider.DEFAULT_KEY_ID, "k".toCharArray())
@@ -2652,39 +2771,39 @@ class WebSearchD5Test {
             p.search("q", 999)
             when (p.id) {
                 BraveSearchProvider.ID ->
-                    assertTrue("brave count must clip to 10", httpGet.lastUrl!!.contains("count=10"))
+                    assertEquals("brave count must clip to 10", "10", httpGet.lastUrl!!.substringAfter("count=").substringBefore("&"))
                 TavilySearchProvider.ID ->
-                    assertTrue("tavily max_results must clip to 10", httpPost.lastBody!!.contains("\"max_results\":10"))
+                    assertEquals("tavily max_results must clip to 10", "10", Json.parseToJsonElement(httpPost.lastBody!!).jsonObject["max_results"].toString())
                 ExaSearchProvider.ID ->
-                    assertTrue("exa numResults must clip to 10", httpPost.lastBody!!.contains("\"numResults\":10"))
+                    assertEquals("exa numResults must clip to 10", "10", Json.parseToJsonElement(httpPost.lastBody!!).jsonObject["numResults"].toString())
                 FirecrawlSearchProvider.ID ->
-                    assertTrue("firecrawl limit must clip to 10", httpPost.lastBody!!.contains("\"limit\":10"))
+                    assertEquals("firecrawl limit must clip to 10", "10", Json.parseToJsonElement(httpPost.lastBody!!).jsonObject["limit"].toString())
                 else -> error("unexpected keyed id: ${p.id}")
             }
             // count=-3 → 裁切為 1（負值同樣落到下限）。
             p.search("q", -3)
             when (p.id) {
                 BraveSearchProvider.ID ->
-                    assertTrue("brave count must clip -3 to 1", httpGet.lastUrl!!.contains("count=1"))
+                    assertEquals("brave count must clip -3 to 1", "1", httpGet.lastUrl!!.substringAfter("count=").substringBefore("&"))
                 TavilySearchProvider.ID ->
-                    assertTrue("tavily max_results must clip -3 to 1", httpPost.lastBody!!.contains("\"max_results\":1"))
+                    assertEquals("tavily max_results must clip -3 to 1", "1", Json.parseToJsonElement(httpPost.lastBody!!).jsonObject["max_results"].toString())
                 ExaSearchProvider.ID ->
-                    assertTrue("exa numResults must clip -3 to 1", httpPost.lastBody!!.contains("\"numResults\":1"))
+                    assertEquals("exa numResults must clip -3 to 1", "1", Json.parseToJsonElement(httpPost.lastBody!!).jsonObject["numResults"].toString())
                 FirecrawlSearchProvider.ID ->
-                    assertTrue("firecrawl limit must clip -3 to 1", httpPost.lastBody!!.contains("\"limit\":1"))
+                    assertEquals("firecrawl limit must clip -3 to 1", "1", Json.parseToJsonElement(httpPost.lastBody!!).jsonObject["limit"].toString())
                 else -> error("unexpected keyed id: ${p.id}")
             }
             // count=0 → 裁切為 1。
             p.search("q", 0)
             when (p.id) {
                 BraveSearchProvider.ID ->
-                    assertTrue("brave count must clip to 1", httpGet.lastUrl!!.contains("count=1"))
+                    assertEquals("brave count must clip to 1", "1", httpGet.lastUrl!!.substringAfter("count=").substringBefore("&"))
                 TavilySearchProvider.ID ->
-                    assertTrue("tavily max_results must clip to 1", httpPost.lastBody!!.contains("\"max_results\":1"))
+                    assertEquals("tavily max_results must clip to 1", "1", Json.parseToJsonElement(httpPost.lastBody!!).jsonObject["max_results"].toString())
                 ExaSearchProvider.ID ->
-                    assertTrue("exa numResults must clip to 1", httpPost.lastBody!!.contains("\"numResults\":1"))
+                    assertEquals("exa numResults must clip to 1", "1", Json.parseToJsonElement(httpPost.lastBody!!).jsonObject["numResults"].toString())
                 FirecrawlSearchProvider.ID ->
-                    assertTrue("firecrawl limit must clip to 1", httpPost.lastBody!!.contains("\"limit\":1"))
+                    assertEquals("firecrawl limit must clip to 1", "1", Json.parseToJsonElement(httpPost.lastBody!!).jsonObject["limit"].toString())
                 else -> error("unexpected keyed id: ${p.id}")
             }
         }
@@ -2696,6 +2815,21 @@ class WebSearchD5Test {
         val http = FakeGet { ok(body = braveJson) }
         BraveSearchProvider(vault, http).search("a&b c", 5)
         assertTrue("query 必須 URL-encoded（& → %26、空格 → +）", http.lastUrl!!.contains("q=a%26b+c"))
+    }
+
+    @Test fun bravePublishedFallsBackToPublishedDateAndPublished() = runBlocking {
+        // page_age 缺席 → published_date 補上；page_age／published_date 皆缺 → published 補上。
+        val body = """{"web":{"results":[
+              {"title":"T1","url":"https://example.com/a","description":"d","published_date":"2024-07-01"},
+              {"title":"T2","url":"https://example.com/b","description":"d","published":"2024-08-01"}
+        ]}}"""
+        val vault = FakeVault()
+        vault.putKey(BraveSearchProvider.DEFAULT_KEY_ID, "k".toCharArray())
+        val http = FakeGet { ok(body = body) }
+        val out = BraveSearchProvider(vault, http).search("q", 5)
+        val results = (out as WebSearchOutcome.Ok).results
+        assertEquals("2024-07-01", results[0].published)
+        assertEquals("2024-08-01", results[1].published)
     }
 
     @Test fun braveQueryIsCappedAt600() = runBlocking {
@@ -2811,6 +2945,22 @@ class WebSearchD5Test {
             } finally {
                 snapshot.wipe()
             }
+        }
+    }
+
+    @Test fun searchWithSnapshotOnEmptyKeyIsMissingKeyUnavailable() = runBlocking {
+        // searchWithSnapshot 的空 key 短路：空 CharArray（ownerKeyId 匹配）→ Unavailable(MISSING_KEY)、零 HTTP；
+        // CredentialSnapshot internal ctor 由同 module 測試使用（ownerKeyId 必須匹配 provider keyId 才不觸發跨 provider 拒絕）。
+        val vault = FakeVault()
+        val http = FakeGet { ok(body = braveJson) }
+        val snapshot = CredentialSnapshot(CharArray(0), "deadbeef", BraveSearchProvider.DEFAULT_KEY_ID)
+        try {
+            val out = BraveSearchProvider(vault, http).searchWithSnapshot(snapshot, "q", 5)
+            assertTrue(out is WebSearchOutcome.Unavailable)
+            assertEquals(WebUnavailableReason.MISSING_KEY, (out as WebSearchOutcome.Unavailable).reason)
+            assertEquals(0, http.calls.get())
+        } finally {
+            snapshot.wipe()
         }
     }
 
@@ -2974,12 +3124,14 @@ class WebSearchD5Test {
               {"title":"p0","url":"https://example.com:0/","description":"port zero rejected"},
               {"title":"p65536","url":"https://example.com:65536/","description":"port too big"},
               {"title":"p99999","url":"https://example.com:99999/","description":"port too big"},
+              {"title":"p65535","url":"https://example.com:65535/","description":"max valid port"},
               {"title":"ok","url":"https://example.com:8080/","description":"valid port"}
         ]}}"""
         val hits = parseBraveResults(Json { ignoreUnknownKeys = true }, body)
         assertTrue(hits != null)
-        assertEquals(1, hits!!.size)
-        assertEquals("https://example.com:8080/", hits[0].url)
+        assertEquals(2, hits!!.size)
+        assertTrue(hits.any { it.url == "https://example.com:65535/" })
+        assertTrue(hits.any { it.url == "https://example.com:8080/" })
     }
 
     @Test fun keyedNonStringOrMissingUrlSkipsItem() = runBlocking {

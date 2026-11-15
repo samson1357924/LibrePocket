@@ -168,8 +168,8 @@ object ElevatedProcessKiller {
      * body vs descendant 歸因（Stage 4 review R2）：子孫側跳過僅計本計數；
      * 本體側跳過同時計本計數與 [bodyPidReuseSkippedCount]（本體歸因）。
      * #136-B3 device-acceptance checklist：發佈並讀取本計數（與
-     * [bodyPidReuseSkippedCount]）；host/JVM 預期 ≈0–2（僅本體兩信號，
-     * mismatch 機率極低，常態 0）；裝置預期一切皆經 unattested 臂
+     * [bodyPidReuseSkippedCount]）；host/JVM 預期 ≈0–1（僅本體信號，mismatch 至多閂
+     * 一次；機率極低，常態 0）；裝置預期一切皆經 unattested 臂
      * （≈2/killTree 走 [bodyDestroyUnattestedCount]，本計數≈0）——其他任何
      * 讀數皆須調查。
      *
@@ -180,8 +180,9 @@ object ElevatedProcessKiller {
      * 行為，必須由 #136-B3 以裝置端證據決定——pidReuseSkipped 必須列入
      * #136-B3 裝置驗收清單（device-acceptance checklist）：啟用提權 runner
      * 前，須先以真機量測本計數確認平台 attest 能力。
-     * 上界：per handle per killTree 最多 2 次（destroy＋destroyForcibly 各重驗一次；
-     * 本體兩個信號亦同 2）；完全不可 attest 平台本體信號≈0（unattested 路徑計
+     * 上界：子孫側 per handle per killTree 最多 2 次（destroy＋destroyForcibly 各重驗一次）；
+     * 本體側上界 1（one-shot mismatch latch：首個 proven mismatch 即閂，剩餘 destroyForcibly
+     * 信號被抑制——零重讀、零計數）；完全不可 attest 平台本體信號≈0（unattested 路徑計
      * [bodyDestroyUnattestedCount]）；must feed #136-B3 device-acceptance.
      */
     private val pidReuseSkipped = AtomicInteger(0)
@@ -225,9 +226,11 @@ object ElevatedProcessKiller {
      * incarnation，可證回收）時被跳過——**每信號計 1**（與 [pidReuseSkippedCount]
      * 同時遞增；子孫側跳過不計此計數）。one-shot latch 抑制之剩餘信號不計
      * （非 mismatch 證實態，純 bystander 保護）；`isAlive()==false` 的常規確認
-     * 死亡不計。上界：per killTree 最多 2（本體兩信號）。
+     * 死亡不計。上界：per killTree 最多 1（one-shot mismatch latch：首個 proven
+     * mismatch 即閂——destroyForcibly 信號被抑制，零重讀、零計數；本體共兩信號）。
      * #136-B3 device-acceptance checklist：發佈並讀取本計數（與
-     * [pidReuseSkippedCount]）；host/JVM 預期 ≈0–2（常態 0，mismatch 機率極低）；
+     * [pidReuseSkippedCount]）；host/JVM 預期 ≈0–1（常態 0，mismatch 機率極低；
+     * one-shot latch 保證 per killTree 至多 1）；
      * 裝置預期 ≈0（一切皆經 unattested 臂，≈2/killTree 計入
      * [bodyDestroyUnattestedCount]）——其他任何讀數皆須調查。
      */
@@ -451,7 +454,7 @@ object ElevatedProcessKiller {
         // （fail-closed；串流由 drain 關）。
         val handle: Any = attest.handle ?: return
         // ProcessHandle 類本身缺席（舊 Android）在 reflectHandleAttest 內收斂
-        // （NoClassDefFoundError），不外抛（外層 killTree 另有 runCatching 縱深）。
+        // （NoClassDefFoundError），不外抛。
         val handleClass: Class<*> = attest.handleClass ?: return
         val descendants = try {
             handleClass.getMethod("descendants").invoke(handle) as? java.util.stream.Stream<*>
@@ -528,6 +531,10 @@ object ElevatedProcessKiller {
         } catch (_: InaccessibleObjectException) {
             null
         } catch (_: Exception) {
+            null
+        } catch (_: Throwable) {
+            // 類缺席／連結期 Error（如 NoClassDefFoundError）亦收斂為 null
+            // （toolkit 缺席＝unattested 退化；callers 已處理 handle==null）。
             null
         }
         // ProcessHandle 類本身缺席（舊 Android）在連結期走 NoClassDefFoundError

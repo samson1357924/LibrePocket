@@ -136,17 +136,24 @@ class ElevatedProcessKillerTest {
 
     @Test fun killTreeAttestsBodyBeforeSignalAndCountsUnattestedPlatform() {
         // Stage 4（本體 best-effort PID-reuse attestation）判定表式釘點：
-        // 本體兩個信號（destroy 先、destroyForcibly 後）與子孫逐信號重驗一致，
-        // 每次信號前獨立評估 pidReuseSignalAllowed（同一純判定函數，子孫與本體
-        // 共用——兩條路徑同一 HandleAttest seam；killDescendantsReflective 與
-        // attestBodyDestroy 皆經其 signalAllowed 餵入）。
+        // 下方 pidReuseSignalAllowed 的各次呼叫釘住的是子孫路徑——
+        // killDescendantsReflective 經 HandleAttest.signalAllowed 共用的同一純判定函數。
+        // 本體路徑（attestBodyDestroy／signalBody）自 Stage 4 review R1(a) 起不再經本
+        // 判定式：它 inline 重寫同一 raw 比較（alive＋startInstant 值相等判定式），
+        // 語義為 fail-toward-destruction——任何不可驗（alive==null／快照或重讀
+        // startInstant 為 null／isAlive 讀抛）一律退化為無條件 destroy＋
+        // bodyDestroyUnattested（kill 契約優先；不計 pidReuseSkipped——nothing was
+        // proven）；僅「兩讀皆成功且 startInstant 不符」（proven positive mismatch）
+        // 才跳過該信號＋計 pidReuseSkipped＋bodyPidReuseSkipped＋one-shot latch
+        // （剩餘本體信號無條件抑制——零重讀、零計數、destroyForcibly 不再評估）；
+        // alive==false（含 mid-window 兩讀之間死亡）⇒ 零信號、零計數。
         //
         // 接線（snapshot→recheck→skip＋計數）無法以假 ProcessHandle 直測：單元測試編譯
         // 走 SDK 公開表面過濾，toHandle/descendants/ProcessHandle 之 override／
         // 子類化皆不可行（見本檔 KDoc），真實 PID 回收亦無法確定性誘發；故本體
-        // cadence 以純判定表釘點——body 的 destroy/destroyForcibly 兩次獨立評估
-        // 恰好對應 pidReuseSignalAllowed 的兩次呼叫（同一 (alive, expectedStart,
-        // currentStart) 判定式）。
+        // cadence 以純判定表釘點——body 的 destroy/destroyForcibly 兩次獨立重驗與下方
+        // 判定表同一 (alive, expectedStart, currentStart) 比較式，惟落地路徑為 signalBody
+        // 的 inline 比較，而非 pidReuseSignalAllowed。
         val t0 = java.time.Instant.ofEpochMilli(1_700_000_000_000L)
         val t1 = java.time.Instant.ofEpochMilli(1_800_000_000_000L)
         // destroy 信號第 1 次獨立重驗：alive＋快照一致 → 放行（attested ⇒ handle.destroy）。

@@ -40,6 +40,7 @@ class ElevatedRunnerPhaseBLateCompensationTest {
     private val privateRoot = "/data/data/files"
 
     private var hermeticExec: HermeticExecFixture? = null
+    private var floorBefore: Int = 0
 
     @Before fun setUpIsolation() {
         hermeticExec = HermeticExecFixture("phaseb-hermetic", "id")
@@ -47,6 +48,7 @@ class ElevatedRunnerPhaseBLateCompensationTest {
             "#136-B3 gate must stay closed",
             PrivilegeActivation.ELEVATED_RUNNERS_READY,
         )
+        floorBefore = ElevatedCleanupTracker.releaseFloorHits()
         ElevatedCleanupTracker.clearUnverified()
         ElevatedCleanupTracker.noteClean()
         pollOutstandingTo(0)
@@ -70,6 +72,7 @@ class ElevatedRunnerPhaseBLateCompensationTest {
         assertEquals("test leaked outstanding slots", 0, leakedOutstanding)
         assertEquals("test leaked active calls", 0, leakedActive)
         assertEquals("test leaked quarantined processes", 0, leakedQuarantine)
+        assertEquals("release floor must not be hit during this test", floorBefore, ElevatedCleanupTracker.releaseFloorHits())
     }
 
     private fun pollOutstandingTo(expected: Int, boundMs: Long = 15_000L) {
@@ -760,6 +763,129 @@ class ElevatedRunnerPhaseBLateCompensationTest {
                 ElevatedCleanupTracker.noteClean()
                 awaitNoElevatedThreads()
             }
+        }
+    }
+
+    /**
+     * (b2) `elevated-late-spawn` 起線程失敗＋registrar 拋（Stage 2 pin；harness 同 (b)）：
+     * caller CAS 認領成功後 `startLateDaemon` 佔槽→起線程失敗→start-failure 臂收斂至
+     * `releaseCleanupSlotAfterVerify(v, verified=false, slotHeld=true)`；registrar 拋 ⇒
+     * 登記不落地：`quarantineRegistrationFailedCount` +1、槽保留（outstanding==1）、
+     * quarantine 空——fail-closed。確定性 barrier 結構與 (b) 完全相同（spawn→worker
+     * 退出→cancelGate 放行→expireWorker 認領），registrar 注入於 try/finally 內還原。
+     * ARMED harness：late Process 為 latch 阻塞 destroy（teardown 才放），注入 killer
+     * 亦記數後 latch 阻塞。
+     */
+    @Test fun lateSpawnDaemonThreadStartFailureWithThrowingRegistrarKeepsSlotFailClosed() {
+        val before = ElevatedCleanupTracker.quarantineRegistrationFailedCount()
+        val spawnEntered = CountDownLatch(1)
+        val spawnRelease = CountDownLatch(1)
+        val cancelGate = CountDownLatch(1)
+        val cancelBlockEntered = CountDownLatch(1)
+        val killerLatch = CountDownLatch(1)
+        val lateRef = AtomicReference<LatchBlockedDestroyProcess?>()
+        val resultRef = AtomicReference<ElevatedCallSupervisor.Res<Process>?>()
+        val kills = AtomicInteger(0)
+        val isCancelled: () -> Boolean = {
+            if (spawnEntered.count > 0) {
+                false
+            } else if (resultRef.get() != null) {
+                false
+            } else {
+                cancelBlockEntered.countDown()
+                stuckAwait(cancelGate)
+                true
+            }
+        }
+        ElevatedProcessIo.quarantineRegistrar = { throw RuntimeException("registrar boom") }
+        val bg = Thread {
+            resultRef.set(
+                ElevatedCallSupervisor.awaitSpawnWithThreadStarter(
+                    deadlineNanos = System.nanoTime() + TimeUnit.SECONDS.toNanos(60),
+                    isCancelled = isCancelled,
+                    killer = {
+                        kills.incrementAndGet()
+                        stuckAwait(killerLatch)
+                    },
+                    startThread = { t ->
+                        if (t.name == "elevated-late-spawn") {
+                            throw RuntimeException("simulated start failure on elevated-late-spawn")
+                        }
+                        t.start()
+                    },
+                ) {
+                    spawnEntered.countDown()
+                    stuckAwait(spawnRelease)
+                    LatchBlockedDestroyProcess(killerLatch).also { lateRef.set(it) }
+                },
+            )
+        }.also { it.isDaemon = true; it.start() }
+        try {
+            assertTrue("spawn must enter", spawnEntered.await(10_000L, TimeUnit.MILLISECONDS))
+            assertTrue(
+                "caller watcher must block in cancel gate",
+                cancelBlockEntered.await(10_000L, TimeUnit.MILLISECONDS),
+            )
+            spawnRelease.countDown()
+            pollRefNonNull(lateRef, "late spawn")
+            pollTrue("spawn worker must exit before cancel gate opens") {
+                countLive("elevated-supervisor") == 1
+            }
+            cancelGate.countDown()
+            val res = pollRefNonNull(resultRef, "caller result")
+            assertTrue("expected Res.Expired, got $res", res is ElevatedCallSupervisor.Res.Expired)
+            res as ElevatedCallSupervisor.Res.Expired
+            assertTrue(
+                "daemon start failure must flag cleanupIncomplete, got $res",
+                res.hasLinger,
+            )
+            val late = pollRefNonNull(lateRef, "late spawn")!!
+            // registrar 拋 ⇒ 登記未落地：計數恰好 +1（start-failure 臂單站點）、槽保留、
+            // quarantine 空（登記從未成功）。
+            assertEquals(before + 1, ElevatedCleanupTracker.quarantineRegistrationFailedCount())
+            assertEquals(1, ElevatedCleanupTracker.outstanding())
+            assertEquals(0, ElevatedCleanupTracker.quarantinedCount())
+            assertEquals("killer must never run on the start-failure path", 0, kills.get())
+            assertEquals(0, late.destroyCalls.get())
+            assertEquals(0, late.destroyForciblyCalls.get())
+            val admission = ElevatedCleanupTracker.tryEnterReserved()
+            if (admission == ElevatedCleanupTracker.Admission.OK) {
+                // bug path（OK）才可能佔席：立即歸還，避免洩漏 active 席。
+                ElevatedCleanupTracker.leaveCall()
+            }
+            assertEquals(
+                "admission must stay BACKLOG_FULL while the slot is held",
+                ElevatedCleanupTracker.Admission.BACKLOG_FULL,
+                admission,
+            )
+            assertEquals(0, ElevatedCleanupTracker.activeCalls())
+            // 恰好一次：floor 零命中。
+            assertEquals(floorBefore, ElevatedCleanupTracker.releaseFloorHits())
+            // 還原 registrar 後重試 helper（有意保留的 1 槽）：登記成功 ⇒ 釋放恰好一次。
+            ElevatedProcessIo.quarantineRegistrar = { ElevatedCleanupTracker.quarantineUnverified(it) }
+            ElevatedProcessIo.releaseCleanupSlotAfterVerify(late, verified = false, slotHeld = true)
+            assertEquals(0, ElevatedCleanupTracker.outstanding())
+            assertEquals(1, ElevatedCleanupTracker.quarantinedCount())
+            assertEquals(before + 1, ElevatedCleanupTracker.quarantineRegistrationFailedCount())
+            assertEquals(floorBefore, ElevatedCleanupTracker.releaseFloorHits())
+        } finally {
+            // 還原預設 registrar；所有斷言完成後才放 armed killer latch。
+            ElevatedProcessIo.quarantineRegistrar = { ElevatedCleanupTracker.quarantineUnverified(it) }
+            killerLatch.countDown()
+            cancelGate.countDown()
+            spawnRelease.countDown()
+            bg.join(10_000L)
+            // 主體未走到回收重試（斷言先失敗）時的兜底：有意保留的 1 槽在此收斂，
+            // 避免 tearDown 輪詢誤判；helper 為 registered→release，恰好一次。
+            val late = lateRef.get()
+            if (late != null && ElevatedCleanupTracker.outstanding() == 1) {
+                ElevatedProcessIo.releaseCleanupSlotAfterVerify(late, verified = false, slotHeld = true)
+            }
+            pollOutstandingTo(0)
+            pollActiveTo(0)
+            ElevatedCleanupTracker.clearUnverified()
+            ElevatedCleanupTracker.noteClean()
+            awaitNoElevatedThreads()
         }
     }
 

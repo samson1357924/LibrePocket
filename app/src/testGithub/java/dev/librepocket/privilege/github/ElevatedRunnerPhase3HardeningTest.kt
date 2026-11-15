@@ -52,6 +52,7 @@ class ElevatedRunnerPhase3HardeningTest {
     private val privateRoot = "/data/data/files"
 
     private var hermeticExec: HermeticExecFixture? = null
+    private var floorBefore: Int = 0
 
     @Before fun setUpIsolation() {
         hermeticExec = HermeticExecFixture("phase3hard-hermetic", "id")
@@ -59,6 +60,7 @@ class ElevatedRunnerPhase3HardeningTest {
             "#136-B3 gate must stay closed",
             PrivilegeActivation.ELEVATED_RUNNERS_READY,
         )
+        floorBefore = ElevatedCleanupTracker.releaseFloorHits()
         ElevatedCleanupTracker.clearUnverified()
         ElevatedCleanupTracker.noteClean()
         pollOutstandingTo(0)
@@ -83,6 +85,7 @@ class ElevatedRunnerPhase3HardeningTest {
         assertEquals("test leaked outstanding slots", 0, leakedOutstanding)
         assertEquals("test leaked active calls", 0, leakedActive)
         assertEquals("test leaked quarantined processes", 0, leakedQuarantine)
+        assertEquals("release floor must not be hit during this test", floorBefore, ElevatedCleanupTracker.releaseFloorHits())
     }
 
     private fun pollOutstandingTo(expected: Int, boundMs: Long = 15_000L) {

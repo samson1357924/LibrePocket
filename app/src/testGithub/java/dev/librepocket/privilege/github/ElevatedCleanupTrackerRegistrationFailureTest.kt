@@ -21,8 +21,10 @@ import org.junit.Test
  *   遞增 [ElevatedCleanupTracker.quarantineRegistrationFailedCount]、准入續拒（BACKLOG_FULL）；
  * - 補 pin verified=true 路徑（slotHeld=true → 釋放、slotHeld=false → 不動）與
  *   `===`-dedup no-op 路徑（已登記 handle 重入 helper → 釋放恰好一次、不新增計數）；
- * - 一個 drain 級整合 pin：`elevated-cleanup` 起線程 OOM＋registrar 拋 → 二次登記與
- *   verify 臂 helper 各計 1 次失敗、槽保留、`cleanupIncomplete=true`；
+ * - drain 級整合 pin：`elevated-cleanup` 起線程 OOM＋registrar 拋 → 二次登記與
+ *   verify 臂 helper 各計 1 次失敗、槽保留、`cleanupIncomplete=true`；另補三臂
+ *   registrar-throw pin：kill 臂／preflight 臂（timeoutMs=0L 確定性入口過期）／
+ *   `elevated-stdout` 起線程失敗（`cleanupOnThreadStartFailureInner`）臂；
  * - 純 JVM、零真機、零 su、零 binder；排序一律同步呼叫（helper 直調）。
  *
  * 隔離：@Before/@After 強制還原預設 registrar（`{ ElevatedCleanupTracker.quarantineUnverified(it) }`），
@@ -262,6 +264,150 @@ class ElevatedCleanupTrackerRegistrationFailureTest {
             // 還原預設 registrar；殘留 quarantine／槽／breaker 由測畢自釋＋@After 收斂。
             ElevatedProcessIo.quarantineRegistrar = { ElevatedCleanupTracker.quarantineUnverified(it) }
         }
+    }
+
+    // ---- (c2) drain 整合 pin：kill 臂／preflight 臂／elevated-stdout 起線程失敗臂 ----
+
+    @Test fun drainKillPathVerifyFalseWithThrowingRegistrarKeepsSlotFailClosed() {
+        val hanger = NoOpHangProcess()
+        val before = ElevatedCleanupTracker.quarantineRegistrationFailedCount()
+        try {
+            ElevatedProcessIo.quarantineRegistrar = { throw RuntimeException("registrar boom") }
+            val d = ElevatedProcessIo.drain(
+                process = hanger,
+                timeoutMs = 300L,
+                killer = { it.destroy() },
+                isCancelled = { false },
+            )
+            // post-kill verify=false（NoOpHangProcess 恒 false）→ helper 登記拋 ⇒ +1、槽保留。
+            assertEquals(before + 1, ElevatedCleanupTracker.quarantineRegistrationFailedCount())
+            assertEquals(1, ElevatedCleanupTracker.outstanding())
+            assertEquals(0, ElevatedCleanupTracker.quarantinedCount())
+            assertTrue("kill-path drain must flag cleanupIncomplete", d.cleanupIncomplete)
+            assertTrue("waitFor never completes ⇒ timedOut must be true", d.timedOut)
+            val admission = ElevatedCleanupTracker.tryEnterReserved()
+            if (admission == ElevatedCleanupTracker.Admission.OK) {
+                // bug path（OK）才可能佔席：立即歸還，避免洩漏 active 席。
+                ElevatedCleanupTracker.leaveCall()
+            }
+            assertEquals(
+                "admission must stay BACKLOG_FULL while the slot is held",
+                ElevatedCleanupTracker.Admission.BACKLOG_FULL,
+                admission,
+            )
+            assertEquals(0, ElevatedCleanupTracker.activeCalls())
+        } finally {
+            ElevatedProcessIo.quarantineRegistrar = { ElevatedCleanupTracker.quarantineUnverified(it) }
+        }
+        // 還原 registrar 後重試 helper（同 handle 重登、冪等）：登記成功 ⇒ 釋放恰好一次。
+        ElevatedProcessIo.releaseCleanupSlotAfterVerify(hanger, verified = false, slotHeld = true)
+        assertEquals(0, ElevatedCleanupTracker.outstanding())
+        assertEquals(1, ElevatedCleanupTracker.quarantinedCount())
+        assertEquals(before + 1, ElevatedCleanupTracker.quarantineRegistrationFailedCount())
+        // 恰好一次：floor 零命中。
+        assertEquals(floorBefore, ElevatedCleanupTracker.releaseFloorHits())
+        pollOutstandingTo(0)
+        // 本測試有意登記 1 筆 quarantine：清殘留保持 tearDown 零洩漏斷言有效。
+        ElevatedCleanupTracker.clearUnverified()
+    }
+
+    @Test fun drainPreflightVerifyFalseWithThrowingRegistrarKeepsSlotFailClosed() {
+        // timeoutMs=0L：computeDeadlineNanos(0L, now)==now，isExpired 以
+        // (deadline - nowNanos()).coerceAtLeast(0L) <= 0L 判定——入口即過期，
+        // 確定性選中 preflight 臂（不靠時間窗口猜調度）。
+        val hanger = NoOpHangProcess()
+        val before = ElevatedCleanupTracker.quarantineRegistrationFailedCount()
+        try {
+            ElevatedProcessIo.quarantineRegistrar = { throw RuntimeException("registrar boom") }
+            val d = ElevatedProcessIo.drain(
+                process = hanger,
+                timeoutMs = 0L,
+                killer = { it.destroy() },
+                isCancelled = { false },
+            )
+            // preflight 臂 post-kill verify=false → helper 登記拋 ⇒ +1、槽保留；
+            // preflight 固定回 timedOut=true。
+            assertEquals(before + 1, ElevatedCleanupTracker.quarantineRegistrationFailedCount())
+            assertEquals(1, ElevatedCleanupTracker.outstanding())
+            assertEquals(0, ElevatedCleanupTracker.quarantinedCount())
+            assertTrue("preflight drain must flag cleanupIncomplete", d.cleanupIncomplete)
+            assertTrue("preflight arm always returns timedOut=true", d.timedOut)
+            val admission = ElevatedCleanupTracker.tryEnterReserved()
+            if (admission == ElevatedCleanupTracker.Admission.OK) {
+                ElevatedCleanupTracker.leaveCall()
+            }
+            assertEquals(
+                "admission must stay BACKLOG_FULL while the slot is held",
+                ElevatedCleanupTracker.Admission.BACKLOG_FULL,
+                admission,
+            )
+            assertEquals(0, ElevatedCleanupTracker.activeCalls())
+        } finally {
+            ElevatedProcessIo.quarantineRegistrar = { ElevatedCleanupTracker.quarantineUnverified(it) }
+        }
+        // 還原 registrar 後重試 helper：登記成功 ⇒ 釋放恰好一次。
+        ElevatedProcessIo.releaseCleanupSlotAfterVerify(hanger, verified = false, slotHeld = true)
+        assertEquals(0, ElevatedCleanupTracker.outstanding())
+        assertEquals(1, ElevatedCleanupTracker.quarantinedCount())
+        assertEquals(before + 1, ElevatedCleanupTracker.quarantineRegistrationFailedCount())
+        assertEquals(floorBefore, ElevatedCleanupTracker.releaseFloorHits())
+        pollOutstandingTo(0)
+        ElevatedCleanupTracker.clearUnverified()
+    }
+
+    @Test fun drainAbortedArmVerifyFalseWithThrowingRegistrarKeepsSlotFailClosed() {
+        val hanger = NoOpHangProcess()
+        val before = ElevatedCleanupTracker.quarantineRegistrationFailedCount()
+        try {
+            ElevatedProcessIo.quarantineRegistrar = { throw RuntimeException("registrar boom") }
+            // 只讓 elevated-stdout gobbler 起線程失敗（stdin-closer／elevated-cleanup
+            // 照常起）：drain 收斂至 cleanupOnThreadStartFailure（Inner 臂），
+            // post-kill verify=false → helper 登記拋 ⇒ +1、槽保留。
+            val d = ElevatedProcessIo.drainWithThreadStarter(
+                process = hanger,
+                timeoutMs = 300L,
+                killer = { it.destroy() },
+                isCancelled = { false },
+                startThread = { t ->
+                    if (t.name == "elevated-stdout") {
+                        throw RuntimeException("simulated gobbler start failure")
+                    } else {
+                        t.start()
+                    }
+                },
+            )
+            // Inner 臂實值（非 drainFailClosedDrained 兜底）：timedOut=false、readFailed=true、
+            // tailIncomplete=true、cleanupIncomplete=true；untrackedResidual 僅由
+            // saturation（acquireSlotOrQuarantine 敗）置 true——此處未飽和 ⇒ false。
+            assertTrue("aborted arm must flag cleanupIncomplete", d.cleanupIncomplete)
+            assertFalse("aborted arm is local resource exhaustion, not budget ⇒ timedOut=false", d.timedOut)
+            assertTrue("aborted arm must flag readFailed", d.readFailed)
+            assertTrue("aborted arm must flag tailIncomplete", d.tailIncomplete)
+            assertFalse("inner arm only sets untrackedResidual on saturation", d.untrackedResidual)
+            assertEquals(before + 1, ElevatedCleanupTracker.quarantineRegistrationFailedCount())
+            assertEquals(1, ElevatedCleanupTracker.outstanding())
+            assertEquals(0, ElevatedCleanupTracker.quarantinedCount())
+            val admission = ElevatedCleanupTracker.tryEnterReserved()
+            if (admission == ElevatedCleanupTracker.Admission.OK) {
+                ElevatedCleanupTracker.leaveCall()
+            }
+            assertEquals(
+                "admission must stay BACKLOG_FULL while the slot is held",
+                ElevatedCleanupTracker.Admission.BACKLOG_FULL,
+                admission,
+            )
+            assertEquals(0, ElevatedCleanupTracker.activeCalls())
+        } finally {
+            ElevatedProcessIo.quarantineRegistrar = { ElevatedCleanupTracker.quarantineUnverified(it) }
+        }
+        // 還原 registrar 後重試 helper：登記成功 ⇒ 釋放恰好一次。
+        ElevatedProcessIo.releaseCleanupSlotAfterVerify(hanger, verified = false, slotHeld = true)
+        assertEquals(0, ElevatedCleanupTracker.outstanding())
+        assertEquals(1, ElevatedCleanupTracker.quarantinedCount())
+        assertEquals(before + 1, ElevatedCleanupTracker.quarantineRegistrationFailedCount())
+        assertEquals(floorBefore, ElevatedCleanupTracker.releaseFloorHits())
+        pollOutstandingTo(0)
+        ElevatedCleanupTracker.clearUnverified()
     }
 
     // ---- (d) counter wiring：@VisibleForTesting reader 直接讀數＋note 單調 +1 ----

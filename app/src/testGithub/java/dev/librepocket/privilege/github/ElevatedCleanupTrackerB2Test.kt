@@ -355,14 +355,16 @@ class ElevatedCleanupTrackerB2Test {
 
     @Test fun admissionPriorityMatrixAndDenialHoldsNoSeat() {
         // 子例間完全隔離：每段首尾重置 breaker＋槽＋quarantine＋active。
-        fun resetAll() {
+        // Stage 2 契約加固：counted boundary check——先核對該子例應留下的精確數量
+        // （outstanding／activeCalls／quarantinedCount），再清登記／釋放恰好該數量，
+        // 不再盲 while-loop 洗掉子例洩漏（洩漏會直接 fail，而非靜默回收）。
+        fun resetAll(expectedOutstanding: Int, expectedActive: Int, expectedQuarantined: Int) {
+            assertEquals("resetAll: sub-case left outstanding slots", expectedOutstanding, ElevatedCleanupTracker.outstanding())
+            assertEquals("resetAll: sub-case left active seats", expectedActive, ElevatedCleanupTracker.activeCalls())
+            assertEquals("resetAll: sub-case quarantine registrations", expectedQuarantined, ElevatedCleanupTracker.quarantinedCount())
             ElevatedCleanupTracker.clearUnverified()
-            while (ElevatedCleanupTracker.outstanding() > 0) {
-                ElevatedCleanupTracker.releaseSlot()
-            }
-            while (ElevatedCleanupTracker.activeCalls() > 0) {
-                ElevatedCleanupTracker.leaveCall()
-            }
+            repeat(expectedOutstanding) { ElevatedCleanupTracker.releaseSlot() }
+            repeat(expectedActive) { ElevatedCleanupTracker.leaveCall() }
             pollOutstandingTo(0)
             pollActiveTo(0)
             ElevatedCleanupTracker.noteClean()
@@ -370,7 +372,7 @@ class ElevatedCleanupTrackerB2Test {
         var activeHeld = 0
         try {
             // a) backlog＋breaker＋quarantine 三門同立 → BACKLOG（首門優先）。
-            resetAll()
+            resetAll(0, 0, 0)
             repeat(ElevatedCleanupTracker.MAX_OUTSTANDING_CLEANUPS) {
                 assertTrue(ElevatedCleanupTracker.acquireSlot())
             }
@@ -385,7 +387,8 @@ class ElevatedCleanupTrackerB2Test {
             assertEquals(0, ElevatedCleanupTracker.activeCalls())
 
             // b) breaker＋quarantine（outstanding 清空）→ BREAKER（次優先）。
-            resetAll()
+            // 上一子例 a) 有意留下 MAX_OUTSTANDING_CLEANUPS 槽＋1 筆 quarantine 登記。
+            resetAll(ElevatedCleanupTracker.MAX_OUTSTANDING_CLEANUPS, 0, 1)
             repeat(ElevatedCleanupTracker.MAX_CONSECUTIVE_UNCLEAN) {
                 ElevatedCleanupTracker.noteUnclean()
             }
@@ -399,7 +402,8 @@ class ElevatedCleanupTrackerB2Test {
             assertEquals(0, ElevatedCleanupTracker.activeCalls())
 
             // c) reservation（outstanding=1）＋quarantine → BACKLOG（預留先於末門）。
-            resetAll()
+            // 上一子例 b) 有意留下 1 筆 quarantine 登記（無槽、無席）。
+            resetAll(0, 0, 1)
             assertTrue(ElevatedCleanupTracker.acquireSlot())
             ElevatedCleanupTracker.quarantineUnverified(FastAliveProcess())
             assertEquals(
@@ -409,7 +413,8 @@ class ElevatedCleanupTrackerB2Test {
             assertEquals(0, ElevatedCleanupTracker.activeCalls())
 
             // d) quarantine 單門（outstanding=0、consecutive=1、預留通過）→ QUARANTINE。
-            resetAll()
+            // 上一子例 c) 有意留下 1 槽＋1 筆 quarantine 登記。
+            resetAll(1, 0, 1)
             ElevatedCleanupTracker.noteUnclean()
             ElevatedCleanupTracker.quarantineUnverified(FastAliveProcess())
             assertFalse(ElevatedCleanupTracker.isBreakerOpen())
@@ -421,7 +426,8 @@ class ElevatedCleanupTrackerB2Test {
             assertEquals(0, ElevatedCleanupTracker.activeCalls())
 
             // e) CONCURRENCY_FULL 死分支仍可達：僅測用 tryEnterCall 預填 active=MAX_CONCURRENT_CALLS。
-            resetAll()
+            // 上一子例 d) 有意留下 1 筆 quarantine 登記（無槽、無席）。
+            resetAll(0, 0, 1)
             repeat(ElevatedCleanupTracker.MAX_CONCURRENT_CALLS) {
                 assertTrue(ElevatedCleanupTracker.tryEnterCall())
                 activeHeld += 1
@@ -437,6 +443,10 @@ class ElevatedCleanupTrackerB2Test {
             )
             assertEquals(ElevatedCleanupTracker.MAX_CONCURRENT_CALLS, ElevatedCleanupTracker.activeCalls())
         } finally {
+            // 子例 e) 有意留下 activeHeld 席（tryEnterCall 預填）；越界即 fail，不盲放。
+            assertEquals("sub-case e left outstanding slots", 0, ElevatedCleanupTracker.outstanding())
+            assertEquals("sub-case e left active seats", activeHeld, ElevatedCleanupTracker.activeCalls())
+            assertEquals("sub-case e left quarantine registrations", 0, ElevatedCleanupTracker.quarantinedCount())
             ElevatedCleanupTracker.clearUnverified()
             repeat(activeHeld) { ElevatedCleanupTracker.leaveCall() }
             pollOutstandingTo(0)
@@ -655,21 +665,23 @@ class ElevatedCleanupTrackerB2Test {
     // ---- 12. 拒絕不佔席（BACKLOG／BREAKER／QUARANTINE 全門） ----
 
     @Test fun denialsNeverOccupyActiveSeat() {
-        fun resetAll() {
+        // Stage 2 契約加固：counted boundary check——先核對該子例應留下的精確數量
+        // （outstanding／activeCalls／quarantinedCount），再清登記／釋放恰好該數量，
+        // 不再盲 while-loop 洗掉子例洩漏（洩漏會直接 fail，而非靜默回收）。
+        fun resetAll(expectedOutstanding: Int, expectedActive: Int, expectedQuarantined: Int) {
+            assertEquals("resetAll: sub-case left outstanding slots", expectedOutstanding, ElevatedCleanupTracker.outstanding())
+            assertEquals("resetAll: sub-case left active seats", expectedActive, ElevatedCleanupTracker.activeCalls())
+            assertEquals("resetAll: sub-case quarantine registrations", expectedQuarantined, ElevatedCleanupTracker.quarantinedCount())
             ElevatedCleanupTracker.clearUnverified()
-            while (ElevatedCleanupTracker.outstanding() > 0) {
-                ElevatedCleanupTracker.releaseSlot()
-            }
-            while (ElevatedCleanupTracker.activeCalls() > 0) {
-                ElevatedCleanupTracker.leaveCall()
-            }
+            repeat(expectedOutstanding) { ElevatedCleanupTracker.releaseSlot() }
+            repeat(expectedActive) { ElevatedCleanupTracker.leaveCall() }
             pollOutstandingTo(0)
             pollActiveTo(0)
             ElevatedCleanupTracker.noteClean()
         }
         try {
             // BACKLOG（outstanding=MAX_OUTSTANDING_CLEANUPS）。
-            resetAll()
+            resetAll(0, 0, 0)
             repeat(ElevatedCleanupTracker.MAX_OUTSTANDING_CLEANUPS) {
                 assertTrue(ElevatedCleanupTracker.acquireSlot())
             }
@@ -680,7 +692,8 @@ class ElevatedCleanupTrackerB2Test {
             assertEquals(0, ElevatedCleanupTracker.activeCalls())
 
             // BREAKER（consecutive=MAX_CONSECUTIVE_UNCLEAN）。
-            resetAll()
+            // 上一子例 BACKLOG 有意留下 MAX_OUTSTANDING_CLEANUPS 槽（無席、無登記）。
+            resetAll(ElevatedCleanupTracker.MAX_OUTSTANDING_CLEANUPS, 0, 0)
             repeat(ElevatedCleanupTracker.MAX_CONSECUTIVE_UNCLEAN) {
                 ElevatedCleanupTracker.noteUnclean()
             }
@@ -691,7 +704,8 @@ class ElevatedCleanupTrackerB2Test {
             assertEquals(0, ElevatedCleanupTracker.activeCalls())
 
             // QUARANTINE（單門）。
-            resetAll()
+            // 上一子例 BREAKER 有意留下 0 槽（無席、無登記）。
+            resetAll(0, 0, 0)
             ElevatedCleanupTracker.quarantineUnverified(FastAliveProcess())
             assertEquals(
                 ElevatedCleanupTracker.Admission.QUARANTINE,
@@ -700,7 +714,8 @@ class ElevatedCleanupTrackerB2Test {
             assertEquals(0, ElevatedCleanupTracker.activeCalls())
 
             // OK 才佔席（乾淨態首呼叫）。
-            resetAll()
+            // 上一子例 QUARANTINE 有意留下 1 筆 quarantine 登記（無槽、無席）。
+            resetAll(0, 0, 1)
             assertEquals(
                 ElevatedCleanupTracker.Admission.OK,
                 ElevatedCleanupTracker.tryEnterReserved(),
@@ -709,6 +724,10 @@ class ElevatedCleanupTrackerB2Test {
             ElevatedCleanupTracker.leaveCall()
             assertEquals(0, ElevatedCleanupTracker.activeCalls())
         } finally {
+            // 子例 OK 已 leaveCall、各拒門子例零收量；越界即 fail，不盲放。
+            assertEquals("sub-case left outstanding slots", 0, ElevatedCleanupTracker.outstanding())
+            assertEquals("sub-case left active seats", 0, ElevatedCleanupTracker.activeCalls())
+            assertEquals("sub-case left quarantine registrations", 0, ElevatedCleanupTracker.quarantinedCount())
             ElevatedCleanupTracker.clearUnverified()
             pollOutstandingTo(0)
             pollActiveTo(0)

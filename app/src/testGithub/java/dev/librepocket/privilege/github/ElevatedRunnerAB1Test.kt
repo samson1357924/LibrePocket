@@ -37,12 +37,14 @@ import org.junit.Before
 class ElevatedRunnerAB1Test {
 
     private val privateRoot = "/data/data/files"
+    private var floorBefore: Int = 0
 
     @Before fun setUpIsolation() {
         assertFalse(
             "#136-B3 gate must stay closed",
             PrivilegeActivation.ELEVATED_RUNNERS_READY,
         )
+        floorBefore = ElevatedCleanupTracker.releaseFloorHits()
         ElevatedCleanupTracker.clearUnverified()
         ElevatedCleanupTracker.noteClean()
         pollOutstandingTo(0)
@@ -64,6 +66,7 @@ class ElevatedRunnerAB1Test {
         assertEquals("test leaked outstanding slots", 0, leakedOutstanding)
         assertEquals("test leaked active calls", 0, leakedActive)
         assertEquals("test leaked quarantined processes", 0, leakedQuarantine)
+        assertEquals("release floor must not be hit during this test", floorBefore, ElevatedCleanupTracker.releaseFloorHits())
     }
 
     /** success-exit＋stdin getter 吞 interrupt 續等（latch 釋放前永不返回）。 */

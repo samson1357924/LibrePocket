@@ -2357,7 +2357,9 @@ internal object ElevatedCallSupervisor {
         // daemon／worker 內聯）有界返回，不再永久持槽卡死；stall 殘留 worker 由
         // awaitTimeout 記槽（既有契約）。close 結果永不翻 `ok`（verdict 由 parent
         // 驗證已定）；close 擲非 OOM VME 仍經 [recordDeferredVme] 帶回（與舊碼語義一致，
-        // 僅搬進有界 worker 以 AtomicReference 交回 caller）。
+        // 僅搬進有界 worker 以 AtomicReference 交回 caller）；於 detached worker 上、
+        // 超過 [EXIT_JOIN_MS] deferral 窗口後才抛出的非 OOM VME 會被 by design 捨棄
+        // （verdict 仍由父進程驗證決定）。
         val closeVme = AtomicReference<Throwable?>(null)
         runCatching {
             awaitTimeout(EXIT_JOIN_MS, "elevated-late-close") {

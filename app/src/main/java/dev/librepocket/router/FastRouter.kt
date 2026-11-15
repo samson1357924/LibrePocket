@@ -611,9 +611,10 @@ class FastRouter(
          *   `什麼是符號`、`為什麼要用符號`、`符號是什麼`、`符號的意思`、
          *   `符號有哪些種類`、bare `symbols`、`What is a symbol?`、`Explain symbols`
          *   （無命令式准入 ⇒ 不進 symbol 模板；否定閘不介入）。
-         * - `查 find 符號`/`查 search 符號` 等：EN lookup 動詞同為剝離詞，
-         *   符號名恰為 find/search/lookup/locate 者剝空 → clarify（pinned by
-         *   `englishLookupMarkerStripped`）。
+         * - `查 find 符號`/`查 search 符號` 等：EN lookup 動詞在 cue 位置
+         *   （Step A，句首錨定）為剝離詞，符號名恰為 find/search/lookup/locate
+         *   者剝空 → clarify（pinned by `englishLookupMarkerStripped`）；
+         *   非 cue 位置的動詞不再剝離（見 SYMBOL_OPENER 系列 KDoc）。
          */
         private val NEGATION_HINTS = listOf(
             r("不要"), r("不用"), r("不需要"), r("不必"), r("不需"), r("勿"),
@@ -873,58 +874,189 @@ class FastRouter(
         }
 
         /**
-         * B3 symbol-query strip tokens: hint words removed from the intent to
-         * isolate the symbol name. Substring-based (NOT token-based): every
-         * alternative matches as a plain substring, so CJK names embedding hint
-         * chars are over-stripped too — a known residual, e.g. 「查理」 → 「理」
-         * (accepted, pinned by test; a READ-only echo mis-query is harmless).
-         * Latin tokens are word-anchored (`\b(find|search|lookup|locate)\b`,
-         * `\bsymbols?\b`, `\blsp\b`), so
-         * `SymbolTable` / `getSymbol` / `LSPClient` survive intact (an
-         * unanchored `symbol` would shred the `Symbol` inside `getSymbol`).
-         * #5（B3 re-review）EN connective tokens (`for`/`the`/`a`/`an`/
-         * `named`/`called`/`of`/`to`) are word-anchored strip words too:
-         * `search for symbol Foo` → `Foo`（曾漏剝為 `forFoo`）、
-         * `find the symbol Foo`／`lookup the symbol Foo` → `Foo`（曾為 `theFoo`）、
-         * `locate symbol named Foo`／`locate symbol called Foo` → `Foo`
-         * （曾為 `namedFoo`）、`find a symbol Foo` → `Foo`。
-         * 內嵌名不受影響：`theSymbol`／`getSymbol`／`SymbolTable` 的 `the`/`symbol`
-         * 無 word boundary ⇒ 完整保留。
-         * Meta-question tokens (什麼/什么/為什麼/为什么/是什麼/是什么/怎麼/怎么/如何/意思/嗎/吗/呢)
-         * strip as well, so an affirmative-command utterance that reduces to empty
-         * (e.g. `查 是 符號`) clarifies rather than executing. Bare
-         * `符號是什麼？` carries no lookup command, so under the
-         * affirmative-command model it does not reach this path at all (no-match DENIED — pinned by test). The bare
-         * meta-question verbs 是/的/要/用 are stripped
-         * too since the B3 re-review:
-         * 「查 是 符號」 / 「查 要 用 符號」 strip to empty and clarify — but note
-         * utterances WITHOUT a lookup command never reach this path at all
-         * （`什麼是符號`、`為什麼要用符號`、`符號的意思` 等一律 no-match DENIED）；
-         * clarify 只保留帶命令式句首者。
-         * Accepted over-strip residual class (recorded, safe direction):
-         * 「符號是Foo嗎」 → query=Foo if it reached extraction (arguably a
-         * legitimate query), and symbol names containing 是/的/要/用 are shredded
-         * — both fail safe (a mis-query or a clarification, never a wrong
-         * execution); this over-strip is accepted and documented here rather
-         * than fixed with token boundaries. 「符號是Foo嗎」 never reaches
-         * this path — without an affirmative command the symbol template does not
-         * match at all (no-match DENIED).
-         * The meaningful-remainder predicate lives in
-         * [hasSymbolQuery]: at least one Unicode letter/digit must survive,
-         * so punctuation-only remainders (e.g. 「查 - 符號」 → 「-」) clarify too.
-         * A name exactly equal to joined hint tokens also strips to blank and
-         * clarifies (fail-safe direction).
+         * B3 symbol-query extraction (#19 stage-2, A3/A4 fix): positional,
+         * lossless remainder extraction for the symbol template. The intent is
+         * NOT regex-replaced globally; instead the pipeline strips only what is
+         * anchored at position 0 or at the edge, and preserves everything
+         * intra-token verbatim. Steps, in fixed order:
+         *
+         * Step A — anchored openers (each at most once, start-anchored):
+         *   EN: `^(?:please[\s,]+)?(?:find|search|lookup|locate)\b[\s,]*`
+         *       `(?:for\s+|the\s+|a\s+|an\s+)?` — the verb plus ONE optional
+         *       post-verb connective (`find a symbol Foo` → `symbol Foo`);
+         *   CJK: `^(?:(?:請|麻煩|帮我|幫我|给我|給我|请)[\s，,]*)?`
+         *       `(?:查|找|尋|搜|詢|寻|询)[\s，,]*(?:一下)?[\s，,]*` — optional
+         *       politeness prefix + lookup verb + optional 一下;
+         *   command form A: `^symbols?\b[\s]*` — `symbols Foo` → `Foo`.
+         *   Applied sequentially (CJK → EN → command), so `查 find 符號` still
+         *   reduces to empty and clarifies.
+         * Step B — `symbol(s)` keyword tokens removed wherever they appear as
+         *   words (`\bsymbols?\b`, IGNORE_CASE), and CJK hint substrings
+         *   （符號|符号|函式|函数）removed wherever they occur (substring, as
+         *   before). `SymbolTable`/`getSymbol`/`LSPClient` have no word
+         *   boundary at the hint, so they survive intact.
+         * Step C — CJK prose fillers removed as substrings (same class as the
+         *   accepted CJK over-strip residuals): 幫我|這個|那個|一下|請|查|找|
+         *   尋|搜|詢|什麼|什么|何|是|的|要|用|嗎|吗|呢|如何|怎麼|怎么|意思|
+         *   為什麼|为什么|說明|説明|講解|讲解|介紹|介绍|教程.
+         * Step D — leading EN connectives stripped, REPEATEDLY, but only when
+         *   another token remains after the connective
+         *   (`^(?:for|the|a|an|named|called|of|to)\s+(?=\S)`, IGNORE_CASE).
+         *   `locate symbol named Foo` → `Foo`; a bare `a` / `to` / `for` at the
+         *   start of the remainder with NOTHING after it is NOT stripped (a
+         *   single-letter identifier stands: `查 a 符號` → `a`).
+         * Step E — edge trim ONLY: leading/trailing runs of
+         *   `[\s，。、？?：:「」『』“”"'（）]` stripped repeatedly. Nothing
+         *   intra-token is ever removed by this step. NOTE: halfwidth `!` and
+         *   the halfwidth parens are deliberately NOT in the edge class —
+         *   `查 ! Foo`-class inputs must clarify, and `get(id)` must survive
+         *   verbatim (intra parens are allow-listed, never edge-stripped);
+         *   halfwidth `?` stays (trailing question particle), as do the
+         *   fullwidth `（）？` CJK edge shapes. `-` is no longer in the edge
+         *   class either — `查 -main 符號` FASTs with query `-main` verbatim
+         *   (Clojure-family identifiers). `.` is NOT in the edge class:
+         *   `查 .bar 符號` FASTs with query `.bar` — recorded as accepted.
+         *   `查 Foo. 符號` FASTs with query `Foo.` — recorded as accepted.
+         * Step F — empty remainder, or ANY remaining whitespace, or ANY
+         *   Format/control char (Cf/Cc, and any unassigned/surrogate code
+         *   point rejected by the charset below) ⇒ extraction FAILS (returns
+         *   "") ⇒ [hasSymbolQuery] false ⇒ NEED_CLARIFICATION. The tool is a
+         *   single-identifier tool: a multi-token remainder is never a valid
+         *   query — `查 SymbolTable Foo 符號` clarifies rather than collapsing
+         *   into `SymbolTableFoo`.
+         * Step G — charset allow-list: every code point must be Unicode
+         *   letter (L*) or number (N*), or one of `. _ - $ # @ / ( ) : , ; + = ~`.
+         *   Anything else (e.g. `!`, `。`, emoji, unpaired surrogates) ⇒
+         *   extraction FAILS ⇒ clarification. The remainder must ALSO carry at
+         *   least one letter/digit code point.
+         *
+         * The extracted remainder is used intra-token verbatim (esc-escaped)
+         * as the query argument — qualified names pass through losslessly:
+         * `查 Foo.bar 符號` → `Foo.bar`, `查 std::vector 符號` / `查 Foo::Bar
+         * 符號` → `::` preserved, `查 foo/bar.kt 符號` → `/` preserved,
+         * `查 get(id) 符號` → `get(id)`, `查 3.14 符號` → `3.14`,
+         * `查 3,14 符號` → `3,14`, `查 中文變數 符號` → `中文變數`.
+         * Intra-token `(`/`)` are admitted without balance checking
+         * (`查 (Foo 符號` → FAST `(Foo`) — inherited from the symbol-aware
+         * class, harmless (allow-list + non-injection apply), accepted.
+         * Fullwidth letters/numbers (L*, N*) pass the allow-list verbatim
+         * (unnormalized — `Ｆｕ` stays `Ｆｕ`), consistent with stage-1.
+         * Digit-only remainders
+         * anchor the meaningful-remainder gate (load-bearing for
+         * `查 3.14 符號` / `查 42 符號` — both FAST, accepted).
+         *
+         * Accepted residuals (recorded, safe direction, pinned by tests):
+         * - CJK over-strip: 查理 → 理 (the leading 查 is the lookup verb, the
+         *   remainder 理 looks like a symbol name) — accepted, fail-safe
+         *   direction (a mis-query, never a wrong execution).
+         * - 「特別」 is not an opener (starts with 特) ⇒ no-match DENIED;
+         *   「特別找」likewise never reaches this path.
+         * - `查Symbol`-class over-strips (e.g. a symbol literally named with a
+         *   hint substring) remain accepted — CJK hints are substring-stripped
+         *   by design.
+         * - Intra-comma is preserved: `查 3,14 符號` → `3,14` — the comma is a
+         *   legal intra-token character now (never edge-stripped mid-token).
+         * - Anything not matching the allow-list (step G) or still carrying
+         *   whitespace (step F) ⇒ clarification, never a rewritten query.
+         * - `3.14`-class names keep their `.`; `get(id)` keeps `( )`;
+         *   `foo/bar.kt` keeps `/`; `std::vector` keeps `::`.
+         * - `查 a b 符號` strips the leading connective `a ` (another token
+         *   follows) leaving `b` — article-stripping at a cue position, the
+         *   same mechanic as `a Foo` → `Foo`; the two tokens are indistinguishable
+         *   at this position and the rewrite is deterministic (pinned).
+         *
+         * Invalid-charset / multi-token remainders never execute: they fail
+         * extraction (empty) and route NEED_CLARIFICATION via
+         * [missingQuestionFor] ("請問要查哪個符號？").
          */
-        // #5（B3 re-review）EN connective 詞一併剝離（word-anchored、IGNORE_CASE）：
-        // `search for symbol Foo` 曾剝出 `forFoo`、`find the symbol Foo` 曾剝出
-        // `theFoo`、`locate symbol named Foo` 曾剝出 `namedFoo`。
-        // `a`/`an` 以 \b 錨定（短詞可安錨）；`named|called` 不傷內嵌名——
-        // `theSymbol`/`getSymbol`/`SymbolTable` 皆無 word boundary ⇒ 完整保留。
-        private val SYMBOL_QUERY_STRIP =
-            Regex("幫我|這個|那個|一下|請|查|找|尋|搜|詢|符號|符号|函式|函数|為什麼|为什么|是什麼|是什么|什麼|什么|怎麼|怎么|如何|意思|嗎|吗|呢|是|的|要|用|\\b(find|search|lookup|locate|for|the|a|an|named|called|of|to)\\b|\\bsymbols?\\b|\\blsp\\b|[\\s，。、？?！!：:「」『』\"'（）(),.;]", RegexOption.IGNORE_CASE)
+        private val SYMBOL_OPENER_CJK = Regex(
+            "^(?:(?:請|麻煩|帮我|幫我|给我|給我|请)[\\s，,]*)?(?:查|找|尋|搜|詢|寻|询)[\\s，,]*(?:一下)?[\\s，,]*",
+        )
+        private val SYMBOL_OPENER_EN = Regex(
+            "^(?:please[\\s,]+)?(?:find|search|lookup|locate)\\b[\\s,]*(?:for\\s+|the\\s+|a\\s+|an\\s+)?",
+            RegexOption.IGNORE_CASE,
+        )
+        private val SYMBOL_OPENER_CMD = Regex("^symbols?\\b[\\s]*", RegexOption.IGNORE_CASE)
+        private val SYMBOL_KEYWORD = Regex("\\bsymbols?\\b", RegexOption.IGNORE_CASE)
+        private val SYMBOL_CJK_HINT = Regex("符號|符号|函式|函数")
+        private val SYMBOL_CJK_FILLER = Regex(
+            "幫我|這個|那個|一下|請|查|找|尋|搜|詢|什麼|什么|何|是|的|要|用|嗎|吗|呢|如何|怎麼|怎么|意思|為什麼|为什么|說明|説明|講解|讲解|介紹|介绍|教程",
+        )
+        private val SYMBOL_LEADING_CONNECTIVE = Regex(
+            "^(?:for|the|a|an|named|called|of|to)\\s+(?=\\S)",
+            RegexOption.IGNORE_CASE,
+        )
+        private val SYMBOL_EDGE = Regex(
+            "^[\\s，。、？?：:「」『』“”\"'（）]+|[\\s，。、？?：:「」『』“”\"'（）]+$",
+        )
+        private const val SYMBOL_ALLOWED_PUNCT = "._-${'$'}#@/():,;+=~"
 
-        private fun extractSymbolQuery(text: String): String =
-            SYMBOL_QUERY_STRIP.replace(text, "").trim()
+        private fun isQueryLetterOrNumberType(type: Int): Boolean = when (type) {
+            Character.UPPERCASE_LETTER.toInt(), Character.LOWERCASE_LETTER.toInt(),
+            Character.TITLECASE_LETTER.toInt(), Character.MODIFIER_LETTER.toInt(),
+            Character.OTHER_LETTER.toInt(), Character.DECIMAL_DIGIT_NUMBER.toInt(),
+            Character.LETTER_NUMBER.toInt(), Character.OTHER_NUMBER.toInt() -> true
+            else -> false
+        }
+
+        private fun isQueryCodePointAllowed(cp: Int): Boolean {
+            if (isQueryLetterOrNumberType(Character.getType(cp))) return true
+            return cp <= 0x7E && SYMBOL_ALLOWED_PUNCT.indexOf(cp.toChar()) >= 0
+        }
+
+        private fun extractSymbolQuery(text: String): String {
+            var s = text.trim()
+            // Step A — anchored openers (each applied at most once a position;
+            // sequential so `查 find 符號` reduces to empty and clarifies).
+            s = SYMBOL_OPENER_CJK.replaceFirst(s, "").trim()
+            s = SYMBOL_OPENER_EN.replaceFirst(s, "").trim()
+            s = SYMBOL_OPENER_CMD.replaceFirst(s, "").trim()
+            // Step B — symbol keyword tokens and CJK hint substrings (global).
+            s = SYMBOL_KEYWORD.replace(s, "")
+            s = SYMBOL_CJK_HINT.replace(s, "")
+            // Step C — CJK prose fillers (substring, as accepted before).
+            s = SYMBOL_CJK_FILLER.replace(s, "")
+            // Step D — leading EN connectives, repeatedly, only when another
+            // token remains after the connective.
+            while (true) {
+                val t = s.trim()
+                val m = SYMBOL_LEADING_CONNECTIVE.find(t)
+                if (m == null) {
+                    s = t
+                    break
+                }
+                s = t.substring(m.range.last + 1)
+            }
+            // Step E — edge trim only, repeatedly.
+            while (true) {
+                val t = s.trim()
+                val u = SYMBOL_EDGE.replace(t, "")
+                if (u == t) {
+                    s = u
+                    break
+                }
+                s = u
+            }
+            // Step F — empty / whitespace / Cf / Cc (and anything the charset
+            // rejects) ⇒ invalid ⇒ return "" so the clarification gate fires.
+            if (s.isEmpty()) return ""
+            var hasLetterOrDigit = false
+            var i = 0
+            while (i < s.length) {
+                val cp = s.codePointAt(i)
+                val type = Character.getType(cp)
+                if (Character.isWhitespace(cp) || Character.isSpaceChar(cp) ||
+                    type == Character.FORMAT.toInt() || type == Character.CONTROL.toInt()
+                ) {
+                    return ""
+                }
+                if (!isQueryCodePointAllowed(cp)) return ""
+                if (isQueryLetterOrNumberType(type)) hasLetterOrDigit = true
+                i += Character.charCount(cp)
+            }
+            // Step G — at least one letter/digit must anchor the query.
+            return if (hasLetterOrDigit) s else ""
+        }
 
         /**
          * Meaningful-remainder predicate: the stripped remainder must contain
@@ -934,8 +1066,9 @@ class FastRouter(
          * The predicate is BMP-Char-based: `isLetterOrDigit()` is evaluated per
          * UTF-16 code unit, so an astral-only remainder (e.g. 𠮷 U+20BB7, whose
          * two surrogate units are neither letters nor digits) cannot anchor a
-         * query — fail-safe direction. The esc test uses 𠮷 together with a
-         * BMP anchor (`Foo`) for the same reason.
+         * query — fail-safe direction. The esc test pins passthrough for a
+         * paired astral letter embedded in a BMP-letter token instead (a
+         * multi-token remainder would clarify before reaching here).
          */
         private fun hasSymbolQuery(text: String): Boolean =
             extractSymbolQuery(text).any { it.isLetterOrDigit() }

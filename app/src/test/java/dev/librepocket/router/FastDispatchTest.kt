@@ -380,6 +380,9 @@ class FastDispatchTest {
             )
         }
         // 單複數 `find symbols` 剝空 ⇒ 澄清（且不會 Fast）。
+        val bareSymbol = decide("查 find 符號")
+        assertEquals(RouteKind.DENIED, bareSymbol.route)
+        assertEquals(DenyReason.NEED_CLARIFICATION, bareSymbol.reasonCode)
         val bare = decide("find symbols")
         assertEquals(RouteKind.DENIED, bare.route)
         assertEquals(DenyReason.NEED_CLARIFICATION, bare.reasonCode)
@@ -442,6 +445,144 @@ class FastDispatchTest {
             "embedded `the` in theSymbol must survive the strip: ${embedded.toolCall!!.argumentsJson}",
             embedded.toolCall!!.argumentsJson.contains("\"query\": \"theSymbol\""),
         )
+    }
+
+    @Test fun qualifiedNamesPreservedVerbatim() = runBlocking {
+        // #19 stage-2（A4 修復）：the old SYMBOL_QUERY_STRIP globally deleted
+        // `. , ; : ( ) @ # / …` before the executor ran — `查 Foo.bar 符號` routed
+        // FAST with query `Foobar` (wrong symbol, silently). The new pipeline is
+        // positional and lossless: intra-token punctuation survives verbatim.
+        // Full-args exact pin per case (verbatim query + DEFAULT_LIMIT).
+        for ((text, expectedQuery) in listOf(
+            "查 Foo.bar 符號" to "Foo.bar",
+            "查 UserService.get 符號" to "UserService.get",
+            "查 com.example.Foo 符號" to "com.example.Foo",
+            "查 std::vector 符號" to "std::vector",
+            "查 Foo::Bar 符號" to "Foo::Bar",
+            "查 foo/bar.kt 符號" to "foo/bar.kt",
+            "查 get(id) 符號" to "get(id)",
+            "查 3.14 符號" to "3.14",
+            "查 3,14 符號" to "3,14",
+            "查 SymbolTable 符號" to "SymbolTable",
+            "查 中文變數 符號" to "中文變數",
+            // Edge `-` is NOT edge-stripped (Clojure-family identifiers).
+            "查 -main 符號" to "-main",
+            // `lsp` carries no `\blsp\b` strip any more — verbatim.
+            "查 lsp 符號" to "lsp",
+            // Digit-only remainders anchor the meaningful-remainder gate.
+            "查 42 符號" to "42",
+        )) {
+            val d = decide(text)
+            assertEquals(text, RouteKind.FAST, d.route)
+            assertEquals(text, "lsp.symbols", d.toolCall?.toolName)
+            assertNotNull(text, d.toolCall)
+            assertEquals(
+                text,
+                """{"query": "$expectedQuery", "limit": ${LspTools.DEFAULT_LIMIT}}""",
+                d.toolCall!!.argumentsJson,
+            )
+            val obj = Json.parseToJsonElement(d.toolCall!!.argumentsJson).jsonObject
+            assertEquals(text, expectedQuery, obj["query"]!!.jsonPrimitive.content)
+            assertEquals(text, LspTools.DEFAULT_LIMIT, obj["limit"]!!.jsonPrimitive.content.toInt())
+        }
+        // Dispatch variant: `查 com.example.Foo 符號` executes against the fake
+        // backend exactly once and the executor receives the exact qualified
+        // query (surfaced in the synthetic symbol name the fake returns).
+        val backend = CountingBackend()
+        val r = lspDispatcher(backend).decideAndDispatch("查 com.example.Foo 符號", lspOn, sessionId = "s-qn", turnIndex = 3)
+        assertEquals(RouteKind.FAST, r.decision.route)
+        assertEquals(1, backend.invocations.get())
+        val executed = r.outcome as? FastDispatchOutcome.Executed
+        assertNotNull("com.example.Foo must execute: ${r.outcome}", executed)
+        assertTrue(
+            "executor must receive the exact qualified query: ${executed!!.result.resultJson}",
+            executed.result.resultJson.contains("com.example.Foo:example"),
+        )
+    }
+
+    @Test fun singleLetterIdentifiersQueryable() {
+        // #19 stage-2（A3 修復）：EN connectives/單字母識別字不再被誤剝——
+        // `查 a 符號`/`查 to 符號`/`查 for 符號` 都是合法 FAST 查詢（`find symbol a`
+        // 同）。舊全域 `\b(for|the|a|an|named|called|of|to)\b` 刪除會把這些吃空
+        // → NEED_CLARIFICATION（或誤改寫）。
+        for ((text, expectedQuery) in listOf(
+            "查 a 符號" to "a",
+            "查 to 符號" to "to",
+            "查 for 符號" to "for",
+            "find symbol a" to "a",
+        )) {
+            val d = decide(text)
+            assertEquals(text, RouteKind.FAST, d.route)
+            assertEquals(text, "lsp.symbols", d.toolCall?.toolName)
+            assertEquals(
+                text,
+                expectedQuery,
+                Json.parseToJsonElement(d.toolCall!!.argumentsJson).jsonObject["query"]!!.jsonPrimitive.content,
+            )
+        }
+    }
+
+    @Test fun connectiveTokensStillStripArticle() {
+        // #19 stage-2：EN connectives 只在 cue 位置剝離（Step A post-verb
+        // connective slot；Step D leading connective with another token after）
+        // ——article 語境仍剝成 Foo。
+        for (text in listOf(
+            "find a symbol Foo",
+            "find the symbol Foo",
+            "search for symbol Foo",
+            "locate symbol named Foo",
+            "locate symbol called Foo",
+            "find symbols Foo",
+        )) {
+            val d = decide(text)
+            assertEquals(text, RouteKind.FAST, d.route)
+            assertEquals(
+                text,
+                "Foo",
+                Json.parseToJsonElement(d.toolCall!!.argumentsJson).jsonObject["query"]!!.jsonPrimitive.content,
+            )
+        }
+    }
+
+    @Test fun multiTokenRemainderClarifies() = runBlocking {
+        // #19 stage-2：single-identifier tool——任何殘餘仍帶空白一律
+        // NEED_CLARIFICATION（絕不再靜默接合成 `SymbolTableFoo`，也絕不執行）。
+        // 含 #19 B3 final polish 曾釘成 FAST（`Fooonbutton` 類）的三例。
+        val backend = CountingBackend()
+        val dispatcher = lspDispatcher(backend)
+        for (text in listOf(
+            "查 SymbolTable Foo 符號",
+            "查 中文 變數 符號",
+            "search symbol Foo on button",
+            "search symbol Foo on Foo",
+            "查 Foo 符號 on 按鈕 符號",
+            "查 Foo 𠮷 符號",
+            "查 Foo 符號 😀",
+        )) {
+            val d = decide(text)
+            assertEquals(text, RouteKind.DENIED, d.route)
+            assertEquals(text, DenyReason.NEED_CLARIFICATION, d.reasonCode)
+            assertNull(text, d.toolCall)
+            skippedOf(dispatcher.dispatch(d, lspOn), text)
+        }
+        assertEquals(0, backend.invocations.get())
+    }
+
+    @Test fun emptyRemainderClarifiesAndInvalidCharsetClarifies() {
+        // #19 stage-2：空殘餘 / 帶空白殘餘 / 非 allow-list 字元（`!`）一律
+        // NEED_CLARIFICATION——絕不改寫成另一個 query 執行。
+        for (text in listOf(
+            "查 - - 符號",
+            "查 ! Foo 符號",
+            "查 !Foo 符號",
+            "查 Foo! 符號",
+            "查 Foo - 符號",
+        )) {
+            val d = decide(text)
+            assertEquals(text, RouteKind.DENIED, d.route)
+            assertEquals(text, DenyReason.NEED_CLARIFICATION, d.reasonCode)
+            assertNull(text, d.toolCall)
+        }
     }
 
     @Test fun letterNumberSplittersStillDeny() = runBlocking {
@@ -938,13 +1079,29 @@ class FastDispatchTest {
         assertEquals(RouteKind.DENIED, meta.route)
         assertNull(meta.toolCall)
         assertNull("no-match denial carries no reasonCode: ${meta.reasonCode}", meta.reasonCode)
-        // `查 LSPClient 符號` → FAST with query=LSPClient（\blsp\b 有錨，LSPClient 完整保留）。
+        // `查 LSPClient 符號` → FAST with query=LSPClient（positional extraction：
+        // `LSPClient` 無 hint 詞邊界，完整保留；`\blsp\b` 剝離已不存在）。
         val anchored = decide("查 LSPClient 符號")
         assertEquals(RouteKind.FAST, anchored.route)
         assertTrue(
-            "LSPClient must survive the \\blsp\\b strip: ${anchored.toolCall!!.argumentsJson}",
+            "LSPClient must survive positional extraction: ${anchored.toolCall!!.argumentsJson}",
             anchored.toolCall!!.argumentsJson.contains("\"query\": \"LSPClient\""),
         )
+        // `查 a b 符號` 剝除 cue 位置的 leading connective `a `（後方仍有 token），
+        // 殘餘 `b`——與 `a Foo` → `Foo` 相同的 article-stripping 機制；兩個 token
+        // 在此位置不可區分，改寫是確定的（已記錄 deterministic cue-strip residual）。
+        val cueStrip = decide("查 a b 符號")
+        assertEquals(RouteKind.FAST, cueStrip.route)
+        assertEquals(
+            "b",
+            Json.parseToJsonElement(cueStrip.toolCall!!.argumentsJson).jsonObject["query"]!!.jsonPrimitive.content,
+        )
+        // `査 中文變數名 符號`（U+67FB 異體初字）→ no-match DENIED——査 不是 opener
+        // （deviation (a)：異體碼點未涵蓋），pin 住以防回歸。
+        val variantInitial = decide("査 中文變數名 符號")
+        assertEquals(RouteKind.DENIED, variantInitial.route)
+        assertNull(variantInitial.reasonCode)
+        assertNull(variantInitial.toolCall)
     }
 
     @Test fun englishNegationNeverExecutes() = runBlocking {
@@ -1018,6 +1175,13 @@ class FastDispatchTest {
         for (text in listOf(
             "查 是 符號",
             "查 要 用 符號",
+            // `Symbol`/`symbols` 是 keyword token，剝空後無有意義殘餘 ⇒ 澄清。
+            "查 Symbol 符號",
+            "查 symbols 符號",
+            // astral-only remainder：hasSymbolQuery 以 BMP char 錨定，𠮷 的兩個
+            // surrogate units 皆非 letter/digit ⇒ 澄清（fail-safe，已記錄；
+            // hasSymbolQuery 保持 BMP-based，不改動該 predicate）。
+            "查 𠮷 符號",
         )) {
             // marker（查）命中 ⇒ 模板成立；剝離後無有意義殘餘 ⇒ 澄清，絕不執行。
             val d = decide(text)
@@ -1042,38 +1206,34 @@ class FastDispatchTest {
         assertNull(d.toolCall)
     }
 
-    @Test fun escLoneSurrogateIsEscaped() {
-        // Paired surrogate (𠮷 = U+20BB7, Lo) passes through esc unchanged — the
-        // pair is NOT split. Note: the meaningful-remainder predicate iterates
-        // UTF-16 Chars, so an astral letter alone cannot anchor a query — the
-        // remainder keeps BMP letters alongside the pair. (U+1D11E 𝄞 is
-        // category So, not a letter, so it cannot anchor one either.)
-        val paired = decide("查 Foo 𠮷 符號")
+    @Test fun unicodeSurrogateQueriesPinned() {
+        // #19 stage-2（A3/A4）：whitespace-bearing remainders now clarify
+        // （single-identifier tool）⇒ `查 Foo 𠮷 符號` 不再 FAST。Paired astral
+        // letter embedded in a BMP-letter token is a single token and passes
+        // esc unchanged — the pair is NOT split. (U+1D11E 𝄞 is category So,
+        // not a letter, so it cannot anchor one either.)
+        val paired = decide("查 Foo𠮷Bar 符號")
         assertEquals(RouteKind.FAST, paired.route)
         assertTrue("paired surrogate must pass through esc unchanged", paired.toolCall!!.argumentsJson.contains("𠮷"))
 
-        // Lone HIGH surrogate inside a letter-bearing remainder: esc must emit
-        // the 4-lowercase-hex \uXXXX escape (String.format "%04x" convention),
-        // never the raw lone unit.
+        // Unpaired surrogates can never route FAST any more: the charset
+        // allow-list rejects them (clarification, not escaped output).
         val lone = decide("查 Foo\uD800Bar 符號")
-        assertEquals(RouteKind.FAST, lone.route)
-        val json = lone.toolCall!!.argumentsJson
-        assertTrue("lone surrogate must appear as a \\uXXXX escape: $json", json.contains("\\ud800"))
-        assertFalse("raw lone surrogate must never appear in the JSON", json.contains('\uD800'))
+        assertEquals(RouteKind.DENIED, lone.route)
+        assertEquals(DenyReason.NEED_CLARIFICATION, lone.reasonCode)
+        assertNull(lone.toolCall)
 
-        // Lone LOW surrogate: same rule — escaped as \uDC00, never raw.
         val loneLow = decide("查 Foo\uDC00Bar 符號")
-        assertEquals(RouteKind.FAST, loneLow.route)
-        val jsonLow = loneLow.toolCall!!.argumentsJson
-        assertTrue("lone low surrogate must appear as a \\uXXXX escape: $jsonLow", jsonLow.contains("\\udc00"))
-        assertFalse("raw lone low surrogate must never appear in the JSON", jsonLow.contains('\uDC00'))
+        assertEquals(RouteKind.DENIED, loneLow.route)
+        assertEquals(DenyReason.NEED_CLARIFICATION, loneLow.reasonCode)
+        assertNull(loneLow.toolCall)
 
-        // A well-formed pair at the very END of the string is NOT split: esc
-        // passes both units through unchanged.
-        val endPair = decide("查 Foo 符號 😀")
+        // A well-formed pair at the very END of the query token is NOT split:
+        // esc passes both units through unchanged.
+        val endPair = decide("查 Foo𠮷 符號")
         assertEquals(RouteKind.FAST, endPair.route)
         val jsonEnd = endPair.toolCall!!.argumentsJson
-        assertTrue("paired surrogate at end must pass through esc unchanged: $jsonEnd", jsonEnd.contains("😀"))
+        assertTrue("paired surrogate at end must pass through esc unchanged: $jsonEnd", jsonEnd.contains("𠮷"))
         assertFalse("pair at end must not be escaped: $jsonEnd", jsonEnd.contains("\\ud83d"))
     }
 
@@ -2227,11 +2387,8 @@ class FastDispatchTest {
             "search for symbol Foo" to "Foo",
             "查一下 symbols Foo" to "Foo",
             "symbols Foo" to "Foo",
-            // #19 B3 final polish：`on` 非條件子句（後接非詞幹）——FAST，exact query 以 scratch 探針實測釘住
-            //（剝離流水線維持原樣；空白全剝、裸 `on` 殘留接合，見 SYMBOL_QUERY_STRIP）。
-            "search symbol Foo on button" to "Fooonbutton",
-            "search symbol Foo on Foo" to "FooonFoo",
-            "查 Foo 符號 on 按鈕 符號" to "Fooon按鈕",
+            // (#19 stage-2：`search symbol Foo on button` 等 multi-token 殘餘
+            //  改判 NEED_CLARIFICATION——見 multiTokenRemainderClarifies。)
             // #19 B3 stage-1 fix flip side：結構性錨定不得誤傷識別字/普通詞。
             "search symbol Approved" to "Approved",
             "search symbol approval" to "approval",

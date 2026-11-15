@@ -236,14 +236,14 @@ class MainScreenAssistVoiceRoutingTest {
         fun publishRetrigger(
             targetTaskId: Int = 10,
             sessionInstanceId: Long = 7L,
-            issuedUptimeMs: Long = SystemClock.uptimeMillis(),
+            issuedElapsedRealtimeMs: Long = SystemClock.elapsedRealtime(),
         ): Long = VoiceHandoffProvider.nextToken().also { token ->
             VoiceHandoffProvider.publish(
                 PendingVoiceRetrigger(
                     token = token,
                     targetTaskId = targetTaskId,
                     sessionInstanceId = sessionInstanceId,
-                    issuedUptimeMs = issuedUptimeMs,
+                    issuedElapsedRealtimeMs = issuedElapsedRealtimeMs,
                 ),
             )
         }
@@ -934,7 +934,7 @@ class MainScreenAssistVoiceRoutingTest {
             h.publishRetrigger(
                 targetTaskId = 10,
                 sessionInstanceId = 7L,
-                issuedUptimeMs = SystemClock.uptimeMillis() - 11_000L,
+                issuedElapsedRealtimeMs = SystemClock.elapsedRealtime() - 11_000L,
             )
         }
         composeRule.waitForIdle()
@@ -961,7 +961,7 @@ class MainScreenAssistVoiceRoutingTest {
             h.publishRetrigger(
                 targetTaskId = 10,
                 sessionInstanceId = 7L,
-                issuedUptimeMs = SystemClock.uptimeMillis() + 60_000L,
+                issuedElapsedRealtimeMs = SystemClock.elapsedRealtime() + 60_000L,
             )
         }
         composeRule.waitForIdle()
@@ -990,7 +990,7 @@ class MainScreenAssistVoiceRoutingTest {
             publishedToken = h.publishRetrigger(
                 targetTaskId = 10,
                 sessionInstanceId = 7L,
-                issuedUptimeMs = SystemClock.uptimeMillis() - 11_000L,
+                issuedElapsedRealtimeMs = SystemClock.elapsedRealtime() - 11_000L,
             )
         }
         composeRule.waitForIdle()
@@ -1033,7 +1033,7 @@ class MainScreenAssistVoiceRoutingTest {
     private fun gateRetrigger(
         pending: PendingVoiceRetrigger?,
         identity: VoiceTaskIdentity?,
-        nowUptimeMs: Long = SystemClock.uptimeMillis(),
+        nowElapsedRealtimeMs: Long = SystemClock.elapsedRealtime(),
     ): Boolean = shouldDeliverVoiceRetrigger(
         pending = pending,
         identity = identity,
@@ -1042,20 +1042,20 @@ class MainScreenAssistVoiceRoutingTest {
         navLoading = false,
         viewedSessionId = null,
         drawerState = gateDrawer(),
-        nowUptimeMs = nowUptimeMs,
+        nowElapsedRealtimeMs = nowElapsedRealtimeMs,
     )
 
     @Test
     fun shouldDeliverVoiceRetrigger_nullIdentity_returnsFalse() {
-        val now = SystemClock.uptimeMillis()
+        val now = SystemClock.elapsedRealtime()
         val pending = PendingVoiceRetrigger(7L, 10, 7L, now)
 
-        assertEquals(false, gateRetrigger(pending, identity = null, nowUptimeMs = now))
+        assertEquals(false, gateRetrigger(pending, identity = null, nowElapsedRealtimeMs = now))
     }
 
     @Test
     fun shouldDeliverVoiceRetrigger_taskMismatch_returnsFalse() {
-        val now = SystemClock.uptimeMillis()
+        val now = SystemClock.elapsedRealtime()
         val pending = PendingVoiceRetrigger(7L, 10, 7L, now)
 
         assertEquals(false, gateRetrigger(pending, VoiceTaskIdentity(11, 7L), now))
@@ -1063,7 +1063,7 @@ class MainScreenAssistVoiceRoutingTest {
 
     @Test
     fun shouldDeliverVoiceRetrigger_sessionInstanceMismatch_returnsFalse() {
-        val now = SystemClock.uptimeMillis()
+        val now = SystemClock.elapsedRealtime()
         val pending = PendingVoiceRetrigger(7L, 10, 7L, now)
 
         assertEquals(false, gateRetrigger(pending, VoiceTaskIdentity(10, 99L), now))
@@ -1071,7 +1071,7 @@ class MainScreenAssistVoiceRoutingTest {
 
     @Test
     fun shouldDeliverVoiceRetrigger_negativeAge_returnsFalse() {
-        val now = SystemClock.uptimeMillis()
+        val now = SystemClock.elapsedRealtime()
         // Entry issued in the future (clock skew/bogus timestamp) must never be delivered.
         val pending = PendingVoiceRetrigger(7L, 10, 7L, now + 60_000L)
 
@@ -1080,7 +1080,7 @@ class MainScreenAssistVoiceRoutingTest {
 
     @Test
     fun shouldDeliverVoiceRetrigger_ageExactlyTtl_returnsTrue() {
-        val now = SystemClock.uptimeMillis()
+        val now = SystemClock.elapsedRealtime()
         val pending = PendingVoiceRetrigger(7L, 10, 7L, now - VoiceHandoffContract.RETRIGGER_TTL_MS)
 
         assertEquals(true, gateRetrigger(pending, VoiceTaskIdentity(10, 7L), now))
@@ -1088,7 +1088,7 @@ class MainScreenAssistVoiceRoutingTest {
 
     @Test
     fun shouldDeliverVoiceRetrigger_ageTtlPlusOne_returnsFalse() {
-        val now = SystemClock.uptimeMillis()
+        val now = SystemClock.elapsedRealtime()
         val pending = PendingVoiceRetrigger(7L, 10, 7L, now - VoiceHandoffContract.RETRIGGER_TTL_MS - 1)
 
         assertEquals(false, gateRetrigger(pending, VoiceTaskIdentity(10, 7L), now))

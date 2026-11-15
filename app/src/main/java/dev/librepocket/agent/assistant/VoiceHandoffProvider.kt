@@ -47,7 +47,7 @@ class VoiceHandoffProvider : ContentProvider() {
                 val token = b.getLong(VoiceHandoffContract.KEY_TOKEN, 0L)
                 val targetTaskId = b.getInt(VoiceHandoffContract.KEY_TARGET_TASK_ID, -1)
                 val sessionInstanceId = b.getLong(VoiceHandoffContract.KEY_SESSION_INSTANCE_ID, 0L)
-                val issued = b.getLong(VoiceHandoffContract.KEY_ISSUED_UPTIME_MS, 0L)
+                val issued = b.getLong(VoiceHandoffContract.KEY_ISSUED_ELAPSED_REALTIME_MS, 0L)
                 // Bundle.EMPTY only when the publish was actually stored; a null ack means
                 // "not stored" so the caller can retry instead of believing a dead token lives.
                 if (publish(PendingVoiceRetrigger(token, targetTaskId, sessionInstanceId, issued))) {
@@ -86,7 +86,7 @@ class VoiceHandoffProvider : ContentProvider() {
                 val p = _pending.value
                 // Same TTL gate as consume: an expired (or clock-skewed) entry must not leak
                 // its token payload to peekers; report it as absent instead.
-                val age = p?.let { SystemClock.uptimeMillis() - it.issuedUptimeMs }
+                val age = p?.let { SystemClock.elapsedRealtime() - it.issuedElapsedRealtimeMs }
                 if (age != null && (age < 0 || age > VoiceHandoffContract.RETRIGGER_TTL_MS)) {
                     Bundle.EMPTY
                 } else {
@@ -95,7 +95,7 @@ class VoiceHandoffProvider : ContentProvider() {
                             putLong(VoiceHandoffContract.KEY_TOKEN, p.token)
                             putInt(VoiceHandoffContract.KEY_TARGET_TASK_ID, p.targetTaskId)
                             putLong(VoiceHandoffContract.KEY_SESSION_INSTANCE_ID, p.sessionInstanceId)
-                            putLong(VoiceHandoffContract.KEY_ISSUED_UPTIME_MS, p.issuedUptimeMs)
+                            putLong(VoiceHandoffContract.KEY_ISSUED_ELAPSED_REALTIME_MS, p.issuedElapsedRealtimeMs)
                         }
                     }
                 }
@@ -113,9 +113,9 @@ class VoiceHandoffProvider : ContentProvider() {
     companion object {
         private val _pending = MutableStateFlow<PendingVoiceRetrigger?>(null)
         val pending: StateFlow<PendingVoiceRetrigger?> = _pending.asStateFlow()
-        // Seeded from monotonic uptime so tokens stay monotonic across :voice-process restarts
+        // Seeded from monotonic elapsed realtime so tokens stay monotonic across :voice-process restarts
         // (a fresh process must not re-issue token 1 and collide with/impersonate a live token).
-        // (uptime shl 12) keeps bounded headroom below Long overflow and starts odd; any residual
+        // (elapsed realtime shl 12) keeps bounded headroom below Long overflow and starts odd; any residual
         // collision is harmless because delivery is sid-bound and TTL-limited.
         private val seq = AtomicLong((SystemClock.elapsedRealtime() shl 12) or 1L)
 
@@ -139,7 +139,7 @@ class VoiceHandoffProvider : ContentProvider() {
             if (sessionInstanceId != Long.MIN_VALUE && cur.sessionInstanceId != sessionInstanceId) return false
             // TTL: an expired retrigger must never fire STT; drop it on consume attempt.
             // Negative age (clock skew / bogus issued timestamp) is treated as expired too.
-            val age = SystemClock.uptimeMillis() - cur.issuedUptimeMs
+            val age = SystemClock.elapsedRealtime() - cur.issuedElapsedRealtimeMs
             if (age < 0 || age > VoiceHandoffContract.RETRIGGER_TTL_MS) {
                 _pending.value = null
                 return false

@@ -44,14 +44,14 @@ class VoiceHandoffProviderTest {
             attachInfo(appContext, ProviderInfo().apply { authority = "${appContext.packageName}.voice.handoff" })
         }
 
-    private fun publish(token: Long, targetTaskId: Int = 10, sessionInstanceId: Long = 7L, issuedUptimeMs: Long = SystemClock.uptimeMillis()) {
+    private fun publish(token: Long, targetTaskId: Int = 10, sessionInstanceId: Long = 7L, issuedElapsedRealtimeMs: Long = SystemClock.elapsedRealtime()) {
         assertTrue(
             VoiceHandoffProvider.publish(
                 PendingVoiceRetrigger(
                     token = token,
                     targetTaskId = targetTaskId,
                     sessionInstanceId = sessionInstanceId,
-                    issuedUptimeMs = issuedUptimeMs,
+                    issuedElapsedRealtimeMs = issuedElapsedRealtimeMs,
                 ),
             ),
         )
@@ -118,7 +118,7 @@ class VoiceHandoffProviderTest {
                     putLong(VoiceHandoffContract.KEY_TOKEN, badToken)
                     putInt(VoiceHandoffContract.KEY_TARGET_TASK_ID, 10)
                     putLong(VoiceHandoffContract.KEY_SESSION_INSTANCE_ID, 7L)
-                    putLong(VoiceHandoffContract.KEY_ISSUED_UPTIME_MS, SystemClock.uptimeMillis())
+                    putLong(VoiceHandoffContract.KEY_ISSUED_ELAPSED_REALTIME_MS, SystemClock.elapsedRealtime())
                 },
             )
             assertNull("token $badToken must be rejected", ack)
@@ -129,7 +129,7 @@ class VoiceHandoffProviderTest {
     @Test
     fun callPublish_withValidBundle_acksAndPeekRoundTrips() {
         val provider = newAttachedProvider()
-        val issued = SystemClock.uptimeMillis() - 1234L
+        val issued = SystemClock.elapsedRealtime() - 1234L
 
         val ack = provider.call(
             VoiceHandoffContract.METHOD_PUBLISH,
@@ -138,7 +138,7 @@ class VoiceHandoffProviderTest {
                 putLong(VoiceHandoffContract.KEY_TOKEN, 4242L)
                 putInt(VoiceHandoffContract.KEY_TARGET_TASK_ID, 10)
                 putLong(VoiceHandoffContract.KEY_SESSION_INSTANCE_ID, 7L)
-                putLong(VoiceHandoffContract.KEY_ISSUED_UPTIME_MS, issued)
+                putLong(VoiceHandoffContract.KEY_ISSUED_ELAPSED_REALTIME_MS, issued)
             },
         )
 
@@ -147,19 +147,19 @@ class VoiceHandoffProviderTest {
         assertEquals(4242L, peek.getLong(VoiceHandoffContract.KEY_TOKEN))
         assertEquals(10, peek.getInt(VoiceHandoffContract.KEY_TARGET_TASK_ID))
         assertEquals(7L, peek.getLong(VoiceHandoffContract.KEY_SESSION_INSTANCE_ID))
-        assertEquals(issued, peek.getLong(VoiceHandoffContract.KEY_ISSUED_UPTIME_MS))
+        assertEquals(issued, peek.getLong(VoiceHandoffContract.KEY_ISSUED_ELAPSED_REALTIME_MS))
     }
 
     @Test
     fun peekExpired_returnsEmptyBundle() {
-        val now = SystemClock.uptimeMillis()
-        publish(950L, targetTaskId = 10, sessionInstanceId = 7L, issuedUptimeMs = now)
+        val now = SystemClock.elapsedRealtime()
+        publish(950L, targetTaskId = 10, sessionInstanceId = 7L, issuedElapsedRealtimeMs = now)
 
         val freshPeek = newAttachedProvider().call(VoiceHandoffContract.METHOD_PEEK, null, null)!!
         assertTrue(freshPeek.containsKey(VoiceHandoffContract.KEY_TOKEN))
         assertEquals(950L, freshPeek.getLong(VoiceHandoffContract.KEY_TOKEN))
 
-        publish(951L, targetTaskId = 10, sessionInstanceId = 7L, issuedUptimeMs = SystemClock.uptimeMillis() - VoiceHandoffContract.RETRIGGER_TTL_MS - 1)
+        publish(951L, targetTaskId = 10, sessionInstanceId = 7L, issuedElapsedRealtimeMs = SystemClock.elapsedRealtime() - VoiceHandoffContract.RETRIGGER_TTL_MS - 1)
 
         val expiredPeek = newAttachedProvider().call(VoiceHandoffContract.METHOD_PEEK, null, null)!!
         assertEquals(0L, expiredPeek.getLong(VoiceHandoffContract.KEY_TOKEN, 0L))
@@ -169,8 +169,8 @@ class VoiceHandoffProviderTest {
 
     @Test
     fun consume_expiredBeyondTtl_returnsFalseAndDropsEntry() {
-        val now = SystemClock.uptimeMillis()
-        publish(900L, targetTaskId = 10, sessionInstanceId = 7L, issuedUptimeMs = now - VoiceHandoffContract.RETRIGGER_TTL_MS - 1)
+        val now = SystemClock.elapsedRealtime()
+        publish(900L, targetTaskId = 10, sessionInstanceId = 7L, issuedElapsedRealtimeMs = now - VoiceHandoffContract.RETRIGGER_TTL_MS - 1)
 
         val ack = consumeBundle(900L, targetTaskId = 10, sessionInstanceId = 7L)
 
@@ -180,16 +180,16 @@ class VoiceHandoffProviderTest {
 
     @Test
     fun consume_ageExactlyTtl_returnsTrue() {
-        val now = SystemClock.uptimeMillis()
-        publish(901L, targetTaskId = 10, sessionInstanceId = 7L, issuedUptimeMs = now - VoiceHandoffContract.RETRIGGER_TTL_MS)
+        val now = SystemClock.elapsedRealtime()
+        publish(901L, targetTaskId = 10, sessionInstanceId = 7L, issuedElapsedRealtimeMs = now - VoiceHandoffContract.RETRIGGER_TTL_MS)
 
         assertTrue(VoiceHandoffProvider.consume(901L, 10, 7L))
     }
 
     @Test
     fun consume_negativeAge_returnsFalseAndDropsEntry() {
-        val now = SystemClock.uptimeMillis()
-        publish(902L, targetTaskId = 10, sessionInstanceId = 7L, issuedUptimeMs = now + 60_000L)
+        val now = SystemClock.elapsedRealtime()
+        publish(902L, targetTaskId = 10, sessionInstanceId = 7L, issuedElapsedRealtimeMs = now + 60_000L)
 
         assertFalse(VoiceHandoffProvider.consume(902L, 10, 7L))
         assertNull(VoiceHandoffProvider.pending.value)

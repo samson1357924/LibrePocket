@@ -11,8 +11,8 @@ import java.util.concurrent.atomic.AtomicLong
 
 private const val TAG = "LibreVoiceSession"
 private const val DUPLICATE_SHOW_DEBOUNCE_MS = 350L
-// Seeded from monotonic uptime so session instance ids stay monotonic across :voice-process
-// restarts. (uptime shl 12) keeps bounded headroom below Long overflow and starts odd; any
+// Seeded from monotonic elapsed realtime so session instance ids stay monotonic across :voice-process
+// restarts. (elapsed realtime shl 12) keeps bounded headroom below Long overflow and starts odd; any
 // residual collision is harmless because delivery is sid-bound and TTL-limited.
 private val SESSION_INSTANCE_SEQ = AtomicLong((SystemClock.elapsedRealtime() shl 12) or 1L)
 
@@ -74,7 +74,7 @@ open class LibreVoiceInteractionSession(context: Context) : VoiceInteractionSess
         { c, t, s -> AssistantVoiceHandoff.requestRetrigger(c, t, s) }
 
     @Volatile
-    private var lastAcceptedShowUptimeMs: Long = 0L
+    private var lastAcceptedShowElapsedRealtimeMs: Long = 0L
 
     /**
      * Activity-only 流程（人類 review #5 session UI）：關預設 voice UI window，
@@ -87,7 +87,7 @@ open class LibreVoiceInteractionSession(context: Context) : VoiceInteractionSess
 
     override fun onShow(args: Bundle?, showFlags: Int) {
         super.onShow(args, showFlags)
-        val now = SystemClock.uptimeMillis()
+        val now = SystemClock.elapsedRealtime()
 
         // Initial launch is still pending task binding: suppress duplicate dispatch/start.
         if (launchPending && activeTaskId == null) {
@@ -98,10 +98,10 @@ open class LibreVoiceInteractionSession(context: Context) : VoiceInteractionSess
         // existing task/activity (single-flight). Do NOT call startVoiceActivity again (F2: it would
         // create a new dedicated voice task). Publish a cross-process, target-bound token (F1).
         if (activeTaskId != null) {
-            if (now - lastAcceptedShowUptimeMs < DUPLICATE_SHOW_DEBOUNCE_MS) {
+            if (now - lastAcceptedShowElapsedRealtimeMs < DUPLICATE_SHOW_DEBOUNCE_MS) {
                 return
             }
-            lastAcceptedShowUptimeMs = now
+            lastAcceptedShowElapsedRealtimeMs = now
             try {
                 val token = retriggerPublisher(
                     context,
@@ -112,14 +112,14 @@ open class LibreVoiceInteractionSession(context: Context) : VoiceInteractionSess
                     Log.w(TAG, "voice retrigger publish failed; allowing immediate retry gesture")
                     // Allow an immediate retry gesture. A failed publish must not wipe an older
                     // pending one-shot token from the same session cycle.
-                    lastAcceptedShowUptimeMs = 0L
+                    lastAcceptedShowElapsedRealtimeMs = 0L
                 }
             } catch (e: Exception) {
                 // Defensive: requestRetrigger already logs and returns 0L on failure; keep the throw path safe.
                 Log.w(TAG, "voice retrigger handoff publish failed; keeping active task", e)
                 // Allow an immediate retry gesture. A failed publish must not wipe an older
                 // pending one-shot token from the same session cycle.
-                lastAcceptedShowUptimeMs = 0L
+                lastAcceptedShowElapsedRealtimeMs = 0L
             }
             return
         }
@@ -132,7 +132,7 @@ open class LibreVoiceInteractionSession(context: Context) : VoiceInteractionSess
         // entries from prior dead cycles, and may also drop a <TTL prior-cycle token whose voice task
         // survived a :voice-process loss; that is intended fail-closed convergence (retrigger is one-shot).
         AssistantVoiceHandoff.clear(context)
-        lastAcceptedShowUptimeMs = now
+        lastAcceptedShowElapsedRealtimeMs = now
         try {
             startVoiceActivity(buildVoiceAssistIntent())
             // Launch accepted but task not yet started; wait for onTaskStarted to bind taskId.

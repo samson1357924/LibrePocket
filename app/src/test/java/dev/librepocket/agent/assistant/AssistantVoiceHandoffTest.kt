@@ -8,7 +8,12 @@ import android.database.Cursor
 import android.net.Uri
 import android.os.Bundle
 import android.os.SystemClock
+import androidx.compose.material3.DrawerState
+import androidx.compose.material3.DrawerValue
 import androidx.test.core.app.ApplicationProvider
+import dev.librepocket.agent.ui.Routes
+import dev.librepocket.agent.ui.shouldDeliverVoiceRetrigger
+import java.time.Duration
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -127,14 +132,14 @@ class AssistantVoiceHandoffTest {
         override fun update(uri: Uri, values: ContentValues?, selection: String?, selectionArgs: Array<out String>?): Int = 0
     }
 
-    private fun seedPending(token: Long, issuedUptimeMs: Long, targetTaskId: Int = 10, sessionInstanceId: Long = 7L) {
+    private fun seedPending(token: Long, issuedElapsedRealtimeMs: Long, targetTaskId: Int = 10, sessionInstanceId: Long = 7L) {
         assertTrue(
             VoiceHandoffProvider.publish(
                 PendingVoiceRetrigger(
                     token = token,
                     targetTaskId = targetTaskId,
                     sessionInstanceId = sessionInstanceId,
-                    issuedUptimeMs = issuedUptimeMs,
+                    issuedElapsedRealtimeMs = issuedElapsedRealtimeMs,
                 ),
             ),
         )
@@ -156,7 +161,7 @@ class AssistantVoiceHandoffTest {
     fun requestRetrigger_failure_returnsZero_andLeavesSameCycleOlderToken() {
         // Pre-seed an older pending entry from the same session cycle (10/7L, different token);
         // the failure cleanup must not wipe it.
-        seedPending(token = 999L, issuedUptimeMs = SystemClock.uptimeMillis(), targetTaskId = 10, sessionInstanceId = 7L)
+        seedPending(token = 999L, issuedElapsedRealtimeMs = SystemClock.elapsedRealtime(), targetTaskId = 10, sessionInstanceId = 7L)
 
         // Probe-verified: registering a replacement provider under the manifest authority replaces
         // dispatch, so this models "IPC blew up" deterministically for the publish call.
@@ -176,7 +181,7 @@ class AssistantVoiceHandoffTest {
     fun requestRetrigger_nullAck_returnsZero_andLeavesSameCycleOlderToken() {
         // Pre-seed an older pending entry from the same session cycle (10/7L, different token);
         // the null-ack cleanup must not wipe it.
-        seedPending(token = 999L, issuedUptimeMs = SystemClock.uptimeMillis(), targetTaskId = 10, sessionInstanceId = 7L)
+        seedPending(token = 999L, issuedElapsedRealtimeMs = SystemClock.elapsedRealtime(), targetTaskId = 10, sessionInstanceId = 7L)
 
         // Probe-verified: registering a replacement provider under the manifest authority replaces
         // dispatch, so this models "publish with no ack" deterministically for the publish call.
@@ -194,20 +199,20 @@ class AssistantVoiceHandoffTest {
 
     @Test
     fun currentPending_filtersExpiredAndFutureEntries() {
-        val now = SystemClock.uptimeMillis()
+        val now = SystemClock.elapsedRealtime()
 
         // Expired (older than RETRIGGER_TTL_MS).
-        seedPending(token = 1L, issuedUptimeMs = now - VoiceHandoffContract.RETRIGGER_TTL_MS - 1)
+        seedPending(token = 1L, issuedElapsedRealtimeMs = now - VoiceHandoffContract.RETRIGGER_TTL_MS - 1)
         assertNull(AssistantVoiceHandoff.currentPending(appContext))
 
         // Future-dated (clock skew / bogus timestamp): negative age, treated as absent.
         VoiceHandoffProvider.resetForTest()
-        seedPending(token = 2L, issuedUptimeMs = SystemClock.uptimeMillis() + 5_000L)
+        seedPending(token = 2L, issuedElapsedRealtimeMs = SystemClock.elapsedRealtime() + 5_000L)
         assertNull(AssistantVoiceHandoff.currentPending(appContext))
 
         // Fresh entry within TTL: visible.
         VoiceHandoffProvider.resetForTest()
-        seedPending(token = 3L, issuedUptimeMs = SystemClock.uptimeMillis())
+        seedPending(token = 3L, issuedElapsedRealtimeMs = SystemClock.elapsedRealtime())
         assertEquals(3L, AssistantVoiceHandoff.currentPending(appContext)?.token)
     }
 
@@ -273,7 +278,7 @@ class AssistantVoiceHandoffTest {
         // minimum (post-CAS METHOD_CLEAR). This is an intentional lock, not an accident: if a
         // future change adds any provider call to the success path, this test must fail.
         // Pre-seed a fresh pending entry (companion publish is in-process, no IPC).
-        seedPending(token = 999L, issuedUptimeMs = SystemClock.uptimeMillis(), targetTaskId = 10, sessionInstanceId = 7L)
+        seedPending(token = 999L, issuedElapsedRealtimeMs = SystemClock.elapsedRealtime(), targetTaskId = 10, sessionInstanceId = 7L)
 
         val counting = CountingProvider()
         swapHandoffProvider(counting)
@@ -287,13 +292,13 @@ class AssistantVoiceHandoffTest {
 
     @Test
     fun currentPending_ageExactlyTtl_returnsEntry() {
-        seedPending(token = 555L, issuedUptimeMs = SystemClock.uptimeMillis() - VoiceHandoffContract.RETRIGGER_TTL_MS)
+        seedPending(token = 555L, issuedElapsedRealtimeMs = SystemClock.elapsedRealtime() - VoiceHandoffContract.RETRIGGER_TTL_MS)
         val pending = AssistantVoiceHandoff.currentPending(appContext)
         assertNotNull("entry aged exactly TTL is still valid", pending)
         assertEquals(555L, pending?.token)
 
         VoiceHandoffProvider.resetForTest()
-        seedPending(token = 556L, issuedUptimeMs = SystemClock.uptimeMillis() - VoiceHandoffContract.RETRIGGER_TTL_MS - 1)
+        seedPending(token = 556L, issuedElapsedRealtimeMs = SystemClock.elapsedRealtime() - VoiceHandoffContract.RETRIGGER_TTL_MS - 1)
         assertNull("entry aged TTL+1 is expired", AssistantVoiceHandoff.currentPending(appContext))
     }
 
@@ -303,7 +308,7 @@ class AssistantVoiceHandoffTest {
         // Provider arm: seed a live entry first; a zero-token consume must fail without touching it.
         assertTrue(
             VoiceHandoffProvider.publish(
-                PendingVoiceRetrigger(555L, 10, 7L, SystemClock.uptimeMillis()),
+                PendingVoiceRetrigger(555L, 10, 7L, SystemClock.elapsedRealtime()),
             ),
         )
         assertFalse(VoiceHandoffProvider.consume(0L, 10, 7L))
@@ -312,10 +317,71 @@ class AssistantVoiceHandoffTest {
 
     @Test
     fun consume_withSeededExpiredEntry_returnsFalseAndDropsEntry() {
-        val now = SystemClock.uptimeMillis()
-        seedPending(token = 777L, issuedUptimeMs = now - VoiceHandoffContract.RETRIGGER_TTL_MS - 1)
+        val now = SystemClock.elapsedRealtime()
+        seedPending(token = 777L, issuedElapsedRealtimeMs = now - VoiceHandoffContract.RETRIGGER_TTL_MS - 1)
 
         assertFalse(AssistantVoiceHandoff.consume(777L, appContext, targetTaskId = 10, sessionInstanceId = 7L))
+        assertNull("expired entry must be dropped on consume attempt", VoiceHandoffProvider.pending.value)
+    }
+
+    // F3: the retrigger TTL is measured on monotonic elapsed realtime, which includes deep
+    // sleep, while uptimeMillis does not. An over-TTL entry must fail every expiry gate after
+    // the device slept — even though only 100 ms of awake time elapsed — and a fresh entry must
+    // survive the same 100 ms awake advance (control). Deltas are asserted instead of absolute
+    // clock values so the test does not depend on the shadow clock's base offset.
+    @Test
+    fun deepSleep_expiresEntryOnAllGates_onlyAwakeTimeCountsTowardUptime() {
+        // Control: fresh entry + 100 ms of awake advance is still deliverable on the gate.
+        VoiceHandoffProvider.resetForTest()
+        seedPending(token = 4321L, issuedElapsedRealtimeMs = SystemClock.elapsedRealtime(), targetTaskId = 10, sessionInstanceId = 7L)
+        ShadowSystemClock.advanceBy(Duration.ofMillis(100))
+        val controlPending = VoiceHandoffProvider.pending.value
+        assertEquals(true, shouldDeliverVoiceRetrigger(
+            pending = controlPending,
+            identity = VoiceTaskIdentity(10, 7L),
+            currentRoute = Routes.CHAT,
+            hasEndpoint = true,
+            navLoading = false,
+            viewedSessionId = null,
+            drawerState = DrawerState(initialValue = DrawerValue.Closed, confirmStateChange = { true }),
+        ))
+        assertTrue(AssistantVoiceHandoff.consume(4321L, appContext, targetTaskId = 10, sessionInstanceId = 7L))
+
+        // Deep sleep: 30 minutes of wall/realtime pass while uptime only advances by the 100 ms
+        // of awake time. Token TTL (10 s) is blown for elapsed realtime but not for uptime.
+        VoiceHandoffProvider.resetForTest()
+        val uptimeBefore = SystemClock.uptimeMillis()
+        val realtimeBefore = SystemClock.elapsedRealtime()
+        seedPending(token = 9876L, issuedElapsedRealtimeMs = SystemClock.elapsedRealtime(), targetTaskId = 10, sessionInstanceId = 7L)
+        ShadowSystemClock.advanceBy(Duration.ofMillis(100))
+        ShadowSystemClock.simulateDeepSleep(Duration.ofMinutes(30))
+        assertEquals("uptime must only advance while awake", 100L, SystemClock.uptimeMillis() - uptimeBefore)
+        assertEquals(
+            "elapsed realtime must include the deep-sleep interval",
+            100L + Duration.ofMinutes(30).toMillis(),
+            SystemClock.elapsedRealtime() - realtimeBefore,
+        )
+
+        // Every expiry gate agrees the entry is expired. currentPending/peek run BEFORE consume so
+        // they exercise their own TTL filters against the still-present entry; the delivery gate is
+        // evaluated against the entry snapshot (the provider keeps it until consume drops it).
+        val pendingSnapshot = VoiceHandoffProvider.pending.value
+        assertNotNull("entry must still be present after deep sleep (deep-sleep gate, not absence)", pendingSnapshot)
+        assertFalse(
+            "expired entry must not be deliverable",
+            shouldDeliverVoiceRetrigger(
+                pending = pendingSnapshot,
+                identity = VoiceTaskIdentity(10, 7L),
+                currentRoute = Routes.CHAT,
+                hasEndpoint = true,
+                navLoading = false,
+                viewedSessionId = null,
+                drawerState = DrawerState(initialValue = DrawerValue.Closed, confirmStateChange = { true }),
+            ),
+        )
+        assertNull("currentPending must filter the deep-sleep-expired entry", AssistantVoiceHandoff.currentPending(appContext))
+        assertEquals("peek must report the deep-sleep-expired entry as absent", 0L, AssistantVoiceHandoff.peek(appContext))
+        assertFalse("consume must reject the deep-sleep-expired entry", AssistantVoiceHandoff.consume(9876L, targetTaskId = 10, sessionInstanceId = 7L))
         assertNull("expired entry must be dropped on consume attempt", VoiceHandoffProvider.pending.value)
     }
 }

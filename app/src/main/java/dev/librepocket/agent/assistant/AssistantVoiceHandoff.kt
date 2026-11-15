@@ -42,7 +42,7 @@ object AssistantVoiceHandoff {
         // TTL filter: expired (or clock-skewed, negative-age) retriggers are treated as absent
         // (callers clear; never delivered).
         if (resolved != null) {
-            val age = SystemClock.uptimeMillis() - resolved.issuedUptimeMs
+            val age = SystemClock.elapsedRealtime() - resolved.issuedElapsedRealtimeMs
             if (age < 0 || age > VoiceHandoffContract.RETRIGGER_TTL_MS) {
                 return null
             }
@@ -68,7 +68,7 @@ object AssistantVoiceHandoff {
             token = token,
             targetTaskId = targetTaskId,
             sessionInstanceId = sessionInstanceId,
-            issuedUptimeMs = SystemClock.uptimeMillis(),
+            issuedElapsedRealtimeMs = SystemClock.elapsedRealtime(),
         )
         // Cross-process publish is authoritative (the provider's call() handler stores it).
         // No local mirror: a failed IPC must never look like a successful handoff (the caller
@@ -168,7 +168,7 @@ object AssistantVoiceHandoff {
         putLong(VoiceHandoffContract.KEY_TOKEN, token)
         putInt(VoiceHandoffContract.KEY_TARGET_TASK_ID, targetTaskId)
         putLong(VoiceHandoffContract.KEY_SESSION_INSTANCE_ID, sessionInstanceId)
-        putLong(VoiceHandoffContract.KEY_ISSUED_UPTIME_MS, issuedUptimeMs)
+        putLong(VoiceHandoffContract.KEY_ISSUED_ELAPSED_REALTIME_MS, issuedElapsedRealtimeMs)
     }
 
     private fun Bundle.toPending(): PendingVoiceRetrigger? {
@@ -178,7 +178,7 @@ object AssistantVoiceHandoff {
             token = token,
             targetTaskId = getInt(VoiceHandoffContract.KEY_TARGET_TASK_ID, -1),
             sessionInstanceId = getLong(VoiceHandoffContract.KEY_SESSION_INSTANCE_ID, 0L),
-            issuedUptimeMs = getLong(VoiceHandoffContract.KEY_ISSUED_UPTIME_MS, 0L),
+            issuedElapsedRealtimeMs = getLong(VoiceHandoffContract.KEY_ISSUED_ELAPSED_REALTIME_MS, 0L),
         )
     }
 

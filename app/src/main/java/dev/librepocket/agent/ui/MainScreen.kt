@@ -552,7 +552,7 @@ internal fun RetriggerStaleClearEffect(
         if (id == null || id.taskId != p.targetTaskId || id.sessionInstanceId != p.sessionInstanceId) {
             return@LaunchedEffect
         }
-        val age = SystemClock.uptimeMillis() - p.issuedUptimeMs
+        val age = SystemClock.elapsedRealtime() - p.issuedElapsedRealtimeMs
         val stale = age < 0 || age > VoiceHandoffContract.RETRIGGER_TTL_MS
         if (stale || (!navLoading && !hasEndpoint)) {
             AssistantVoiceHandoff.clear(context = context, targetTaskId = p.targetTaskId, sessionInstanceId = p.sessionInstanceId, token = p.token)
@@ -624,13 +624,13 @@ internal fun shouldDeliverVoiceRetrigger(
     navLoading: Boolean,
     viewedSessionId: String?,
     drawerState: DrawerState,
-    nowUptimeMs: Long = SystemClock.uptimeMillis(),
+    nowElapsedRealtimeMs: Long = SystemClock.elapsedRealtime(),
 ): Boolean =
     pending != null &&
         identity != null &&
         identity.taskId == pending.targetTaskId &&
         identity.sessionInstanceId == pending.sessionInstanceId &&
-        nowUptimeMs - pending.issuedUptimeMs in 0..VoiceHandoffContract.RETRIGGER_TTL_MS &&
+        nowElapsedRealtimeMs - pending.issuedElapsedRealtimeMs in 0..VoiceHandoffContract.RETRIGGER_TTL_MS &&
         chatSafeBoundary(currentRoute, hasEndpoint, navLoading, viewedSessionId, drawerState)
 
 /**

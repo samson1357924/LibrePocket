@@ -439,7 +439,10 @@ class ShizukuShellRunner(
         }
         when (grant) {
             is GrantCheck.Valid -> Unit
-            is GrantCheck.Invalid -> return ElevatedBinaryResult.Denied(ShellDeny.NOT_WHITELISTED, grant.reason)
+            is GrantCheck.Invalid -> return ElevatedBinaryResult.Denied(
+                ShellDeny.NOT_WHITELISTED,
+                Redactor.redactError(grant.reason).take(128),
+            )
         }
         // U1 執行門：activation 未就緒即 Denied 且零 spawn；抛異常同樣
         // fail-closed Denied 且零 spawn（B3 有界同上）。
@@ -501,7 +504,10 @@ class ShizukuShellRunner(
             }
             when (reGrant) {
                 is GrantCheck.Valid -> Unit
-                is GrantCheck.Invalid -> return ElevatedBinaryResult.Denied(ShellDeny.NOT_WHITELISTED, reGrant.reason)
+                is GrantCheck.Invalid -> return ElevatedBinaryResult.Denied(
+                    ShellDeny.NOT_WHITELISTED,
+                    Redactor.redactError(reGrant.reason).take(128),
+                )
             }
             val reActivatedRes = ElevatedCallSupervisor.awaitPreSpawn(deadlineNanos, isCancelled) { activationCheck() }
             val reActivated = when (reActivatedRes) {

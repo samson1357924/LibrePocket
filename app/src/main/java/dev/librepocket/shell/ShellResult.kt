@@ -34,9 +34,13 @@ sealed interface ShellResult {
      *   由編譯器隨新欄自動更新——與提權側 `ByteArray` 承載不同，本型別全為
      *   `String`／ primitives，data class 語義即正確，無需手寫）：
      *   true＝飽和零 thread（全域 backlog 存在）／process 段 worker 在 grace 後仍
-     *   存活（linger daemon）／tail 未排空（would-be Ok 升級）；false＝entry 期滿
-     *   零 worker／spawn 前預檢期滿（未 spawn，無需清理）／runner 內 kill 已執行
-     *   且已收斂（殘留只剩有界 gobbler tail，見 `outputIncomplete` 升級路徑）。
+     *   存活（linger daemon）／tail 未排空（would-be Ok 升級）／`hasLinger` 或
+     *   `outstanding()>0`（任何 preSpawnLinger 映射）；false＝僅在
+     *   `!expiredHasLinger && outstanding()==0` 時成立（spawn 前 preflight 入口
+     *   零 budget 字面 `false`，零 worker／無殘留；其餘——含 quota 後顯式過期、
+     *   cancel 門 `Ok(true)`／中斷臂——皆經 `ElevatedRunnerCommon.preSpawnLinger(false)`
+     *   且全域無殘留）／runner 內 kill 已執行且已收斂（殘留只剩有界 gobbler
+     *   tail，見 `outputIncomplete` 升級路徑）。
      * - 審計：[dev.librepocket.shell.PrivilegeAuditLog.verdictName] 仍映 `TIMEOUT`
      *  （verdict 不變；linger 細節不在審計表，見該表 B3 TODO）。
      */

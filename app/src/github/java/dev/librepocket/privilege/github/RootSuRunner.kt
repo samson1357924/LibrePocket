@@ -471,7 +471,10 @@ class RootSuRunner(
         }
         when (grant) {
             is GrantCheck.Valid -> Unit
-            is GrantCheck.Invalid -> return ElevatedBinaryResult.Denied(ShellDeny.NOT_WHITELISTED, grant.reason)
+            is GrantCheck.Invalid -> return ElevatedBinaryResult.Denied(
+                ShellDeny.NOT_WHITELISTED,
+                Redactor.redactError(grant.reason).take(128),
+            )
         }
         // U1 執行門：activation 未就緒即 Denied 且零 spawn；抛異常同樣
         // fail-closed Denied 且零 spawn（不碰 su 解析/quota/spawn；B3 有界同上）。
@@ -541,7 +544,10 @@ class RootSuRunner(
             }
             when (reGrant) {
                 is GrantCheck.Valid -> Unit
-                is GrantCheck.Invalid -> return ElevatedBinaryResult.Denied(ShellDeny.NOT_WHITELISTED, reGrant.reason)
+                is GrantCheck.Invalid -> return ElevatedBinaryResult.Denied(
+                    ShellDeny.NOT_WHITELISTED,
+                    Redactor.redactError(reGrant.reason).take(128),
+                )
             }
             val reActivatedRes = ElevatedCallSupervisor.awaitPreSpawn(deadlineNanos, isCancelled) { activationCheck() }
             val reActivated = when (reActivatedRes) {
@@ -664,6 +670,7 @@ class RootSuRunner(
             val shellScript = if (root != null) {
                 "cd ${quoteArg(root)} && exec $inner"
             } else {
+                // mirror cwd arm：exec 取代 su 的 child shell，使 destroy 契約直達命令本體（信號可鎚）。
                 "exec $inner"
             }
             val wrapped = listOf(su, "-c", shellScript)

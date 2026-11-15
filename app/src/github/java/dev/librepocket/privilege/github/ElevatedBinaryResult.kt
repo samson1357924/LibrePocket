@@ -200,10 +200,14 @@ interface BinaryElevatedRunner : ElevatedShellRunner {
  *   watcher 殘留）：一切曾啟監督 worker 的逾期映射經
  *   `ElevatedRunnerCommon.preSpawnLinger` 判定（`hasLinger || outstanding>0`
  *   即 true）；`result=false` 與同 request `outstanding==1` 並存即為契約違反
- *   （舊 blocked entry 缺口，現已封）。worker 從未啟動的純 preflight
- *   （入口零 budget、quota 後顯式過期）保持 false（零新增殘留）；spawn 逾期
- *   沿既有 `hasLinger` 穿透（late Process 缺口）。取消門的 `Ok(true)`／`Err`
- *   （hook 抛）仍 false（門 worker 已正常回收）。
+ *   （舊 blocked entry 缺口，現已封）。`cleanupIncomplete=false` 僅在
+ *   `!expiredHasLinger && outstanding()==0` 時成立：二 runner（`RootSuRunner`／
+ *   `ShizukuShellRunner`，逐站點等價）於所有非 spawn `Err`／`Expired`／`Denied`
+ *   站點一律經 `ElevatedRunnerCommon.preSpawnLinger(x.hasLinger)` 映射旗標
+ *   （含 cancel 門／門 `Ok(true)`／中斷臂的 `preSpawnLinger(false)`、quota 後
+ *   顯式過期前門——`outstanding()>0` 仍覆蓋）；唯 spawn 前 preflight 入口零 budget
+ *   站點仍為字面 `false`（worker 從未啟動，零新增殘留）；spawn 逾期沿既有
+ *   `hasLinger` 穿透（late Process 缺口）。
  * - tail 取消／超時（R2-PhaseC P2-2）：finished（命令已 exit 0）但 tail 未排空
  *   （取消／deadline／tail budget 致 gobbler 中斷＋殘留，`Drained.tailIncomplete`）
  *   → `TimedOut`（攜 partial＋truncated＋cleanupIncomplete），不再回 Ok；

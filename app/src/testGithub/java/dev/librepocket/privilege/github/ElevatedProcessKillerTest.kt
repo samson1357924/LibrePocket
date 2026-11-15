@@ -58,12 +58,30 @@ class ElevatedProcessKillerTest {
             doomed = descendantPids(root)
             assertTrue("expected >=1 descendant, got $doomed", doomed.isNotEmpty())
 
+            val unattestedBefore = ElevatedProcessKiller.bodyDestroyUnattestedCount()
             ElevatedProcessKiller.killTree(root)
 
             assertTrue("parent should exit after killTree", root.waitFor(5, TimeUnit.SECONDS))
             assertFalse("parent should not be alive", root.isAlive)
             val survivors = pollAlive(doomed, 5_000L)
             assertTrue("descendants should all be dead, survivors=$survivors", survivors.isEmpty())
+            // F3（host-capability gated positive-path pin）：本 JVM 可 attest 本體
+            // （toHandle 可 invoke 且回傳非 null）⇒ 本體兩信號一律經 attested arm
+            // 發出，未經 attest 計數不前進；反射失敗／回傳 null ⇒ assume 跳過。
+            val attestable = try {
+                Process::class.java.getMethod("toHandle").invoke(root) != null
+            } catch (_: Throwable) {
+                null
+            }
+            assumeTrue(
+                "host JVM cannot attest body handle; skip positive-path pin",
+                attestable == true,
+            )
+            assertEquals(
+                "attested body signals must not count as unattested",
+                unattestedBefore,
+                ElevatedProcessKiller.bodyDestroyUnattestedCount(),
+            )
         } finally {
             runCatching { root.destroyForcibly() }
             // 精準收尾：只處理本次子孫 pid，不碰無關進程。
@@ -171,14 +189,9 @@ class ElevatedProcessKillerTest {
         // 已死（destroy 已生效或自然退出，第二個信號前）→ 跳過、不計診斷。
         assertFalse(ElevatedProcessKiller.pidReuseSignalAllowed(false, t0, t0))
         // bodyDestroyUnattestedCount：未經 attest 的本體信號計數（cannot-attest-at-all
-        // 平台專屬；#136-B3 device-acceptance checklist 項）。僅釘名稱／有界性，
-        // 不依賴具體讀數——killTreeDegradesToSingleKillWhenToHandleUnsupported 已在
-        // 同 JVM 觸發 unconditional 路徑（increment 2），讀數平台／測序相依，
-        // 故只斷言 >= 0。
-        assertTrue(
-            "bodyDestroyUnattestedCount must exist and be bounded >= 0",
-            ElevatedProcessKiller.bodyDestroyUnattestedCount() >= 0,
-        )
+        // 平台專屬；#136-B3 device-acceptance checklist 項）。具體讀數由
+        // killTreeOnNonAttestableFakeProcessDegradesToUnconditionalDestroyAndCounts
+        // 釘點（FakeProcess 兩信號 +2）；平台／測序相依不在此重複斷言。
     }
 
     @Test fun killTreeOnNonAttestableFakeProcessDegradesToUnconditionalDestroyAndCounts() {

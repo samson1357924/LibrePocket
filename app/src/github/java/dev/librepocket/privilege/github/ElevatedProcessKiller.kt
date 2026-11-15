@@ -241,6 +241,29 @@ object ElevatedProcessKiller {
     internal fun bodyPidReuseSkippedCount(): Int = bodyPidReuseSkipped.get()
 
     /**
+     * Stage 4（handle 信號被平台拒絕之診斷計數；telemetry-only，產品不讀取）：
+     * 經 `ProcessHandle.destroy()`／`destroyForcibly()` Method `invoke` 後布林回傳
+     * 為 `false`（EPERM／拒絕）之次數——「handle 信號失敗無聲」自此有計數出口。
+     * 僅真正 invoke 且回傳 `false` 才計：latch 抑制／已死跳過／未 invoke 的信號
+     * 不計；`invoke` 擲出（異常路徑，如中途死亡／競態）亦不計（非「拒絕」語義）。
+     * once per SIGNAL（子孫兩信號各一次＋本體 attested 臂各一次；unattested 退化
+     * 臂經 `process.destroy()`（void）不經此計）。
+     * 刻意 telemetry-only：不接 admission／verdict／breaker／計數歸因；
+     * 供 #136-B3 device-acceptance 清單讀取（與 [pidReuseSkippedCount] 同級純診斷）。
+     */
+    private val handleSignalRefused = AtomicInteger(0)
+
+    /** handle 信號被平台拒絕（Boolean=false）之次數快照（僅測試／診斷用；#136-B3 device-acceptance）。 */
+    @VisibleForTesting
+    internal fun handleSignalRefusedCount(): Int = handleSignalRefused.get()
+
+    /** handle 信號 invoke＋EPERM=false 計數（telemetry-only；見 [handleSignalRefused]）。 */
+    private fun invokeHandleSignal(method: Method, h: Any) {
+        val delivered = method.invoke(h)
+        if (delivered is Boolean && !delivered) handleSignalRefused.incrementAndGet()
+    }
+
+    /**
      * Stage 2A（P1-A7）信號判定（純函數 seam，供 JVM 單測直斷；
      * [killDescendantsReflective] 子孫與 [attestBodyDestroy] 本體經 runtime
      * reflection 餵入實際值，兩條路徑共用同一 seam 語義）：
@@ -436,7 +459,7 @@ object ElevatedProcessKiller {
             bodyPidReuseSkipped.incrementAndGet()
             return true
         }
-        runCatching { signalMethod.invoke(h) }
+        runCatching { invokeHandleSignal(signalMethod, h) }
         return mismatchLatched
     }
 
@@ -497,10 +520,10 @@ object ElevatedProcessKiller {
                 if (alive == false) return@forEach
                 val expectedStart: Any? = if (alive == true) attest.startInstantOf(h) else null
                 if (attest.signalAllowed(h, expectedStart)) {
-                    runCatching { destroy?.invoke(h) }
+                    runCatching { destroy?.let { invokeHandleSignal(it, h) } }
                 }
                 if (attest.signalAllowed(h, expectedStart)) {
-                    runCatching { destroyForcibly?.invoke(h) }
+                    runCatching { destroyForcibly?.let { invokeHandleSignal(it, h) } }
                 }
             }
         } catch (_: Exception) {

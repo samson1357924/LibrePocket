@@ -134,6 +134,7 @@ class ElevatedRunnerPhase3HardeningTest {
             "elevated-wait",
             "elevated-verify",
             "elevated-late-spawn",
+            "elevated-late-close",
             "elevated-quarantine-sweep",
             "elevated-quarantine-verify",
         )

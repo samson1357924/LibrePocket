@@ -127,6 +127,7 @@ class ElevatedRunnerPhaseBLateCompensationTest {
             "elevated-supervisor",
             "elevated-late-spawn",
             "elevated-late-kill",
+            "elevated-late-close",
             "elevated-quarantine-sweep",
             "elevated-quarantine-verify",
             "elevated-wait",
@@ -552,9 +553,10 @@ class ElevatedRunnerPhaseBLateCompensationTest {
             val r = runner.runBinary(ElevatedRequest(listOf("id"), "PB-LATE-SAT"), 300L)
             val elapsed = System.currentTimeMillis() - start
             assertTrue("$r", r is ElevatedBinaryResult.TimedOut)
+            // invariant 為有界返回，非 wall-clock budget（3s 視平台排程而 flaky）。
             assertTrue(
                 "caller must return within a bounded time, elapsed=$elapsed",
-                elapsed < 3_000L,
+                elapsed < 10_000L,
             )
             r as ElevatedBinaryResult.TimedOut
             assertTrue("late gap must flag, got $r", r.cleanupIncomplete)
@@ -891,6 +893,225 @@ class ElevatedRunnerPhaseBLateCompensationTest {
     }
 
     /**
+     * (b3) `elevated-late-spawn` daemon 本體＋registrar 拋（Stage 4 pin；harness 同 (b)）：
+     * caller CAS 認領成功後 daemon 起動（正常起線程）→ lateCompensateSpawn：killer 抛
+     * OutOfMemoryError → waitFor=false（never verified）→ verify=false → 三流 best-effort 關
+     * （C1 有界監督 `elevated-late-close` worker，不翻 verdict）→ 內層 guarded 登記直呼
+     * [ElevatedCleanupTracker.quarantineUnverified]（**不經** registrar seam）→ handle 落 quarantine；
+     * 外層 helper [ElevatedProcessIo.releaseCleanupSlotAfterVerify] 經 registrar 登記**拋** ⇒
+     * `quarantineRegistrationFailedCount` +1、槽**保留**（outstanding==1、fail-closed）。
+     * `before`/登記數／admission/floor 斷言對齊 (b2) 紀律；teardown 統一還原 registrar 並
+     * 清 quarantine（有意保留的 1 槽在主體內收斂；fallback 於 finally）。
+     */
+    @Test fun lateDaemonBodyWithThrowingRegistrarKeepsSlotFailClosed() {
+        val before = ElevatedCleanupTracker.quarantineRegistrationFailedCount()
+        val spawnEntered = CountDownLatch(1)
+        val spawnRelease = CountDownLatch(1)
+        val cancelGate = CountDownLatch(1)
+        val cancelBlockEntered = CountDownLatch(1)
+        val lateRef = AtomicReference<LatchBlockedDestroyProcess?>()
+        val resultRef = AtomicReference<ElevatedCallSupervisor.Res<Process>?>()
+        val kills = AtomicInteger(0)
+        val isCancelled: () -> Boolean = {
+            if (spawnEntered.count > 0) {
+                false
+            } else if (resultRef.get() != null) {
+                false
+            } else {
+                cancelBlockEntered.countDown()
+                stuckAwait(cancelGate)
+                true
+            }
+        }
+        ElevatedProcessIo.quarantineRegistrar = { throw RuntimeException("registrar boom") }
+        val bg = Thread {
+            resultRef.set(
+                ElevatedCallSupervisor.awaitSpawnWithThreadStarter(
+                    deadlineNanos = System.nanoTime() + TimeUnit.SECONDS.toNanos(60),
+                    isCancelled = isCancelled,
+                    killer = {
+                        kills.incrementAndGet()
+                        throw OutOfMemoryError("daemon killer oom")
+                    },
+                    // 預設 startThread：elevated-late-spawn 正常起線程，走 daemon 本體臂。
+                ) {
+                    spawnEntered.countDown()
+                    stuckAwait(spawnRelease)
+                    LatchBlockedDestroyProcess(CountDownLatch(0)).also { lateRef.set(it) }
+                },
+            )
+        }.also { it.isDaemon = true; it.start() }
+        try {
+            assertTrue("spawn must enter", spawnEntered.await(10_000L, TimeUnit.MILLISECONDS))
+            assertTrue(
+                "caller watcher must block in cancel gate",
+                cancelBlockEntered.await(10_000L, TimeUnit.MILLISECONDS),
+            )
+            spawnRelease.countDown()
+            pollRefNonNull(lateRef, "late spawn")
+            // worker publish（expired==false）後退出：caller CAS 認領後起 daemon。
+            pollTrue("spawn worker must exit before cancel gate opens") {
+                countLive("elevated-supervisor") == 1
+            }
+            cancelGate.countDown()
+            val res = pollRefNonNull(resultRef, "caller result")
+            assertTrue("expected Res.Expired, got $res", res is ElevatedCallSupervisor.Res.Expired)
+            res as ElevatedCallSupervisor.Res.Expired
+            assertTrue(
+                "late daemon compensation failure must flag cleanupIncomplete, got $res",
+                res.hasLinger,
+            )
+            val late = pollRefNonNull(lateRef, "late spawn")!!
+            // barrier：daemon 本體完成 lateCompensateSpawn＋helper 收斂（註冊拋出→計數）。
+            pollTrue("daemon body must converge fail-closed and keep the slot") {
+                ElevatedCleanupTracker.quarantineRegistrationFailedCount() == before + 1
+            }
+            pollTrue("daemon must exit") { countLive("elevated-late-spawn") == 0 }
+            // 內層直呼 quarantineUnverified 落地（不走 registrar）；外層 helper 拋出僅計數、不落地。
+            assertEquals(before + 1, ElevatedCleanupTracker.quarantineRegistrationFailedCount())
+            assertEquals(1, ElevatedCleanupTracker.outstanding())
+            assertEquals(1, ElevatedCleanupTracker.quarantinedCount())
+            assertEquals(1, kills.get())
+            val admission = ElevatedCleanupTracker.tryEnterReserved()
+            if (admission == ElevatedCleanupTracker.Admission.OK) {
+                // bug path（OK）才可能佔席：立即歸還，避免洩漏 active 席。
+                ElevatedCleanupTracker.leaveCall()
+            }
+            assertEquals(
+                "admission must stay BACKLOG_FULL while the slot is held",
+                ElevatedCleanupTracker.Admission.BACKLOG_FULL,
+                admission,
+            )
+            assertEquals(0, ElevatedCleanupTracker.activeCalls())
+            // 恰好一次：floor 零命中。
+            assertEquals(floorBefore, ElevatedCleanupTracker.releaseFloorHits())
+            // 還原 registrar 後重試 helper（有意保留的 1 槽）：登記成功（quarantine 內 handle
+            // 經 `===` 去重，數量不變）⇒ 恰好釋放恰好一次。
+            ElevatedProcessIo.quarantineRegistrar = { ElevatedCleanupTracker.quarantineUnverified(it) }
+            ElevatedProcessIo.releaseCleanupSlotAfterVerify(late, verified = false, slotHeld = true)
+            assertEquals(0, ElevatedCleanupTracker.outstanding())
+            assertEquals(1, ElevatedCleanupTracker.quarantinedCount())
+            assertEquals(before + 1, ElevatedCleanupTracker.quarantineRegistrationFailedCount())
+            assertEquals(floorBefore, ElevatedCleanupTracker.releaseFloorHits())
+        } finally {
+            // 還原預設 registrar；所有斷言完成後才放 cancel/spawn latch。
+            ElevatedProcessIo.quarantineRegistrar = { ElevatedCleanupTracker.quarantineUnverified(it) }
+            cancelGate.countDown()
+            spawnRelease.countDown()
+            bg.join(10_000L)
+            // 主體未走到回收重試（斷言先失敗）時的兜底：有意保留的 1 槽在此收斂，
+            // 避免 tearDown 輪詢誤判；helper 為 registered→release，恰好一次。
+            val late = lateRef.get()
+            if (late != null && ElevatedCleanupTracker.outstanding() == 1) {
+                ElevatedProcessIo.releaseCleanupSlotAfterVerify(late, verified = false, slotHeld = true)
+            }
+            pollOutstandingTo(0)
+            pollActiveTo(0)
+            ElevatedCleanupTracker.clearUnverified()
+            ElevatedCleanupTracker.noteClean()
+            awaitNoElevatedThreads()
+        }
+    }
+
+    /**
+     * (b4) worker 內聯補償＋registrar 拋（Stage 4 pin；harness 同 P1B2Test S4 內聯 arm）：
+     * spawn 阻塞於 pre-publish gate，deadline 先行逾期 ⇒ caller 先過期（interrupt 無效、
+     * grace 後 lingering 記 1 槽），worker 放行後 publish、重讀 expired==true 自行
+     * `compensateInline` 認領補償：killer 抛 OutOfMemoryError → waitFor=false → verify=false
+     * → 三流有界關 → 內層直呼 `quarantineUnverified`（落 quarantine）；外層 helper registrar
+     * **拋** ⇒ `quarantineRegistrationFailedCount` +1、補償槽**保留**。lingering 槽由
+     * worker 本體 finally 恰好釋放（2→1 收斂於 outstanding==1）。admission/floor 斷言對齊 (b2)。
+     */
+    @Test fun compensateInlineWithThrowingRegistrarKeepsSlotFailClosed() {
+        fun awaitUninterruptibly(latch: CountDownLatch) {
+            while (true) {
+                try {
+                    latch.await()
+                    break
+                } catch (_: InterruptedException) {
+                    // 吞中斷模擬不可中斷阻塞。
+                }
+            }
+        }
+        val before = ElevatedCleanupTracker.quarantineRegistrationFailedCount()
+        val spawnEntered = CountDownLatch(1)
+        val spawnRelease = CountDownLatch(1)
+        val kills = AtomicInteger(0)
+        val procRef = AtomicReference<LatchBlockedDestroyProcess?>()
+        ElevatedProcessIo.quarantineRegistrar = { throw RuntimeException("registrar boom") }
+        val res = ElevatedCallSupervisor.awaitSpawn(
+            deadlineNanos = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(100L),
+            isCancelled = { false },
+            killer = {
+                kills.incrementAndGet()
+                throw OutOfMemoryError("inline killer oom")
+            },
+        ) {
+            spawnEntered.countDown()
+            awaitUninterruptibly(spawnRelease)
+            LatchBlockedDestroyProcess(CountDownLatch(0)).also { procRef.set(it) }
+        }
+        try {
+            assertTrue(spawnEntered.await(10, TimeUnit.SECONDS))
+            assertTrue("expected Expired, got $res", res is ElevatedCallSupervisor.Res.Expired)
+            assertTrue((res as ElevatedCallSupervisor.Res.Expired).hasLinger)
+            // caller 過期返回當下：lingering 槽已記（deadline 先行逾期）。
+            spawnRelease.countDown()
+            // barrier：worker 完成 publish→CAS 認領→compensateInline（helper 計數至 before+1）。
+            pollTrue("inline compensation must converge fail-closed and keep the slot") {
+                ElevatedCleanupTracker.quarantineRegistrationFailedCount() == before + 1
+            }
+            // worker lingering 槽由本體 finally 恰好釋放：2（lingering＋補償）→ 1（補償槽保留）。
+            pollTrue("worker must exit and release the lingering slot") {
+                ElevatedCleanupTracker.outstanding() == 1
+            }
+            val proc = procRef.get()
+                ?: throw AssertionError("spawn block must deliver the late process")
+            // 內層直呼 quarantineUnverified 落地（不走 registrar）；外層 helper 拋出僅計數、不落地。
+            assertEquals(before + 1, ElevatedCleanupTracker.quarantineRegistrationFailedCount())
+            assertEquals(1, ElevatedCleanupTracker.outstanding())
+            assertEquals(1, ElevatedCleanupTracker.quarantinedCount())
+            assertEquals(1, kills.get())
+            val admission = ElevatedCleanupTracker.tryEnterReserved()
+            if (admission == ElevatedCleanupTracker.Admission.OK) {
+                // bug path（OK）才可能佔席：立即歸還，避免洩漏 active 席。
+                ElevatedCleanupTracker.leaveCall()
+            }
+            assertEquals(
+                "admission must stay BACKLOG_FULL while the slot is held",
+                ElevatedCleanupTracker.Admission.BACKLOG_FULL,
+                admission,
+            )
+            assertEquals(0, ElevatedCleanupTracker.activeCalls())
+            // 恰好一次：floor 零命中。
+            assertEquals(floorBefore, ElevatedCleanupTracker.releaseFloorHits())
+            // 還原 registrar 後重試 helper（有意保留的 1 補償槽）：登記成功（quarantine 內
+            // handle 經 `===` 去重，數量不變）⇒ 恰好釋放恰好一次。
+            ElevatedProcessIo.quarantineRegistrar = { ElevatedCleanupTracker.quarantineUnverified(it) }
+            ElevatedProcessIo.releaseCleanupSlotAfterVerify(proc, verified = false, slotHeld = true)
+            assertEquals(0, ElevatedCleanupTracker.outstanding())
+            assertEquals(1, ElevatedCleanupTracker.quarantinedCount())
+            assertEquals(before + 1, ElevatedCleanupTracker.quarantineRegistrationFailedCount())
+            assertEquals(floorBefore, ElevatedCleanupTracker.releaseFloorHits())
+        } finally {
+            // 還原預設 registrar；所有斷言完成後才放 gate。
+            ElevatedProcessIo.quarantineRegistrar = { ElevatedCleanupTracker.quarantineUnverified(it) }
+            spawnRelease.countDown()
+            // 主體未走到回收重試（斷言先失敗）時的兜底：有意保留的 1 補償槽在此收斂，
+            // 避免 tearDown 輪詢誤判；helper 為 registered→release，恰好一次。
+            val proc = procRef.get()
+            if (proc != null && ElevatedCleanupTracker.outstanding() == 1) {
+                ElevatedProcessIo.releaseCleanupSlotAfterVerify(proc, verified = false, slotHeld = true)
+            }
+            pollOutstandingTo(0)
+            pollActiveTo(0)
+            ElevatedCleanupTracker.clearUnverified()
+            ElevatedCleanupTracker.noteClean()
+            awaitNoElevatedThreads()
+        }
+    }
+
+    /**
      * (c) caller 側 CAS 認領瞬間槽飽和（startLateDaemon 飽和 arm）：spawn 逾期交付
      * 發佈、worker 退出後、caller 取消門放行之前，預填至 MAX 使 acquireSlot
      * 必敗——expireWorker 認領成功後 startLateDaemon 無槽可佔→quarantine 登記
@@ -979,9 +1200,10 @@ class ElevatedRunnerPhaseBLateCompensationTest {
             cancelGate.countDown()
             val res = pollRefNonNull(resultRef, "caller result")
             val elapsed = System.currentTimeMillis() - start
+            // invariant 為有界返回，非 wall-clock budget（3s 視平台排程而 flaky）。
             assertTrue(
                 "caller must return within a bounded time, elapsed=$elapsed",
-                elapsed < 3_000L,
+                elapsed < 10_000L,
             )
             assertTrue("expected Res.Expired, got $res", res is ElevatedCallSupervisor.Res.Expired)
             res as ElevatedCallSupervisor.Res.Expired

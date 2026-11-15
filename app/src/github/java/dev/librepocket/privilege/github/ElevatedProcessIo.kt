@@ -1211,8 +1211,13 @@ internal object ElevatedCleanupTracker {
  * - [Res.Expired.hasLinger] 僅表示「supervisor worker 仍存活（grace 後）或
  *   曾交付 late 值」：spawn 路徑穿透至 `TimedOut.cleanupIncomplete`（有 late
  *   Process 缺口）；非 spawn 路徑（grant／status／suExists 等）無 Process 資源，
- *   殘留執行緒已經 outstanding／breaker 追蹤，verdict 旗標保持 false（既有契約，
- *   見 B3 grant 測試），由呼叫方傳 `hasLinger=false` 映射（見 [ElevatedRunnerCommon]）。
+ *   但二 runner 一律經 `ElevatedRunnerCommon.preSpawnLinger(x.hasLinger)` 映射——
+ *   `cleanupIncomplete=false` 僅在 `!expiredHasLinger && outstanding()==0` 時成立
+ *   （`outstanding()>0` 覆蓋 watcher-only 殘留），全非 spawn `Err`／`Expired`／
+ *   `Denied` 站點皆帶 `preSpawnLinger(x.hasLinger)`（含 cancel 門、門 `Ok(true)`／
+ *   中斷臂的 `preSpawnLinger(false)`、quota 後顯式過期前門）；唯 spawn 前 preflight
+ *   入口零 budget 站點仍字面 `false`（worker 從未啟動）。P2-4 契約見
+ *   `preSpawnLinger` KDoc（~L4213）。
  *
  * 常數不動 READY／MAX（新增本物件常數，不改 [ElevatedCleanupTracker] 上限）。
  */
@@ -2346,21 +2351,32 @@ internal object ElevatedCallSupervisor {
             ok = false
             recordDeferredVme(t)
         }
-        try {
-            p.inputStream.close()
-        } catch (t: Throwable) {
-            recordDeferredVme(t)
+        // Security LOW-3：三流 getter＋close 整體跑有界監督（單一
+        // `elevated-late-close` worker，[awaitTimeout] 同 [exitValueBounded] 式）。
+        // Binder stall（Shizuku 同步 IPC）⇒ 監督超界即 Expired，本執行緒（late 補償
+        // daemon／worker 內聯）有界返回，不再永久持槽卡死；stall 殘留 worker 由
+        // awaitTimeout 記槽（既有契約）。close 結果永不翻 `ok`（verdict 由 parent
+        // 驗證已定）；close 擲非 OOM VME 仍經 [recordDeferredVme] 帶回（與舊碼語義一致，
+        // 僅搬進有界 worker 以 AtomicReference 交回 caller）。
+        val closeVme = AtomicReference<Throwable?>(null)
+        runCatching {
+            awaitTimeout(EXIT_JOIN_MS, "elevated-late-close") {
+                fun attemptClose(close: () -> Unit) {
+                    try {
+                        close()
+                    } catch (t: Throwable) {
+                        if (t is VirtualMachineError && t !is OutOfMemoryError) {
+                            closeVme.compareAndSet(null, t)
+                        }
+                    }
+                }
+                attemptClose { p.inputStream.close() }
+                attemptClose { p.errorStream.close() }
+                attemptClose { p.outputStream.close() }
+                Unit
+            }
         }
-        try {
-            p.errorStream.close()
-        } catch (t: Throwable) {
-            recordDeferredVme(t)
-        }
-        try {
-            p.outputStream.close()
-        } catch (t: Throwable) {
-            recordDeferredVme(t)
-        }
+        closeVme.get()?.let { recordDeferredVme(it) }
         // Round-3 Phase E（P1-1）：未驗證即登記 quarantine（worker 完成≠verified dead；
         // 呼叫方 breaker 計數經返回值另行終審，此處只登記，不雙計）。
         // Stage 4（P2）：登記改 guarded——拋出不外抛（outer releaseCleanupSlotAfterVerify 以冪等 `===` 去重重試登記＋釋放）。
@@ -2862,9 +2878,44 @@ internal object ElevatedProcessIo {
          * 接線後補 stdin 收斂）。
          */
         /** 全路徑有界返回裁決（drain 契約）：內部任一層漏網 ⇒ fail-closed Drained
-         *  （runner 映 Failed，永非 Ok/TimedOut；untrackedResidual 遙測置 true）。 */
+         *  （runner 映 Failed，永非 Ok/TimedOut；untrackedResidual 遙測置 true）。
+         *
+         * （CR-1）catch-all 臂新契約：先 threads 後 process——
+         * - 中斷已起執行緒（`elevated-stdout`／`elevated-stderr`／`elevated-stdin-close`）；
+         *   仍存活者以其 normal path 同一 state 三態經
+         *   [ElevatedCleanupTracker.markLingering] 登記（outCounted／errCounted／stdinCounted
+         *   原子，與 kill／start-failure 路徑同式）；持槽後由線程本體 finally 恰好釋放一次
+         *   （已終止／state 非 0 no-op，零雙計、零槽洩漏）；
+         * - process 最佳努力登記 [ElevatedProcessIo.quarantineRegistrar]（拋出即
+         *   [ElevatedCleanupTracker.noteQuarantineRegistrationFailed] 遙測；本臂不經
+         *   verify／runCleanupBounded，無槽可留，登記失敗僅 noteUnclean＋breaker 兜底）；
+         * - [ElevatedCleanupTracker.noteUntrackedResidual] 遙測 +1（registered ⇒
+         *   admission 以 QUARANTINE 拒新 spawn，恢復走 sweep 路徑；本臂不自行清 quarantine）。
+         * `noteUnclean()` 與回傳 `Drained` 旗標（readFailed／tailIncomplete／cleanupIncomplete／
+         * untrackedResidual／timedOut）保持原契約不變。 */
         fun drainFailClosedDrained(): Drained {
             runCatching { ElevatedCleanupTracker.noteUnclean() }
+            // 先 threads（中斷＋殘留記槽）再 process（quarantine 登記）：已起執行緒
+            // 仍存活即有上界殘留，先收斂；process 登記冪等（`===` 去重）且最佳努力。
+            val startedThreads = listOfNotNull(tOutRef, tErrRef, stdinCloserRef)
+            startedThreads.forEach { t ->
+                if (t.isAlive) {
+                    runCatching { t.interrupt() }
+                }
+            }
+            // lingered ⇒ 持槽由線程本體 finally 恰好釋放（markLingering 三態）；已終止 no-op
+            startedThreads.forEach { t ->
+                if (!t.isAlive) return@forEach
+                val counted = when {
+                    t === tOutRef -> outCounted
+                    t === tErrRef -> errCounted
+                    else -> stdinCounted
+                }
+                runCatching { ElevatedCleanupTracker.markLingering(t, counted) }
+            }
+            runCatching { ElevatedProcessIo.quarantineRegistrar(process) }
+                .onFailure { runCatching { ElevatedCleanupTracker.noteQuarantineRegistrationFailed() } }
+            runCatching { ElevatedCleanupTracker.noteUntrackedResidual() }
             if (callerInterrupted) runCatching { Thread.currentThread().interrupt() }
             return Drained(
                 stdout = ByteArray(0),
@@ -3067,17 +3118,20 @@ internal object ElevatedProcessIo {
         // [markLingering]（三態＋僅未計數時佔槽；本體 finally 釋放，見上）。
         val tOut = try {
             Thread({
+                var s: InputStream? = null
                 try {
-                    val s = process.inputStream
-                    inAcquired.set(s)
+                    val stream = process.inputStream
+                    s = stream
+                    inAcquired.set(stream)
                     if (aborted.get() || Thread.currentThread().isInterrupted) {
                         out.markFailed()
-                        runCatching { s.close() }
+                        runCatching { stream.close() }
                     } else {
-                        copyCapped(s, out)
+                        copyCapped(stream, out)
                     }
                 } catch (t: Throwable) {
                     out.markFailed()
+                    runCatching { s?.close() }
                     if (t is VirtualMachineError && t !is OutOfMemoryError) throw t
                 } finally {
                     inAcquired.set(null)
@@ -3101,17 +3155,20 @@ internal object ElevatedProcessIo {
         }
         val tErr = try {
             Thread({
+                var s: InputStream? = null
                 try {
-                    val s = process.errorStream
-                    errAcquired.set(s)
+                    val stream = process.errorStream
+                    s = stream
+                    errAcquired.set(stream)
                     if (aborted.get() || Thread.currentThread().isInterrupted) {
                         err.markFailed()
-                        runCatching { s.close() }
+                        runCatching { stream.close() }
                     } else {
-                        copyCapped(s, err)
+                        copyCapped(stream, err)
                     }
                 } catch (t: Throwable) {
                     err.markFailed()
+                    runCatching { s?.close() }
                     if (t is VirtualMachineError && t !is OutOfMemoryError) throw t
                 } finally {
                     errAcquired.set(null)

@@ -59,6 +59,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.staticCompositionLocalOf
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
@@ -88,6 +89,9 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
 private const val TAG = "ChatScreen"
+
+/** Test seam: supplies the STT arbiter's clock (monotonic nanos); production uses [System.nanoTime]. */
+internal val LocalVoiceSttArbiterClock = staticCompositionLocalOf<() -> Long> { System::nanoTime }
 
 /** User-visible text for a chat notice code; unknown codes fall through raw. */
 internal fun chatNoticeText(code: String): String =
@@ -320,7 +324,8 @@ fun ChatScreen(
     // sttArbiterState 為 currentInFlight 的 compose 鏡像（arm 承認／result settle 時翻轉，
     // 重觸發上方統一決策效應續行下一 arm）；userVoiceArmed 為 mic 鈕的一次態 arm
     //（閘忙時按住佇列一次，settle 後續行）。
-    val sttArbiter = remember { VoiceSttArbiter() }
+    val arbiterClock = LocalVoiceSttArbiterClock.current
+    val sttArbiter = remember { VoiceSttArbiter(clockNanos = arbiterClock) }
     var sttArbiterState by remember { mutableStateOf<VoiceSttArmKind?>(null) }
     // 每枚進行中 launch 各自佔一個回呼 slot（共 2 枚）：slotBusy 標記佔用、slotGen 記錄該 slot 對應的
     // admit generation（launch 時自 currentGeneration 讀取，即剛承認的那一枚 arm 的 generation）。
@@ -354,8 +359,8 @@ fun ChatScreen(
         // （watchdog 釋放後無 successor——generation 不動、slot 已空）。gen == 0L（本檔每次
         // launch 皆登記，故不會走入；保守視為 fresh）→ 正常路徑。
         // STALE-SPECIMENS: stale-result 案例（S3-style watchdog 驅逐、successor 超越、gen==0L 保守 fresh）
-        // 釘在 VoiceSttArbiterTest／isStaleVoiceResult 純述詞層；此處不做 Compose 層 stale 模擬——
-        // screen 的 clock 不可注入（documented limitation）。
+        // 釘在 VoiceSttArbiterTest／isStaleVoiceResult 純述詞層；Compose 層 stale 模擬亦可經
+        // LocalVoiceSttArbiterClock 注入假時鐘（見 ChatScreenVoiceLaunchTest）。
         if (gen != 0L && !stillAdmitting) {
             // stale result from a watchdog-evicted launch: release bookkeeping happened already
             // (slot freed above); never let a 2-minute-old transcript overwrite the draft.

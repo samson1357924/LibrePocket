@@ -154,6 +154,7 @@ class ChatScreenVoiceLaunchTest {
     private class RecordingRegistry : ActivityResultRegistry() {
         var lastRequestCode = -1
         val launchedIntents = mutableListOf<Intent>()
+        val launchedRequestCodes = mutableListOf<Int>()
 
         override fun <I : Any?, O : Any?> onLaunch(
             requestCode: Int,
@@ -162,6 +163,7 @@ class ChatScreenVoiceLaunchTest {
             options: ActivityOptionsCompat?,
         ) {
             lastRequestCode = requestCode
+            launchedRequestCodes += requestCode
             if (input is Intent) {
                 launchedIntents += input
             }
@@ -1565,6 +1567,150 @@ class ChatScreenVoiceLaunchTest {
         assertEquals(3, registry.launchedIntents.size)
         assertEquals(listOf(42L), consumedRetrigger)
         assertEquals(1, consumedInitial)
+        assertEquals(0, provider.streamCalls)
+    }
+
+    @Test
+    fun staleInitialResult_neverPrefillsOverSuccessorDraft() {
+        registerRecognitionService()
+        val provider = VoiceLaunchFakeProvider()
+        val vm = newVm(provider)
+        val registry = RecordingRegistry()
+        val owner = object : ActivityResultRegistryOwner {
+            override val activityResultRegistry: ActivityResultRegistry = registry
+        }
+        var now = 1_000_000_000L
+        val voiceRequested = MutableStateFlow(true)
+
+        composeRule.setContent {
+            val req by voiceRequested.collectAsState()
+            CompositionLocalProvider(
+                LocalActivityResultRegistryOwner provides owner,
+                LocalVoiceSttArbiterClock provides { now },
+            ) {
+                ChatScreen(
+                    padding = PaddingValues(0.dp),
+                    viewModel = vm,
+                    userSwitches = mapOf(VoiceTools.SWITCH_INPUT to true),
+                    voiceInputRequested = req,
+                    onVoiceInputConsumed = { voiceRequested.value = false },
+                    voiceSwitchesLoaded = true,
+                )
+            }
+        }
+        composeRule.waitForIdle()
+        assertEquals(1, registry.launchedIntents.size)
+
+        // Advance past the recognizer watchdog: the INITIAL launch is treated as settled at the
+        // next decision, but its callback slot stays wedged (result never dispatched below).
+        composeRule.runOnIdle { now += VoiceSttArbiter.RECOGNIZER_WATCHDOG_NANOS + 1_000L }
+        composeRule.onNodeWithContentDescription("語音輸入").performClick()
+        composeRule.waitForIdle()
+
+        // The mic (USER) arm is admitted via the watchdog; slot 0 remains wedged.
+        assertEquals(2, registry.launchedIntents.size)
+        assertEquals(0, provider.streamCalls)
+
+        // The USER launch reports back first: its (fresh) transcript prefills the draft.
+        val freshResult = Intent().putStringArrayListExtra(
+            RecognizerIntent.EXTRA_RESULTS,
+            arrayListOf("fresh text"),
+        )
+        composeRule.runOnIdle {
+            registry.dispatchResult(
+                registry.launchedRequestCodes[1],
+                ActivityResult(Activity.RESULT_OK, freshResult),
+            )
+        }
+        composeRule.waitForIdle()
+        assertEquals("fresh text", vm.input.value)
+
+        // The stale INITIAL launch reports back late: it must never overwrite the successor draft.
+        val staleResult = Intent().putStringArrayListExtra(
+            RecognizerIntent.EXTRA_RESULTS,
+            arrayListOf("stale draft overwrite attempt"),
+        )
+        composeRule.runOnIdle {
+            registry.dispatchResult(
+                registry.launchedRequestCodes[0],
+                ActivityResult(Activity.RESULT_OK, staleResult),
+            )
+        }
+        composeRule.waitForIdle()
+        assertEquals("fresh text", vm.input.value)
+        assertEquals(2, registry.launchedIntents.size)
+    }
+
+    @Test
+    fun bothSlotsBusy_thirdArm_degradesToNoService_andGateReleases() {
+        registerRecognitionService()
+        val provider = VoiceLaunchFakeProvider()
+        val vm = newVm(provider)
+        val registry = RecordingRegistry()
+        val owner = object : ActivityResultRegistryOwner {
+            override val activityResultRegistry: ActivityResultRegistry = registry
+        }
+        var now = 1_000_000_000L
+        val voiceRequested = MutableStateFlow(true)
+        val retriggerToken = MutableStateFlow(0L)
+        val consumedRetrigger = ArrayList<Long>()
+
+        composeRule.setContent {
+            val req by voiceRequested.collectAsState()
+            val token by retriggerToken.collectAsState()
+            CompositionLocalProvider(
+                LocalActivityResultRegistryOwner provides owner,
+                LocalVoiceSttArbiterClock provides { now },
+            ) {
+                ChatScreen(
+                    padding = PaddingValues(0.dp),
+                    viewModel = vm,
+                    userSwitches = mapOf(VoiceTools.SWITCH_INPUT to true),
+                    voiceInputRequested = req,
+                    onVoiceInputConsumed = { voiceRequested.value = false },
+                    voiceSwitchesLoaded = true,
+                    voiceRetriggerToken = token,
+                    onVoiceRetriggerConsumed = {
+                        consumedRetrigger += it
+                        retriggerToken.value = 0L
+                        true
+                    },
+                )
+            }
+        }
+        composeRule.waitForIdle()
+        // Launch #1: INITIAL in flight; slot 0 held; no result dispatched (never returns).
+        assertEquals(1, registry.launchedIntents.size)
+
+        // Past the watchdog: the mic (USER) arm is admitted; launch #2 takes slot 1; slot 0 wedged.
+        composeRule.runOnIdle { now += VoiceSttArbiter.RECOGNIZER_WATCHDOG_NANOS + 1_000L }
+        composeRule.onNodeWithContentDescription("語音輸入").performClick()
+        composeRule.waitForIdle()
+        assertEquals(2, registry.launchedIntents.size)
+        assertEquals(0, provider.streamCalls)
+
+        // Past the watchdog again: both arms are watchdog-evicted by the next decision, yet both
+        // slots stay busy (neither result ever returned). A fresh retrigger arm is admitted by
+        // the (now free) gate, finds no slot, degrades with a user-visible notice and releases.
+        composeRule.runOnIdle { now += VoiceSttArbiter.RECOGNIZER_WATCHDOG_NANOS + 1_000L }
+        composeRule.runOnIdle { retriggerToken.value = 42L }
+        composeRule.waitForIdle()
+
+        // Consume happens before the launch attempt: the token is consumed exactly once, no new
+        // recognizer is launched, and the DETAIL_NO_SERVICE fallback is shown.
+        assertEquals(listOf(42L), consumedRetrigger)
+        assertEquals(2, registry.launchedIntents.size)
+        composeRule.onNodeWithText(
+            VoiceStt.fallbackMessage(DenyReason.NO_PRIVILEGE, VoiceStt.DETAIL_NO_SERVICE),
+        ).assertIsDisplayed()
+        assertEquals(0, provider.streamCalls)
+
+        // Gate must be released for a subsequent arm even after the wedge degrade: re-arm with a
+        // fresh token and expect the same one-shot admit -> degrade path with the gate still free.
+        composeRule.runOnIdle { retriggerToken.value = 43L }
+        composeRule.waitForIdle()
+        assertEquals(listOf(42L, 43L), consumedRetrigger)
+        assertEquals(2, registry.launchedIntents.size)
         assertEquals(0, provider.streamCalls)
     }
 }

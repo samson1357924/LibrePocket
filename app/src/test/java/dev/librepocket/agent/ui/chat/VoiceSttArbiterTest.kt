@@ -460,4 +460,63 @@ class VoiceSttArbiterTest {
         // Zero token derives "absent" and likewise admits nothing.
         assertSame(VoiceSttDecision.Idle, decideLoaded(arbiter, retrigger = isRetriggerArmed(0L)))
     }
+
+    @Test
+    fun arbiter_watchdogCycle_preservesGenerationPairingAboveThree() {
+        var now = 1_000_000_000L
+        val arbiter = VoiceSttArbiter(clockNanos = { now })
+
+        // gen1: INITIAL admits and never reports back (recognizer hangs).
+        assertEquals(
+            VoiceSttDecision.Admit(VoiceSttArmKind.INITIAL),
+            decideLoaded(arbiter, initial = true),
+        )
+        val gen1 = arbiter.currentGeneration
+        assertEquals(1L, gen1)
+        arbiter.onLaunchReported(VoiceSttArmKind.INITIAL, launched = true, generation = gen1)
+
+        // Watchdog fires; RETRIGGER admitted as gen2.
+        now += VoiceSttArbiter.RECOGNIZER_WATCHDOG_NANOS + 1
+        assertEquals(
+            VoiceSttDecision.Admit(VoiceSttArmKind.RETRIGGER),
+            decideLoaded(arbiter, retrigger = true),
+        )
+        val gen2 = arbiter.currentGeneration
+        assertEquals(2L, gen2)
+        arbiter.onLaunchReported(VoiceSttArmKind.RETRIGGER, launched = true, generation = gen2)
+
+        // gen2 settles normally; USER admitted as gen3.
+        arbiter.onResultSettled(gen2)
+        assertNull(arbiter.currentInFlight)
+        assertEquals(
+            VoiceSttDecision.Admit(VoiceSttArmKind.USER),
+            decideLoaded(arbiter, user = true),
+        )
+        val gen3 = arbiter.currentGeneration
+        assertEquals(3L, gen3)
+        arbiter.onLaunchReported(VoiceSttArmKind.USER, launched = true, generation = gen3)
+
+        // Watchdog fires again; a fresh INITIAL flag is admitted as gen4.
+        now += VoiceSttArbiter.RECOGNIZER_WATCHDOG_NANOS + 1
+        assertEquals(
+            VoiceSttDecision.Admit(VoiceSttArmKind.INITIAL),
+            decideLoaded(arbiter, initial = true),
+        )
+        val gen4 = arbiter.currentGeneration
+        assertEquals(4L, gen4)
+        assertEquals(VoiceSttArmKind.INITIAL, arbiter.currentInFlight)
+
+        // Stale settles from every pre-gen4 generation cannot release gen4's slot.
+        arbiter.onResultSettled(gen1)
+        arbiter.onResultSettled(gen2)
+        arbiter.onResultSettled(gen3)
+        assertEquals(VoiceSttArmKind.INITIAL, arbiter.currentInFlight)
+        // Busy gate stays Idle while gen4 is in flight.
+        assertSame(VoiceSttDecision.Idle, decideLoaded(arbiter, retrigger = true, user = true))
+
+        // gen4 settles with its own generation: the slot clears.
+        arbiter.onResultSettled(gen4)
+        assertNull(arbiter.currentInFlight)
+        assertSame(VoiceSttDecision.Idle, decideLoaded(arbiter))
+    }
 }

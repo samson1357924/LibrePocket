@@ -71,7 +71,7 @@ internal sealed interface VoiceSttDecision {
 internal fun isRetriggerArmed(token: Long): Boolean = token != 0L
 
 internal class VoiceSttArbiter(
-    private val clockNanos: () -> Long = System::nanoTime,
+    internal val clockNanos: () -> Long = System::nanoTime,
 ) {
     private var inFlight: VoiceSttArmKind? = null
 

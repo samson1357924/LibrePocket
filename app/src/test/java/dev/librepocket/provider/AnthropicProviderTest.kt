@@ -626,4 +626,90 @@ class AnthropicProviderTest {
             server.shutdown()
         }
     }
+
+    @Test
+    fun firstMessageMustBeUser() {
+        val provider = AnthropicProvider(testConfig(), { null })
+
+        // assistant-first: typed non-retryable failure before any HTTP.
+        try {
+            provider.buildBody(
+                ChatRequest(model = "m", messages = listOf(ChatMessage("assistant", "hi"))),
+            )
+            fail("expected ProviderFailure for assistant-first history")
+        } catch (e: ProviderFailure) {
+            assertFalse(e.retryable)
+            assertEquals("FIRST_MESSAGE_MUST_BE_USER", e.message)
+        }
+
+        // system + assistant-first: the system row does not satisfy the gate.
+        try {
+            provider.buildBody(
+                ChatRequest(
+                    model = "m",
+                    messages = listOf(
+                        ChatMessage("system", "sys"),
+                        ChatMessage("assistant", "hi"),
+                    ),
+                ),
+            )
+            fail("expected ProviderFailure for system+assistant-first history")
+        } catch (e: ProviderFailure) {
+            assertFalse(e.retryable)
+            assertEquals("FIRST_MESSAGE_MUST_BE_USER", e.message)
+        }
+
+        // all-system (no non-system message at all): also rejected.
+        try {
+            provider.buildBody(
+                ChatRequest(model = "m", messages = listOf(ChatMessage("system", "sys"))),
+            )
+            fail("expected ProviderFailure for all-system history")
+        } catch (e: ProviderFailure) {
+            assertFalse(e.retryable)
+            assertEquals("FIRST_MESSAGE_MUST_BE_USER", e.message)
+        }
+
+        // Empty messages: the same null branch, also rejected.
+        try {
+            provider.buildBody(ChatRequest(model = "m", messages = emptyList()))
+            fail("expected ProviderFailure for empty messages")
+        } catch (e: ProviderFailure) {
+            assertFalse(e.retryable)
+            assertEquals("FIRST_MESSAGE_MUST_BE_USER", e.message)
+        }
+
+        // system rows + a user turn: the precheck passes and buildBody succeeds.
+        provider.buildBody(
+            ChatRequest(
+                model = "m",
+                messages = listOf(
+                    ChatMessage("system", "sys"),
+                    ChatMessage("user", "hi"),
+                ),
+            ),
+        )
+
+        // assistant-first carrying tool calls: the precheck fires BEFORE the
+        // pairing gate, so the code is FIRST_MESSAGE_MUST_BE_USER, not a
+        // pairing error.
+        try {
+            provider.buildBody(
+                ChatRequest(
+                    model = "m",
+                    messages = listOf(
+                        ChatMessage(
+                            "assistant",
+                            "",
+                            toolCalls = listOf(ToolCall("toolu_1", "t", "{}")),
+                        ),
+                    ),
+                ),
+            )
+            fail("expected ProviderFailure for assistant-first tool-call history")
+        } catch (e: ProviderFailure) {
+            assertFalse(e.retryable)
+            assertEquals("FIRST_MESSAGE_MUST_BE_USER", e.message)
+        }
+    }
 }

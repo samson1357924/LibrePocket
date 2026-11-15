@@ -63,14 +63,15 @@ private class DefCapAllowPolicy : PolicyStore {
  *   send-time trim, and char reconciliation.
  * - [boundedTakesMaxLegThenSnapsForwardOverPair],
  *   [multiCallBatchSnapsForwardWhole], [orphanNewestToolRowRetainedForDownstreamReject],
- *   [globallyUnpairedHistoryFallsBackToNaiveCut], [singlePendingBackfillSnapsPairAtomically],
+ *   [globallyUnpairedHistoryDropsLeadingInvalidSlice], [singlePendingBackfillSnapsPairAtomically],
  *   [degenerateSnapPastEndYieldsEmptyList],
  *   [multiTurnSequentialToolRoundsSnapCleanlyToIntermediateBoundary], and
  *   [outOfOrderBatchToolResultsResolveToCleanTurnBoundary] pin the snap semantics:
  *   dual-leg max, whole-batch snap, single-pending backfill matching ProviderJson,
  *   out-of-order result resolution, sequential round boundaries, degenerate snap-past-end,
  *   no orphan special-case in the window (retain + downstream `validateToolPairing` fail-closed),
- *   and naive-cut fallback for globally unpaired histories.
+ *   and the #16 turn-boundary snap dropping an invalid leading slice wholesale for
+ *   globally unpaired histories (naive cut kept only when no user row follows).
  * - [sendTimeTrimPreservesToolPairAtomicityUnderUnbounded] and
  *   [sendTimeTrimAlignsToUserBoundaryWhenHeadPlainMessageDrops] pin the second trim layer
  *   (send-time MAX_REQUEST_CHARS) pair-atomicity under Unbounded historyCap;
@@ -83,10 +84,11 @@ private class DefCapAllowPolicy : PolicyStore {
  * - [invalidDiscardedPrefixDoesNotBreakLaterPairSnapping],
  *   [invalidDiscardedPrefixUnderBoundedCapAndSendTimeTrim], and
  *   [malformedBatchAndToolRowWithToolCallsFailClosed] pin Phase A local batch
- *   boundary snapping: invalid or malformed prefixes wholly before the cut do not
- *   disable pair-atomic snapping for later valid batches (under count, bounded char,
- *   and send-time `MAX_REQUEST_CHARS` trims), while `role == "tool"` rows carrying
- *   `toolCalls` fail closed at the gate (`TOOL_CALLS_ROLE_MUST_BE_ASSISTANT`).
+ *   boundary snapping: under count, bounded char, and send-time
+ *   `MAX_REQUEST_CHARS` trims, later valid pairs are always dropped wholesale
+ *   (counted in the drop), never half a batch, split, or repaired — while
+ *   `role == "tool"` rows carrying `toolCalls` fail closed at the gate
+ *   (`TOOL_CALLS_ROLE_MUST_BE_ASSISTANT`).
  * - [userBoundarySnapAdvancesOntoNextUser], [userBoundarySnapKeepsUserStartAndZeroStart],
  *   [userBoundarySnapLimitClampsToNextUser], [userBoundarySnapEmptyAndOutOfRangeAreSafe],
  *   [userBoundarySnapComposesWithPairSnap], [userBoundarySnapNeverExceedsLimit], and
@@ -509,13 +511,15 @@ class TurnControllerDefaultCapTest {
     }
   }
 
-  @Test(timeout = 30_000) fun globallyUnpairedHistoryFallsBackToNaiveCut() {
+  @Test(timeout = 30_000) fun globallyUnpairedHistoryDropsLeadingInvalidSlice() {
     // Negative pin: a history that is already globally unpaired is NOT
     // repaired by the window. Case 1 ships the naive cut as-is (no user
     // row follows it) and the downstream validator fails closed on the
-    // shipped shape; Case 2 shows the #16 turn-boundary snap drops an
-    // invalid leading slice wholesale when a user row does follow it —
-    // boundary alignment, never pairing repair.
+    // shipped shape; Case 2 shows the #16 turn-boundary snap drops the
+    // invalid leading slice wholesale (never retaining the naive cut) when
+    // a user row does follow it — boundary alignment, never pairing
+    // repair. The naive cut is kept only when no user row lies within
+    // [start, limit].
     // Case 1: dangling trailing batch (call with no result). Naive
     // MaxMessages(1) keeps [call]; the snaps must not move or repair it.
     val danglingCall = ChatMessage(
@@ -539,8 +543,11 @@ class TurnControllerDefaultCapTest {
     }
     // Case 2: blank toolCallId with multiple pending calls. Since pending.size == 2,
     // backfill is ambiguous and fails; the naive MaxMessages(2) cut lands on
-    // the tool row, and the user-boundary snap then advances past it to the
-    // next user row — the window ships [tail], not the unpaired pair.
+    // the tool row, and the user-boundary snap then drops the whole leading
+    // invalid slice (blankCall + blankTool) and advances to the next user
+    // row — the window ships [tail], not the unpaired pair and not the
+    // naive cut. The naive cut is kept only when no user row lies within
+    // [start, limit] (Case 1).
     // (Pre-#16 the window shipped [tool(blank), tail] and the downstream
     // validator failed closed with the blank-id rejection.)
     val blankCall = ChatMessage(

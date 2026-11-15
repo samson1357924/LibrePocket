@@ -70,8 +70,9 @@ private class OmissionAllowPolicy : PolicyStore {
  * Resume a 150-turn dialogue (300 short replay rows): the model-context
  * prefix windows to [HistoryWindowCap.DEFAULT] (200) at construction and
  * again inside the first send's combined window, so the outgoing request
- * carries 199 rows (the naive combined cut lands on the leading assistant
- * row; the user-boundary snap drops one more) while the UI replay keeps all
+ * carries 199 rows (the naive combined cut drops the leading user row u50;
+ * the user-boundary snap then drops the leading assistant row a50 behind it)
+ * while the UI replay keeps all
  * 300. The provider-request context omission total (init window + combined
  * window, 100 + 2 = 102) surfaces via [ChatViewModel.contextOmittedCount];
  * the DB-tail omission ([ChatViewModel.historyOmittedCount]) stays 0

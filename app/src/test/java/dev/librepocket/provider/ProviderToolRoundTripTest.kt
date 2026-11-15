@@ -356,12 +356,16 @@ class ProviderToolRoundTripTest {
 
     @Test
     fun anthropicParallelToolsMergeToSingleUserMessage() {
+        // The leading user message is an Anthropic hard requirement: the
+        // first non-system message must be role=user (adapter-level
+        // precheck, FIRST_MESSAGE_MUST_BE_USER).
         val tc1 = ToolCall(id = "toolu_p1", name = "get_weather", argumentsJson = """{"city":"Taipei"}""")
         val tc2 = ToolCall(id = "toolu_p2", name = "get_weather", argumentsJson = """{"city":"Taichung"}""")
         val body = AnthropicProvider(anthropicConfig(), { null }).buildBody(
             ChatRequest(
                 model = "m",
                 messages = listOf(
+                    ChatMessage("user", "hi"),
                     ChatMessage("assistant", "", toolCalls = listOf(tc1, tc2)),
                     ChatMessage("tool", "sunny", toolCallId = tc1.id),
                     ChatMessage("tool", "cloudy", toolCallId = tc2.id),
@@ -370,12 +374,12 @@ class ProviderToolRoundTripTest {
             ),
         )
         val messages = strictObj(body)["messages"]!!.jsonArray.map { it.jsonObject }
-        assertEquals(2, messages.size)
+        assertEquals(3, messages.size)
         assertEquals(
-            listOf("assistant", "user"),
+            listOf("user", "assistant", "user"),
             messages.map { it["role"]!!.jsonPrimitive.content },
         )
-        val userBlocks = messages[1]["content"]!!.jsonArray.map { it.jsonObject }
+        val userBlocks = messages[2]["content"]!!.jsonArray.map { it.jsonObject }
         assertEquals(2, userBlocks.size)
         assertTrue(userBlocks.all { it["type"]!!.jsonPrimitive.content == "tool_result" })
         assertEquals(
@@ -625,7 +629,10 @@ class ProviderToolRoundTripTest {
 
     @Test
     fun forwardRefFailsClosedOnAllAdapters() {
+        // Leading user turn: Anthropic's adapter prechecks first non-system
+        // role=user; the pairing validator still fails closed on the orphan.
         val history = listOf(
+            ChatMessage("user", "hi"),
             ChatMessage("tool", "early", toolCallId = "call_b"),
             ChatMessage("assistant", "", toolCalls = listOf(toolCall("call_b"))),
         )
@@ -637,6 +644,7 @@ class ProviderToolRoundTripTest {
     @Test
     fun duplicateOutputFailsClosedOnAllAdapters() {
         val history = listOf(
+            ChatMessage("user", "hi"),
             ChatMessage("assistant", "", toolCalls = listOf(toolCall("call_a"))),
             ChatMessage("tool", "one", toolCallId = "call_a"),
             ChatMessage("tool", "two", toolCallId = "call_a"),
@@ -674,6 +682,7 @@ class ProviderToolRoundTripTest {
     @Test
     fun interleavedNewCallTurnFailsUnresolvedOnAllAdapters() {
         val history = listOf(
+            ChatMessage("user", "hi"),
             ChatMessage("assistant", "", toolCalls = listOf(toolCall("call_a"), toolCall("call_b"))),
             ChatMessage("tool", "out-a", toolCallId = "call_a"),
             ChatMessage("assistant", "", toolCalls = listOf(toolCall("call_c"))),
@@ -686,6 +695,7 @@ class ProviderToolRoundTripTest {
     @Test
     fun interleavedPlainAssistantFailsUnresolvedOnAllAdapters() {
         val history = listOf(
+            ChatMessage("user", "hi"),
             ChatMessage("assistant", "", toolCalls = listOf(toolCall("call_a"), toolCall("call_b"))),
             ChatMessage("tool", "out-a", toolCallId = "call_a"),
             ChatMessage("assistant", "thinking"),
@@ -799,8 +809,10 @@ class ProviderToolRoundTripTest {
 
     @Test
     fun anthropicEmptyAssistantFailsClosed() {
+        // Leading user row required by the Anthropic first-message precheck;
+        // the empty assistant is what this case rejects.
         expectFailWithCode("ANTHROPIC_EMPTY_CONTENT") {
-            anthropicBodyOf(listOf(ChatMessage("assistant", "")))
+            anthropicBodyOf(listOf(ChatMessage("user", "hi"), ChatMessage("assistant", "")))
         }
     }
 

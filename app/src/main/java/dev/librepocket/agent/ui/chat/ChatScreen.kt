@@ -415,6 +415,9 @@ fun ChatScreen(
                             text = "有 $contextOmittedCount 則較早歷史未送出模型",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.semantics {
+                                liveRegion = androidx.compose.ui.semantics.LiveRegionMode.Polite
+                            },
                         )
                     }
                 }

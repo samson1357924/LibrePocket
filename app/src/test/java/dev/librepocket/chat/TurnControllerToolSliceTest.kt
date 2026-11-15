@@ -1301,6 +1301,10 @@ class TurnControllerToolSliceTest {
         assertTrue(failedRecord.isFinal)
         assertEquals("continuation request over budget", failedRecord.error)
         assertTrue(failedRecord.partialText.contains("[tool-result:lsp.symbols"))
+        // The continuation threw before publishing: the flow retains the base
+        // request's published value (0 here — a single fat live row ships
+        // whole; no top-up leaks into contextOmission on the throw path).
+        assertEquals(0, c.contextOmission.value)
     }
 
     @Test fun continuationRoundLevelBudgetFailsClosedWithEightMaxCalls() = runBlocking {

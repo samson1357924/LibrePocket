@@ -44,19 +44,18 @@ interface ChatSession {
    * window, plus the send-time MAX_REQUEST_CHARS head trim) drop only
    * original rows; synthesized tool-round rows are never dropped and never
    * counted; the continuation top-up only adds the prefix trim (rows the
-   * prefix trim removes are likewise all original rows). The base legs count
-   * the original rows
-   * (the resumed history prefix + this send's live rows) after every
-   * windowing leg — the construction-time
-   * history window, the per-request combined window, and the send-time
-   * MAX_REQUEST_CHARS head trim (a tool continuation additionally tops up
-   * its own prefix trim). A tool continuation throw leaves the last
-   * published value (the base request's publish — a request that was never
-   * shipped, retained for observation). Rejections before any request leave
-   * the last published value too — the construction-time seed (production) /
-   * the shared zero default (fakes) until the first
-   * publish; from the second send on, the previous request's published
-   * value is retained.
+   * prefix trim removes are likewise all original rows). What it publishes
+   * is the count of original rows absent from the outgoing request — this
+   * send's live rows plus the resumed history prefix — after every
+   * windowing leg (the construction-time history window, the per-request
+   * combined window, and the send-time MAX_REQUEST_CHARS head trim; a tool
+   * continuation additionally tops up its own prefix trim). A tool
+   * continuation throw leaves the last published value (the base request's
+   * publish — a request that was never shipped, retained for observation).
+   * Rejections before any request leave the last published value too — the
+   * construction-time seed (production) / the shared zero default (fakes)
+   * until the first publish; from the second send on, the previous
+   * request's published value is retained.
    *
    * Orthogonal to [requestTrimmedCount] (the send-time MAX_REQUEST_CHARS
    * leg alone — a subset of this total, kept for debug) and to the

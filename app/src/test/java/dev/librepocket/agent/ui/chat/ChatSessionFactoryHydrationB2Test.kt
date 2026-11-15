@@ -115,18 +115,19 @@ class ChatSessionFactoryHydrationB2Test {
       opened.session.send("q-new")
       val req = provider.seenRequests.single()
       // B2: DEFAULT count leg (200) windows the 300-row prefix + live.
-      // Prefix windows 300 -> 200, combined 200 + live = 201 -> 199 after
-      // the user-boundary snap re-aligns the naive cut onto the next user
-      // row (the cut lands on the leading assistant row of the capped
-      // prefix, so it drops one more).
+      // Prefix windows 300 -> 200, combined 200 + live = 201 -> naive cut
+      // drops the leading user row u50; the user-boundary snap re-aligns the
+      // naive cut onto the next user row (dropping the assistant a50 behind
+      // it) -> 199 rows.
       assertEquals(
         "resume must travel DEFAULT (200, i.e. 199 request rows after the user-boundary snap), not 2000-tail (300+1=301), got ${req.messages.size}",
         199,
         req.messages.size,
       )
       // Re-anchored post-B2 content pin: kept prefix is rows 100..299 (u50..a149);
-      // combined cut (naive 1) re-aligns over the leading assistant row a50 onto
-      // the next user row (u51) -> first shipped row is "u51" (B2 + #16 snap).
+      // combined cut (naive 1) drops the leading user row u50; the
+      // user-boundary snap then re-aligns over the leading assistant row a50
+      // onto the next user row (u51) -> first shipped row is "u51".
       assertEquals("u51", req.messages.first().text)
       assertTrue(req.messages.last().text.startsWith("q-new"))
     } finally {

@@ -251,8 +251,11 @@ class ContinuationOverBudgetException : Exception("continuation request over bud
  * the cut is kept as-is (fail-closed): the window never repairs *pairing*;
  * leading invalid/unpaired slices may be dropped wholesale by boundary
  * alignment (counted in the drop); only the no-user-row-follows case keeps
- * the slice and fails closed downstream in
- * `ProviderJson.validateToolPairing`, mirroring the pair-atomic policy. A
+ * the slice: a pairing violation still fails closed downstream in
+ * `ProviderJson.validateToolPairing`; a pure assistant/tool first row with
+ * no pairing violation is refused at the provider side (Anthropic HTTP 400 /
+ * `FIRST_MESSAGE_MUST_BE_USER`; OpenAI has no hard rejection and mis-reads
+ * the context) — mirroring the pair-atomic policy. A
  * legal tool batch never straddles a user row, and a batch wholly before the
  * cut is dropped together with its user row, so tool-pair integrity is
  * unaffected.
@@ -333,11 +336,14 @@ sealed interface HistoryWindowCap {
  * snaps forward to the next `role == "user"` row via
  * [snapHistoryToUserBoundary] — dropping the leading non-user rows whole —
  * with fail-closed semantics: if no user row
- * follows within the allowed window the naive cut is kept and the violation
- * fails closed downstream. The window never repairs *pairing*; leading
- * invalid/unpaired slices may be dropped wholesale by boundary alignment
- * (counted in the drop); only the no-user-row-follows case keeps the slice
- * and fails closed downstream.
+ * follows within the allowed window the naive cut is kept. The window never
+ * repairs *pairing*; leading invalid/unpaired slices may be dropped
+ * wholesale by boundary alignment (counted in the drop); only the
+ * no-user-row-follows case keeps the slice: a pairing violation still fails
+ * closed downstream in `ProviderJson.validateToolPairing`; a pure
+ * assistant/tool first row with no pairing violation is refused at the
+ * provider side (Anthropic HTTP 400 / `FIRST_MESSAGE_MUST_BE_USER`; OpenAI
+ * has no hard rejection and mis-reads the context).
  */
 internal fun applyHistoryCap(history: List<ChatMessage>, cap: HistoryWindowCap): List<ChatMessage> {
   if (history.isEmpty()) return history
@@ -394,8 +400,12 @@ private fun charWindowStart(history: List<ChatMessage>, maxChars: Int): Int {
  * that cut ships is decided by [snapHistoryToUserBoundary]: when a
  * `role == "user"` row follows within `[start, limit]` the leading
  * invalid/unpaired slice is dropped wholesale (counted in the drop); only
- * when no user row lies within `[start, limit]` is the cut kept and the
- * slice fails closed downstream in `ProviderJson.validateToolPairing`.
+ * when no user row lies within `[start, limit]` is the cut kept: a pairing
+ * violation still fails closed downstream in
+ * `ProviderJson.validateToolPairing`; a pure assistant/tool first row with
+ * no pairing violation is refused at the provider side (Anthropic HTTP 400 /
+ * `FIRST_MESSAGE_MUST_BE_USER`; OpenAI has no hard rejection and mis-reads
+ * the context).
  */
 private fun snapHistoryToPairBoundary(history: List<ChatMessage>, naiveStart: Int): Int {
   if (naiveStart <= 0) return 0
@@ -441,8 +451,11 @@ private fun snapHistoryToPairBoundary(history: List<ChatMessage>, naiveStart: In
  *    limit). The send-time trims pass their last-user/newest-row protection
  *    limit so the snap can never consume the row the trim must preserve.
  * 4. No `role == "user"` row within `[start, limit]` returns [start]
- *    (fail-closed: keeps the naive cut and lets
- *    `ProviderJson.validateToolPairing` fail closed downstream — mirroring
+ *    (fail-closed: keeps the naive cut; a pairing violation still fails
+ *    closed downstream in `ProviderJson.validateToolPairing`; a pure
+ *    assistant/tool first row with no pairing violation is refused at the
+ *    provider side — Anthropic HTTP 400 / `FIRST_MESSAGE_MUST_BE_USER`;
+ *    OpenAI has no hard rejection and mis-reads the context — mirroring
  *    the pair-atomic policy, the window never repairs *pairing*).
  * 5. Forward-only, never backwards; whole rows are dropped.
  * 6. System rows are treated exactly like any other non-user row: they
@@ -452,9 +465,11 @@ private fun snapHistoryToPairBoundary(history: List<ChatMessage>, naiveStart: In
  *
  * The window never repairs *pairing*; leading invalid/unpaired slices may
  * be dropped wholesale by boundary alignment (counted in the drop); only
- * the no-user-row-follows case keeps the slice and fails closed
- * downstream. Violations still fail closed downstream in
- * `ProviderJson.validateToolPairing`.
+ * the no-user-row-follows case keeps the slice: a pairing violation still
+ * fails closed downstream in `ProviderJson.validateToolPairing`; a pure
+ * assistant/tool first row with no pairing violation is refused at the
+ * provider side (Anthropic HTTP 400 / `FIRST_MESSAGE_MUST_BE_USER`; OpenAI
+ * has no hard rejection and mis-reads the context).
  */
 internal fun snapHistoryToUserBoundary(
   history: List<ChatMessage>,
@@ -6183,9 +6198,13 @@ class TurnController(
    * history-prefix trimming (oldest-first, whole messages, tool pairing kept
    * atomic by snapping forward via [snapHistoryToPairBoundary], the structured payload counted;
    * the cut then re-aligns to the next user row via [snapHistoryToUserBoundary] so the retained
-   * prefix never opens on an orphan assistant/tool row — the slice fails closed downstream only
-   * when no user row follows within `[start, limit]`; otherwise the leading orphan rows are
-   * dropped wholesale) is additionally published on
+   * prefix never opens on an orphan assistant/tool row — the slice is kept only
+   * when no user row follows within `[start, limit]` (a pairing violation then
+   * fails closed downstream in `ProviderJson.validateToolPairing`; a pure
+   * assistant/tool first row with no pairing violation is refused at the
+   * provider side — Anthropic HTTP 400 / `FIRST_MESSAGE_MUST_BE_USER`; OpenAI
+   * has no hard rejection and mis-reads the context); otherwise the leading
+   * orphan rows are dropped wholesale) is additionally published on
    * [lastRequestTrimmedCount]/[requestTrimmedCount] (counts),
    * [lastRequestTrimmedChars]/[lastRequestChars] (chars), and on top of the
    * base request's [contextOmission] value
@@ -6259,6 +6278,23 @@ class TurnController(
       throw ContinuationOverBudgetException()
     }
     val finalBase = if (drop > 0) baseMessages.drop(drop) else baseMessages
+    // Defense-in-depth (LOW-2): the trim exhausted the prefix down to a
+    // non-user head — the slice is kept only when no user row lies within
+    // `[start, baseMessages.size - 1]`. Shipping it would be refused/mis-read
+    // at the provider side (Anthropic HTTP 400 on a first non-user message;
+    // OpenAI has no hard rejection and mis-reads the context). Fail closed
+    // (typed, non-retryable) instead. Unreachable by construction today:
+    // `buildRequest` always carries the live user row at the tail of the
+    // base and the snap limit `baseMessages.size - 1` includes it, so the
+    // retained head is always a user row — the guard pins that invariant.
+    // `finalBase` is guaranteed non-empty here: the while bound is
+    // `drop < baseMessages.size - 1` and both snaps refuse to push `drop`
+    // past `baseMessages.size - 1`, so at least the newest base row survives.
+    if (finalBase.first().role != "user") {
+      // The trim exhausted the prefix down to a non-user head: shipping it
+      // would be rejected by the provider. Fail closed (typed, non-retryable).
+      throw ContinuationOverBudgetException()
+    }
     // Publish the continuation's own prefix trim (never silent): buildRequest
     // already emitted the base request's context-window trim, so this adds on
     // top — lastRequestTrimmedCount then reflects the TOTAL head trim of the
@@ -6337,8 +6373,12 @@ class TurnController(
    * call/result pairs are never fractured; the cut then re-aligns to the
    * next user row via [snapHistoryToUserBoundary] (never beyond the
    * last-user protection limit) so the retained slice never opens on an
-   * orphan assistant/tool row — an illegal retained slice still fails
-   * closed downstream (only when no user row follows within `[start, limit]`).
+   * orphan assistant/tool row — an illegal retained slice is kept only when
+   * no user row follows within `[start, limit]` (a pairing violation then
+   * fails closed downstream in `ProviderJson.validateToolPairing`; a pure
+   * assistant/tool first row with no pairing violation is refused at the
+   * provider side — Anthropic HTTP 400 / `FIRST_MESSAGE_MUST_BE_USER`; OpenAI
+   * has no hard rejection and mis-reads the context).
    *
    * Ephemeral time context: a [buildRuntimeTimeContext] block is appended to a
    * copy of the last user message only. No user message means no injection

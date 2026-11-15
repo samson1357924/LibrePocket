@@ -249,23 +249,21 @@ class ChatViewModel(
     private val _history = MutableStateFlow<List<UiMessage>>(emptyList())
 
     /**
-     * Stage E: exact number of older replay rows omitted by the tail cap.
-     * Observable truncation (never silent): surfaces "已省略N則" without a
-     * new UI flow. Reset alongside [_history] on every load path.
-     * Note: no UI consumer currently collects this — it stays as VM-level
-     * observability only. The provider-request context omission (what the
-     * model actually never sees, including the window legs) is published
-     * separately as [contextOmittedCount].
+     * Stage E: exact number of older replay rows omitted by the tail cap
+     * (DB-tail scan, `includePartial=true`). VM-level observability only:
+     * the UI-replay DB-tail count; no UI consumer — the user-visible badge
+     * is [contextOmittedCount] (provider-request omission); never summed
+     * with either counter. Reset alongside [_history] on every load path.
      */
     private val _historyOmittedCount = MutableStateFlow(0)
     val historyOmittedCount: StateFlow<Int> = _historyOmittedCount.asStateFlow()
 
     /**
      * R5-5: send-time per-request trim count, collected from the attached
-     * [ChatSession.requestTrimmedCount]. Load-time resume omission
-     * ([historyOmittedCount], DB tail cap) and this send-time trim are
-     * orthogonal counters — never summed, reset independently. Reset to 0 on
-     * every attach (new session starts untrimmed) and on lifecycle/endpoint
+     * [ChatSession.requestTrimmedCount]. Load-time DB-tail replay omission
+     * ([historyOmittedCount]) and this send-time trim are orthogonal
+     * counters — never summed, reset independently. Reset to 0 on every
+     * attach (new session starts untrimmed) and on lifecycle/endpoint
      * invalidation (the owning session is detached). Kept for debug: the
      * user-facing provider-request omission total (this leg plus the
      * history-window legs) is [contextOmittedCount].
@@ -280,12 +278,13 @@ class ChatViewModel(
      * request after every windowing leg — the construction-time history
      * window, the per-request combined window, and the send-time
      * MAX_REQUEST_CHARS head trim (a tool continuation additionally tops up
-     * its own prefix trim). Orthogonal to [historyOmittedCount] (DB tail
-     * cap; DB-tail rows are never part of the model prefix — disjoint sets,
-     * never summed) and to [requestTrimmedCount] (the send-time 100k-trim
-     * leg alone, a subset of this total, kept for debug). Reset to 0
-     * on every attach (new session starts untrimmed) and on lifecycle/
-     * endpoint invalidation (the owning session is detached).
+     * its own prefix trim). Orthogonal to [historyOmittedCount] (DB-tail
+     * replay count; DB-tail rows are never part of the model prefix —
+     * disjoint sets, never summed) and to [requestTrimmedCount] (the
+     * send-time 100k-trim leg alone, a subset of this total, kept for
+     * debug). Reset to 0 on every attach (new session starts untrimmed) and
+     * on every detach/invalidation path (openSession pre-clear, pending
+     * ledger fence, endpoint invalidation, lifecycle clearChat).
      */
     private val _contextOmittedCount = MutableStateFlow(0)
     val contextOmittedCount: StateFlow<Int> = _contextOmittedCount.asStateFlow()

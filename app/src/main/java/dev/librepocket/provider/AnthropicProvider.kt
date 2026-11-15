@@ -22,6 +22,12 @@ import okhttp3.OkHttpClient
  *   nothing (no dispatcher — #19 vertical slice scope).
  *   Non-thinking only; reasoning-bearing histories fail closed
  *   (`THINKING_ROUND_TRIP_NOT_SUPPORTED`, checked first in `buildBody`).
+ * - The first non-system message must be `role=user`: Anthropic rejects any
+ *   other first non-system role at the HTTP layer with a 400. `buildBody`
+ *   fails fast instead (`FIRST_MESSAGE_MUST_BE_USER`, typed and
+ *   non-retryable) before any pairing validation or wire emission — the
+ *   client-side equivalent of the Anthropic 400. OpenAI Chat Completions and
+ *   Responses have no such restriction; the other adapters are unaffected.
  * - Missing `message_stop` or unclosed visible/tool blocks ->
  *   `Failed(retryable=true)`.
  * - Block-protocol breaches (P1-3) latch: a delta/stop for an unknown
@@ -99,6 +105,14 @@ class AnthropicProvider(
     internal fun buildBody(request: ChatRequest): String {
         requireNoReasoningHistory(request)
         requireNoAssistantImages(request.messages)
+        // Fail-fast (typed, non-retryable): Anthropic rejects any conversation
+        // whose first non-system message is not role=user. Catch it here
+        // (zero HTTP, before any pairing validation) instead of shipping a
+        // guaranteed HTTP 400.
+        val firstNonSystem = request.messages.firstOrNull { it.role != "system" }
+        if (firstNonSystem == null || firstNonSystem.role != "user") {
+            throw ProviderFailure(false, "FIRST_MESSAGE_MUST_BE_USER")
+        }
         when (request.responseFormat) {
             null, ResponseFormat.Text -> Unit
             ResponseFormat.JsonObject, is ResponseFormat.JsonSchema -> {

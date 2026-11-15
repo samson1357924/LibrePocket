@@ -693,6 +693,64 @@ class TurnControllerBudgetBenchmarkTest {
     }
   }
 
+  @Test(timeout = 30_000) fun continuationOverBudgetRetainsContextOmission() {
+    // Phase B (owner P2-2b), omission twin of continuationOverBudgetRetainsBaseCells:
+    // the ContinuationOverBudgetException throw path must leave contextOmission at
+    // the base request's published value, never the continuation top-up (the request
+    // was never shipped). Fixture mirrors continuationOverBudgetRetainsBaseCells:
+    // a single near-admission-cap live user row plus a fat tool result pushes the
+    // untrimmable minimum over the cap, so the continuation throws before shipping.
+    val fixedClock = Clock.fixed(Instant.parse("2026-10-09T01:41:22Z"), ZoneId.of("UTC"))
+    val fixedZone = { ZoneId.of("UTC") }
+    val fatBackend = BmFatBackend(
+      (1..12).map {
+        LspTools.Symbol(
+          "\"".repeat(SafeToolSlice.MAX_STRING_CHARS),
+          "function",
+          "p".repeat(SafeToolSlice.MAX_STRING_CHARS),
+          it,
+        )
+      },
+    )
+    val provider = BmFakeProvider()
+    val c = controller(
+      provider,
+      history = emptyList(),
+      clock = fixedClock,
+      systemZone = fixedZone,
+      toolSlice = sliceLoop(fatBackend, fixedClock),
+    )
+    // Base omission observed at attempt stream time (the attempt ships; the
+    // continuation never ships, so this is the last published base value the
+    // throw path must retain).
+    var baseOmission = -1
+    provider.handler = { _ ->
+      baseOmission = c.contextOmission.value
+      flow {
+        emit(
+          StreamEvent.ToolDone(
+            toolIndex = 0,
+            id = "call-a",
+            name = "lsp.symbols",
+            argumentsJson = """{"query":"A"}""",
+          ),
+        )
+        emit(StreamEvent.Done("tool_calls"))
+      }
+    }
+    try {
+      runBlocking { c.send("a".repeat(90_000)) }
+      // Fail-closed terminal (same path pinned by continuationOverBudgetRetainsBaseCells).
+      assertEquals(ChatStatus.ERROR, c.uiState.value.status)
+      assertEquals(1, provider.seenRequests.size)
+      assertTrue("fixture must observe the base publish, got $baseOmission", baseOmission >= 0)
+      // Throw path retains the base published value (never the top-up).
+      assertEquals(baseOmission, c.contextOmission.value)
+    } finally {
+      c.close()
+    }
+  }
+
   @Test(timeout = 30_000) fun syntheticTinyDeltaDripBenchmarkSkeleton() {
     // Synthetic flood skeleton (non-device): 3000 x 1-char deltas through the
     // #83 hybrid flush cadence. Pins exactness + the O(flushes) bound and logs

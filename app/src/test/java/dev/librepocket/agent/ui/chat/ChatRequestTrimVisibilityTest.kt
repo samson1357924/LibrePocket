@@ -364,11 +364,15 @@ class ChatRequestTrimVisibilityTest {
             }
         }
         assertEquals(0, vm.requestTrimmedCount.value)
+        // Attach resets contextOmission alongside requestTrimmedCount (fresh
+        // session: empty window, seed 0; the attach-time zero stands).
+        assertEquals(0, vm.contextOmittedCount.value)
         // ...and an untrimmed send emits 0 through the same path.
         onMain { vm.onInputChange("hello") }
         onMain { vm.send() }
         awaitTrue { vm.sessionState.value.status == ChatStatus.IDLE && vm.messages.value.size == 2 }
         assertEquals(0, vm.requestTrimmedCount.value)
+        assertEquals(0, vm.contextOmittedCount.value)
     }
 
     @Test
@@ -397,6 +401,9 @@ class ChatRequestTrimVisibilityTest {
         )
         try {
             assertEquals(0, session.requestTrimmedCount.value)
+            // No ViewModel in this test; pin the session's exposed omission
+            // flow at the same zero point (Unbounded cap: window drops nothing).
+            assertEquals(0, session.contextOmission.value)
             runBlocking { session.send("hi") }
             // Char accounting stops after the first head row (u0); the cut
             // then re-aligns to the next user row, dropping the assistant

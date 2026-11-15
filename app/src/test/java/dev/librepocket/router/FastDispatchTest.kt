@@ -327,6 +327,17 @@ class FastDispatchTest {
             assertEquals(text, RouteKind.FAST, d.route)
             assertTrue("query must be Foo: ${d.toolCall!!.argumentsJson}", d.toolCall!!.argumentsJson.contains("\"query\": \"Foo\""))
         }
+        // 內嵌存活：theSymbol/SymbolOfFoo（`the`/`of` 無邊界不切）不得被剝出。
+        for (text in listOf("查 theSymbol 符號", "查 SymbolOfFoo 符號")) {
+            val d = decide(text)
+            assertEquals(text, RouteKind.FAST, d.route)
+            val ident = text.removePrefix("查 ").removeSuffix(" 符號")
+            assertTrue(
+                "query must be $ident: ${d.toolCall!!.argumentsJson}",
+                d.toolCall!!.argumentsJson.contains("\"query\": \"$ident\""),
+            )
+        }
+        // 單複數 `find symbols` 剝空 ⇒ 澄清（且不會 Fast）。
         val bare = decide("find symbols")
         assertEquals(RouteKind.DENIED, bare.route)
         assertEquals(DenyReason.NEED_CLARIFICATION, bare.reasonCode)
@@ -354,6 +365,41 @@ class FastDispatchTest {
         assertEquals(RouteKind.DENIED, d.route)
         assertNull(d.reasonCode)
         assertNull(d.toolCall)
+    }
+
+    @Test fun englishConnectiveTokensStripped() {
+        // #5（B3 re-review）EN connective tokens（for/the/a/an/named/called/of/to，
+        // word-anchored、IGNORE_CASE）自 query 剝離——`search for symbol Foo` 不得
+        // 剝出 `forFoo`、`find the symbol Foo` 不得剝出 `theFoo`、
+        // `locate symbol named Foo` 不得剝出 `namedFoo`。
+        for (text in listOf(
+            "search for symbol Foo",
+            "find the symbol Foo",
+            "lookup the symbol Foo",
+            "locate symbol named Foo",
+            "locate symbol called Foo",
+            "find a symbol Foo",
+        )) {
+            val d = decide(text)
+            assertEquals(text, RouteKind.FAST, d.route)
+            assertTrue(
+                "query must be Foo: ${d.toolCall!!.argumentsJson}",
+                d.toolCall!!.argumentsJson.contains("\"query\": \"Foo\""),
+            )
+            val json = d.toolCall!!.argumentsJson
+            assertFalse("forFoo must be stripped: $json", json.contains("forFoo"))
+            assertFalse("theFoo must be stripped: $json", json.contains("theFoo"))
+            assertFalse("namedFoo must be stripped: $json", json.contains("namedFoo"))
+            assertFalse("calledFoo must be stripped: $json", json.contains("calledFoo"))
+            assertFalse("aFoo must be stripped: $json", json.contains("aFoo"))
+        }
+        // 內嵌名不被誤剝：`theSymbol` 的 `the` 無 word boundary ⇒ 完整保留。
+        val embedded = decide("查 theSymbol 符號")
+        assertEquals(RouteKind.FAST, embedded.route)
+        assertTrue(
+            "embedded `the` in theSymbol must survive the strip: ${embedded.toolCall!!.argumentsJson}",
+            embedded.toolCall!!.argumentsJson.contains("\"query\": \"theSymbol\""),
+        )
     }
 
     @Test fun letterNumberSplittersStillDeny() = runBlocking {
@@ -863,6 +909,26 @@ class FastDispatchTest {
         val d = decide("never find symbol Foo")
         val skipped = skippedOf(dispatcher.dispatch(d, lspOn), "never find symbol Foo")
         assertEquals(DenyReason.NEED_CLARIFICATION, skipped.reasonCode)
+        assertEquals(0, backend.invocations.get())
+    }
+
+    @Test fun englishDenyVerbDeniesAndClarifies() = runBlocking {
+        // #3 B3 re-review: `den[iy]\w*` covers every deny/denies/denied/denying inflection
+        // — `查 deny 符號 Foo` must hit the negation gate and clarify.
+        val backend = CountingBackend()
+        val dispatcher = lspDispatcher(backend)
+        for (text in listOf(
+            "查 deny 符號 Foo",
+            "查 denies 符號 Foo",
+            "查 denied 符號 Foo",
+            "查 denying 符號 Foo",
+        )) {
+            val d = decide(text)
+            assertEquals(text, RouteKind.DENIED, d.route)
+            assertEquals(text, DenyReason.NEED_CLARIFICATION, d.reasonCode)
+            assertNull(text, d.toolCall)
+            skippedOf(dispatcher.dispatch(d, lspOn), text)
+        }
         assertEquals(0, backend.invocations.get())
     }
 
@@ -1576,6 +1642,21 @@ class FastDispatchTest {
             "毋查 Foo 符號",
             "休查 Foo 符號",
             "我 沒 辦 法 查 Foo 符號",
+            // #3（B3 re-review）明確禁止/順延句族（natural-language 等價於否定）：
+            // 全數成立 symbol 模板（command form 或 lookup marker）⇒ 模板成立後否定閘轉
+            // NEED_CLARIFICATION；絕不 FAST、絕不進 executor。
+            "symbols Foo banana",
+            "我拒絕查 Foo 符號",
+            "拒绝查 Foo 符号",
+            "我拒绝查 Foo 符号",
+            "先暫緩查 Foo 符號",
+            "暫緩查 Foo 符號",
+            "延緩查 Foo 符號",
+            "延遲查 Foo 符號",
+            "延後查 Foo 符號",
+            "推遲查 Foo 符號",
+            "I forbid you to search symbol Foo",
+            "suspend lookup of symbol Foo",
         )
         for (text in markerProbes) {
             val d = decide(text)
@@ -1586,8 +1667,14 @@ class FastDispatchTest {
         }
         // 群組二：EN-mix `我不想 symbol Foo` 無 lookup marker ⇒ A2 兩段式模板不成立
         // ⇒ no-match DENIED（reasonCode null，不進否定閘）。
+        // #3（B3 re-review）：`searching`/`finding`/`hold off` 皆不匹配
+        // word-anchored marker `\b(find|search|lookup|locate)\b` ⇒ 同樣無 marker，
+        // 直接 no-match DENIED——DENIED、絕不執行、後端零呼叫。
         for (text in listOf(
             "我不想 symbol Foo",
+            "I forbid searching for symbol Foo",
+            "hold off on symbols",
+            "postpone finding symbols",
         )) {
             val d = decide(text)
             assertEquals(text, RouteKind.DENIED, d.route)
@@ -1641,6 +1728,40 @@ class FastDispatchTest {
             skippedOf(dispatcher.dispatch(d, lspOn), text)
         }
         assertEquals(0, backend.invocations.get())
+    }
+
+    @Test fun interrogativeSymbolUtterancesDenyZeroBackend() = runBlocking {
+        // #4（B3 re-review）：問句/知識/教學（how-to）語句即使帶 lookup verb
+        // 也絕不得進 symbol 模板 ⇒ no-match DENIED（reasonCode null）、
+        // toolCall null、dispatch Skipped、後端零呼叫——問句不是查詢命令。
+        val backend = CountingBackend()
+        val dispatcher = lspDispatcher(backend)
+        for (text in listOf(
+            "Why does search symbol Foo work?",
+            "How to find symbol Foo?",
+            "How to find symbol Foo",
+            "Explain how to search symbols",
+            "Explain how to search symbols Foo",
+            "教我如何查 Foo 符號",
+            "請教我如何查 Foo 符號",
+            "請問怎麼查 Foo 符號",
+            "如何查 Foo 符號",
+            "怎麼查 Foo 符號",
+            "為什麼查 Foo 符號",
+            // 以疑問尾標 嗎 收尾 ⇒ 問句，即使含 marker 亦不執行。
+            "查 Foo 符號嗎？",
+        )) {
+            val d = decide(text)
+            assertEquals(text, RouteKind.DENIED, d.route)
+            assertNull(text, d.reasonCode)
+            assertNull(text, d.toolCall)
+            skippedOf(dispatcher.dispatch(d, lspOn), text)
+        }
+        assertEquals(0, backend.invocations.get())
+        // Positive guard：基本查詢路徑不受豁免影響——`查 Foo 符號` 仍 FAST。
+        val control = decide("查 Foo 符號")
+        assertEquals(RouteKind.FAST, control.route)
+        assertEquals("lsp.symbols", control.toolCall?.toolName)
     }
 
     @Test fun cjkMixedMarkerSymbolLookupRoutesFast() {

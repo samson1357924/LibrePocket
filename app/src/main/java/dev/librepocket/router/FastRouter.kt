@@ -50,7 +50,9 @@ import java.util.concurrent.atomic.AtomicLong
  * now also checked behaviorally (sampling, not the full table):
  * `FastDispatchTest.newToolMustExpandVerbTableBeforeReady` probes the
  * sampled negated intents to deny the ready tool before FAST, not just
- * RULES membership.
+ * RULES membership. 路由順序見下方「matchTemplate 路由順序」段：symbol 前閘介於
+ * SLOW_HINTS 與 RULES 之間，`查 AlarmManager 符號` 綁 lsp.symbols——由
+ * `FastDispatchTest.codeIdentifierSymbolNamesRouteToLspSymbols` 釘住。
  *
  * A1/A2 routing hardening (fail-opens closed, conservatively): the
  * `lsp.symbols` template no longer fires on mere hint presence — it now
@@ -59,12 +61,58 @@ import java.util.concurrent.atomic.AtomicLong
  * `\b(find|search|lookup|locate)\b`; `where` deliberately excluded).
  * Question/knowledge utterances (`What is a symbol?`, `Explain symbols`,
  * `請解釋符號`, `符號有哪些種類`, bare `symbols`, `符號是Foo嗎`) fall through
- * to no-match DENIED (reasonCode null) — not clarification. The negation
+ * to no-match DENIED (reasonCode null) when nothing else matches — not
+ * clarification. #4（B3 re-review）interrogative/teaching-request utterances
+ * *with* a lookup verb （`Why does search symbol Foo work?`,
+ * `How to find symbol Foo`, `教我如何查 Foo 符號`）: [isInterrogativeOrTeachingRequest]
+ * excludes them from the symbol front gate, so the symbol template never
+ * matches (never FAST); they then fall through — either to no-match DENIED
+ * （reasonCode null）when no keyword template matches, or to the matching
+ * keyword template's own fail-closed outcome （e.g. `查 AlarmManager 符號呢`
+ * → alarm.create missing-time clarification; NEVER FAST). The gate now
+ * lives in the symbol front gate ahead of [RULES] (see the
+ * matchTemplate 路由順序 paragraph below), not inside the RULES loop — hint
+ * presence alone still routes
+ * no-match DENIED when no lookup marker is present (pinned by
+ * `FastDispatchTest.symbolQueryBeatsKeywordHints`). The negation
  * gate is now a conservative ANY-presence gate ([NEGATION_MARKERS]): any
- * occurrence of 不/沒/別/勿/莫… or English negation words clarifies over
+ * occurrence of 不/沒/別/勿/莫… or English negation words — plus (#3 B3
+ * re-review) the explicit prohibition/postponement words
+ * （`forbid`/`prohibit`/`ban`/`postpone`/`suspend`/`defer`/`den[iy]\w*`/`hold off`
+ * on the EN side; 拒絕/暫緩/延緩/延後/推遲/延遲/延期/推後/寬限/延宕 on the CJK
+ * compound side, in [NEGATION_HINTS]） — clarifies over
  * the same three normalized texts — phrases are open-ended, so a closed
  * verb table cannot be complete; over-clarification is the fail-safe
  * direction (the single ready tool is READ-only).
+ *
+ * matchTemplate 路由順序（B3 re-review pin；依序，fail-safe）：
+ * 1. SLOW_HINTS（自動化描述 → SLOW automation descriptor，由 projection
+ *    誠實拒絕，play 上 FLAVOR_BLOCKED）先於一切；
+ * 2. code-symbol lookup 前閘第二：containsAny(SYMBOL_HINTS) 且
+ *    [hasSymbolLookupIntent] 命中且非 [isInterrogativeOrTeachingRequest]
+ *    才回 `lsp.symbols`——在任何關鍵詞工具之前。
+ *    識別字如 `AlarmManager`／`NotificationManager`／`CalendarProvider`／
+ *    `ScreenshotController`／`EmailClient`／`VolumeController` 內含其他工具的
+ *    無錨點 hint 子串（`alarm`、`notification`、`calendar`、`screenshot`、
+ *    `e-?mail`、`volume`），若仍走 RULES 順序會被這些工具先搶走
+ *    （`查 AlarmManager 符號` 會落到 alarm.create 的缺時間澄清）。
+ *    前閘保證 `查 AlarmManager 符號` 綁 lsp.symbols 而非 alarm.create；
+ *    #4（B3 re-review）：問句/知識/教學（how-to）語句絕不滿足 symbol 前閘——
+ *    英文開頭疑問詞/教學動詞（why|how|who|what|when|where|explain|teach|tell，
+ *    word-anchored）、中文開頭教學/疑問起始語（教我|學我|学我|請教|请教|請問|请问|問|
+ *    问|如何|怎麼|怎么|為什麼|为什么|何時|何时|何地|何处|何處|可否|是否|怎樣|怎样）、
+ *    或以疑問尾標收尾（? ？ 嗎 吗 呢）者一律不進 symbol 前閘 ⇒ 該語句不走 lsp.symbols
+ *    （絕不 FAST）；無其他規則命中時 no-match DENIED（reasonCode null），
+ *    命中 keyword 規則時落到該規則原有的 fail-closed 語意（例如查 AlarmManager
+ *    符號呢 → alarm.create 缺時間澄清），絕不執行（pinned by
+ *    `FastDispatchTest.interrogativeSymbolUtterancesDenyZeroBackend`）。
+ * 3. RULES 關鍵詞工具最後（SYMBOLS 已自 RULES 移除，symbol 匹配由前閘獨占；
+ *    [templateToolNames] 顯式補入 lsp.symbols 維持 expansion-rule oracle）。
+ * 前閘與舊 RULES 內 symbol 條目同樣要求 A2 lookup intent——僅有 hint 不足；
+ * SLOW 命中不受前閘影響（自動化語句仍先轉 automation descriptor）。
+ * 由 `FastDispatchTest.codeIdentifierSymbolNamesRouteToLspSymbols`（六個識別字
+ * 端到端 FAST＋invocation==1）與 `FastDispatchTest.symbolQueryBeatsKeywordHints`
+ * （非 symbol 意圖照常落 keyword 工具、無 marker 者 no-match）釘住。
  *
  * Pure logic, no Android dependencies.
  *
@@ -211,12 +259,16 @@ class FastRouter(
         if (containsAny(text, SLOW_HINTS)) {
             return TemplateMatch(ToolRegistry.SLOW_TOOL_NAME, jsonText(text))
         }
+        // Symbol-naming lookup is checked before keyword-matched tools:
+        // identifiers like `AlarmManager` contain other tools' hint words, but
+        // `查 AlarmManager 符號` is a code-symbol query, not an alarm/call/mail ask.
+        // Interrogative/teaching utterances (「Why does search symbol Foo work?」)
+        // never qualify — question/knowledge is not a lookup command (#4).
+        if (containsAny(text, SYMBOL_HINTS) && hasSymbolLookupIntent(text) && !isInterrogativeOrTeachingRequest(text)) {
+            return TemplateMatch(LspTools.SYMBOLS_NAME, symbolArgs(text))
+        }
         for ((toolName, hints, args) in RULES) {
             if (containsAny(text, hints)) {
-                // A2: the symbol template needs an explicit lookup intent in
-                // addition to hint presence; otherwise it falls through to
-                // no-match DENIED (reasonCode null), not clarification.
-                if (toolName == LspTools.SYMBOLS_NAME && !hasSymbolLookupIntent(text)) continue
                 return TemplateMatch(toolName, args(text))
             }
         }
@@ -256,7 +308,8 @@ class FastRouter(
         // test is [hasSymbolLookupIntent] (command form or lookup marker;
         // fullwidth ｓｅａｒｃｈ/ｆｉｎｄ do NOT match the EN marker — they
         // route no-match, same fail-safe direction, pinned by the
-        // fullwidth-English tests).
+        // fullwidth-English tests). The prefilter fires in the symbol front
+        // gate (see matchTemplate), never inside the RULES loop.
         private val SYMBOL_HINTS = listOf(r("符號"), r("符号"), r("\\bsymbols?\\b"))
         // A2 explicit-lookup gate for the symbol template: either the
         // single-word command form (`symbol(s) <name>`, anchored at start)
@@ -268,6 +321,37 @@ class FastRouter(
         private val SYMBOL_LOOKUP_MARKER =
             Regex("查|找|尋|搜|詢|寻|询|查询|查找|搜尋|搜寻|\\b(find|search|lookup|locate)\\b", RegexOption.IGNORE_CASE)
         private val SYMBOL_COMMAND_FORM = Regex("^symbols?\\s+\\S", RegexOption.IGNORE_CASE)
+        // #4（B3 re-review）：問句／教學（how-to）型語句的 symbol 前閘豁免。
+        // 「Why does search symbol Foo work?」這類自然語句只要含 lookup verb 就會
+        // 命中前閘而執行——問句/知識/教學語句絕不得進 symbol 模板（symbol 前閘豁免）：
+        // 命中豁免只免除 symbol 模板；其餘 keyword 規則照常套用（如查 AlarmManager
+        // 符號呢 → alarm.create 缺時間澄清，DENIED 絕不 FAST），當無任何 keyword
+        // 規則命中時才落 no-match DENIED（reasonCode null）。
+        // 英文：開頭為疑問詞/教學動詞（word-anchored，IGNORE_CASE；`tell` 涵蓋
+        // 「tell me …」）；中文：開頭為 教我|學我|学我|請教|請問|问… 等教學/疑問起始語；
+        // 或整句以疑問尾標（? ？ 嗎 吗 呢）收尾——問句不是查詢命令。
+        // 命中 ⇒ symbol 模板不成立；其餘模板（其他工具）不受影響（fail-safe 只關 symbol
+        // 前閘，其餘模板維持原語意）。
+        private val INTERROGATIVE_EN_PREFIX =
+            Regex("^(?:why|how|who|what|when|where|explain|teach|tell)\\b", RegexOption.IGNORE_CASE)
+        private val INTERROGATIVE_CJK_PREFIX =
+            Regex("^(?:教我|學我|学我|請教|请教|請問|请问|问|問|如何|怎麼|怎么|為什麼|为什么|何時|何时|何地|何处|何處|可否|是否|怎樣|怎样)")
+        private val INTERROGATIVE_ENDINGS = charArrayOf('?', '？', '嗎', '吗', '呢')
+
+        /**
+         * Interrogative/teaching-request predicate for the symbol front gate:
+         * trimmed text starts with an EN question/teaching word (word-anchored,
+         * case-insensitive), starts with a CJK teaching/question opener, or ends
+         * with a CJK/EN question tail （? ？ 嗎 吗 呢）. Matching utterances are
+         * never symbol lookups — the symbol template does not match; the utterance
+         * falls through (no-match DENIED only when no keyword rule matches; otherwise
+         * the matching keyword rule's own fail-closed outcome — never FAST).
+         */
+        private fun isInterrogativeOrTeachingRequest(text: String): Boolean {
+            if (INTERROGATIVE_EN_PREFIX.containsMatchIn(text)) return true
+            if (INTERROGATIVE_CJK_PREFIX.containsMatchIn(text)) return true
+            return text.lastOrNull()?.let { it in INTERROGATIVE_ENDINGS } ?: false
+        }
         private val SLOW_HINTS = listOf(
             r("自動點擊"), r("自动点击"), r("點擊螢幕"), r("点击屏幕"), r("幫我點"), r("帮我点"),
             r("自動填表"), r("自动填表"), r("代操"), r("自動操作"), r("自动操作"),
@@ -279,7 +363,9 @@ class FastRouter(
          * ANY-presence 閘（見下）——只要有否定詞/不確定詞存在即澄清。
          *
          * 兩表互補（COMPLEMENTARY），不得刪除單顆粒集或通用禁止詞：本表（[NEGATION_HINTS]）
-         * 收多動詞複合否定與通用禁止詞（取消/停止/禁止/算了＋不/別/没&貼動詞 等 176 條；
+         * 收多動詞複合否定與通用禁止詞（取消/停止/禁止/算了＋不/別/没&貼動詞 等 194 條——
+         * B3 re-review（#3）新增明確禁止/順延 句族：拒絕/暫緩/延緩/延後/推遲/延遲/
+         * 延期/推後/寬限/延宕 繁簡對稱共 18 條，與 {取消,停止,禁止,算了} 同屬通用禁止詞載荷；
          * 本表相對 [NEGATION_MARKERS] 的獨有載荷 = `取消`/`停止`/`禁止`/`算了` 四個通用禁止詞
          * ——中文複合詞的每條子串皆含不/未/別等單顆粒，實為 MARKERS 的子集合；與 MARKERS
          * 英文集重複的 11 個 \b 詞）；
@@ -300,7 +386,10 @@ class FastRouter(
          * 含繁簡交叉混排組合——例如 `別尋`/`别尋`/`沒寻`/`没尋` 四組全列，防禦混排輸入）＋
          * 通用否定詞＋`\bnever\b`/`\bno\b`/`\bnot\b`/`\brefus\w*\b`/`\bavoid\w*\b`/`\bskip\w*\b`/`\bwithout\b`
          *（英文否定為 best-effort：`refuses symbols` 已涵蓋；其餘未列動詞仍是殘餘缺口，
-         * 屬 fail-open 候選，監測留待 Phase 2/3）。其他模板動詞（擷／安排／帶／切／靜音）
+         * 屬 fail-open 候選，監測留待 Phase 2/3）；#3 B3 re-review 另於
+         * [NEGATION_MARKERS] 英文 \b 集擴充明確禁止/順延句族
+         *（`forbid`/`prohibit`/`ban`/`postpone`/`suspend`/`defer`/`den[iy]\w*`/`hold off`），
+         * 中文複合禁止/順延句族（拒絕/暫緩/延緩/延後/推遲/延遲/延期/推後/寬限/延宕）則載入本表。其他模板動詞（擷／安排／帶／切／靜音）
          * 在其工具把 executionReady 翻轉前補入——不得提前宣稱涵蓋。
          * 否定偵測同時跑在原始文本、NFKC 正規化後「刪除非（非 Lm）字母字元（含所有數字）與 ASCII 英數字」的文本、以及
          * 「非字母/數字字元→空白」的文本上（見 [isNegated]），故 `別 查`／`不\u200B查`／
@@ -328,8 +417,11 @@ class FastRouter(
          *   (b) 混合文字同形字（Cyrillic/Greek lookalikes；例如 `nеver` 用 U+0435）
          *       未折疊——Phase 2/3 再評估 confusable folding；
          *   (c) 英文覆蓋為 best-effort，限於列舉動詞
-         *       （`never`/`don'?t`/`do not`/`stop`/`cancel`/`refus\w*`/`avoid\w*`/`skip\w*`/`without`/`no`/`not`）；
-         *       `cannot` 類及未列舉動詞不涵蓋；
+         *       （`never`/`don'?t`/`do not`/`stop`/`cancel`/`refus\w*`/`avoid\w*`/`skip\w*`/`without`/`no`/`not`
+         *       ＋#3 B3 re-review：`forbid\w*`/`prohibit\w*`/`ban\w*`/`postpone\w*`/`suspend\w*`/`defer\w*`/
+         *       `den[iy]\w*`/`hold\\s*off`）；
+         *       `cannot`/`later`/`afterwards` 類及未列舉動詞不涵蓋；`ban\w*` 會過度涵蓋 `banana` 以及識別字前綴（`BanController`、`BannerLayout`、`DenialOfServiceException`——皆 `\bban\w*\b`/`\bden[iy]\w*\b` 全詞命中，壓成需澄清而非誤執行）
+         *       ——皆過度澄清 fail-safe 方向，接受並記錄；
          *   (d) 全形-only 符號 hint 不會路由（SYMBOL_HINTS 比對原始文本，安全方向）；
          *   (e) `符號是Foo嗎` → no-match（A2 起：無 lookup marker，不進模板，reasonCode null）；
          *       `特別找` 過度澄清（pinned）；`查理`→`理` 過度剝離（pinned）；
@@ -357,6 +449,13 @@ class FastRouter(
             r("别调"), r("别导"), r("别发"), r("别传"), r("别帮"), r("别给"),
             r("别查"),
             // `不`+動詞（繁簡對稱）
+            // 明確禁止/順延（#3 B3 re-review）：自然語言等價於否定/延遲執行——
+            // `我拒絕查 Foo 符號`／`先暫緩查 Foo 符號` 一類語句必不得進
+            // symbol 模板執行；收錄於複合否定表（非單顆粒表），繁簡對稱＋混排涵蓋
+            // 拒絕/暫緩/延緩/延後/推遲/延遲/延期/推後/寬限/延宕 句族。
+            r("拒絕"), r("拒绝"), r("暫緩"), r("暂缓"), r("延緩"), r("延缓"),
+            r("延後"), r("延后"), r("推遲"), r("推迟"), r("延遲"), r("延迟"),
+            r("延期"), r("推後"), r("推后"), r("寬限"), r("宽限"), r("延宕"),
             r("不查"), r("不找"), r("不尋"), r("不搜"), r("不詢"), r("不問"),
             r("不打"), r("不設"), r("不開"), r("不截"), r("不播"),
             r("不調"), r("不導"), r("不發"), r("不傳"), r("不幫"), r("不給"),
@@ -394,7 +493,10 @@ class FastRouter(
         // clarifies — phrases are open-ended, so a closed verb table cannot be complete.
         // The two tables are COMPLEMENTARY: [NEGATION_MARKERS]
         // holds the single-particle set （不 沒 没 別 别 勿 莫 嫑 否 無 无 免 未 毋 休） plus the
-        // English \b set; [NEGATION_HINTS]
+        // English \b set — `no`/`not`/`never`/`don'?t`/`do not`/`stop`/`cancel`/`refus\w*`/
+        // `avoid\w*`/`skip\w*`/`without` plus (#3 B3 re-review, explicit prohibition/
+        // postponement): `forbid\w*`/`prohibit\w*`/`ban\w*`/`postpone\w*`/`suspend\w*`/
+        // `defer\w*`/`den[iy]\w*`/`hold\s*off`; [NEGATION_HINTS]
         // holds the multi-verb compound negations plus general forbiddens, whose unique
         // load-bearing contribution is {取消,停止,禁止,算了} (its Chinese compounds and EN
         // entries are subsets of this gate). The single-particle set and those four words
@@ -415,6 +517,16 @@ class FastRouter(
             r("\\bno\\b"), r("\\bnot\\b"), r("\\bnever\\b"), r("\\bdon'?t\\b"), r("\\bdo not\\b"),
             r("\\bstop\\b"), r("\\bcancel\\b"), r("\\brefus\\w*\\b"), r("\\bavoid\\w*\\b"),
             r("\\bskip\\w*\\b"), r("\\bwithout\\b"),
+            // 明確禁止/順延EN句族（#3 B3 re-review）：自然語言等價於否定——
+            // 明確詞集：`forbid`／`prohibit`／`ban`／`postpone`／`suspend`／`defer`／`den[iy]\w*`（含 deny/denies/denied/denying）／`hold off`。
+            // `I forbid you to search symbol Foo`／`postpone finding symbols`／
+            // `hold off on symbols`／`suspend lookup` 皆不得落 FAST；模板命中者轉澄清，
+            // 無模板命中者 no-match DENIED——皆為 DENIED、絕不執行。
+            // 註：`\bban\w*\b` 會過度涵蓋 `banana`（`symbols Foo banana` → 澄清）——
+            // 過度澄清為 fail-safe 方向，接受並記錄。
+            r("\\bforbid\\w*\\b"), r("\\bprohibit\\w*\\b"), r("\\bban\\w*\\b"),
+            r("\\bpostpone\\w*\\b"), r("\\bsuspend\\w*\\b"), r("\\bdefer\\w*\\b"),
+            r("\\bden[iy]\\w*\\b"), r("\\bhold\\s*off\\b"),
         )
 
         // Shared argument patterns (also hoisted: previously recompiled per
@@ -430,7 +542,7 @@ class FastRouter(
 
         // FastRouter template rules + arg builders, hoisted to the
         // companion with the hint regexes (Stage C completion): the
-        // 12-entry rule list and the builder closures stop allocating
+        // 11-entry rule list and the builder closures stop allocating
         // per FastRouter(); decide() is a hot path. The shared JSON/esc
         // helpers and the phone finder live here too so the RULES lambdas
         // never capture the instance.
@@ -493,28 +605,19 @@ class FastRouter(
                 OPEN_APP_HINTS,
                 { t -> "{\"appName\": \"${esc(t)}\", \"packageName\": \"\"}" },
             ),
-            // B3 reference expansion (`lsp.symbols`, the single ready tool):
-            // symbol-naming intents route FAST only when projected AND ready;
-            // the query is the hint-stripped remainder (blank ⇒ clarification
-            // in [missingQuestionFor], never an empty-query execution).
-            // A2: hint alone is not enough — the match site requires
-            // [hasSymbolLookupIntent] (see matchTemplate).
-            Triple(
-                LspTools.SYMBOLS_NAME,
-                SYMBOL_HINTS,
-                { t -> symbolArgs(t) },
-            ),
         )
 
         /**
-         * Fast-lane template coverage: every tool name with a RULES template.
-         * Expansion-rule oracle for `FastDispatchTest`: every
+         * Fast-lane template coverage: every tool name with a RULES template,
+         * plus `lsp.symbols` — its template is the symbol front gate ahead of
+         * the RULES loop (see [matchTemplate]), not a RULES entry. This is the
+         * expansion-rule oracle for `FastDispatchTest`: every
          * `executionReady` registry tool must be covered here BEFORE its flag
          * flips (a RULES gap is fail-safe, a NEGATION gap is not — see the
          * class KDoc). Untemplated tools can never reach FAST by construction
          * ([matchTemplate] returns null ⇒ DENIED no-match).
          */
-        fun templateToolNames(): Set<String> = RULES.map { it.first }.toSet()
+        fun templateToolNames(): Set<String> = RULES.map { it.first }.toSet() + setOf(LspTools.SYMBOLS_NAME)
 
         private fun jsonText(text: String): String =
             "{\"text\": \"${esc(text)}\"}"
@@ -602,6 +705,14 @@ class FastRouter(
          * `\bsymbols?\b`, `\blsp\b`), so
          * `SymbolTable` / `getSymbol` / `LSPClient` survive intact (an
          * unanchored `symbol` would shred the `Symbol` inside `getSymbol`).
+         * #5（B3 re-review）EN connective tokens (`for`/`the`/`a`/`an`/
+         * `named`/`called`/`of`/`to`) are word-anchored strip words too:
+         * `search for symbol Foo` → `Foo`（曾漏剝為 `forFoo`）、
+         * `find the symbol Foo`／`lookup the symbol Foo` → `Foo`（曾為 `theFoo`）、
+         * `locate symbol named Foo`／`locate symbol called Foo` → `Foo`
+         * （曾為 `namedFoo`）、`find a symbol Foo` → `Foo`。
+         * 內嵌名不受影響：`theSymbol`／`getSymbol`／`SymbolTable` 的 `the`/`symbol`
+         * 無 word boundary ⇒ 完整保留。
          * Meta-question tokens (什麼/什么/為什麼/为什么/是什麼/是什么/怎麼/怎么/如何/意思/嗎/吗/呢)
          * strip as well, so a marker-bearing utterance that reduces to empty
          * (e.g. `查 是 符號`) clarifies rather than executing. Bare
@@ -627,8 +738,13 @@ class FastRouter(
          * A name exactly equal to joined hint tokens also strips to blank and
          * clarifies (fail-safe direction).
          */
+        // #5（B3 re-review）EN connective 詞一併剝離（word-anchored、IGNORE_CASE）：
+        // `search for symbol Foo` 曾剝出 `forFoo`、`find the symbol Foo` 曾剝出
+        // `theFoo`、`locate symbol named Foo` 曾剝出 `namedFoo`。
+        // `a`/`an` 以 \b 錨定（短詞可安錨）；`named|called` 不傷內嵌名——
+        // `theSymbol`/`getSymbol`/`SymbolTable` 皆無 word boundary ⇒ 完整保留。
         private val SYMBOL_QUERY_STRIP =
-            Regex("幫我|這個|那個|一下|請|查|找|尋|搜|詢|符號|符号|函式|函数|為什麼|为什么|是什麼|是什么|什麼|什么|怎麼|怎么|如何|意思|嗎|吗|呢|是|的|要|用|\\b(find|search|lookup|locate)\\b|\\bsymbols?\\b|\\blsp\\b|[\\s，。、？?！!：:「」『』\"'（）(),.;]", RegexOption.IGNORE_CASE)
+            Regex("幫我|這個|那個|一下|請|查|找|尋|搜|詢|符號|符号|函式|函数|為什麼|为什么|是什麼|是什么|什麼|什么|怎麼|怎么|如何|意思|嗎|吗|呢|是|的|要|用|\\b(find|search|lookup|locate|for|the|a|an|named|called|of|to)\\b|\\bsymbols?\\b|\\blsp\\b|[\\s，。、？?！!：:「」『』\"'（）(),.;]", RegexOption.IGNORE_CASE)
 
         private fun extractSymbolQuery(text: String): String =
             SYMBOL_QUERY_STRIP.replace(text, "").trim()
@@ -713,7 +829,10 @@ class FastRouter(
          */
         // [isNegated] 同命三個文本（raw / NFKCremoved / NFKCspaced）；A1 保守否定閘。
         // 兩表互補（COMPLEMENTARY），不得刪除單顆粒集或四個通用禁止詞：[NEGATION_MARKERS]
-        // 收單一顆粒集（不 沒 没 別 别 勿 莫 嫑 否 無 无 免 未 毋 休）＋英文 \b 集；[NEGATION_HINTS]
+        // 收單一顆粒集（不 沒 没 別 别 勿 莫 嫑 否 無 无 免 未 毋 休）＋英文 \b 集
+        //（`no`/`not`/`never`/`don'?t`/`do not`/`stop`/`cancel`/`refus\w*`/`avoid\w*`/`skip\w*`/`without`
+        // ＋#3 B3 re-review：`forbid\w*`/`prohibit\w*`/`ban\w*`/`postpone\w*`/`suspend\w*`/`defer\w*`/
+        // `den[iy]\w*`/`ban\w*`/`hold\s*off`）；[NEGATION_HINTS]
         // 收多動詞複合否定與通用禁止詞，其獨有載荷 = {取消,停止,禁止,算了}（中文複合詞與英文集
         // 實為 MARKERS 的子集合/重複，可清理但非必須）。
         // 兩表皆 OR 同命同文本——任何否定詞/不確定詞存在即澄清，絕不執行（封閉表不

@@ -231,6 +231,7 @@ class WebSearchService(
                 val m = mine
                 if (m == null) {
                     // 防禦性分支：正常不可達（lateHit == null ⇒ 已選舉／加入 in-flight）；重解析避免以未選舉的狀態繼續。
+                    iterationSticky = null // 一律退回當前 vault 重解析（含此防禦性分支）
                     retry = true
                 } else if (!leader) {
                     try {

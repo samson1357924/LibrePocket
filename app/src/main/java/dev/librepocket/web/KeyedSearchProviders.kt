@@ -32,8 +32,11 @@ import kotlinx.serialization.json.putJsonObject
  *   的 init 檢查與 `mismatchedKeyIdFailsFastAtConstruction` 測試）。自訂 endpoint
  *   需未來 D3 驗證流程另行開放，本層有意不接受。D3 的 `WebSearchSettings.keyIdFor`
  *   留待 D3 落地；無論 D3 為何，本層皆 fail-fast。
- * - 缺 key（vault 無值／讀取失敗／空字串）→ `Unavailable(MISSING_KEY)`，零網路請求，
- *   不靜默換 provider；401／403 → `Failed(AUTH)`、請求形狀錯誤 → `Failed(PROTOCOL)`，
+ * - 持久故障（vault 無值／讀取完全失敗／blank key）→ `Unavailable(MISSING_KEY)`，零網路請求；
+ *   暫時故障（vault 抖動）→ Service 旁路快取（uncacheable），delegate `search()` 會重讀 vault 一次，
+ *   若當時恢復則照常打 upstream（query 原文 egress；仍 fail-closed、仍不寫快取、永不用過期憑證），
+ *   接線前 consent 文案必須據此告知。不靜默換 provider；
+ *   401／403 → `Failed(AUTH)`、請求形狀錯誤 → `Failed(PROTOCOL)`，
  *   兩者皆不 fallback（見 [WebSearchSelector.mayFallback]）。
  * - Vault 安全：`getKey` 回傳的 [CharArray] 以不可變 [CredentialSnapshot] 承載；
  *   snapshot 由最外層持有者於 `finally` 以 `fill` 抹除；
@@ -134,7 +137,7 @@ private fun resultOrNull(
  *
  * Throw 契約沿 D1 [WebSearchProvider]：除 [CancellationException] 原樣透傳外不拋異常
  * （建構期的 [IllegalArgumentException] 除外）；
- * vault 讀取失敗 fail-closed 為 `Unavailable(MISSING_KEY)`。
+ * vault 讀取失敗 fail-closed 為 `Unavailable(MISSING_KEY)`（持久故障零網路；暫時故障見 search() 旁路語義）。
  */
 abstract class BaseKeyedSearchProvider(
     private val vault: KeyVault,
@@ -171,10 +174,13 @@ abstract class BaseKeyedSearchProvider(
      * 單次 vault 讀取取得的憑證狀態（F1 fix）：讀取成功 → [CredentialState.Ready]，
      * 同一份不可變 [CredentialSnapshot] 既產生 fingerprint、亦供 HTTP 請求使用，
      * 消除原 read#1(指紋)／read#2(key) 之間的憑證漂移（TOCTOU）。
-     * SHA-256（byte-packed CharArray，避免中間 String）截斷為 16 hex chars（64 bits）；
+     * SHA-256（trim 後 byte-packed CharArray，避免中間 String）取前 8 bytes 之十六進位（16 hex chars，64 bits）；
      * in-memory only、不持久化，無 egress 通道；對高熵 key 實務不可逆推回 key material。
      * （低熵 key 的 dictionary 還原不在本層威脅模型：指紋永不落盤、不印出、不出本處理程序。）
-     * 無法確定當前憑證狀態（vault 讀取失敗／缺 key／指紋計算失敗）→ [CredentialState.Unavailable]，Service 將完全旁路快取。
+     * key 判定前先正規化 trim（leading/trailing 空白，以 `Char.isWhitespace()`／`Character.isSpaceChar(code)` 判定，含全空白 → Unavailable）；
+     * trim 僅正規化兩端；key 內任何非 printable ASCII 字元（含內嵌空白、控制／格式／DEL／>0x7E）→ Unavailable；
+     * 正當 provider key 為可列印 ASCII，拒絕此類字元以防 header 注入與指紋異常。
+     * 無法確定當前憑證狀態（vault 讀取失敗／缺 key／blank／含 FORMAT／CONTROL／非 ASCII／指紋計算失敗）→ [CredentialState.Unavailable]，Service 將完全旁路快取。
      * [CancellationException] 原樣透傳。
      */
     final override suspend fun credentialState(): CredentialState {
@@ -185,43 +191,66 @@ abstract class BaseKeyedSearchProvider(
         } catch (_: Exception) {
             return CredentialState.Unavailable
         } ?: return CredentialState.Unavailable
-        // blank／empty／不可見 key → Unavailable（先 wipe；不產生 fingerprint 列）。
-        // 涵蓋 C0 控制字元與 DEL／C1（CONTROL 類，含 <= 0x20 與 0x7F/0x80-0x9F）、
-        // Unicode 空白（NBSP/figure/narrow/ideographic space 等，以 isSpaceChar 判）
-        // 與 FORMAT 類不可見字元（ZWSP、BOM、soft hyphen、bidi controls）；正當 key 永不含 Cf／Cc 不可見字元。
-        if (raw.isEmpty() || raw.all { it.code <= 0x20 || Character.isWhitespace(it.code) || Character.isSpaceChar(it.code)
-                || Character.getType(it.code) == Character.FORMAT.toInt() || Character.getType(it.code) == Character.CONTROL.toInt() }) {
+        // 預作 normalized trim：掃描 leading/trailing 空白（Char.isWhitespace() 或 Character.isSpaceChar(code)），
+        // 取 [start, end)；全空白（start >= end）→ wipe raw → Unavailable（不產生 fingerprint 列）。
+        var start = 0
+        var end = raw.size
+        while (start < end && (raw[start].isWhitespace() || Character.isSpaceChar(raw[start].code))) start++
+        while (end > start && (raw[end - 1].isWhitespace() || Character.isSpaceChar(raw[end - 1].code))) end--
+        if (start >= end) {
             raw.fill('\u0000')
             return CredentialState.Unavailable
         }
-        // buf 配置移入 try（Error-window 加固）；任何 Throwable 皆先抹除 raw 再原樣拋出。
-        val fingerprint = try {
-            val buf = ByteArray(raw.size * 2)
+        // 範圍非全陣列時製 trimmed 副本並 wipe 原 raw；fingerprint 與 snapshot 皆以 trimmed 為準。
+        // copy 在 try 內：Error（如 OOM）window 內亦不得殘留 key material（沿用本函數的 Error-window 加固）。
+        val trimmed = if (start == 0 && end == raw.size) {
+            raw
+        } else {
             try {
-                fingerprintOf(raw, buf)
+                val t = raw.copyOfRange(start, end)
+                raw.fill('\u0000')
+                t
+            } catch (t: Throwable) {
+                raw.fill('\u0000')
+                throw t
+            }
+        }
+        // 單一可列印 ASCII 述詞（trim 後才判定；trim 僅正規化兩端）：每字符 code 須落在 0x21 '!' ～ 0x7E '~'；
+        // key 內任何非 printable ASCII 字元（含內嵌空白、控制／格式／DEL／>0x7E）→ Unavailable
+        // （防 header 注入與指紋異常；正當 provider key 為可列印 ASCII，永不含此類字元；blank 全空白亦已由上方 trim 涵蓋）。
+        if (trimmed.any { it.code !in 0x21..0x7E }) {
+            trimmed.fill('\u0000')
+            return CredentialState.Unavailable
+        }
+        // buf 配置移入 try（Error-window 加固）；任何 Throwable 皆先抹除 trimmed 再原樣拋出。
+        val fingerprint = try {
+            val buf = ByteArray(trimmed.size * 2)
+            try {
+                fingerprintOf(trimmed, buf)
             } finally {
                 buf.fill(0)
             }
         } catch (e: CancellationException) {
-            // CE 原樣透傳；raw 一併抹除
-            raw.fill('\u0000')
+            // CE 原樣透傳；trimmed 一併抹除
+            trimmed.fill('\u0000')
             throw e
         } catch (t: Throwable) {
             // Error（如 OOM）window 內亦不得殘留 key material；不改例外型別、原樣拋出。
-            raw.fill('\u0000')
+            trimmed.fill('\u0000')
             throw t
         }
         if (fingerprint == null) {
-            // 指紋計算失敗（含理論上的 NoSuchAlgorithmException）→ 不 raw throw。
-            raw.fill('\u0000')
+            // 指紋計算失敗（含理論上的 NoSuchAlgorithmException）→ 回 Unavailable 而非往外拋。
+            trimmed.fill('\u0000')
             return CredentialState.Unavailable
         }
-        // 所有權移交呼叫方（呼叫方負責 wipe）；此處不得 wipe raw。
-        return CredentialState.Ready(CredentialSnapshot(raw, fingerprint))
+        // 所有權移交呼叫方（呼叫方負責 wipe）；此處不得 wipe trimmed。
+        return CredentialState.Ready(CredentialSnapshot(trimmed, fingerprint))
     }
 
     /**
-     * 計算 [raw] 的 byte-packed SHA-256 指紋（16 hex）；任何失敗（含 NoSuchAlgorithmException）→ null。
+     * 計算 [raw] 的 byte-packed SHA-256 指紋：取 digest 前 8 bytes 直接組出 16 hex chars（64 bits），
+     * 不產生完整 hash 字串暫存（S1）；digest 於 finally 清零。任何失敗（含 NoSuchAlgorithmException）→ null。
      * 呼叫方負責 wipe [raw]／[buf]。
      */
     private fun fingerprintOf(raw: CharArray, buf: ByteArray): String? {
@@ -233,7 +262,18 @@ abstract class BaseKeyedSearchProvider(
             }
             val digest = java.security.MessageDigest.getInstance("SHA-256")
             digest.update(buf)
-            return digest.digest().joinToString("") { b -> "%02x".format(Locale.ROOT, b.toInt() and 0xFF) }.take(16)
+            val d = digest.digest()
+            return try {
+                val sb = StringBuilder(16)
+                for (i in 0 until 8) {
+                    val b = d[i].toInt() and 0xFF
+                    sb.append((b ushr 4).digitToChar(16))
+                    sb.append((b and 0x0F).digitToChar(16))
+                }
+                sb.toString()
+            } finally {
+                d.fill(0)
+            }
         } catch (e: CancellationException) {
             throw e
         } catch (_: Exception) {
@@ -254,9 +294,9 @@ abstract class BaseKeyedSearchProvider(
 
     /**
      * 單次 vault 讀取：request 與 cache fingerprint 同源（F1 fix），不再有第二次 vault 讀取。
-     * vault 故障／缺 key → `Unavailable(MISSING_KEY)`、零網路請求、不寫 cache
+     * 持久 vault 故障／缺 key／blank key → `Unavailable(MISSING_KEY)`、零網路請求、不寫 cache
      *（Ok 以外不進 cache 的既有不變量維持）。
-     * blank key → `Unavailable(MISSING_KEY)`、零網路。
+     * 暫時故障則由 delegate 每次呼叫重讀 vault——恢復則照常打 upstream（query egress），仍不快取。
      */
     final override suspend fun search(query: String, count: Int): WebSearchOutcome {
         if (query.isBlank()) return WebSearchOutcome.Unavailable(WebUnavailableReason.EMPTY_QUERY)

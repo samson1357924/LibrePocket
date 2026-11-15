@@ -10,20 +10,28 @@ enum class WebCapability {
 sealed interface CredentialState {
     /** 非 keyed provider（無綁定憑證）→ 沿用舊 cache 行為。 */
     data object NotApplicable : CredentialState
-    /** vault 讀取失敗／缺 key（含暫時故障）→ Service 完全旁路快取（不讀不寫、不進 single-flight）、fail-closed；零網路（delegate `search()` 傳回 MISSING_KEY）。 */
+    /**
+     * vault 讀取失敗／缺 key 等致憑證狀態未知。持久故障（缺 key／vault 完全故障／blank key）→ Service 完全旁路快取（不讀不寫、不進 single-flight）、fail-closed，delegate `search()` 重讀亦失敗、零網路。
+     * 暫時故障（vault 抖動）→ 同樣旁路（uncacheable），delegate `search()` 會重讀 vault 一次——若當時已恢復則照常打 upstream（query 原文 egress）；仍 fail-closed、仍不寫快取、永不使用過期憑證。
+     */
     data object Unavailable : CredentialState
-    /** 讀取成功；snapshot 所有權移交呼叫方，呼叫方負責 wipe（見 [CredentialSnapshot.wipe]）。 */
+    /**
+     * 讀取成功；snapshot 所有權移交呼叫方，呼叫方負責 wipe（見 [CredentialSnapshot.wipe]）。
+     * 所有權契約（亦見 `searchWithSnapshot()` KDoc）：呼叫方 MUST 以 try/finally 於 finally 內 `wipe()`，
+     * 即使 search()／searchWithSnapshot() 拋出；snapshot 為單次使用。被呼叫端不得保留／複製／清零傳入的 snapshot；
+     * 負責 wipe 的是持有最外層 search() 呼叫的一方（一般為最外層 WebSearchService）。
+     */
     class Ready(val snapshot: CredentialSnapshot) : CredentialState
 }
 
 /**
- * 不可變憑證快照：同一份 CharArray 既產生 cache 指紋（[fingerprint]）、亦供 HTTP 請求使用，
+ * 不可變憑證快照：同一份（trim 後）CharArray 既產生 cache 指紋（[fingerprint]）、亦供 HTTP 請求使用，
  * 消除 read#1(指紋)／read#2(key) 之間的憑證漂移。in-memory only；絕不落盤。
- * 指紋 = SHA-256(CharArray 經 LE byte-pack) 截斷 16 hex。key material 不進指紋、不印出。
+ * 指紋 = SHA-256(trim 後 CharArray 經 LE byte-pack)，取前 8 bytes 之十六進位（16 hex chars）。key material 不進指紋、不印出。
  */
 class CredentialSnapshot internal constructor(
     internal val key: CharArray,
-    val fingerprint: String,
+    internal val fingerprint: String,
 ) {
     /** 與原 `search()` 相同的正規化：concat → trim。僅供 provider 內部單次請求使用。 */
     internal fun keyAsTrimmedString(): String = key.concatToString().trim()
@@ -81,6 +89,8 @@ interface WebSearchProvider {
      * 預設實作 fail-closed（`Unavailable(MISSING_KEY)`）：keyed provider MUST 覆寫本方法
      * （否則 HTTP 會重讀 vault，重新引入憑證漂移）。keyless provider 不會走到這裡。
      * 不得清零傳入的 snapshot（由最外層持有者負責）。
+     * 所有權契約（MUST）：持有最外層 search() 呼叫的一方 MUST 以 try/finally 於 finally 內 `wipe()`
+     * 傳入的 snapshot，即使本方法拋出；snapshot 為單次使用；被呼叫端不得保留／複製／清零傳入的 snapshot。
      */
     suspend fun searchWithSnapshot(snapshot: CredentialSnapshot, query: String, count: Int): WebSearchOutcome =
         WebSearchOutcome.Unavailable(WebUnavailableReason.MISSING_KEY)

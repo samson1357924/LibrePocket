@@ -1984,6 +1984,55 @@ class WebSearchD5Test {
         assertTrue("CF blank key 的 buffer 必須被抹除", vault.captured!!.all { it == '\u0000' })
     }
 
+    // ---- key 述詞：trim + 可列印 ASCII（0x21–0x7E）gate ----
+
+    @Test fun keyWithEmbeddedNewlineIsMissingKeyZeroNetwork() = runBlocking {
+        // 內嵌 CR/LF（含 header 注入形狀）：非可列印 ASCII → Unavailable、零網路；captured buffer 必須被抹除。
+        val vault = TrackingVault()
+        vault.putKey(BraveSearchProvider.DEFAULT_KEY_ID, "abc\r\nevil".toCharArray())
+        val httpGet = FakeGet { ok(body = braveJson) }
+        val out = BraveSearchProvider(vault, httpGet).search("kotlin", 5)
+        assertTrue(out is WebSearchOutcome.Unavailable)
+        assertEquals(WebUnavailableReason.MISSING_KEY, (out as WebSearchOutcome.Unavailable).reason)
+        assertEquals(0, httpGet.calls.get())
+        assertTrue("內嵌換行 key 的 captured buffer 必須被抹除", vault.captured!!.all { it == '\u0000' })
+    }
+
+    @Test fun keyWithEmbeddedControlOrFormatCharIsMissingKey() = runBlocking {
+        // 內嵌 CONTROL（U+0001、DEL U+007F）與 FORMAT（U+200B）字元：非可列印 ASCII → Unavailable、零網路。
+        for (variant in listOf("ab\u0001cd", "ab\u007Fcd", "ab\u200Bcd")) {
+            val vault = TrackingVault()
+            vault.putKey(BraveSearchProvider.DEFAULT_KEY_ID, variant.toCharArray())
+            val httpGet = FakeGet { ok(body = braveJson) }
+            val out = BraveSearchProvider(vault, httpGet).search("kotlin", 5)
+            assertTrue("內嵌控制／格式字元變體應為 Unavailable：$out", out is WebSearchOutcome.Unavailable)
+            assertEquals(WebUnavailableReason.MISSING_KEY, (out as WebSearchOutcome.Unavailable).reason)
+            assertEquals(0, httpGet.calls.get())
+            assertTrue("內嵌控制／格式字元 key 的 captured buffer 必須被抹除", vault.captured!!.all { it == '\u0000' })
+        }
+    }
+
+    @Test fun whitespacePaddedKeyIsTrimmedForHttpAndCache() = runBlocking {
+        // 前後空白 padding：HTTP header 收到 trim 後的 key；cache 身份綁定 trimmed 指紋
+        //（第二次搜尋命中快取、只打一次上游）。
+        val vault = FakeVault()
+        vault.putKey(BraveSearchProvider.DEFAULT_KEY_ID, "  key-A  ".toCharArray())
+        val sentTokens = CopyOnWriteArrayList<String?>()
+        val http = FakeGetWithHeaders { _, headers ->
+            sentTokens.add(headers["X-Subscription-Token"])
+            ok(body = braveJsonFor("A-title"))
+        }
+        val svc = WebSearchService(BraveSearchProvider(vault, http))
+        val first = svc.search("kotlin", 5)
+        assertTrue(first is WebSearchOutcome.Ok)
+        assertEquals("key-A", http.lastHeaders!!["X-Subscription-Token"])
+        val second = svc.search("kotlin", 5)
+        assertTrue(second is WebSearchOutcome.Ok)
+        assertTrue("第二次應命中快取", (second as WebSearchOutcome.Ok).cached)
+        assertEquals(1, http.calls.get())
+        assertEquals(listOf<String?>("key-A"), sentTokens.toList())
+    }
+
     // ---- credentialState／vault 失敗分支 ----
 
     @Test fun hasKeyThrowsMakesProbeNotReady() = runBlocking {

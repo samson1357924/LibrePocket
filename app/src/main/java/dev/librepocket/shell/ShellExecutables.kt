@@ -115,6 +115,11 @@ object ShellExecutables {
         "/product",
         "/system_ext",
         "/apex",
+        // ubuntu-26.04：GNU→rust coreutils（uutils），/bin 與 /usr/bin 下的多數
+        // coreutils 改為 symlink 至此 real 落點（如 /usr/bin/id ->
+        // ../lib/cargo/bin/coreutils/id）；root-owned 755，落在此表內且
+        // 受 writability 閘保護，不放寬其他約束。
+        "/usr/lib/cargo/bin/coreutils",
     )
 
     /** 直接通道固定 `PATH`（[TRUSTED_BIN_DIRS] 串接，不取宿主 `PATH`）。 */

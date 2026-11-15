@@ -259,6 +259,35 @@ class ElevatedRunnerP1B2Test {
         }
     }
 
+    /**
+     * 殺後卡清理 worker 模型（Stage 3c）：drain 的 bounded slice（毫秒級
+     * `waitFor`）恆回 false（drain 走到 deadline → kill 路徑；process 在 drain
+     * bounded wait 期間始終「活著」）；destroy 置旗（killer 信號）；verify 的
+     * 5s 長等待回 destroyed（`verifyParentStoppedBounded` 恰好以
+     * `waitFor(5, SECONDS)` 驗證 ⇒ verified=true）；destroyed 後 `isAlive==false`。
+     * 清理 worker 卡死由測試 latch 控制（test killer 先 destroy 再阻塞）。
+     */
+    private class KillableStalledCleanupProcess : Process() {
+        @Volatile
+        var destroyed = false
+
+        override fun getOutputStream(): OutputStream = ByteArrayOutputStream()
+        override fun getInputStream(): InputStream = ByteArrayInputStream(ByteArray(0))
+        override fun getErrorStream(): InputStream = ByteArrayInputStream(ByteArray(0))
+        override fun waitFor(): Int = 0
+        override fun waitFor(timeout: Long, unit: TimeUnit): Boolean =
+            if (unit.toMillis(timeout) >= TimeUnit.SECONDS.toMillis(5)) destroyed else false
+        override fun exitValue(): Int = 0
+        override fun isAlive(): Boolean = !destroyed
+        override fun destroy() {
+            destroyed = true
+        }
+        override fun destroyForcibly(): Process {
+            destroyed = true
+            return this
+        }
+    }
+
     /** 遠端 hang：waitFor 即回 destroyed（立即，不睡 grace）。 */
     private open class HangRemote(var destroyed: Boolean = false) {
         fun getInputStream(): InputStream = ByteArrayInputStream(ByteArray(0))
@@ -2820,5 +2849,103 @@ class ElevatedRunnerP1B2Test {
             awaitNoElevatedThreads()
             ElevatedCleanupTracker.noteClean()
         }
+    }
+
+    // ---- Stage 3c：cleanup worker 不可中斷 stall 且 verify=true——admission 續拒直至 worker 退出 ----
+
+    @Test fun drainCleanupWorkerStuckVerifyTrueKeepsAdmissionDeniedUntilWorkerExits() {
+        // Stage 3c thread-bound custody 迴歸：cleanup worker 卡在 killer 內（destroy 已信號、
+        // block 不返回），verify 仍判證死（5s 長等待回 true）——verified=true 臂不得因
+        // slotHeldOut==true 而無條件 releaseSlot（舊碼 fail-open：slot 無人追蹤、
+        // admission 重開）。修正後：post-grace 線性化點把 custody 轉移給 worker 本體
+        // （slotHeldOut=false），caller 的 releaseCleanupSlotAfterVerify(true, false)
+        // 為 no-op，outstanding 續 ≥1——admission 密封直至 worker finally 釋放。
+        ElevatedCleanupTracker.clearUnverified()
+        ElevatedCleanupTracker.noteClean()
+        pollOutstandingTo(0)
+        val floorBefore = ElevatedCleanupTracker.releaseFloorHits()
+        val stallLatch = CountDownLatch(1)
+        fun awaitUninterruptibly(latch: CountDownLatch) {
+            while (true) {
+                try {
+                    latch.await()
+                    break
+                } catch (_: InterruptedException) {
+                    // swallow：drain 會 interrupt worker 一次，吞掉續等至 countDown
+                }
+            }
+        }
+        val victim = KillableStalledCleanupProcess()
+        val killerCalls = AtomicInteger(0)
+        val drained = AtomicReference<ElevatedProcessIo.Drained?>(null)
+        val bg = Thread {
+            drained.set(
+                ElevatedProcessIo.drainWithThreadStarter(
+                    process = victim,
+                    timeoutMs = 300L,
+                    killer = { p ->
+                        killerCalls.incrementAndGet()
+                        p.destroy()
+                        // 不可中斷 stall 模型（drain 會 interrupt worker 一次）：吞掉續等至 countDown。
+                        awaitUninterruptibly(stallLatch)
+                    },
+                    isCancelled = { false },
+                    startThread = { it.start() },
+                ),
+            )
+        }.also { it.isDaemon = true; it.start() }
+        try {
+            // drain 有界返回（worker 仍卡在 latch）：此刻 post-grace 線性化點已執行，
+            // custody 已移交 worker 本體、caller 零釋放義務。
+            // 有界輪詢，不以固定 sleep 當 oracle。
+            pollTrue("drain must return while the cleanup worker stays stalled", 10_000L) {
+                drained.get() != null && killerCalls.get() == 1
+            }
+            bg.join(10_000L)
+            assertFalse("drain must have returned", bg.isAlive)
+            assertEquals(
+                "verify=true must NOT release the slot while the worker is stalled",
+                1,
+                ElevatedCleanupTracker.outstanding(),
+            )
+            assertEquals(
+                "stalled cleanup must keep admission fail-closed",
+                ElevatedCleanupTracker.Admission.BACKLOG_FULL,
+                ElevatedCleanupTracker.tryEnterReserved(),
+            )
+            assertEquals(
+                "stalled cleanup must not leak active-call seats",
+                0,
+                ElevatedCleanupTracker.activeCalls(),
+            )
+            assertEquals(
+                "verify=true registers nothing (quarantine untouched)",
+                0,
+                ElevatedCleanupTracker.quarantinedCount(),
+            )
+        } finally {
+            stallLatch.countDown()
+        }
+        // worker finally（三態 1→2）釋放恰好一次：outstanding 歸零、floor 零命中、quarantine 零登記。
+        bg.join(10_000L)
+        pollOutstandingTo(0, 5_000L)
+        assertEquals(
+            "stalled worker finally must release exactly once (no floor hit)",
+            floorBefore,
+            ElevatedCleanupTracker.releaseFloorHits(),
+        )
+        assertEquals(
+            "verify=true must not quarantine after custody transfer",
+            0,
+            ElevatedCleanupTracker.quarantinedCount(),
+        )
+        val d = drained.get()
+        assertTrue("drain result must be present", d != null)
+        assertTrue(
+            "worker never finished ⇒ cleanupIncomplete=true",
+            d!!.cleanupIncomplete,
+        )
+        ElevatedCleanupTracker.clearUnverified()
+        ElevatedCleanupTracker.noteClean()
     }
 }

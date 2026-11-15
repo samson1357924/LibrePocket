@@ -387,9 +387,11 @@ class ElevatedRunnerAB1Test {
             }
             assertEquals(1, spawns.get())
             assertEquals(1, entered.get())
-            // 釋放 spawn 門 → 1 個走 timeout＋不可中斷 destroy → Stage 3b：cleanup 槽
-            // post-verify 即釋放（victim 改由 quarantine 封存追蹤，fail-closed 不變），
-            // outstanding 歸 0；後續 denied（QUARANTINE 封存）。
+            // 釋放 spawn 門 → 1 個走 timeout＋不可中斷 destroy → Stage 3c：cleanup worker
+            // 卡在 destroyLatch，custody 已移交 worker 本體，verified-false 亦不由
+            // caller 釋放（victim 改由 quarantine 封存追蹤，fail-closed 不變）；
+            // 釋放 destroyLatch 讓 worker 退出、finally 恰好釋放一次即 outstanding 歸 0；
+            // 後續 denied（QUARANTINE 封存）。
             spawnGate.countDown()
             threads.forEach { it.join(30_000L) }
             assertTrue(
@@ -407,8 +409,10 @@ class ElevatedRunnerAB1Test {
                 "denied msgs=${denied.map { it.message }}",
                 denied.all { it.message.contains("backlog full") },
             )
-            // Stage 3b：cleanup 槽 post-verify 即釋放（verified-false → quarantine
-            // 先行登記、release 殿後）；victim 由 quarantine 封存，admission 密封。
+            // Stage 3c：cleanup worker 卡在 destroyLatch（custody 已移交 worker 本體，
+            // verified-false 亦不由 caller 釋放）；先釋放 destroyLatch 讓 worker 退出、
+            // finally 恰好釋放一次。victim 由 quarantine 封存，admission 密封。
+            destroyLatch.countDown()
             pollOutstandingTo(0)
             assertEquals(1, ElevatedCleanupTracker.quarantinedCount())
             assertFalse(ElevatedCleanupTracker.isSaturated())

@@ -338,13 +338,14 @@ class ElevatedRunnerPhase3HardeningTest {
             assertTrue("cleanupIncomplete expected", b.cleanupIncomplete)
             assertEquals(1, kills.get())
             assertEquals(1, spawns.get())
-            // 五槽同持（wait＋verify＋stdout＋stderr＋stdin），同步峰值有界。
-            // Stage 3b slot-ownership transfer：cleanup 點於 verify 結果已知後釋放
-            // （verified-false → quarantine 先行、release 殿後）——victim 改由 quarantine
-            // 封存追蹤（fail-closed 不變），outstanding 落回 5。
+            // 六槽同持（wait＋verify＋stdout＋stderr＋stdin＋cleanup），同步峰值有界。
+            // Stage 3c thread-bound custody：cleanup worker 卡滯（destroy 卡在 latch）——
+            // custody 已移交 worker 本體，verified-false 亦不由 caller 釋放；cleanup 點
+            // 於 worker 退出時才釋放——victim 改由 quarantine 封存追蹤
+            // （fail-closed 不變），outstanding 落回 6。
             assertEquals(
                 "outstanding=${ElevatedCleanupTracker.outstanding()}",
-                5,
+                6,
                 ElevatedCleanupTracker.outstanding(),
             )
             assertEquals(1, ElevatedCleanupTracker.quarantinedCount())
@@ -353,11 +354,11 @@ class ElevatedRunnerPhase3HardeningTest {
                 "peak=$peak must stay within MAX=${ElevatedCleanupTracker.MAX_OUTSTANDING_CLEANUPS}",
                 peak <= ElevatedCleanupTracker.MAX_OUTSTANDING_CLEANUPS,
             )
-            // 終審：單次不清創計 1，不熔斷；席已釋。
+            // 終審：單次不清創計 1，不熔斷。
             assertEquals(1, ElevatedCleanupTracker.consecutiveCount())
             assertFalse(ElevatedCleanupTracker.isBreakerOpen())
             assertEquals(0, ElevatedCleanupTracker.activeCalls())
-            // 殘留期間新 call 即預留拒（5+7>7），零新增 spawn。
+            // 殘留期間新 call 即預留拒（6+7>7），零新增 spawn。
             val denied = runner.runBinary(ElevatedRequest(listOf("id"), "P3-6PT"), 300L)
             assertTrue("$denied", denied is ElevatedBinaryResult.Denied)
             denied as ElevatedBinaryResult.Denied
@@ -421,11 +422,12 @@ class ElevatedRunnerPhase3HardeningTest {
             assertTrue("cleanupIncomplete expected", b.cleanupIncomplete)
             assertEquals(1, kills.get())
             assertEquals(1, spawns.get())
-            // Stage 3b slot-ownership transfer：cleanup 點於 verify 結果已知後釋放——
-            // outstanding 落回 5，victim 改由 quarantine 封存（fail-closed 不變）。
+            // Stage 3c thread-bound custody：cleanup worker 卡滯——custody 已移交 worker
+            // 本體，verified-false 亦不由 caller 釋放；outstanding 落回 6，
+            // victim 改由 quarantine 封存（fail-closed 不變）。
             assertEquals(
                 "outstanding=${ElevatedCleanupTracker.outstanding()}",
-                5,
+                6,
                 ElevatedCleanupTracker.outstanding(),
             )
             assertEquals(1, ElevatedCleanupTracker.quarantinedCount())

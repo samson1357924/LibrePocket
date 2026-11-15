@@ -144,6 +144,8 @@ class AssistantVoiceRobolectricTest {
         assertNotNull("voice handoff provider must be declared in the merged manifest", providerInfo)
         assertFalse("provider must stay app-private", providerInfo!!.exported)
         assertEquals("${context.packageName}.voice.handoff", providerInfo.authority)
+        assertFalse("provider must not grant URI permissions", providerInfo.grantUriPermissions)
+        assertFalse("provider must not run multiprocess", providerInfo.multiprocess)
         assertEquals(
             "provider must run in the app (main) process, not :voice",
             context.packageName,
@@ -163,6 +165,22 @@ class AssistantVoiceRobolectricTest {
             }
         }
         error("not found: ${relPaths.toList()} under ${System.getProperty("user.dir")}")
+    }
+
+    @Test
+    fun manifest_voiceHandoffProvider_lockdownAttributes_arePresent() {
+        val manifest = findSource(
+            "src/main/AndroidManifest.xml",
+            "app/src/main/AndroidManifest.xml",
+        ).readText()
+        // Textual guard: merged-manifest ProviderInfo defaults (grantUriPermissions/multiprocess
+        // both default false) can make the PackageManager assertions vacuous; this locks the
+        // source declaration itself.
+        val providerBlock = Regex("<provider[^>]*VoiceHandoffProvider[^>]*/>").find(manifest)?.value
+            ?: error("VoiceHandoffProvider declaration not found in manifest")
+        assertTrue("provider must declare grantUriPermissions=\"false\": $providerBlock", providerBlock.contains("android:grantUriPermissions=\"false\""))
+        assertTrue("provider must declare multiprocess=\"false\": $providerBlock", providerBlock.contains("android:multiprocess=\"false\""))
+        assertTrue("provider must declare exported=\"false\": $providerBlock", providerBlock.contains("android:exported=\"false\""))
     }
 
     @Test

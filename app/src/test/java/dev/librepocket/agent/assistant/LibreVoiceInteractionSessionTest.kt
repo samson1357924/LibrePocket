@@ -203,7 +203,7 @@ class LibreVoiceInteractionSessionTest {
         assertEquals(0, session.hideCalls)
 
         // Simulate UI consuming retrigger handoff; active task continues.
-        assertTrue(AssistantVoiceHandoff.consume(pending.token, context))
+        assertTrue(AssistantVoiceHandoff.consume(pending.token, context, pending.targetTaskId, pending.sessionInstanceId))
         session.onTaskFinished(null, 10)
         assertEquals(1, session.hideCalls)
     }
@@ -359,6 +359,48 @@ class LibreVoiceInteractionSessionTest {
         // throwOnStart still true, but proves a new launch attempt was made (not blocked as pending).
         assertEquals(2, session.startedIntents.size)
         assertEquals(2, session.hideCalls)
+    }
+
+    @Test
+    fun newShowCycle_clearsExpiredPriorCycleResidue_butPreservesLiveEntry() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val now = SystemClock.elapsedRealtime()
+
+        // Expired prior-cycle residue: a fresh show cycle must converge it (expired-only).
+        assertTrue(
+            VoiceHandoffProvider.publish(
+                PendingVoiceRetrigger(
+                    token = 6101L,
+                    targetTaskId = 10,
+                    sessionInstanceId = 77L,
+                    issuedElapsedRealtimeMs = now - VoiceHandoffContract.RETRIGGER_TTL_MS - 1,
+                ),
+            ),
+        )
+        val expiring = RecordingVoiceSession(context)
+        expiring.onShow(null, 0)
+        assertEquals("fresh cycle must drop expired residue", null, VoiceHandoffProvider.pending.value)
+
+        // An unexpired token published milliseconds ago by ANOTHER session instance for a
+        // surviving voice task must survive a fresh cycle (TTL, not freshness guess, discriminates).
+        VoiceHandoffProvider.resetForTest()
+        assertTrue(
+            VoiceHandoffProvider.publish(
+                PendingVoiceRetrigger(
+                    token = 6102L,
+                    targetTaskId = 10,
+                    sessionInstanceId = 78L,
+                    issuedElapsedRealtimeMs = SystemClock.elapsedRealtime(),
+                ),
+            ),
+        )
+        val preserving = RecordingVoiceSession(context)
+        preserving.onShow(null, 0)
+        assertEquals(
+            "fresh cycle must not wipe a live entry published by another session instance",
+            6102L,
+            VoiceHandoffProvider.pending.value?.token,
+        )
     }
 
     @Test

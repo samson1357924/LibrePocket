@@ -154,6 +154,8 @@
         <provider
             android:name=".assistant.VoiceHandoffProvider"
             android:authorities="${applicationId}.voice.handoff"
-            android:exported="false" />
+            android:exported="false"
+            android:grantUriPermissions="false"
+            android:multiprocess="false" />
     </application>
 </manifest>

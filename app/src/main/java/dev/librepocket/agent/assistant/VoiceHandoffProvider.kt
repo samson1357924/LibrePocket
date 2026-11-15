@@ -6,6 +6,7 @@ import android.database.Cursor
 import android.net.Uri
 import android.os.Bundle
 import android.os.SystemClock
+import android.util.Log
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -14,13 +15,19 @@ import java.util.concurrent.atomic.AtomicLong
 /**
  * Defense-in-depth caller check for the app-private handoff provider.
  *
- * Same package (including the `:voice` process, which shares [android.content.Context.packageName])
- * is allowed; in-process/Robolectric direct calls (callingPackage == null) are allowed; a different
- * package (even one sharing the app's UID or signing key) is rejected. Exported=false via the
- * manifest remains the hard boundary; this is belt-and-suspenders so it is not the only one.
+ * UID tiebreak: when both UIDs are known (>= 0) they must be equal — a different UID is
+ * rejected even if the package name matches (e.g. a reinstalled/shared-UID lookalike).
+ * Package check remains as belt-and-suspenders: in-process/Robolectric callers and
+ * same-package components (incl. the `:voice` process, which shares
+ * [android.content.Context.packageName]) are allowed; a different package is rejected
+ * even with no UID info. Exported=false via the manifest remains the hard boundary; this
+ * is belt-and-suspenders so it is not the only one. The `-1` defaults keep the previous
+ * pure package semantics for existing call sites/tests that pass no UIDs.
  */
-internal fun isCallerAllowed(callerPackage: String?, ownPackage: String?): Boolean =
-    callerPackage == null || callerPackage == ownPackage
+internal fun isCallerAllowed(callerPackage: String?, ownPackage: String?, callerUid: Int = -1, ownUid: Int = -1): Boolean {
+    if (callerUid >= 0 && ownUid >= 0 && callerUid != ownUid) return false
+    return callerPackage == null || callerPackage == ownPackage
+}
 
 /**
  * Main-process, app-private handoff state/provider for C2 voice retrigger (F1/F2, #137).
@@ -31,6 +38,10 @@ internal fun isCallerAllowed(callerPackage: String?, ownPackage: String?): Boole
  *
  * Security: exported=false, same-UID only by manifest; contract is internal and intended for the
  * trusted session path. Tokens are one-shot, replaceable by newer gestures, and expire after RETRIGGER_TTL_MS.
+ * The IPC boundary is provider-enforced: METHOD_CONSUME requires full identity (taskId + sid),
+ * METHOD_PUBLISH stamps the stored entry with the provider's clock (caller-supplied issued is
+ * ignored), and no bare (empty-extras) IPC path can reach clearAll — the bare clear is
+ * same-process only. See METHOD_CLEAR_EXPIRED for the fresh-cycle convergence affordance.
  */
 class VoiceHandoffProvider : ContentProvider() {
 
@@ -40,16 +51,40 @@ class VoiceHandoffProvider : ContentProvider() {
         // Defense-in-depth: reject callers from other same-UID packages. Same package (incl. the
         // :voice process, which shares this packageName) and in-process/Robolectric calls
         // (callingPackage == null) are allowed; see [isCallerAllowed].
-        if (!isCallerAllowed(callingPackage, context?.packageName)) return null
-        return when (method) {
+        if (!isCallerAllowed(
+                callingPackage,
+                context?.packageName,
+                android.os.Binder.getCallingUid(),
+                context?.applicationInfo?.uid ?: -1,
+            )
+        ) {
+            return null
+        }
+        // L-1: this runs on a Binder thread in the main process; Bundle parsing can throw
+        // (ClassCastException from a wrong-typed value, etc.). Never let an uncaught throwable
+        // escape into the framework — reject the envelope instead. Log no payload contents.
+        return try {
+            when (method) {
             VoiceHandoffContract.METHOD_PUBLISH -> {
                 val b = extras ?: Bundle()
                 val token = b.getLong(VoiceHandoffContract.KEY_TOKEN, 0L)
                 val targetTaskId = b.getInt(VoiceHandoffContract.KEY_TARGET_TASK_ID, -1)
                 val sessionInstanceId = b.getLong(VoiceHandoffContract.KEY_SESSION_INSTANCE_ID, 0L)
-                val issued = b.getLong(VoiceHandoffContract.KEY_ISSUED_ELAPSED_REALTIME_MS, 0L)
-                // Bundle.EMPTY only when the publish was actually stored; a null ack means
-                // "not stored" so the caller can retry instead of believing a dead token lives.
+                // M-2: the caller-supplied KEY_ISSUED_ELAPSED_REALTIME_MS is never read.
+                // The provider (main process) stamps the stored entry with its own clock;
+                // the caller cannot outsource/forward-anchor the TTL.
+                val issued = SystemClock.elapsedRealtime()
+                // Refuse publishes carrying an undeliverable identity (sentinel/zero axes):
+                // fail-closed at the boundary instead of occupying the slot until TTL.
+                if (token <= 0L || targetTaskId == -1 || targetTaskId == Int.MIN_VALUE ||
+                    sessionInstanceId == 0L || sessionInstanceId == Long.MIN_VALUE
+                ) {
+                    return null
+                }
+                // Ack semantics: a non-null Bundle means the entry was stored, and the stored
+                // entry carries the PROVIDER's clock stamp (peek reads it back from _pending, so
+                // the stamp round-trips). A null ack means "not stored" so the caller can retry
+                // instead of believing a dead token lives.
                 if (publish(PendingVoiceRetrigger(token, targetTaskId, sessionInstanceId, issued))) {
                     Bundle.EMPTY
                 } else {
@@ -57,29 +92,58 @@ class VoiceHandoffProvider : ContentProvider() {
                 }
             }
             VoiceHandoffContract.METHOD_CONSUME -> {
-                val b = extras ?: Bundle()
+                // M-1: the IPC boundary requires full identity. A token-only / wildcard
+                // METHOD_CONSUME is rejected here (ok=false, entry preserved) — the
+                // "voice task can only consume its own token" binding is provider-enforced,
+                // not a caller-side convention. The in-process companion consume() stays
+                // wildcard-capable for same-process/test use; see its KDoc.
+                val b = extras
+                // Gate before any typed read: presence of both identity keys is required first
+                // (wildcard rejected). A wrong-typed value throws here and is caught by the
+                // envelope catch → null ack, entry preserved.
+                if (b == null ||
+                    !b.containsKey(VoiceHandoffContract.KEY_TARGET_TASK_ID) ||
+                    !b.containsKey(VoiceHandoffContract.KEY_SESSION_INSTANCE_ID)
+                ) {
+                    return Bundle().apply { putBoolean(VoiceHandoffContract.KEY_OK, false) }
+                }
+                val targetTaskId = b.getInt(VoiceHandoffContract.KEY_TARGET_TASK_ID)
+                val sessionInstanceId = b.getLong(VoiceHandoffContract.KEY_SESSION_INSTANCE_ID)
+                if (targetTaskId == Int.MIN_VALUE || sessionInstanceId == Long.MIN_VALUE) {
+                    return Bundle().apply { putBoolean(VoiceHandoffContract.KEY_OK, false) }
+                }
                 val token = b.getLong(VoiceHandoffContract.KEY_TOKEN, 0L)
-                val targetTaskId = b.getInt(VoiceHandoffContract.KEY_TARGET_TASK_ID, Int.MIN_VALUE)
-                val sessionInstanceId = b.getLong(VoiceHandoffContract.KEY_SESSION_INSTANCE_ID, Long.MIN_VALUE)
                 val ok = consume(token, targetTaskId, sessionInstanceId)
                 Bundle().apply { putBoolean(VoiceHandoffContract.KEY_OK, ok) }
             }
             VoiceHandoffContract.METHOD_CLEAR -> {
-                val b = extras ?: Bundle()
-                val token = b.getLong(VoiceHandoffContract.KEY_TOKEN, 0L)
-                val hasTarget = b.containsKey(VoiceHandoffContract.KEY_TARGET_TASK_ID) ||
-                    b.containsKey(VoiceHandoffContract.KEY_SESSION_INSTANCE_ID)
-                if (hasTarget) {
-                    clearMatching(
-                        b.getInt(VoiceHandoffContract.KEY_TARGET_TASK_ID, Int.MIN_VALUE),
-                        b.getLong(VoiceHandoffContract.KEY_SESSION_INSTANCE_ID, Long.MIN_VALUE),
-                        token,
-                    )
-                } else if (token != 0L) {
-                    clearIfToken(token)
+                // L-4: the bare no-arg path is same-process only (facade/tests call the
+                // companion clearAll() directly). IPC can never reach clearAll: with no
+                // extras (or extras carrying no token and no identity keys) this is a no-op.
+                if (arg == null && extras == null) {
+                    Bundle.EMPTY
                 } else {
-                    clearAll()
+                    val b = extras ?: Bundle()
+                    val token = b.getLong(VoiceHandoffContract.KEY_TOKEN, 0L)
+                    val hasTarget = b.containsKey(VoiceHandoffContract.KEY_TARGET_TASK_ID) ||
+                        b.containsKey(VoiceHandoffContract.KEY_SESSION_INSTANCE_ID)
+                    if (hasTarget) {
+                        clearMatching(
+                            b.getInt(VoiceHandoffContract.KEY_TARGET_TASK_ID, Int.MIN_VALUE),
+                            b.getLong(VoiceHandoffContract.KEY_SESSION_INSTANCE_ID, Long.MIN_VALUE),
+                            token,
+                        )
+                    } else if (token != 0L) {
+                        clearIfToken(token)
+                    }
+                    // else: no token and no identity keys -> no-op (no clearAll from IPC).
+                    Bundle.EMPTY
                 }
+            }
+            VoiceHandoffContract.METHOD_CLEAR_EXPIRED -> {
+                // Expired-only convergence for a fresh session cycle: drop the slot iff the
+                // entry is expired (age < 0 or age > TTL); unexpired entries are preserved.
+                clearExpired()
                 Bundle.EMPTY
             }
             VoiceHandoffContract.METHOD_PEEK -> {
@@ -101,6 +165,16 @@ class VoiceHandoffProvider : ContentProvider() {
                 }
             }
             else -> null
+            }
+        } catch (t: Throwable) {
+            // L-1: no payload, no extras contents — only the method name, stripped and truncated.
+            val safeMethod = method.take(32).replace('\n', ' ').replace('\r', ' ')
+            if (t is Error) {
+                Log.e(TAG, "voice-handoff IPC failure (method=$safeMethod)", t)
+            } else {
+                Log.w(TAG, "voice-handoff IPC envelope rejected (method=$safeMethod)")
+            }
+            null
         }
     }
 
@@ -111,6 +185,8 @@ class VoiceHandoffProvider : ContentProvider() {
     override fun update(uri: Uri, values: ContentValues?, selection: String?, selectionArgs: Array<out String>?): Int = 0
 
     companion object {
+        private const val TAG = "VoiceHandoffProvider"
+
         private val _pending = MutableStateFlow<PendingVoiceRetrigger?>(null)
         val pending: StateFlow<PendingVoiceRetrigger?> = _pending.asStateFlow()
         // Seeded from monotonic elapsed realtime so tokens stay monotonic across :voice-process restarts
@@ -130,6 +206,12 @@ class VoiceHandoffProvider : ContentProvider() {
             return true
         }
 
+        /**
+         * Same-process/in-process consume; wildcard-capable (MIN_VALUE = "unspecified" axis).
+         * The IPC boundary ([call]) rejects token-only/wildcard consumes — callers there must
+         * carry full identity. This companion path stays permissive for same-process use
+         * (e.g. in-process delivery, tests); it never crosses a process boundary.
+         */
         @Synchronized
         internal fun consume(token: Long, targetTaskId: Int, sessionInstanceId: Long): Boolean {
             val cur = _pending.value ?: return false
@@ -171,7 +253,23 @@ class VoiceHandoffProvider : ContentProvider() {
             _pending.value = null
         }
 
+        /**
+         * Expired-only convergence: drops the pending entry iff it is expired-or-skewed
+         * (age < 0 or age > TTL); an unexpired entry is preserved. No return value.
+         * Used by a fresh session cycle to converge dead prior-cycle residue without
+         * touching a live entry another session instance just published.
+         */
+        @Synchronized
+        internal fun clearExpired() {
+            val cur = _pending.value ?: return
+            val age = SystemClock.elapsedRealtime() - cur.issuedElapsedRealtimeMs
+            if (age < 0 || age > VoiceHandoffContract.RETRIGGER_TTL_MS) {
+                _pending.value = null
+            }
+        }
+
         /** Test/reset hook (main-process/in-process only). */
+        @Synchronized
         internal fun resetForTest() {
             _pending.value = null
             seq.set((SystemClock.elapsedRealtime() shl 12) or 1L)

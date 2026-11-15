@@ -324,6 +324,99 @@ class AssistantVoiceHandoffTest {
         assertNull("expired entry must be dropped on consume attempt", VoiceHandoffProvider.pending.value)
     }
 
+    // ---- Stage 3: bare clear is local-only; clearExpired; provider-stamped publish ----
+
+    @Test
+    fun clear_noArg_clearsLocalPending_andIssuesNoIpc() {
+        seedPending(token = 999L, issuedElapsedRealtimeMs = SystemClock.elapsedRealtime(), targetTaskId = 10, sessionInstanceId = 7L)
+
+        val counting = CountingProvider()
+        swapHandoffProvider(counting)
+        try {
+            AssistantVoiceHandoff.clear(appContext)
+            assertNull("bare clear must still clear the local slot", VoiceHandoffProvider.pending.value)
+            assertTrue("bare clear must not issue any provider IPC: ${counting.calls}", counting.calls.isEmpty())
+        } finally {
+            restoreManifestProvider()
+        }
+    }
+
+    @Test
+    fun clear_withToken_stillIssuesIpc() {
+        seedPending(token = 999L, issuedElapsedRealtimeMs = SystemClock.elapsedRealtime(), targetTaskId = 10, sessionInstanceId = 7L)
+
+        val counting = CountingProvider()
+        swapHandoffProvider(counting)
+        try {
+            AssistantVoiceHandoff.clear(appContext, token = 999L)
+            assertEquals(listOf(VoiceHandoffContract.METHOD_CLEAR), counting.calls.map { it.first })
+        } finally {
+            restoreManifestProvider()
+        }
+    }
+
+    @Test
+    fun clearExpired_localExpiredEntry_isCleared_freshEntry_isPreserved() {
+        val now = SystemClock.elapsedRealtime()
+
+        // Expired entry: cleared.
+        seedPending(token = 1L, issuedElapsedRealtimeMs = now - VoiceHandoffContract.RETRIGGER_TTL_MS - 1, targetTaskId = 10, sessionInstanceId = 7L)
+        AssistantVoiceHandoff.clearExpired()
+        assertNull("expired entry must be cleared by clearExpired", VoiceHandoffProvider.pending.value)
+
+        // Fresh entry: preserved.
+        seedPending(token = 2L, issuedElapsedRealtimeMs = SystemClock.elapsedRealtime(), targetTaskId = 10, sessionInstanceId = 7L)
+        AssistantVoiceHandoff.clearExpired()
+        assertEquals("fresh entry must be preserved by clearExpired", 2L, VoiceHandoffProvider.pending.value?.token)
+
+        // Negative-age (skewed) entry: cleared.
+        VoiceHandoffProvider.resetForTest()
+        seedPending(token = 3L, issuedElapsedRealtimeMs = SystemClock.elapsedRealtime() + 60_000L, targetTaskId = 10, sessionInstanceId = 7L)
+        AssistantVoiceHandoff.clearExpired()
+        assertNull("negative-age entry must be cleared by clearExpired", VoiceHandoffProvider.pending.value)
+    }
+
+    @Test
+    fun clearExpired_withContext_sendsOnlyClearExpiredIpc_andSwallowsFailures() {
+        seedPending(token = 4L, issuedElapsedRealtimeMs = SystemClock.elapsedRealtime(), targetTaskId = 10, sessionInstanceId = 7L)
+
+        val counting = CountingProvider()
+        swapHandoffProvider(counting)
+        try {
+            AssistantVoiceHandoff.clearExpired(appContext)
+            assertEquals(listOf(VoiceHandoffContract.METHOD_CLEAR_EXPIRED), counting.calls.map { it.first })
+            assertNull("clearExpired must not send extras", counting.calls.first().second)
+        } finally {
+            restoreManifestProvider()
+        }
+
+        // IPC blowing up must not escape.
+        swapHandoffProvider(ThrowingProvider())
+        try {
+            AssistantVoiceHandoff.clearExpired(appContext)
+        } finally {
+            restoreManifestProvider()
+        }
+    }
+
+    // Smoke check only: the caller also mints with elapsedRealtime BEFORE the provider stamps,
+    // so this cannot distinguish the two stamps. The M-2 regression pin lives in
+    // VoiceHandoffProviderTest.callPublish_ignoresCallerIssued_storesProviderClockStamp.
+    @Test
+    fun requestRetrigger_publishedEntry_isProviderClockStamped() {
+        val before = SystemClock.elapsedRealtime()
+        val token = AssistantVoiceHandoff.requestRetrigger(appContext, targetTaskId = 10, sessionInstanceId = 7L)
+        val after = SystemClock.elapsedRealtime()
+
+        assertNotEquals(0L, token)
+        val pending = VoiceHandoffProvider.pending.value
+        assertNotNull(pending)
+        assertTrue(
+            "provider must stamp the stored entry with its own clock (age ≈ 0)",
+            pending!!.issuedElapsedRealtimeMs in before..after,
+        )
+    }
+
     // F3: the retrigger TTL is measured on monotonic elapsed realtime, which includes deep
     // sleep, while uptimeMillis does not. An over-TTL entry must fail every expiry gate after
     // the device slept — even though only 100 ms of awake time elapsed — and a fresh entry must

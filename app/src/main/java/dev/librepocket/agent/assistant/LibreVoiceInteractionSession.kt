@@ -128,10 +128,13 @@ open class LibreVoiceInteractionSession(context: Context) : VoiceInteractionSess
         sessionHidden = false
         sessionInstanceId = nextSessionInstanceId()
         // This session has no live task binding (activeTaskId == null, launchPending == false) and no token
-        // on its just-minted sid axis yet. clear(context) with no args is clearAll — it discards stale
-        // entries from prior dead cycles, and may also drop a <TTL prior-cycle token whose voice task
-        // survived a :voice-process loss; that is intended fail-closed convergence (retrigger is one-shot).
-        AssistantVoiceHandoff.clear(context)
+        // on its just-minted sid axis yet. Converge ONLY expired/skewed (>TTL or negative-age) prior-cycle
+        // residue — an unexpired token published milliseconds ago by ANOTHER session instance for a
+        // surviving voice task is PRESERVED. TTL bounds the residue; a normal-task instance cannot
+        // consume anyway (identity-gated at the provider). clearExpired = local clearExpired() +
+        // best-effort METHOD_CLEAR_EXPIRED IPC (no extras); the provider rejects bare clears, only
+        // expired entries are dropped.
+        AssistantVoiceHandoff.clearExpired(context)
         lastAcceptedShowElapsedRealtimeMs = now
         try {
             startVoiceActivity(buildVoiceAssistIntent())

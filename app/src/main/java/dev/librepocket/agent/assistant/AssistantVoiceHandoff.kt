@@ -64,6 +64,8 @@ object AssistantVoiceHandoff {
         sessionInstanceId: Long,
     ): Long {
         val token = VoiceHandoffProvider.nextToken()
+        // NB: [issuedElapsedRealtimeMs] is advisory only — the provider stamps the stored entry
+        // with its own clock and never trusts the caller-supplied value.
         val pending = PendingVoiceRetrigger(
             token = token,
             targetTaskId = targetTaskId,
@@ -96,11 +98,16 @@ object AssistantVoiceHandoff {
         return token
     }
 
+    /**
+     * Consume [token]. Identity is REQUIRED (no wildcard default — the IPC boundary rejects
+     * wildcard identity anyway): pass the owning task's taskId/sessionInstanceId. Bare
+     * token-only consume remains possible via [VoiceHandoffProvider.consume] in-process only.
+     */
     fun consume(
         token: Long,
         context: Context? = null,
-        targetTaskId: Int = Int.MIN_VALUE,
-        sessionInstanceId: Long = Long.MIN_VALUE,
+        targetTaskId: Int,
+        sessionInstanceId: Long,
     ): Boolean {
         if (token == 0L) return false
         val local = VoiceHandoffProvider.consume(token, targetTaskId, sessionInstanceId)
@@ -128,6 +135,14 @@ object AssistantVoiceHandoff {
         return false
     }
 
+    /**
+     * Clears the pending handoff entry.
+     *
+     * Bare no-argument call (no identity, no token) is same-process only: it clears the
+     * local provider slot and performs NO IPC — the provider rejects a bare/empty METHOD_CLEAR
+     * over IPC (there is no cross-process clear-all). Cross-process clearing requires a
+     * token and/or identity, which is what this method sends when either is present.
+     */
     fun clear(
         context: Context? = null,
         targetTaskId: Int = Int.MIN_VALUE,
@@ -142,19 +157,40 @@ object AssistantVoiceHandoff {
         } else {
             VoiceHandoffProvider.clearAll()
         }
+        // Bare wildcard (no identity, no token): local-only, no IPC — the provider has no
+        // cross-process clear-all path; the bare clear must not wipe a remote slot either.
+        if (context != null && (hasIdentity || token != 0L)) {
+            try {
+                context.contentResolver.call(
+                    uri(context),
+                    VoiceHandoffContract.METHOD_CLEAR,
+                    null,
+                    identityBundle(targetTaskId, sessionInstanceId).apply {
+                        if (token != 0L) putLong(VoiceHandoffContract.KEY_TOKEN, token)
+                    },
+                )
+            } catch (_: Exception) {
+            }
+        }
+    }
+
+    /**
+     * Expired-only convergence for a fresh session cycle: clears the local pending entry
+     * iff it is expired-or-skewed (age < 0 or age > TTL) and sends a best-effort
+     * METHOD_CLEAR_EXPIRED over IPC (no extras) so the main-process slot converges too.
+     * An unexpired entry published milliseconds ago by another session instance for a
+     * surviving voice task is PRESERVED — the TTL is the discriminator, not the caller's
+     * freshness guess. IPC failures are swallowed (same style as [clear]).
+     */
+    fun clearExpired(context: Context? = null) {
+        VoiceHandoffProvider.clearExpired()
         context?.let {
             try {
                 it.contentResolver.call(
                     uri(it),
-                    VoiceHandoffContract.METHOD_CLEAR,
+                    VoiceHandoffContract.METHOD_CLEAR_EXPIRED,
                     null,
-                    if (hasIdentity || token != 0L) {
-                        identityBundle(targetTaskId, sessionInstanceId).apply {
-                            if (token != 0L) putLong(VoiceHandoffContract.KEY_TOKEN, token)
-                        }
-                    } else {
-                        null
-                    },
+                    null,
                 )
             } catch (_: Exception) {
             }

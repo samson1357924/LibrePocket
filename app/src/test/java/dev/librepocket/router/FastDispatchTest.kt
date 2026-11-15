@@ -2606,16 +2606,55 @@ class FastDispatchTest {
         }
     }
 
-    @Test fun narrowTailAcceptedResidualStaysFast() {
-        // #19 B3 accepted residual (narrow-tail limitation; documented in KDoc)：
-        // 疑問顆粒後接圖形標點（。）躲過疑問尾標檢查 ⇒ 仍成立 symbol 前閘 ⇒ FAST（query `Foo`）。
-        val d = decide("查 Foo 符號呢。")
-        assertEquals(RouteKind.FAST, d.route)
-        assertEquals("lsp.symbols", d.toolCall?.toolName)
-        assertNotNull(d.toolCall)
-        assertEquals(
-            "Foo",
-            Json.parseToJsonElement(d.toolCall!!.argumentsJson).jsonObject["query"]!!.jsonPrimitive.content,
-        )
+    @Test fun interrogativePunctuatedEndingsDenyZeroBackend() = runBlocking {
+        // #19 B3 stage-6.1（interrogative-tail hardening）：疑問顆粒後接中性
+        // 句末終止符 run 時，symbol 前閘仍不得成立 ⇒ DENIED、toolCall == null、
+        // decideAndDispatch 不執行、backend.invocations == 0（問句絕不執行）。
+        // 先前的 narrowTailAcceptedResidualStaysFast 曾釘住 FAST（narrow-tail
+        // limitation）的錯誤契約——已刪除並翻轉為此測試。
+        val backend = CountingBackend()
+        val dispatcher = lspDispatcher(backend)
+        for (text in listOf(
+            "查 Foo 符號呢。",
+            "查 Foo 符號嗎.",
+            "查 Foo 符號呢！",
+            "查 Foo 符號呢!!!",
+            "查 Foo 符號呢…",
+            "查 Foo 符號呢 。",
+            "查 Foo 符號 呢 。",
+            "查 Foo 符號嗎。",
+            "查 Foo 符號呢。！",
+            "查 Foo 符號嗎？。",
+        )) {
+            // decide()：decision is DENIED, toolCall == null。
+            val d = decide(text)
+            assertEquals(text, RouteKind.DENIED, d.route)
+            assertNull(text, d.toolCall)
+            // decideAndDispatch：decision DENIED、outcome 非 Executed、backend.invocations 不增。
+            val before = backend.invocations.get()
+            val result = dispatcher.decideAndDispatch(text, lspOn, sessionId = "s1", turnIndex = 1)
+            assertEquals(text, RouteKind.DENIED, result.decision.route)
+            assertNull(text, result.decision.toolCall)
+            assertFalse(text, result.outcome is FastDispatchOutcome.Executed)
+            assertEquals(text, before, backend.invocations.get())
+        }
+        assertEquals(0, backend.invocations.get())
+        // Positive guards：命令式肯定語句仍 FAST，query 精確等值（與
+        // affirmativeSymbolCommandsStayFast 同一 Json.parseToJsonElement 風格）。
+        for ((text, expectedQuery) in listOf(
+            "查 Foo 符號" to "Foo",
+            "find the symbol Foo" to "Foo",
+            "search for symbol Foo" to "Foo",
+        )) {
+            val d = decide(text)
+            assertEquals(text, RouteKind.FAST, d.route)
+            assertEquals(text, "lsp.symbols", d.toolCall?.toolName)
+            assertNotNull(text, d.toolCall)
+            assertEquals(
+                text,
+                expectedQuery,
+                Json.parseToJsonElement(d.toolCall!!.argumentsJson).jsonObject["query"]!!.jsonPrimitive.content,
+            )
+        }
     }
 }

@@ -393,7 +393,9 @@ class FastRouter(
         //    屈折形式；`how-to`／`howto` 為明示替代）、
         //    CJK：`說明|説明|講解|讲解|介紹|介绍|討論|讨论|教程|方法(?:是)?|意思|名稱|名称|如何|怎麼|怎么|怎样|怎樣`
         //    （過度封閉為受控 fail-safe 方向，接受）
-        // 4. 不以疑問尾標收尾（? ？ 嗎 吗 呢，見 [INTERROGATIVE_ENDINGS]）。
+        // 4. 不以疑問尾標收尾（? ？ 嗎 吗 呢，見 [INTERROGATIVE_ENDINGS]）——
+        //    判讀前先重複剝離句尾中性句末終止符 run（[NEUTRAL_SENTENCE_TERMINATORS] 封閉集），
+        //    故疑問顆粒後接一串終止符（`呢。`／`嗎！`／`呢!!!`／`嗎。！`）仍歸類為疑問 ⇒ 否決。
         // 5. [hasSymbolQuery] 仍由呼叫端（missingQuestionFor）要求——剝離提示詞
         //    後無有意義殘餘（無 Unicode 字母/數字）時轉 NEED_CLARIFICATION，
         //    FAST 與否皆不可能（與先前行為一致）。
@@ -430,6 +432,21 @@ class FastRouter(
             RegexOption.IGNORE_CASE,
         )
         private val INTERROGATIVE_ENDINGS = charArrayOf('?', '？', '嗎', '吗', '呢')
+
+        // 此集為刻意的最小 NFKC 閉子集；漏網之終止符形態（如 U+301C〜、U+3030〰、U+22EF⋯）皆由
+        // extraction C′（remainder 含 嗎|吗|呢 ⇒ 澄清）與 whitespace 閘背擋——安全機制不依賴此集完備。
+        // #19 B3 stage-6.1（疑問尾標加固）：中性句末終止符封閉集（半形＋全形）。
+        // 疑問尾標探針在判讀尾碼前會重複剝離此集的句尾 run，再判讀剩餘最後碼點——
+        // 疑問顆粒後接一串終止符（`查 Foo 符號呢。`、`查 Foo 符號呢!!!`、
+        // `查 Foo 符號呢…`、`查 Foo 符號嗎。！`）仍正確歸類為疑問 ⇒ 否決。
+        // 保守封閉集：不在此集且非疑問顆粒 ⇒ 停止剝離（如 `查 Foo 符號呢 Extra`
+        // ——multi-token 由 extraction 的 whitespace 閘澄清，永不到執行）。
+        // `?`／`？` 本身是疑問顆粒（在 INTERROGATIVE_ENDINGS），不在此集，
+        // 故剝離終止符 run 後尾部仍是 `?`／`？` 時正確歸類為疑問。
+        private val NEUTRAL_SENTENCE_TERMINATORS: Set<Char> = setOf(
+            '.', '．', '。', '！', '!', '‥', '…', '～', '~', '，', ',', '、', '；', ';', '：', ':',
+            '）', ')', '」', '』', '”', '"', '\'', '’',
+        )
 
         // 授權子句/教學標記的正規化探針（#19 B3 stage-1 fix；解決 Cf/格式符拆分繞過）。
         // NFKC → 剝 Cf/格式符 → 非字母/數字 run 摺成單一空白（`_` 保留——`after_approval`
@@ -476,11 +493,20 @@ class FastRouter(
          * clause anywhere (checked against the raw text AND the two normalized
          * probes, see [clauseProbeSpaced]/[clauseProbeJoined]); it contains NO
          * teaching/description marker anywhere (same three texts); and its
-         * Cf-stripped view does NOT end with a question tail （? ？ 嗎 吗 呢）.
-         * The tail check ignores Cf/default-ignorables (best-effort) — it is
-         * NOT Unicode-complete: graphical punctuation after a question particle
-         * (`呢。`／`嗎！`) defeats it (narrow-tail limitation, recorded).
-         * Tail probe now also strips Hangul fillers (U+115F/U+1160/U+3164/U+FFA0) and combining marks (\p{M}); graphical punctuation after a particle remains the documented narrow-tail limitation.
+         * Cf-stripped view, after repeatedly dropping a trailing run of neutral
+         * sentence-final terminators ([NEUTRAL_SENTENCE_TERMINATORS], a fixed
+         * closed set — halfwidth + fullwidth `. ． 。 ！ ! ‥ … ～ ~ ， , 、 ； ; ： : ） ) 」 』 ” " ' ’`),
+         * does NOT end with a question tail （? ？ 嗎 吗 呢，見 [INTERROGATIVE_ENDINGS];
+         * the fullwidth forms of the interrogative question particles are listed
+         * there). The tail probe strips Cf/Hangul fillers/combining marks AND a
+         * trailing terminator run before reading the last code unit — so a
+         * particle followed by neutral sentence-final punctuation (`呢。`／`嗎！`／`呢!!!`／`呢…`／`嗎。！`) is
+         * correctly denied. `?`/`？` are themselves
+         * interrogative particles (NOT in the terminator set), so a run like
+         * `嗎？。` still classifies as interrogative after the `。` drop;
+         * The terminator set is closed and deliberately minimal; gaps are
+         * backstopped by the Step C′ reject (a particle anywhere in the
+         * remainder denies) and the whitespace gate — never by execution.
          *
          * Any gate failure falls through to the RULES loop, then to no-match
          * DENIED (reasonCode null) when nothing matches, or to the matching
@@ -517,17 +543,22 @@ class FastRouter(
             ) {
                 return false
             }
-            // 疑問尾標檢查跑在剝離 Cf/Hangul filler/combining mark 後的視圖上：
+            // 疑問尾標檢查跑在剝離 Cf/Hangul filler/combining mark、並重複剝離
+            // 句尾中性句末終止符 run（NEUTRAL_SENTENCE_TERMINATORS 封閉集）後的視圖上：
             // 句尾預設忽略字（如 `查 Foo 符號呢\u200B`）及填充字/組合記號
-            // （如 `呢\u3164`／`呢\u0301`）不得翻轉 DENIED→FAST。
-            // best-effort：疑問顆粒後接圖形標點（`呢。`／`嗎！`）
-            // 仍躲過本檢查——narrow-tail 侷限，記錄於上方 KDoc。
+            // （如 `呢\u3164`／`呢\u0301`）不得翻轉 DENIED→FAST；疑問顆粒後接一串
+            // 中性終止符（`呢。`／`嗎！`／`呢!!!`／`呢…`／`嗎。！`）時，run 被剝離後
+            // 尾部仍是疑問顆粒 ⇒ 否決（見 [INTERROGATIVE_ENDINGS]）。
             val tailProbe = Normalizer.normalize(trimmed, Normalizer.Form.NFKC)
                 .replace(CLAUSE_Cf, "")
                 .replace(HANGUL_FILLER, "")
                 .replace(COMBINING_MARKS, "")
                 .trim()
-            return tailProbe.lastOrNull()?.let { it !in INTERROGATIVE_ENDINGS } ?: true
+            var tailEnd = tailProbe.length
+            while (tailEnd > 0 && tailProbe[tailEnd - 1] in NEUTRAL_SENTENCE_TERMINATORS) tailEnd--
+            // 終止符 run 可能夾著空白（`呢 。`）；剝 run 後再 trim，使尾部的疑問顆粒
+            // 於閘層即被辨識（多 token 夾空白的補救顯性見 extraction C′ backstop）。
+            return tailProbe.substring(0, tailEnd).trim().lastOrNull()?.let { it !in INTERROGATIVE_ENDINGS } ?: true
         }
         private val SLOW_HINTS = listOf(
             r("自動點擊"), r("自动点击"), r("點擊螢幕"), r("点击屏幕"), r("幫我點"), r("帮我点"),
@@ -903,8 +934,16 @@ class FastRouter(
          *   boundary at the hint, so they survive intact.
          * Step C — CJK prose fillers removed as substrings (same class as the
          *   accepted CJK over-strip residuals): 幫我|這個|那個|一下|請|查|找|
-         *   尋|搜|詢|什麼|什么|何|是|的|要|用|嗎|吗|呢|如何|怎麼|怎么|意思|
+         *   尋|搜|詢|什麼|什么|何|是|的|要|用|如何|怎麼|怎么|意思|
          *   為什麼|为什么|說明|説明|講解|讲解|介紹|介绍|教程.
+         *   #19 B3 stage-6.1：疑問顆粒（嗎|吗|呢）不再列入本步的剝離集——
+         *   疑問顆粒出現在殘餘中 anywhere 即解析失敗（見下一步）。
+         * Step C′ — CJK interrogative particles （嗎|吗|呢） are NEVER stripped
+         *   anywhere in the remainder; a remainder that still contains one
+         *   anywhere fails extraction (empty) ⇒ NEED_CLARIFICATION (fail-closed;
+         *   those particles are implausible inside a real symbol name).
+         *   (`查 呢 符號`-class input now also fails here — same clarification
+         *   outcome as before, reached fail-closed instead of via stripping.)
          * Step D — leading EN connectives stripped, REPEATEDLY, but only when
          *   another token remains after the connective
          *   (`^(?:for|the|a|an|named|called|of|to)\s+(?=\S)`, IGNORE_CASE).
@@ -986,7 +1025,7 @@ class FastRouter(
         private val SYMBOL_KEYWORD = Regex("\\bsymbols?\\b", RegexOption.IGNORE_CASE)
         private val SYMBOL_CJK_HINT = Regex("符號|符号|函式|函数")
         private val SYMBOL_CJK_FILLER = Regex(
-            "幫我|這個|那個|一下|請|查|找|尋|搜|詢|什麼|什么|何|是|的|要|用|嗎|吗|呢|如何|怎麼|怎么|意思|為什麼|为什么|說明|説明|講解|讲解|介紹|介绍|教程",
+            "幫我|這個|那個|一下|請|查|找|尋|搜|詢|什麼|什么|何|是|的|要|用|如何|怎麼|怎么|意思|為什麼|为什么|說明|説明|講解|讲解|介紹|介绍|教程",
         )
         private val SYMBOL_LEADING_CONNECTIVE = Regex(
             "^(?:for|the|a|an|named|called|of|to)\\s+(?=\\S)",
@@ -1043,6 +1082,10 @@ class FastRouter(
                 }
                 s = u
             }
+            // Step C′ — CJK interrogative particles （嗎|吗|呢） anywhere in the
+            // remainder ⇒ extraction FAILS (empty) ⇒ NEED_CLARIFICATION
+            // (fail-closed; never stripped, never part of a plausible query).
+            if (s.contains('嗎') || s.contains('吗') || s.contains('呢')) return ""
             // Step F — empty / whitespace / Cf / Cc (and anything the charset
             // rejects) ⇒ invalid ⇒ return "" so the clarification gate fires.
             if (s.isEmpty()) return ""

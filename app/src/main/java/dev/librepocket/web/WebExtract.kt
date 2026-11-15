@@ -80,6 +80,8 @@ internal class DeadlineExceededException : RuntimeException()
  *   ＋`maxBytes`＋`maxModelChars`＋policy identity（`policy`＋`configRevision`），
  *   不同 policy/revision 不互撞）零 upstream、`cached=true`；
  *   `Failed`／`Unavailable`／取消一律不寫。
+ *   有界雙上限（正交）：筆數 [MAX_CACHE_ENTRIES]（200）＋位元組 [MAX_CACHE_BYTES]
+ *   （4 MiB；near-weighted LRU；單筆超限不入快取）。
  *   快取命中仍須 per-call 政策重驗（含 DNS preflight），不旁路當次政策評估；
  *   不同 resolver／endpoint（同 policy＋revision 之下）不得重用結果；
  *   重驗本身不 purge 快取；授權撤銷僅能經 `invalidate()`／bump `configRevision`。
@@ -175,8 +177,15 @@ object WebExtract {
     /** 快取 TTL 60min。 */
     const val DEFAULT_TTL_MS = 60 * 60 * 1_000L
 
-    /** 快取上限筆數（LRU 有界）。 */
+    /** 快取上限筆數（LRU 有界）。與 [MAX_CACHE_BYTES] 正交：兩者皆 enforced。 */
     const val MAX_CACHE_ENTRIES = 200
+
+    /**
+     * 快取總位元組上限（4 MiB；near-weighted LRU：entry 權重＝
+     * key／snippet／envelope／title／url／published／siteName 長度×2＋固定 overhead）。
+     * 與 [MAX_CACHE_ENTRIES] 正交：兩者皆 enforced；單筆超限者不入快取。
+     */
+    const val MAX_CACHE_BYTES = 4L * 1024 * 1024
 
     /** 手動跟隨上限（超過即 `Failed(TOO_MANY_REDIRECTS)`）。 */
     const val MAX_REDIRECTS = 5
@@ -369,6 +378,9 @@ internal suspend fun fetchRawWithTimeout(
     return RawFetchOut.Resp(response)
 }
 
+/** entry 權重之固定開銷（Object header／map node／bookkeeping 之近似估算）。 */
+private const val ENTRY_OVERHEAD_BYTES = 256L
+
 /**
  * D4 抽取快取（TTL 60min；純 JVM）。
  *
@@ -385,25 +397,44 @@ internal suspend fun fetchRawWithTimeout(
  *  但不同 resolver／endpoint 安全上下文不得重用結果；重驗本身不 purge
  *   快取；授權撤銷僅能經 `invalidate()`／bump `configRevision` 生效；跨 tier
  *  （不同 `policy`／`configRevision`）內容永不共用。
- * - 時鐘可注入，TTL 到期 lazy 淘汰＋`put` 順手掃；有界 LRU
- *  （[WebExtract.MAX_CACHE_ENTRIES]）。
+ * - 時鐘可注入，TTL 到期 lazy 淘汰＋`put` 順手掃；有界 LRU，雙上限正交：
+ *  筆數上限 [WebExtract.MAX_CACHE_ENTRIES]（200）＋位元組上限
+ *  [WebExtract.MAX_CACHE_BYTES]（4 MiB；建構子可注入小值測試）。
+ *  entry 權重（near-weighted）＝key／snippet／envelope／title／url／published／
+ *  siteName 之長度×2＋固定 [ENTRY_OVERHEAD_BYTES]；`put` 時先 sweep expired
+ *  → 單筆超限直接不寫 → LRU（accessOrder）逐出直到放得下；`clear()` 歸零
+ *  `currentBytes`；TTL sweep／覆寫同 key 皆即時調整 bytes 計。
  */
 class WebExtractCache(
     val ttlMs: Long = WebExtract.DEFAULT_TTL_MS,
     private val clockMs: () -> Long = System::currentTimeMillis,
+    private val maxBytes: Long = WebExtract.MAX_CACHE_BYTES,
 ) {
     init {
         require(ttlMs > 0) { "ttlMs must be > 0" }
     }
 
-    private data class Entry(val outcome: WebExtractOutcome.Ok, val expiresAt: Long)
+    private data class Entry(val outcome: WebExtractOutcome.Ok, val expiresAt: Long, val weight: Long)
+
+    /** 目前快取內 entry 權重之總和（bytes 近似；與 map.size 同鎖維護）。 */
+    private var currentBytes = 0L
+
+    private fun weightOf(k: String, o: WebExtractOutcome.Ok): Long {
+        val c = o.content
+        var w = ENTRY_OVERHEAD_BYTES
+        w += k.length * 2L
+        w += c.snippet.length * 2L
+        w += o.envelope.length * 2L
+        w += c.title.length * 2L
+        w += c.url.length * 2L
+        w += (c.published?.length ?: 0) * 2L
+        w += (c.siteName?.length ?: 0) * 2L
+        return w
+    }
 
     private val map: MutableMap<String, Entry> =
         Collections.synchronizedMap(
-            object : LinkedHashMap<String, Entry>(64, 0.75f, true) {
-                override fun removeEldestEntry(e: MutableMap.MutableEntry<String, Entry>): Boolean =
-                    size > WebExtract.MAX_CACHE_ENTRIES
-            },
+            LinkedHashMap(64, 0.75f, true),
         )
 
     /**
@@ -430,6 +461,7 @@ class WebExtractCache(
             entry = map[k]
             if (entry != null && clockMs() >= entry.expiresAt) {
                 map.remove(k)
+                currentBytes -= entry.weight
                 return null
             }
         }
@@ -446,6 +478,7 @@ class WebExtractCache(
         val now = clockMs()
         val expiresAt = now.coerceAtMost(Long.MAX_VALUE - ttlMs) + ttlMs
         val snapshot = outcome.copy(cached = false, content = outcome.content.copy())
+        val weight = weightOf(k, snapshot)
         synchronized(map) {
             // epoch guard（置於 map 鎖內）：進入時捕獲之 generation 已變
             //（clear()/invalidate() 已 bump），拒絕本次寫入——陳舊 leader
@@ -453,7 +486,24 @@ class WebExtractCache(
             // 故鎖內看到 bump 即知 clear 已開始或完成）。
             if (generation.get() != generationCaptured) return
             sweepLocked(now)
-            map[k] = Entry(snapshot, expiresAt)
+            if (weight > maxBytes) {
+                // 單筆超限：寫入回 caller 但不入快取（approved D-8）；
+                // 不驅逐其他 entry 為其騰位——合理之 miss。
+                return
+            }
+            // 覆寫同 key：先扣除舊 entry 權重（避免雙計）。
+            map.remove(k)?.let { currentBytes -= it.weight }
+            // LRU（accessOrder LinkedHashMap）逐出直到放得下；筆數上限正交。
+            while (map.isNotEmpty() &&
+                (currentBytes + weight > maxBytes || map.size >= WebExtract.MAX_CACHE_ENTRIES)
+            ) {
+                val it = map.entries.iterator()
+                val eldest = it.next()
+                currentBytes -= eldest.value.weight
+                it.remove()
+            }
+            map[k] = Entry(snapshot, expiresAt, weight)
+            currentBytes += weight
         }
     }
 
@@ -467,7 +517,10 @@ class WebExtractCache(
         // 先 bump generation 再清 map：任何捕獲舊 epoch 的寫入從此刻起一律被
         // [putByKey] 拒絕（即使 map 清空與寫入競爭，guard 也以 epoch 判決）。
         generation.incrementAndGet()
-        map.clear()
+        synchronized(map) {
+            map.clear()
+            currentBytes = 0L
+        }
     }
 
     val size: Int get() = synchronized(map) { map.size }
@@ -475,7 +528,11 @@ class WebExtractCache(
     private fun sweepLocked(nowMs: Long) {
         val it = map.entries.iterator()
         while (it.hasNext()) {
-            if (nowMs >= it.next().value.expiresAt) it.remove()
+            val next = it.next()
+            if (nowMs >= next.value.expiresAt) {
+                currentBytes -= next.value.weight
+                it.remove()
+            }
         }
     }
 }

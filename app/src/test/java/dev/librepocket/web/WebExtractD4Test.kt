@@ -84,6 +84,38 @@ class WebExtractD4Test {
     private fun countIgnoreCase(haystack: String, needle: String): Int =
         Regex(Regex.escape(needle), RegexOption.IGNORE_CASE).findAll(haystack).count()
 
+    /** 固定形狀之 Ok，供 cache byte 權重測試（url 長度恆為 15）。 */
+    private fun byteCacheOk(snippet: String, envelope: String): WebExtractOutcome.Ok =
+        WebExtractOutcome.Ok(
+            content = WebExtractContent(
+                title = "t",
+                url = "https://e.com/x",
+                snippet = snippet,
+                published = null,
+                siteName = null,
+            ),
+            envelope = envelope,
+            truncated = false,
+            cached = false,
+            bytesKept = 1,
+        )
+
+    /**
+     * near-weighted entry 權重（鏡照 [WebExtractCache] 之 weightOf：
+     * overhead 256L＋(key／snippet／envelope／title／url 長度)×2）。
+     * 以 throwaway cache 計算 key（cache key 為公開 API：放行讀取但避免複製 key 格式）。
+     */
+    private fun expectedEntryWeight(
+        url: String,
+        snippet: String,
+        envelope: String,
+        optIn: EndpointNetworkOptIn,
+    ): Long {
+        val probe = WebExtractCache()
+        val k = probe.key(url, WebExtract.DEFAULT_MAX_BYTES, WebExtract.DEFAULT_MODEL_CHARS, optIn)
+        return 256L + 2L * (k.length + snippet.length + envelope.length + "t".length + "https://e.com/x".length)
+    }
+
     private fun okResp(
         body: String,
         code: Int = 200,
@@ -1515,6 +1547,66 @@ class WebExtractD4Test {
         )
         assertFalse("截斷前綴之後的資料不得出現於 envelope", out.envelope.contains("TAIL_KEYDATA_9527"))
         assertFalse("截斷前綴之後的資料不得出現於 snippet", out.content.snippet.contains("TAIL_KEYDATA_9527"))
+    }
+
+    // ---- J. 快取 byte 權重上限（near-weighted LRU；與筆數上限正交）----
+
+    @Test fun cacheByteCapEvictsOldestWhenOverWeight() {
+        var now = 1_000L
+        val optIn = EndpointNetworkOptIn()
+        val snippet = "s".repeat(100)
+        val envelope = "e".repeat(100)
+        // 等長 url → 等長 key → 等權重 entry
+        val u1 = "https://e.com/aaaa"
+        val u2 = "https://e.com/bbbb"
+        val u3 = "https://e.com/cccc"
+        val w = expectedEntryWeight(u1, snippet, envelope, optIn)
+        assertEquals("等長 url 應得等權重", w, expectedEntryWeight(u2, snippet, envelope, optIn))
+        assertEquals("等長 url 應得等權重", w, expectedEntryWeight(u3, snippet, envelope, optIn))
+        val cache = WebExtractCache(ttlMs = 60_000, clockMs = { now }, maxBytes = 2 * w + 1)
+        cache.put(u1, WebExtract.DEFAULT_MAX_BYTES, WebExtract.DEFAULT_MODEL_CHARS, optIn, byteCacheOk(snippet, envelope))
+        cache.put(u2, WebExtract.DEFAULT_MAX_BYTES, WebExtract.DEFAULT_MODEL_CHARS, optIn, byteCacheOk(snippet, envelope))
+        cache.put(u3, WebExtract.DEFAULT_MAX_BYTES, WebExtract.DEFAULT_MODEL_CHARS, optIn, byteCacheOk(snippet, envelope))
+        // 容量僅 2 筆 → 最舊者（u1）被逐出
+        assertEquals(2, cache.size)
+        assertTrue("u2 應在快取", cache.get(u2, WebExtract.DEFAULT_MAX_BYTES, WebExtract.DEFAULT_MODEL_CHARS, optIn) != null)
+        assertTrue("u3 應在快取", cache.get(u3, WebExtract.DEFAULT_MAX_BYTES, WebExtract.DEFAULT_MODEL_CHARS, optIn) != null)
+        assertTrue("u1 應被逐出", cache.get(u1, WebExtract.DEFAULT_MAX_BYTES, WebExtract.DEFAULT_MODEL_CHARS, optIn) == null)
+    }
+
+    @Test fun cacheSingleEntryHeavierThanCapNotCached() {
+        val optIn = EndpointNetworkOptIn()
+        val snippet = "s".repeat(1_000)
+        val envelope = "e".repeat(1_000)
+        val u = "https://e.com/big"
+        val w = expectedEntryWeight(u, snippet, envelope, optIn)
+        val cache = WebExtractCache(clockMs = { 1_000L }, maxBytes = w - 1)
+        // 單筆超限 → put 正常返回（無例外），但不入快取
+        cache.put(u, WebExtract.DEFAULT_MAX_BYTES, WebExtract.DEFAULT_MODEL_CHARS, optIn, byteCacheOk(snippet, envelope))
+        assertEquals(0, cache.size)
+        assertTrue(cache.get(u, WebExtract.DEFAULT_MAX_BYTES, WebExtract.DEFAULT_MODEL_CHARS, optIn) == null)
+    }
+
+    @Test fun cacheTtlSweepFreesBytesForNewPut() {
+        var now = 1_000L
+        val optIn = EndpointNetworkOptIn()
+        val snippet = "s".repeat(100)
+        val envelope = "e".repeat(100)
+        val u1 = "https://e.com/aaaa"
+        val u2 = "https://e.com/bbbb"
+        val u3 = "https://e.com/cccc"
+        val w = expectedEntryWeight(u1, snippet, envelope, optIn)
+        val cache = WebExtractCache(ttlMs = 60_000, clockMs = { now }, maxBytes = 2 * w + 1)
+        cache.put(u1, WebExtract.DEFAULT_MAX_BYTES, WebExtract.DEFAULT_MODEL_CHARS, optIn, byteCacheOk(snippet, envelope))
+        cache.put(u2, WebExtract.DEFAULT_MAX_BYTES, WebExtract.DEFAULT_MODEL_CHARS, optIn, byteCacheOk(snippet, envelope))
+        assertEquals(2, cache.size)
+        now += 60_000 // u1、u2 恰好到期
+        cache.put(u3, WebExtract.DEFAULT_MAX_BYTES, WebExtract.DEFAULT_MODEL_CHARS, optIn, byteCacheOk(snippet, envelope))
+        // TTL sweep 於 put 內釋出過期 bytes → u3 放得下
+        assertEquals(1, cache.size)
+        assertTrue("u3 應在快取", cache.get(u3, WebExtract.DEFAULT_MAX_BYTES, WebExtract.DEFAULT_MODEL_CHARS, optIn) != null)
+        assertTrue("u1 應已過期不可見", cache.get(u1, WebExtract.DEFAULT_MAX_BYTES, WebExtract.DEFAULT_MODEL_CHARS, optIn) == null)
+        assertTrue("u2 應已過期不可見", cache.get(u2, WebExtract.DEFAULT_MAX_BYTES, WebExtract.DEFAULT_MODEL_CHARS, optIn) == null)
     }
 
     // ---- I. deadline／線性掃描回歸 ----

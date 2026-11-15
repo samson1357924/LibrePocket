@@ -172,7 +172,8 @@ abstract class BaseKeyedSearchProvider(
      * 同一份不可變 [CredentialSnapshot] 既產生 fingerprint、亦供 HTTP 請求使用，
      * 消除原 read#1(指紋)／read#2(key) 之間的憑證漂移（TOCTOU）。
      * SHA-256（byte-packed CharArray，避免中間 String）截斷為 16 hex chars（64 bits）；
-     * in-memory only、不持久化、不可逆推回 key material。
+     * in-memory only、不持久化，無 egress 通道；對高熵 key 實務不可逆推回 key material。
+     * （低熵 key 的 dictionary 還原不在本層威脅模型：指紋永不落盤、不印出、不出本處理程序。）
      * 無法確定當前憑證狀態（vault 讀取失敗／缺 key／指紋計算失敗）→ [CredentialState.Unavailable]，Service 將完全旁路快取。
      * [CancellationException] 原樣透傳。
      */
@@ -257,7 +258,7 @@ abstract class BaseKeyedSearchProvider(
      *（Ok 以外不進 cache 的既有不變量維持）。
      * blank key → `Unavailable(MISSING_KEY)`、零網路。
      */
-    override suspend fun search(query: String, count: Int): WebSearchOutcome {
+    final override suspend fun search(query: String, count: Int): WebSearchOutcome {
         if (query.isBlank()) return WebSearchOutcome.Unavailable(WebUnavailableReason.EMPTY_QUERY)
         // unreachable defense-in-depth（建構期已 fail-fast）
         if (keyId.isBlank()) return WebSearchOutcome.Unavailable(WebUnavailableReason.MISSING_KEY)

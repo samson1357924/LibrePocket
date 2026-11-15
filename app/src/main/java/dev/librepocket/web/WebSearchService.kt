@@ -151,8 +151,16 @@ class WebSearchService(
                         return bypass()
                     }
                 }
-                val cacheKey = cache.key(delegate.cacheNamespace, query, n)
-                    .let { if (snapshot != null) "$it#rev:${snapshot.fingerprint}" else it }
+                val cacheKey = try {
+                    cache.key(delegate.cacheNamespace, query, n)
+                        .let { if (snapshot != null) "$it#rev:${snapshot.fingerprint}" else it }
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (_: Exception) {
+                    // delegate 的 cacheNamespace getter 拋出（壞 delegate）：fail-closed；
+                    // finally 仍會 wipe snapshot。
+                    return WebSearchOutcome.Failed(WebFailureReason.TRANSPORT)
+                }
                 cache.getByKey(cacheKey)?.let { return it.copy(cached = true) }
 
                 var lateHit: WebSearchOutcome.Ok? = null

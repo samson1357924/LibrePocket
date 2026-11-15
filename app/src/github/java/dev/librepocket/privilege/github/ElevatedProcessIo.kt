@@ -1067,8 +1067,7 @@ internal object ElevatedCleanupTracker {
      * （正常路徑：verify 結果已知後調用本函數恰好釋放一次，verify 窗口內 live victim
      * 始終被追蹤），要麼已於 post-grace 線性化點轉移給 stalled worker 本體（stall
      * 路徑：呼叫方 `releaseCleanupSlotAfterVerify` 為 no-op，本函數改由 worker 本體
-     * finally 調用——admission 於 worker 退出前維持 fail-closed）；或殘留執行緒
-     * 本體 finally 調用）。
+     * finally 調用——admission 於 worker 退出前維持 fail-closed）。
      *
      * floor 觸發即 bug（未佔而釋）：產品保持 floor 不變負，但經
      * [releaseFloorHits] 計數上報（測用不断言，僅供診斷；正常三態機制下永不觸發）。
@@ -3702,8 +3701,9 @@ internal object ElevatedProcessIo {
      * @param startThread Stage 2A（P1-A3）可注入的線程啟動方式（測試注入用）：
      *   drain 層的 `startThread` seam 一併穿入，使 elevated-cleanup 起線程失敗
      *   可注入（「抛即未起」契約同 drain 其他執行緒；預設 `{ it.start() }`）。
-     * @param slotHeldOut Stage 3b 必傳 out：本次呼叫若取得並持有清理槽
-     *   （acquire 成功且走正常返回路徑，或起線程失敗臂登記拋出）即置 true；
+     * @param slotHeldOut Stage 3b／3c 必傳 out：本次呼叫若取得並持有清理槽
+     *   （acquire 成功且走正常返回路徑——無 stall custody 轉移——，或起線程失敗臂登記拋出）
+     *   即置 true；此旗標僅於正常返回／no-stall-transfer 點置位；
      *   呼叫方須在 post-kill verify 結果已知後恰好 `releaseCleanupSlotAfterVerify(process, verified, slotHeldOut.get())`
      *   一次（verified＝true 即釋放；verify 失敗時登記 quarantine 先行、release 殿後，
      *   順序不變；登記拋出則槽保留 fail-closed，見 [releaseCleanupSlotAfterVerify]）。

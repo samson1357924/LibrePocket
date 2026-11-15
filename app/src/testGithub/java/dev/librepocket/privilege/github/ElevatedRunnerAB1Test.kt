@@ -28,9 +28,11 @@ import org.junit.Before
  *   Shizuku（close 阻塞）混合疊加，證跨 runner 共用同一全域計數；
  * - P1-B：8 執行緒 barrier，fake spawn 內 `entered` 計數後 latch 等待；
  *   斷言 spawn==1（恰好，另 7 被預留門拒，reason 含 "backlog full"）；
- *   釋放後 1 個走 timeout＋不可中斷 destroy → Stage 3b slot-ownership transfer：
- *   cleanup 槽 post-verify 即釋放（victim 改由 quarantine 封存），outstanding=0；
- *   後續 denied（QUARANTINE）。finally 全釋放＋輪詢歸零。
+ *   釋放後 1 個走 timeout＋不可中斷 destroy → Stage 3c stall-arm：cleanup worker
+ *   卡在 destroyLatch，custody 於 post-grace 線性化點移交 worker 本體；release
+ *   發生於 destroyLatch.countDown() 令 worker 退出、worker finally 恰好釋放一次
+ *   之時——其間 outstanding 續為 1、admission fail-closed（victim 改由 quarantine 封存）；
+ *   後續 denied（QUARANTINE）不變。finally 全釋放＋輪詢歸零。
  */
 class ElevatedRunnerAB1Test {
 

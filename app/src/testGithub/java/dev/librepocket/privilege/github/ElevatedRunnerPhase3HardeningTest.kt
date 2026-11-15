@@ -22,9 +22,14 @@ import org.junit.Test
 /**
  * Phase 3 資源上界＋生命週期硬化迴歸（P1-4，PR #140 Phase 3）：
  * - 六點同卡 barrier（wait＋cleanup＋verify＋stdout＋stderr＋stdin-close）：
- *   Stage 3b slot-ownership transfer 後 cleanup 槽於 verify 結果已知後才釋放
- *   （verified-false → quarantine 封存、release 殿後），實際同持槽鎖點現為 5
- *   （wait＋verify＋stdout＋stderr＋stdin）；保留「六點／SixPoint」名稱與計數註解；
+ *   Stage 3c 雙 custody（thread-bound custody）下——
+ *   正常路徑：custody 留呼叫方，跨 post-kill verify 持有，verify 結果已知後
+ *   恰好釋放一次；stall 路徑：post-grace 重讀 worker 仍存活即於線性化點將
+ *   custody 移交 worker 本體，release 於 worker 退出（finally）時發生——
+ *   stalled 期間該清理槽不歸零（outstanding≥1，admission fail-closed）；
+ *   verified=false → 呼叫方先登記 quarantine，再行（可能的）釋放；
+ *   實際同持槽鎖點現為 6（wait＋verify＋stdout＋stderr＋stdin＋cleanup，
+ *   test body 斷言 outstanding==6）；保留「六點／SixPoint」名稱與計數註解；
  *   同步峰值 `peakOutstanding() <= MAX_OUTSTANDING_CLEANUPS`（替代 sleep 採樣，
  *   `acquireSlot` 同鎖內同步更新，無遺漏）；終止後 slot 全釋、verdict
  *   `TimedOut(cleanupIncomplete=true)`、breaker 只計 1（不熔斷）、殘留期間新
@@ -367,7 +372,7 @@ class ElevatedRunnerPhase3HardeningTest {
             assertEquals(1, spawns.get())
         } finally {
             latch.countDown()
-            // Stage 3b：本測 by design 留 1 條 quarantine 登記（verify=false）；
+            // Stage 3c：本測 by design 留 1 條 quarantine 登記（verify=false）；
             // teardown 現以 leak 斷言把關，此處先清除登記（僅測試隔離，非#136-B3修復）。
             ElevatedCleanupTracker.clearUnverified()
             pollOutstandingTo(0)
@@ -447,7 +452,7 @@ class ElevatedRunnerPhase3HardeningTest {
             assertEquals(1, spawns.get())
         } finally {
             latch.countDown()
-            // Stage 3b：本測 by design 留 1 條 quarantine 登記（verify=false）；
+            // Stage 3c：本測 by design 留 1 條 quarantine 登記（verify=false）；
             // teardown 現以 leak 斷言把關，此處先清除登記（僅測試隔離，非#136-B3修復）。
             ElevatedCleanupTracker.clearUnverified()
             pollOutstandingTo(0)
@@ -873,7 +878,7 @@ class ElevatedRunnerPhase3HardeningTest {
             repeat(prefilled) {
                 ElevatedCleanupTracker.releaseSlot()
             }
-            // Stage 3b：飽和臂在 acquireSlotOrQuarantine 同鎖內原子登記 1 條
+            // Stage 3c：飽和臂在 acquireSlotOrQuarantine 同鎖內原子登記 1 條
             // quarantine（verify 後登記冪等去重）；by design 留存，teardown 以
             // leak 斷言把關，此處先清除（僅測試隔離，非#136-B3修復）。
             ElevatedCleanupTracker.clearUnverified()

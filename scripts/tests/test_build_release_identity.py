@@ -99,6 +99,28 @@ def _assert_example_sentinel(example: object) -> None:
             raise AssertionError(f"example pins cert_sha256 for {flavor!r} must remain a sentinel placeholder")
 
 
+def _strict_loads(text: str) -> object:
+    """Parse JSON text, rejecting duplicate object keys at any depth.
+
+    Fail-closed: mirrors the pins validator (`check_release_pins.load_pins`), which
+    parses with `object_pairs_hook=_no_duplicate_object`. Plain `json.loads` silently
+    keeps the last duplicate key, so a file could hide certificate-like material under
+    an earlier key while the parsed dict still looked sentinel-clean; this loader
+    raises ValueError instead.
+    """
+    return json.loads(text, object_pairs_hook=signer_pins._no_duplicate_object)
+
+
+def _load_example_strict() -> object:
+    """Read the checked-in example pins file and parse it duplicate-key-strictly.
+
+    Every sentinel assertion against the on-disk example must go through this loader;
+    plain `json.loads` must never gate the example's bytes (duplicate keys would be
+    invisible to the sentinel check).
+    """
+    return _strict_loads(PINS_EXAMPLE.read_text(encoding="utf-8"))
+
+
 FLAVORS = ("play", "foss", "github")
 CONDITIONAL_BACKTICK_GRADLE = (
     'if (false) {\n val `}` = 1\n android {\n defaultConfig {\n'
@@ -1236,21 +1258,21 @@ class SignerPinRegistryTest(unittest.TestCase):
         self.assertFalse(_forbidden_signer_pins_path("scripts/release_signer_pins.example.json"))
 
     def test_checked_in_example_contains_only_sentinel_placeholders(self) -> None:
-        example = json.loads(PINS_EXAMPLE.read_text(encoding="utf-8"))
+        example = _load_example_strict()
         _assert_example_sentinel(example)
 
     def test_example_with_one_real_fingerprint_is_rejected_by_sentinel_assertion(self) -> None:
-        example = json.loads(PINS_EXAMPLE.read_text(encoding="utf-8"))
+        example = _load_example_strict()
         mutated = json.loads(json.dumps(example))
         mutated["play"]["cert_sha256"] = "ab12" * 16
         with self.assertRaises(AssertionError):
             _assert_example_sentinel(mutated)
         # The file on disk must be untouched and still pass the sentinel assertion.
-        on_disk = json.loads(PINS_EXAMPLE.read_text(encoding="utf-8"))
+        on_disk = _load_example_strict()
         _assert_example_sentinel(on_disk)
 
     def test_sentinel_assertion_rejects_other_envelope_mutations(self) -> None:
-        example = json.loads(PINS_EXAMPLE.read_text(encoding="utf-8"))
+        example = _load_example_strict()
         mutations = {}
         # (a) play package drift
         package_drift = json.loads(json.dumps(example))
@@ -1269,8 +1291,82 @@ class SignerPinRegistryTest(unittest.TestCase):
                 with self.assertRaises(AssertionError):
                     _assert_example_sentinel(mutated)
         # The canonical on-disk example must still pass the sentinel assertion.
-        on_disk = json.loads(PINS_EXAMPLE.read_text(encoding="utf-8"))
+        on_disk = _load_example_strict()
         _assert_example_sentinel(on_disk)
+
+    def test_example_with_duplicate_json_keys_is_rejected(self) -> None:
+        """Duplicate JSON keys must not smuggle certificate-like material past the sentinel check.
+
+        Plain ``json.loads`` keeps the last duplicate key, so the variants below parse
+        to a dict identical to the canonical example and would pass a plain-loads
+        sentinel assertion while 64-hex, certificate-like bytes sit in the file. The
+        strict loader (duplicate-key-rejecting, mirroring the pins validator's
+        ``object_pairs_hook=signer_pins._no_duplicate_object``) raises instead, and
+        every sentinel path against the on-disk example goes through it. Why the strict
+        raise is required: the sentinel assertion alone cannot see duplicate keys, so
+        without a strict parse the byte-level "example stays placeholder-only"
+        guarantee would be void.
+        """
+        canonical_text = PINS_EXAMPLE.read_text(encoding="utf-8")
+        # Strictly loaded baseline used only to build comparison values for this test.
+        canonical = _strict_loads(canonical_text)
+        synthetic_cert = "ab" * 32  # 64 hex chars, certificate-fingerprint-shaped
+
+        def flavor_block(name: str, entry: dict) -> str:
+            return (
+                f'  "{name}": {{\n'
+                f'    "package": "{entry["package"]}",\n'
+                f'    "cert_sha256": "{entry["cert_sha256"]}"\n'
+                f"  }}"
+            )
+
+        other_blocks = ",\n".join(flavor_block(flavor, canonical[flavor]) for flavor in ("foss", "github"))
+
+        # Variant (i): duplicated `cert_sha256` inside the `play` entry — synthetic
+        # 64-hex first, canonical sentinel second. Plain loads keeps the last value,
+        # so the parsed dict equals the canonical example.
+        variant_i = (
+            "{\n"
+            '  "play": {\n'
+            f'    "package": "{canonical["play"]["package"]}",\n'
+            f'    "cert_sha256": "{synthetic_cert}",\n'
+            f'    "cert_sha256": "{canonical["play"]["cert_sha256"]}"\n'
+            "  },\n"
+            + other_blocks
+            + "\n}\n"
+        )
+        # Variant (ii): duplicated top-level `play` flavor key — one `play` object with
+        # a 64-hex cert, one canonical. Plain loads keeps the last `play` object, so
+        # the parsed dict equals the canonical example.
+        variant_ii = (
+            "{\n"
+            '  "play": {\n'
+            f'    "package": "{canonical["play"]["package"]}",\n'
+            f'    "cert_sha256": "{synthetic_cert}"\n'
+            "  },\n"
+            + flavor_block("play", canonical["play"])
+            + ",\n"
+            + other_blocks
+            + "\n}\n"
+        )
+        for name, variant in (
+            ("duplicate cert_sha256 in the play entry", variant_i),
+            ("duplicate top-level play flavor", variant_ii),
+        ):
+            with self.subTest(variant=name):
+                with self.assertRaises(ValueError):
+                    # _strict_loads raises ValueError("duplicate key ...") via
+                    # signer_pins._no_duplicate_object; the bytes never reach the
+                    # sentinel assertion.
+                    _strict_loads(variant)
+        # Document the gap — NOT desired behavior: plain json.loads silently accepts
+        # variant (i) and yields a dict equal to the canonical example. Plain loads is
+        # unsafe and must not be used for the example.
+        self.assertEqual(json.loads(variant_i), canonical)
+        # Same gap for variant (ii): plain loads collapses the duplicate `play` key.
+        self.assertEqual(json.loads(variant_ii), canonical)
+        # The canonical on-disk example still passes the strict loader and the sentinel.
+        _assert_example_sentinel(_load_example_strict())
 
     def test_unknown_flavor_is_rejected(self) -> None:
         path = self._write(
@@ -2419,7 +2515,9 @@ class CommittedPinsAbsenceControl(unittest.TestCase):
     registries that only ever lived in history.
     The checked-in example's sentinel placeholder content is asserted on every PR too,
     so a placeholder file that drifts from the canonical sentinel shape fails here even
-    without the policy-filtered suites.
+    without the policy-filtered suites. The example is parsed duplicate-key-strictly
+    (via `_load_example_strict`), so duplicate JSON keys cannot smuggle
+    certificate-like material past that assertion.
     Fail-closed if git is unavailable.
     Runs unconditionally in the `workflow-guard` job of `pr-check.yml` on every PR (and additionally in the policy harness on policy-filtered diffs).
     """
@@ -2450,7 +2548,10 @@ class CommittedPinsAbsenceControl(unittest.TestCase):
             "scripts/release_signer_pins.example.json is permitted: " + ", ".join(offenders),
         )
         # The sentinel example itself is asserted on every PR, unconditionally.
-        _assert_example_sentinel(json.loads(PINS_EXAMPLE.read_text(encoding="utf-8")))
+        # The example is parsed duplicate-key-strictly, so hidden duplicate keys
+        # (which plain json.loads would silently collapse) cannot smuggle
+        # certificate-like material past the sentinel check.
+        _assert_example_sentinel(_load_example_strict())
 
 
 if __name__ == "__main__":

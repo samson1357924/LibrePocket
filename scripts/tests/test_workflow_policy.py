@@ -1583,6 +1583,9 @@ jobs:
         )
 
     def test_workflow_guard_pins_tripwire_before_install_is_rejected(self) -> None:
+        # Finding association is via the index-5 fallout: moving the pins step
+        # before "Install pinned PyYAML" lands the harness at index 5, which the
+        # exact-run pin on the workflow-guard steps enforces.
         pins_step = (
             '      - name: "Pins-absence tripwire (Issue #12)"\n'
             '        run: PYTHONPATH="$PWD" PYTHONDONTWRITEBYTECODE=1 '

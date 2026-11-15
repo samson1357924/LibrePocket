@@ -24,6 +24,7 @@ google-services.json
 *.keystore
 # Real production signer-pin registries must NEVER be committed (Issue #12);
 # only scripts/release_signer_pins.example.json (placeholder negative control) is tracked.
+# authoritative rule: scripts/tests/test_build_release_identity.py CommittedPinsAbsenceControl
 release_signer_pins.json
 release_signer_pins.yaml
 release_signer_pins.yml

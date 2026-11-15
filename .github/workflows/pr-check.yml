@@ -109,8 +109,7 @@ jobs:
               # be able to bypass the gates it edits.
               - '.github/workflows/**'
               - '.github/actions/**'
-              # Any signer-pins-shaped path (root-level or nested) must flip
-              # policy=true so the never-committed tripwire runs (Issue #12).
+              # Signer-pins-shaped basenames flip policy=true (defense-in-depth; enforcement is the workflow-guard tripwire above, unconditional). Marker-named directories do not match these globs; gitignore does not cover them either — the tripwire does.
               - '*signer_pins*'
               - '**/*signer_pins*'
               # Trailing catch-all: the explicit entries above exist for

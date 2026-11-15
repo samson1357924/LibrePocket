@@ -124,9 +124,11 @@ pip from resolving transitive dependencies or building a local sdist/wheel
 before the checker runs, and the shadow preflight byte-pins
 `scripts/requirements-docs.txt` itself so a PR cannot turn the install step
 into code execution by editing the manifest. The commands are
-`python3 -P scripts/check_workflow_policy.py` and
+`python3 -P scripts/check_workflow_policy.py`,
 `PYTHONPATH="$PWD" PYTHONDONTWRITEBYTECODE=1 python3 -P -m unittest
-scripts/tests/test_workflow_policy.py`; the PyYAML version assertion also runs
+scripts/tests/test_workflow_policy.py`, and
+`PYTHONPATH="$PWD" PYTHONDONTWRITEBYTECODE=1 python3 -P -m unittest
+scripts/tests/test_build_release_identity.py -k CommittedPinsAbsenceControl`; the PyYAML version assertion also runs
 `python3 -P -c ...`. `-P` keeps the current directory and script directory off
 `sys.path` so a repo-local `yaml.py`/`unittest.py` cannot be imported before
 the shadow preflight; `PYTHONPATH="$PWD"` explicitly restores only the repo

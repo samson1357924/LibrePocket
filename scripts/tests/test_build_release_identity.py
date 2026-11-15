@@ -36,7 +36,10 @@ def _normalize_for_match(path: str) -> str:
     """NFKC-normalize and strip Unicode format characters for path matching.
 
     Keeps the original separators; callers split on "/" themselves.
-    Lookalike homoglyph substitutions (e.g. Cyrillic і for Latin i) are NOT folded and remain a documented limitation of this path-name control; a content-based registry-shape scan is the planned defense-in-depth layer.
+    Lookalike homoglyph substitutions (e.g. Cyrillic і for Latin i) are NOT folded,
+    and neither are Turkish İ (U+0130, whose .lower() splits a dot above) nor
+    U+2011 (non-breaking hyphen); these remain documented limitations of this
+    path-name control; a content-based registry-shape scan is the planned defense-in-depth layer.
     """
     normalized = unicodedata.normalize("NFKC", path)
     return "".join(ch for ch in normalized if unicodedata.category(ch) != "Cf")
@@ -88,6 +91,8 @@ def _assert_example_sentinel(example: object) -> None:
         entry = example[flavor]
         if not isinstance(entry, dict):
             raise AssertionError(f"example pins entry {flavor!r} must be a JSON object")
+        if set(entry) != {"package", "cert_sha256"}:
+            raise AssertionError(f"example pins entry {flavor!r} must define exactly package/cert_sha256, got {sorted(entry)}")
         if entry.get("package") != expected_packages[flavor]:
             raise AssertionError(f"example pins package for {flavor!r} drifted from the canonical placeholder")
         if entry.get("cert_sha256") != expected_certs[flavor]:
@@ -1244,6 +1249,29 @@ class SignerPinRegistryTest(unittest.TestCase):
         on_disk = json.loads(PINS_EXAMPLE.read_text(encoding="utf-8"))
         _assert_example_sentinel(on_disk)
 
+    def test_sentinel_assertion_rejects_other_envelope_mutations(self) -> None:
+        example = json.loads(PINS_EXAMPLE.read_text(encoding="utf-8"))
+        mutations = {}
+        # (a) play package drift
+        package_drift = json.loads(json.dumps(example))
+        package_drift["play"]["package"] = "dev.librepocket.agent.evil"
+        mutations["play package drift"] = package_drift
+        # (b) extra key in the foss entry
+        extra_key = json.loads(json.dumps(example))
+        extra_key["foss"]["fingerprint"] = "ab12" * 16
+        mutations["foss entry extra key"] = extra_key
+        # (c) missing github flavor
+        missing_github = json.loads(json.dumps(example))
+        del missing_github["github"]
+        mutations["missing github flavor"] = missing_github
+        for name, mutated in mutations.items():
+            with self.subTest(mutation=name):
+                with self.assertRaises(AssertionError):
+                    _assert_example_sentinel(mutated)
+        # The canonical on-disk example must still pass the sentinel assertion.
+        on_disk = json.loads(PINS_EXAMPLE.read_text(encoding="utf-8"))
+        _assert_example_sentinel(on_disk)
+
     def test_unknown_flavor_is_rejected(self) -> None:
         path = self._write(
             "pins.json",
@@ -2375,7 +2403,7 @@ class ReleaseTagVersionTest(unittest.TestCase):
 
 
 class CommittedPinsAbsenceControl(unittest.TestCase):
-    """Issue #12 tripwire: a real signer-pins registry must never be tracked.
+    """Issue #12 tripwire: no signer-pins registry is present in the final tracked tree.
 
     The checked-in placeholder (`scripts/release_signer_pins.example.json`) is the only
     permitted pins file. Docs (RELEASE.md) forbid committing production pins; this test
@@ -2384,6 +2412,14 @@ class CommittedPinsAbsenceControl(unittest.TestCase):
     extensionless name) where ANY path component contains "signer_pins" or "signer-pins"
     is rejected, whatever its suffix — or lack of one. Only the exact canonical
     placeholder example is exempt.
+    Scope: this control enumerates the final tracked tree (`git ls-files`) on every PR
+    and asserts no pins-shaped registry is present in it. A registry added and removed
+    within one PR leaves fingerprints in merge history and is deliberately out of this
+    control's scope (review-time responsibility); this control does not and cannot block
+    registries that only ever lived in history.
+    The checked-in example's sentinel placeholder content is asserted on every PR too,
+    so a placeholder file that drifts from the canonical sentinel shape fails here even
+    without the policy-filtered suites.
     Fail-closed if git is unavailable.
     Runs unconditionally in the `workflow-guard` job of `pr-check.yml` on every PR (and additionally in the policy harness on policy-filtered diffs).
     """
@@ -2398,8 +2434,8 @@ class CommittedPinsAbsenceControl(unittest.TestCase):
                 check=False,
                 timeout=30,
             )
-        except OSError as exc:
-            self.fail(f"pins-absence control requires git to enumerate tracked files: {exc}")
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            self.fail(f"git ls-files timed out or is unavailable: {exc}")
         if result.returncode != 0:
             self.fail(
                 "pins-absence control requires git to enumerate tracked files: "
@@ -2413,6 +2449,8 @@ class CommittedPinsAbsenceControl(unittest.TestCase):
             "production signer-pin registry must never be committed; only "
             "scripts/release_signer_pins.example.json is permitted: " + ", ".join(offenders),
         )
+        # The sentinel example itself is asserted on every PR, unconditionally.
+        _assert_example_sentinel(json.loads(PINS_EXAMPLE.read_text(encoding="utf-8")))
 
 
 if __name__ == "__main__":

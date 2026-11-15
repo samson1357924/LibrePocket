@@ -367,7 +367,8 @@ internal object ElevatedCleanupTracker {
      *   lease 贏得後同鎖記錄；[SWEEP_COOLDOWN_MS] 內重複 kick 即零線程直回 false）；
      * - `lastAttemptNanos`：每 handle 上次驗證嘗試時刻（identity key；[sweepEntries]
      *   記錄，[SWEEP_PER_HANDLE_COOLDOWN_MS] 內跳過同 handle，避免對同一 stall
-     *   handle 高頻起線程；成功解除或 [clearUnverified] 即移除對應條目防洩漏）。
+     *   handle 高頻起線程；成功解除或 [clearUnverified] 即移除對應條目防洩漏；
+     *   Stage 4 起逾 [SWEEP_LAST_ATTEMPT_PRUNE_MS] 未更新之 stale 條目亦於 sweep 內剪除）。
      */
     private var hasLastSweepStart: Boolean = false
     private var lastSweepStartNanos: Long = 0L
@@ -646,6 +647,20 @@ internal object ElevatedCleanupTracker {
      */
     internal const val SWEEP_PER_HANDLE_COOLDOWN_MS = 5000L
 
+    /**
+     * Stage 4（code-reviewer round-0 #8 prune nit）stale 條目剪枝閾值（產品常數；
+     * [sweepEntries]）：`lastAttemptNanos` 條目逾齡本值（1h）未更新，即視為 stale——
+     * 長生命週期 map 裡 dead handle 的 identity-linked 引用不宜無限留存。僅丟引用、
+     * 不動登記語義（quarantine／sweepPending／verdict 皆不受影響）。
+     * 語義：本 sweep 剪枝即跳過不 re-attempt，下次 sweep 視同未嘗試（一次
+     * re-attempt，可接受且合理）；節流實務不變（冷卻窗 [SWEEP_PER_HANDLE_COOLDOWN_MS]
+     * 5s ≪ 1h，正常單調時鐘下逾齡條目原本就會走 re-attempt 並覆寫時刻——現在改為
+     * 先剪枝、隔次 sweep 再 re-attempt）。
+     * 實作註記：字面「僅在冷卻跳過分支內（age<5s）剪枝」永不可達（age<5s 與
+     * age>1h 互斥），故以同鎖內 staleness 前置檢查實現（見 [sweepEntries] 內聯註）。
+     */
+    internal const val SWEEP_LAST_ATTEMPT_PRUNE_MS = 3_600_000L
+
     /** sweep 是否有在飛驗證（快照，僅測試／診斷用）。 */
     internal fun isSweepInFlight(): Boolean = sweepLease.get()
 
@@ -808,6 +823,9 @@ internal object ElevatedCleanupTracker {
      * per-handle 節流（Phase R P3）：同 [lock] 內查 `lastAttemptNanos`，
      * [SWEEP_PER_HANDLE_COOLDOWN_MS] 內已嘗試即跳過該條目（不另起 worker）；
      * 嘗試即記錄時刻（含飽和跳過亦記錄，壓住飽和期熱重試）。
+     * Stage 4 剪枝：條目逾 [SWEEP_LAST_ATTEMPT_PRUNE_MS]（1h）未更新即移除
+     * （同 [lock]，staleness 前置檢查）——本 sweep 跳過、隔次 sweep 視同未嘗試
+     * （一次 re-attempt）；僅丟死 handle 的 identity-linked 引用。
      *
      * @return 本次解除的登記數（stall／存活／逾期／飽和／節流一律 0）。
      */
@@ -826,7 +844,21 @@ internal object ElevatedCleanupTracker {
             synchronized(lock) {
                 if (quarantine.any { it === p } && sweepPending.none { it === p }) {
                     val last = lastAttemptNanos[p]
-                    if (last == null ||
+                    // Stage 4 剪枝（code-reviewer round-0 #8）：staleness 前置檢查，
+                    // 同 [lock]（與節流查表同一紀律，不另持鎖、不另起 worker）。
+                    // 條目逾 [SWEEP_LAST_ATTEMPT_PRUNE_MS] 未更新（dead handle 的
+                    // identity-linked 引用殘留於長生命週期 map）即剪除並本次跳過——
+                    // 不 re-attempt（本 sweep 的使命是剪枝；節流語義不變：冷卻窗內
+                    // 本就不 attempt，逾齡退化為隔次 sweep 的一次 re-attempt）。
+                    // 註：字面「僅在冷卻跳過分支內剪枝」永不可達（冷卻跳過 ⇒
+                    // age < 5s ≪ 1h 剪枝閾值，二者互斥），故以 staleness 前置檢查
+                    // 實現，語義與規格裁定（silent>1h ⇒ 隔次 sweep 一次 re-attempt）
+                    // 一致。
+                    if (last != null &&
+                        now - last > TimeUnit.MILLISECONDS.toNanos(SWEEP_LAST_ATTEMPT_PRUNE_MS)
+                    ) {
+                        lastAttemptNanos.remove(p)
+                    } else if (last == null ||
                         now - last >= TimeUnit.MILLISECONDS.toNanos(SWEEP_PER_HANDLE_COOLDOWN_MS)
                     ) {
                         lastAttemptNanos[p] = now

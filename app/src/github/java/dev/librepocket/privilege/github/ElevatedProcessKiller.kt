@@ -1,6 +1,8 @@
 package dev.librepocket.privilege.github
 
+import androidx.annotation.VisibleForTesting
 import java.lang.reflect.InaccessibleObjectException
+import java.lang.reflect.Method
 import java.util.concurrent.atomic.AtomicInteger
 
 /**
@@ -74,23 +76,42 @@ import java.util.concurrent.atomic.AtomicInteger
  * interrupt＋500ms grace；永不跳過 killer 嘗試），未完成經
  * [ElevatedProcessIo.Drained.cleanupIncomplete] 帶出（runner verdict 映射不變）。
  *
- * Stage 2A（P1-A7，PID-reuse 守門，security-auditor；不改呼叫方契約）：
- * 巢狀（descendants）`destroy/destroyForcibly` 前一律重驗——[killDescendantsReflective]
- * 對每個 handle 於其逐 handle 流出當下之後、信號之前取 `info().startInstant()` 快照
- * （僅存活 handle 取快照；已死 handle 直接跳過不讀 info()），每次信號前重讀
+ * Stage 2A（P1-A7，PID-reuse 守門，security-auditor；Stage 4 擴及本體）：
+ * 子孫（descendants）與**本體** `destroy/destroyForcibly` 前一律重驗——Stage 4
+ * 起兩條路徑共用同一反射 attestation seam（[HandleAttest]，語義逐項一致，
+ * R2-A 宣告類查表紀律不變）：於流出當下之後、信號之前取 `info().startInstant()`
+ * 快照（僅存活 handle 取快照；已死 handle 直接跳過不讀 info()），每次信號前重讀
  * `startInstant()` 與 `isAlive()`：
  * - 兩次 startInstant 不符 ⇒ PID 已被回收重用 ⇒ **跳過信號**
  *   （不得對一顆可能已非原 process 的 PID 發信號；子孫清理 best-effort 語義不變）；
  * - `info()` 抛／`startInstant` 缺席／`isAlive()==false`／不可驗證 ⇒ 同跳過；
  *   其中「不可驗證／PID 回收」（死亡後的常規跳過除外）計入
  *   [pidReuseSkippedCount] 診斷計數（不抛、不崩，fail-closed 方向是不誤殺）；
- * - 本體 killTree 的 `process.destroy()/destroyForcibly()` 不走此守門
- *   （本體 handle 由 caller 持有，語義與現況一致）。
- * 子孫樹殺語義**維持 best-effort**：本守門只縮小「流出→信號」窗口，
+ * - **本體（Stage 4）**：[killTree] 不再無條件 `process.destroy()/destroyForcibly()`。
+ *   平台可 attest（`toHandle` 可 invoke、`ProcessHandle` 類在、`isAlive`／`info`
+ *   Method 在、且本次 `startInstant` 探測可讀）時，兩個信號（destroy 先、
+ *   destroyForcibly 後）各自獨立重驗（與子孫逐信號重驗一致），信號經 **handle**
+ *   的 `destroy/destroyForcibly` Method 發出（handle 即 attested 身份），不經
+ *   `process.destroy()`；身份不可驗／PID 回收 ⇒ 跳過＋計 [pidReuseSkippedCount]；
+ * - 平台**完全無 attestation toolkit**（`toHandle` 缺席／`ProcessHandle` 類缺席／
+ *   `isAlive` Method 缺席／`info` Method 缺席／本次 `startInstant` 探測不可讀——
+ *   即整組工具缺席，而非單次瞬時讀失敗）時，本體退化為今日之**無條件**
+ *   `process.destroy()/destroyForcibly()`（保 kill 契約不破壞），且每個未經
+ *   attest 的信號計入 [bodyDestroyUnattestedCount]（once per SIGNAL，一次
+ *   killTree 最多 2）。fade to 無條件 destroy 僅發生於此（toolkit 全缺；
+ *   探測失敗無法區分結構性缺席與瞬時讀失敗，一律保守歸入 unattested，close
+ *   toward destruction）——平台**有能力** attest 而身份不可驗（瞬時讀失敗／
+ *   PID 回收）者不退化，跳過＋[pidReuseSkippedCount]（與子孫同款 fail-closed）。
+ * 樹殺語義**維持 best-effort**：本守門只縮小「流出→信號」窗口，
  * 不保證 handle 快照當下 PID 仍真值原子配對（TOCTOU 無法根除，裝置 SELinux／
- * Root 差異 E2E 仍歸 #136-B3）。
- * 平台 `info()`／`startInstant()` 完全不可讀時，巢狀樹殺退化為僅殺本體
- * （body-only）——產品必須於啟用前以真機查驗 [pidReuseSkippedCount]（#136-B3 gate）。
+ * Root 差異 E2E 仍歸 #136-B3）。本 KDoc 只描述 JVM／Host 測試環境已驗的
+ * attested-NOW 語義（Host 真子進程單測見 `ElevatedProcessKillerTest`）；JVM 與
+ * 裝置端的差異（AOSP 樁、Shizuku 遠端、實機 startInstant 可讀性）為 #136-B3
+ * 領域，本 KDoc 不宣稱裝置 E2E 已驗證。
+ * 平台 `info()`／`startInstant()` 完全不可讀時，巢狀樹殺退化為僅對本體發信號；
+ * 本體信號為 unattested 無條件 destroy 並計入 [bodyDestroyUnattestedCount]
+ * ——產品必須於啟用前以真機查驗 [pidReuseSkippedCount] 與
+ * [bodyDestroyUnattestedCount]（#136-B3 device-acceptance gate）。
  *
  * B2 P1-3 誠實化（owner 新 P1-3，行為見 drain）：本物件全 runCatching（destroy／
  * destroyForcibly 抛即吞，遠端 destroy 失敗亦吞），`killTree` 正常返回≠進程真死
@@ -103,13 +124,15 @@ import java.util.concurrent.atomic.AtomicInteger
 object ElevatedProcessKiller {
 
     /**
-     * Stage 2A（P1-A7，PID-reuse 守門；診斷用，產品不讀取；正常路徑恆為 0）：
-     * 巢狀信號被跳過之次數——僅計「不可驗證或已回收（unverifiable or recycled）」，
+     * Stage 2A（P1-A7，PID-reuse 守門；Stage 4 起含本體信號；診斷用，產品不讀取）：
+     * 子孫與本體信號被跳過之次數——僅計「不可驗證或已回收（unverifiable or recycled）」，
      * 即我們無法 attest 該 handle 之身份（we could not attest identity）者：
      * `isAlive` API 缺席（method null）、`isAlive` 讀抛／非常規回傳、
      * `info()`／`startInstant()` 不可讀（handle 快照或信號前重讀）、
      * PID 已回收（startInstant 不符）。只有 `isAlive()==false` 的常規確認死亡
-     * （dead-but-alive-previously handles）不計。
+     * （dead-but-alive-previously handles）不計。平台完全無 attestation toolkit
+     * 時，本體信號走 unattested 無條件路徑，計入 [bodyDestroyUnattestedCount]，
+     * 不計此計數。
      *
      * 刻意非接線（deliberate NON-wiring）進 verdict／breaker／admission：
      * 平台若對任何一顆子孫完全無法 attest（無 isAlive／info／startInstant），
@@ -118,8 +141,9 @@ object ElevatedProcessKiller {
      * 行為，必須由 #136-B3 以裝置端證據決定——pidReuseSkipped 必須列入
      * #136-B3 裝置驗收清單（device-acceptance checklist）：啟用提權 runner
      * 前，須先以真機量測本計數確認平台 attest 能力。
-     * 上界：per handle per killTree 最多 2 次（destroy＋destroyForcibly 各重驗一次）；
-     * 完全不可 attest 平台讀數≈2×descendants；must feed #136-B3 device-acceptance.
+     * 上界：per handle per killTree 最多 2 次（destroy＋destroyForcibly 各重驗一次；
+     * 本體兩個信號亦同 2）；完全不可 attest 平台本體信號≈0（unattested 路徑計
+     * [bodyDestroyUnattestedCount]）；must feed #136-B3 device-acceptance.
      */
     private val pidReuseSkipped = AtomicInteger(0)
 
@@ -127,8 +151,27 @@ object ElevatedProcessKiller {
     internal fun pidReuseSkippedCount(): Int = pidReuseSkipped.get()
 
     /**
-     * Stage 2A（P1-A7）巢狀信號判定（純函數 seam，供 JVM 單測直斷；
-     * [killDescendantsReflective] 經 runtime reflection 餵入實際值）：
+     * Stage 4（body unattested destroy 診斷計數；非接線，產品不讀取）：
+     * 平台完全無 attestation toolkit（toHandle 缺席／`ProcessHandle` 類缺席／
+     * `isAlive`／`info` Method 缺席／本次 `startInstant` 探測不可讀）時，
+     * [attestBodyDestroy] 退化為無條件 `process.destroy()/destroyForcibly()`
+     * （保 kill 契約不破壞），**每個未經 attest 的信號計 1**（once per SIGNAL；
+     * 一次 killTree 最多 2）。平台可 attest 而身份不可驗者不進此計數
+     * （計 [pidReuseSkippedCount]）；`isAlive()==false` 的常規確認死亡不計。
+     * 必須列入 #136-B3 裝置驗收清單（device-acceptance checklist）：啟用提權
+     * runner 前，須先以真機量測本計數確認平台是否走 unattested 退化
+     * （must feed #136-B3 device-acceptance）。
+     */
+    private val bodyDestroyUnattested = AtomicInteger(0)
+
+    /** Stage 4 未經 attest 的本體信號數快照（僅測試／診斷用；#136-B3 device-acceptance）。 */
+    @VisibleForTesting
+    internal fun bodyDestroyUnattestedCount(): Int = bodyDestroyUnattested.get()
+
+    /**
+     * Stage 2A（P1-A7）信號判定（純函數 seam，供 JVM 單測直斷；
+     * [killDescendantsReflective] 子孫與 [attestBodyDestroy] 本體經 runtime
+     * reflection 餵入實際值，兩條路徑共用同一 seam 語義）：
      * 僅當 `isAlive()==true`、handle 快照 startInstant 可取得且當前重讀一致時
      * 允許信號；任一不成立即跳過。`info()` 抛／`startInstant` 缺席以
      * `currentStart=null` 表達；handle 快照不可驗證以 `expectedStart=null` 表達
@@ -149,8 +192,82 @@ object ElevatedProcessKiller {
         runCatching { killDescendantsReflective(process) }
         // Y1：只管 destroy，不關流（串流由 drain 經已取引用關；此處重調 getter
         // 可阻塞呼叫執行緒，見上 KDoc 契約）。
+        // Stage 4（本體 best-effort PID-reuse attestation）：本體兩個信號與子孫
+        // 逐信號重驗一致（destroy 先、destroyForcibly 後，各獨立重驗）。
+        runCatching { attestBodyDestroy(process) }
+    }
+
+    /**
+     * Stage 4：本體 destroy 路徑（Y1 契約見上：只管 destroy，不關流）。
+     * 取 [HandleAttest]（與子孫路徑同一 seam）；兩分支：
+     *
+     * - **平台完全無 attestation toolkit**（toHandle 缺席／`ProcessHandle` 類缺席／
+     *   `isAlive`／`info` Method 缺席／本次 `startInstant` 探測不可讀——整組工具
+     *   缺席，而非單次瞬時讀失敗）：保 kill 契約，降級為今日之**無條件**
+     *   `process.destroy()/destroyForcibly()`，且每個未經 attest 的信號計一次
+     *   [bodyDestroyUnattested]（once per SIGNAL；一次 killTree 最多 2）。
+     *   探測失敗無法區分結構性缺席與瞬時讀失敗；一律保守歸入 unattested
+     *   （fail toward destruction，kill 契約優先）。平台**有能力** attest 者不走
+     *   此分支——身份不可驗／瞬時讀失敗 ⇒ 跳過＋[pidReuseSkipped]
+     *   （與子孫同款 fail-closed，不誤殺）。
+     * - **平台可 attest**：兩個信號各自獨立重驗（destroy 先、destroyForcibly 後，
+     *   每次信號前 `isAlive()`＋`startInstant()` 重讀，與子孫逐信號重驗一致）；
+     *   attested ⇒ 信號經 **handle** 的 `destroy/destroyForcibly` Method 發出
+     *   （handle 即 attested 身份），不經 `process.destroy()`；mismatch／
+     *   不可驗 ⇒ 跳過＋[pidReuseSkipped]（[HandleAttest.signalAllowed] 計數）。
+     *   本體 handle 未曾存活（`isAlive()==false`）⇒ 兩個信號皆跳過（已死，無
+     *   PID 重用窗口；不計診斷）。fail-closed 方向恆成立：本體信號要嘛至多兩發
+     *   attested，要嘛若干次跳過——無第三結果。
+     */
+    private fun attestBodyDestroy(process: Process) {
+        val attest = reflectHandleAttest(process)
+        val h = attest.handle
+        // 整組 toolkit 探測（僅一次，本體共用；子孫路徑不經本函數）。
+        if (h == null ||
+            !attest.toolkitPresent ||
+            attest.startInstantOf(h) == null
+        ) {
+            unattestedBodyDestroy(process)
+            return
+        }
+        signalBody(attest, h, attest.destroy, process, forcible = false)
+        signalBody(attest, h, attest.destroyForcibly, process, forcible = true)
+    }
+
+    /**
+     * 平台完全無 attestation toolkit：今日之無條件 `process.destroy()/destroyForcibly()`
+     * （kill 契約不破壞），每個未經 attest 的信號計一次 [bodyDestroyUnattested]
+     * （once per SIGNAL；一次 killTree 最多 2）。
+     */
+    private fun unattestedBodyDestroy(process: Process) {
         runCatching { process.destroy() }
+        bodyDestroyUnattested.incrementAndGet()
         runCatching { process.destroyForcibly() }
+        bodyDestroyUnattested.incrementAndGet()
+    }
+
+    /** Stage 4 單一本體信號（destroy 或 destroyForcibly）：獨立重驗→attested 即發。 */
+    private fun signalBody(
+        attest: HandleAttest,
+        h: Any,
+        signalMethod: Method?,
+        process: Process,
+        forcible: Boolean,
+    ) {
+        if (signalMethod == null) {
+            // handle 缺該信號 Method（ProcessHandle 介面宣告 destroy/destroyForcibly，
+            // 實務上不可達；防禦性退化：保 kill 契約＋計 unattested）。
+            if (forcible) runCatching { process.destroyForcibly() }
+            else runCatching { process.destroy() }
+            bodyDestroyUnattested.incrementAndGet()
+            return
+        }
+        val alive = attest.isAliveOf(h)
+        if (alive == false) return // 已死：無信號可發（常規態，不計）
+        val expectedStart: Any? = if (alive == true) attest.startInstantOf(h) else null
+        if (attest.signalAllowed(h, expectedStart)) {
+            runCatching { signalMethod.invoke(h) }
+        }
     }
 
     private fun killDescendantsReflective(process: Process) {
@@ -159,24 +276,13 @@ object ElevatedProcessKiller {
         // 例 `javaClass` 查表取到的 Method 宣告類不可見，invoke 即
         // IllegalAccessException（setAccessible 又觸 InaccessibleObjectException）。
         // 以宣告類（Process/ProcessHandle，public 且 exported）查表則直通。
-        val handle = try {
-            Process::class.java.getMethod("toHandle").invoke(process) ?: return
-        } catch (_: NoSuchMethodException) {
-            return // 舊 Android 無此 API：退化單殺（fail-closed；串流由 drain 關）。
-        } catch (_: InaccessibleObjectException) {
-            return // JDK 強封裝拒絕：退化單殺（fail-closed；串流由 drain 關）。
-        } catch (_: Exception) {
-            return
-        }
-        // ProcessHandle 類本身缺席（舊 Android）在連結期走 NoClassDefFoundError
-        // 收斂，不外抛（外層 killTree 另有 runCatching 縱深）。
-        val handleClass: Class<*> = try {
-            ProcessHandle::class.java
-        } catch (_: NoClassDefFoundError) {
-            return
-        } catch (_: Exception) {
-            return
-        }
+        val attest = reflectHandleAttest(process)
+        // toHandle 缺席／抛／回傳 null（舊 Android 無此 API）：退化單殺
+        // （fail-closed；串流由 drain 關）。
+        val handle: Any = attest.handle ?: return
+        // ProcessHandle 類本身缺席（舊 Android）在 reflectHandleAttest 內收斂
+        // （NoClassDefFoundError），不外抛（外層 killTree 另有 runCatching 縱深）。
+        val handleClass: Class<*> = attest.handleClass ?: return
         val descendants = try {
             handleClass.getMethod("descendants").invoke(handle) as? java.util.stream.Stream<*>
                 ?: return
@@ -189,8 +295,8 @@ object ElevatedProcessKiller {
         }
         // destroy/destroyForcibly 同以宣告類查表（各取一次，迴圈內直調）；
         // 兩者皆缺即無可殺，直接收斂。
-        val destroy = runCatching { handleClass.getMethod("destroy") }.getOrNull()
-        val destroyForcibly = runCatching { handleClass.getMethod("destroyForcibly") }.getOrNull()
+        val destroy = attest.destroy
+        val destroyForcibly = attest.destroyForcibly
         if (destroy == null && destroyForcibly == null) return
         // Stage 2A（P1-A7）PID-reuse 守門：handle 流出後、信號前一律重驗。
         // - 每 handle 於其流出（forEach 取到該 handle）當下之後、信號之前，僅對
@@ -202,11 +308,103 @@ object ElevatedProcessKiller {
         //   （無法驗證＝不得信號可能已非原 process 的 PID）；
         // - 兩次信號各自重驗（destroy 與 destroyForcibly 之間 PID 亦可能被回收）；
         // - 跳過計 [pidReuseSkipped]（僅不可驗證／已回收；`isAlive()==false` 的
-        //   常規確認死亡不計；不抛不崩；本體單殺不受此守門約束）；
+        //   常規確認死亡不計；不抛不崩；本體 attestation 見 [attestBodyDestroy]，
+        //   同計同一 [pidReuseSkipped]）；
         // - 子孫樹殺語義維持 best-effort（本守門只縮「流出→信號」窗口，
         //   TOCTOU 無法根除，見 KDoc）。
-        val infoMethod = runCatching { handleClass.getMethod("info") }.getOrNull()
-        val isAliveMethod = runCatching { handleClass.getMethod("isAlive") }.getOrNull()
+        // Stage 4：本路徑與 attestBodyDestroy 共用 [HandleAttest] seam，
+        // isAliveOf／startInstantOf／signalAllowed 語義與舊 local 函數一致。
+        try {
+            descendants.forEach { h ->
+                if (h == null) return@forEach
+                // Stage 2A（M3）：快照僅取存活 handle——已死 handle 直接跳過，
+                // 不讀 info()（dead handle 無信號可發；行為不變，僅省一次 info()）；
+                // 不可驗證（null）同樣不取快照（signalAllowed 走 pidReuseSkipped 計數）。
+                val alive = attest.isAliveOf(h)
+                if (alive == false) return@forEach
+                val expectedStart: Any? = if (alive == true) attest.startInstantOf(h) else null
+                if (attest.signalAllowed(h, expectedStart)) {
+                    runCatching { destroy?.invoke(h) }
+                }
+                if (attest.signalAllowed(h, expectedStart)) {
+                    runCatching { destroyForcibly?.invoke(h) }
+                }
+            }
+        } catch (_: Exception) {
+            // Stream.forEach 本體異常（列舉中途 IO/併發失敗）：單個 handle 已在內層
+            // runCatching 逐個收斂，此處僅吞 forEach 本體異常，fail-closed 為
+            // 「已盡力殺」，呼叫方仍回 TimedOut，不升級為崩潰；finally 仍關
+            // descendants 列舉流（`java.util.stream.Stream` 自身，非進程串流）。
+        } finally {
+            runCatching { descendants.close() }
+        }
+    }
+
+    /**
+     * Stage 4：[HandleAttest] 工廠（子孫＋本體共用的反射 attestation seam）。
+     * R2-A「宣告類查表」紀律——toHandle 以 `Process::class.java` 查表、handle 方法
+     * 以 handleClass（`ProcessHandle::class.java`）查表；`ProcessHandle` 類缺席
+     * （舊 Android）在連結期走 [NoClassDefFoundError] 收斂為 null。
+     * 不 invoke 任何信號方法——僅 Method 存在性與 toHandle 一次 invoke；
+     * 讀取成敗由 [HandleAttest.isAliveOf]／[HandleAttest.startInstantOf] 表達。
+     */
+    private fun reflectHandleAttest(process: Process): HandleAttest {
+        // R2-A：宣告類查表（實作類多為模組內 package-private，以其 javaClass 查表
+        // 取到的 Method 宣告類不可見，invoke 即 IllegalAccessException）。
+        val handle = try {
+            Process::class.java.getMethod("toHandle").invoke(process)
+        } catch (_: NoSuchMethodException) {
+            null
+        } catch (_: InaccessibleObjectException) {
+            null
+        } catch (_: Exception) {
+            null
+        }
+        // ProcessHandle 類本身缺席（舊 Android）在連結期走 NoClassDefFoundError
+        // 收斂，不外抛（外層 killTree 另有 runCatching 縱深）。
+        val handleClass: Class<*>? = try {
+            ProcessHandle::class.java
+        } catch (_: NoClassDefFoundError) {
+            null
+        } catch (_: Exception) {
+            null
+        }
+        // destroy/destroyForcibly/info/isAlive 同以宣告類查表（各取一次；不 invoke）。
+        val destroy = handleClass?.let { runCatching { it.getMethod("destroy") }.getOrNull() }
+        val destroyForcibly =
+            handleClass?.let { runCatching { it.getMethod("destroyForcibly") }.getOrNull() }
+        val infoMethod = handleClass?.let { runCatching { it.getMethod("info") }.getOrNull() }
+        val isAliveMethod = handleClass?.let { runCatching { it.getMethod("isAlive") }.getOrNull() }
+        return HandleAttest(handle, handleClass, destroy, destroyForcibly, infoMethod, isAliveMethod)
+    }
+
+    /**
+     * Stage 4（Stage 2A 子孫守門同款 seam；本體＋子孫共用，語義逐項一致）：
+     * 持有 reflect 後的 handle 與 handleClass 宣告類查表結果——
+     * - [handle]：`Process.toHandle()` 之回傳；null ⇒ toHandle 缺席／抛／回傳 null
+     *   （平台無 attestation toolkit；子孫路徑退化單殺、本體路徑退化 unattested
+     *   無條件 destroy）。
+     * - [handleClass]：`ProcessHandle::class.java`；null ⇒ 類缺席
+     *   （舊 Android，NoClassDefFoundError）。
+     * - [destroy]／[destroyForcibly]：handle 信號 Method（不 invoke；本體路徑在
+     *   attested 後才 invoke；子孫路徑迴圈內 invoke）。
+     * - info/isAlive Method 原文保留於 [HandleAttest]；Method 存在性由
+     *   [toolkitPresent] 表達；讀取成敗由 [isAliveOf]／[startInstantOf] 以
+     *   null（不可驗證）表達。
+     * pidReuseSkipped 為本體／子孫共用的診斷計數（僅不可驗證／已回收計）。
+     */
+    private class HandleAttest(
+        val handle: Any?,
+        val handleClass: Class<*>?,
+        val destroy: Method?,
+        val destroyForcibly: Method?,
+        private val infoMethod: Method?,
+        private val isAliveMethod: Method?,
+    ) {
+        /** toolkit 完整性（僅 Method 存在性；`startInstant` 可讀性由呼叫方以 live probe 判定）。 */
+        val toolkitPresent: Boolean
+            get() = handleClass != null && isAliveMethod != null && infoMethod != null
+
         fun isAliveOf(h: Any): Boolean? {
             if (isAliveMethod == null) return null // 平台無 isAlive API：不可驗證
             return try {
@@ -215,6 +413,7 @@ object ElevatedProcessKiller {
                 null // 讀不可驗證
             }
         }
+
         fun startInstantOf(h: Any): Any? {
             if (infoMethod == null) return null
             return try {
@@ -254,37 +453,13 @@ object ElevatedProcessKiller {
                 return false
             }
             val current = startInstantOf(h)
-            if (!pidReuseSignalAllowed(alive, expectedStart, current)) {
+            if (!ElevatedProcessKiller.pidReuseSignalAllowed(alive, expectedStart, current)) {
                 // 不可驗證（expected/current 任一 null ⇒ info 抛或 startInstant 缺席，
                 // 含 handle 快照不可讀）或 PID 已回收（startInstant 不符）：跳過＋計診斷。
                 pidReuseSkipped.incrementAndGet()
                 return false
             }
             return true
-        }
-        try {
-            descendants.forEach { h ->
-                if (h == null) return@forEach
-                // Stage 2A（M3）：快照僅取存活 handle——已死 handle 直接跳過，
-                // 不讀 info()（dead handle 無信號可發；行為不變，僅省一次 info()）；
-                // 不可驗證（null）同樣不取快照（signalAllowed 走 pidReuseSkipped 計數）。
-                val alive = isAliveOf(h)
-                if (alive == false) return@forEach
-                val expectedStart: Any? = if (alive == true) startInstantOf(h) else null
-                if (signalAllowed(h, expectedStart)) {
-                    runCatching { destroy?.invoke(h) }
-                }
-                if (signalAllowed(h, expectedStart)) {
-                    runCatching { destroyForcibly?.invoke(h) }
-                }
-            }
-        } catch (_: Exception) {
-            // Stream.forEach 本體異常（列舉中途 IO/併發失敗）：單個 handle 已在內層
-            // runCatching 逐個收斂，此處僅吞 forEach 本體異常，fail-closed 為
-            // 「已盡力殺」，呼叫方仍回 TimedOut，不升級為崩潰；finally 仍關
-            // descendants 列舉流（`java.util.stream.Stream` 自身，非進程串流）。
-        } finally {
-            runCatching { descendants.close() }
         }
     }
 }

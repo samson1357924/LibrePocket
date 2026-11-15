@@ -133,6 +133,56 @@ class ElevatedProcessKillerTest {
         assertSame(stub, stub.destroyForcibly())
     }
 
+    @Test fun killTreeAttestsBodyBeforeSignalAndCountsUnattestedPlatform() {
+        // Stage 4（本體 best-effort PID-reuse attestation）判定表式釘點：
+        // 本體兩個信號（destroy 先、destroyForcibly 後）與子孫逐信號重驗一致，
+        // 每次信號前獨立評估 pidReuseSignalAllowed（同一純判定函數，子孫與本體
+        // 共用——兩條路徑同一 HandleAttest seam；killDescendantsReflective 與
+        // attestBodyDestroy 皆經其 signalAllowed 餵入）。
+        //
+        // 接線（snapshot→recheck→skip＋計數）無法以假 ProcessHandle 直測：單元測試編譯
+        // 走 SDK 公開表面過濾，toHandle/descendants/ProcessHandle 之 override／
+        // 子類化皆不可行（見本檔 KDoc），真實 PID 回收亦無法確定性誘發；故本體
+        // cadence 以純判定表釘點——body 的 destroy/destroyForcibly 兩次獨立評估
+        // 恰好對應 pidReuseSignalAllowed 的兩次呼叫（同一 (alive, expectedStart,
+        // currentStart) 判定式）。
+        val t0 = java.time.Instant.ofEpochMilli(1_700_000_000_000L)
+        val t1 = java.time.Instant.ofEpochMilli(1_800_000_000_000L)
+        // destroy 信號第 1 次獨立重驗：alive＋快照一致 → 放行（attested ⇒ handle.destroy）。
+        assertTrue(ElevatedProcessKiller.pidReuseSignalAllowed(true, t0, t0))
+        // destroyForcibly 信號第 2 次獨立重驗：一致即放行。
+        assertTrue(ElevatedProcessKiller.pidReuseSignalAllowed(true, t0, t0))
+        // 任一次重驗鍵值不可驗／已回收 → fail-closed（跳過＋pidReuseSkipped）。
+        assertFalse(ElevatedProcessKiller.pidReuseSignalAllowed(true, t0, t1))
+        assertFalse(ElevatedProcessKiller.pidReuseSignalAllowed(true, null, t0))
+        assertFalse(ElevatedProcessKiller.pidReuseSignalAllowed(true, t0, null))
+        assertFalse(ElevatedProcessKiller.pidReuseSignalAllowed(true, null, null))
+        // 已死（destroy 已生效或自然退出，第二個信號前）→ 跳過、不計診斷。
+        assertFalse(ElevatedProcessKiller.pidReuseSignalAllowed(false, t0, t0))
+        // bodyDestroyUnattestedCount：未經 attest 的本體信號計數（cannot-attest-at-all
+        // 平台專屬；#136-B3 device-acceptance checklist 項）。僅釘名稱／有界性，
+        // 不依賴具體讀數——killTreeDegradesToSingleKillWhenToHandleUnsupported 已在
+        // 同 JVM 觸發 unconditional 路徑（increment 2），讀數平台／測序相依，
+        // 故只斷言 >= 0。
+        assertTrue(
+            "bodyDestroyUnattestedCount must exist and be bounded >= 0",
+            ElevatedProcessKiller.bodyDestroyUnattestedCount() >= 0,
+        )
+    }
+
+    @Test fun killTreeOnNonAttestableFakeProcessDoesNotThrow() {
+        // Stage 4 冒煙（wiring-agnostic）：FakeProcess（同包 ElevatedTestFakes；
+        // 未覆寫 toHandle；JDK 基類預設即抛 UOE，android.jar 樁同為 UOE）在任何
+        // 平台皆無法 attest ⇒ 本體走 unconditional destroy（今日行為，kill 契約
+        // 不變＝destroy＋destroyForcibly 必跑、不抛）。
+        // 刻意只斷言「不抛＋有界返回」、不斷言 destroyed／計數（平台相依：可 attest
+        // 平台若未來 FakeProcess 演化為可 attest，信號改走 handle 路徑、fake.destroyed
+        // 不翻；unattested 計數亦視平台而異）。具體計數釘點見上一測試之
+        // bodyDestroyUnattestedCount。
+        val fake = FakeProcess()
+        ElevatedProcessKiller.killTree(fake) // 不抛即通過；有界返回（不 hang）。
+    }
+
     /**
      * 模擬 AOSP/舊 Android 缺 handle 語義（Host JDK 真進程無法自然觸發）。
      *

@@ -550,6 +550,46 @@ class ElevatedCleanupTrackerB2Test {
         }
     }
 
+    // ---- 8b. Stage 4：stale per-handle 節流條目剪枝（>1h 無動靜即移除，隔次 sweep 一次 re-attempt） ----
+
+    @Test fun sweepPrunesStaleLastAttemptEntryPastPruneThreshold() {
+        val fakeNow = AtomicLong(System.nanoTime())
+        val nowNanos: () -> Long = { fakeNow.get() }
+        try {
+            val p = CountingAliveProcess()
+            ElevatedCleanupTracker.quarantineUnverified(p)
+            assertEquals(1, ElevatedCleanupTracker.quarantinedCount())
+            // 首掃：attempt 一次（記 t0 於 lastAttemptNanos）。
+            assertEquals(0, ElevatedCleanupTracker.sweepQuarantine(nowNanos))
+            assertEquals("first sweep must attempt once", 1, p.waitCalls.get())
+            // 推進逾剪枝閾值（1h＋1s）：stale 條目剪除、本次不 attempt（節流語義不變）。
+            fakeNow.addAndGet(
+                TimeUnit.MILLISECONDS.toNanos(
+                    ElevatedCleanupTracker.SWEEP_LAST_ATTEMPT_PRUNE_MS + 1000L,
+                ),
+            )
+            assertEquals(0, ElevatedCleanupTracker.sweepQuarantine(nowNanos))
+            assertEquals(
+                "stale sweep must prune (not re-attempt) in this pass",
+                1, p.waitCalls.get(),
+            )
+            // 下次 sweep：條目已剪（map 不再留存 p）——視同未嘗試，一次 re-attempt。
+            // （map 無直接 getter；以隔次 sweep 的 re-attempt 行為作為「不留存」
+            // 的可辨識代用斷言：若條目未剪，隔次 sweep 仍被逾齡檢視阻擋，waitCalls 不增。）
+            assertEquals(0, ElevatedCleanupTracker.sweepQuarantine(nowNanos))
+            assertEquals(
+                "next sweep after prune must re-attempt once (stale entry gone)",
+                2, p.waitCalls.get(),
+            )
+            assertEquals(1, ElevatedCleanupTracker.quarantinedCount())
+        } finally {
+            ElevatedCleanupTracker.clearUnverified()
+            ElevatedCleanupTracker.noteClean()
+            pollOutstandingTo(0)
+            awaitNoQuarantineThreads()
+        }
+    }
+
     // ---- 9. kick 空集合即 false（零線程、零等待） ----
 
     @Test fun kickSweepAsyncEmptyReturnsFalseWithoutThread() {

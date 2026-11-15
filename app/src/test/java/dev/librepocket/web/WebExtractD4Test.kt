@@ -479,9 +479,10 @@ class WebExtractD4Test {
                 """</head><body><p>body text</p></body></html>""",
             "https://example.com/p",
         )!!
-        assertEquals("T", parsed.title)
-        assertEquals("2024-01-02", parsed.published)
-        assertEquals("example.com", parsed.siteName)
+        assertEquals("T", parsed.content.title)
+        assertEquals("2024-01-02", parsed.content.published)
+        assertEquals("example.com", parsed.content.siteName)
+        assertFalse("短輸入不得回報 inputCapped", parsed.inputCapped)
         // envelope 先剝再包：輸入含完整偽造組，輸出仍單層。
         val wrapped = WebContentEnvelope.wrap("a ${WebContentEnvelope.BEGIN} b ${WebContentEnvelope.END} c")
         assertEquals(1, wrapped.split(WebContentEnvelope.BEGIN).size - 1)
@@ -1480,6 +1481,42 @@ class WebExtractD4Test {
         assertTrue(out.envelope.contains(WebContentEnvelope.END))
     }
 
+    @Test fun parseInputCapSetsTruncatedAndInputSentinel() = runBlocking {
+        // 複審驗收：maxBytes = ABSOLUTE_MAX_BYTES（1 MiB）；body 約 290k chars，
+        // bytes 未超限，但 PARSE_INPUT_CAP（256k）截斷了 parser 輸入前綴。
+        // 預期：truncated=true、snippet 遠短於 effModel、envelope 含 input sentinel、
+        // 截斷前綴之後的資料（TAIL_KEYDATA_9527）不得出現。
+        val dns = publicDns("example.com")
+        val body = "<html><head><title>T</title></head><body><script>" +
+            "y".repeat(290_000) +
+            "</script>TAIL_KEYDATA_9527</body></html>"
+        val http = FakeExtract {
+            WebExtractRawResponse(200, body.toByteArray(Charsets.UTF_8), mapOf("Content-Type" to "text/html; charset=utf-8"))
+        }
+        val svc = WebExtractService(http)
+        val out = svc.extract(
+            "https://example.com/big",
+            resolver = dns,
+            maxBytes = WebExtract.ABSOLUTE_MAX_BYTES,
+        ) as WebExtractOutcome.Ok
+        assertTrue("input 前綴截斷必須回報 truncated=true", out.truncated)
+        assertTrue(
+            "snippet 應遠短於 effModel（${out.content.snippet.length}）",
+            out.content.snippet.length < WebExtract.DEFAULT_MODEL_CHARS,
+        )
+        assertTrue(
+            "envelope 必須含 input sentinel（[...TRUNCATED INPUT AT ... CHARS]），got: ${out.envelope}",
+            out.envelope.contains(WebExtract.TRUNCATED_INPUT_SENTINEL_MARK),
+        )
+        assertTrue("input sentinel 應含 INPUT AT", out.envelope.contains("INPUT AT"))
+        assertTrue(
+            "共同前綴契約：[...TRUNCATED 仍應命中",
+            out.envelope.contains(WebExtract.TRUNCATED_SENTINEL_MARK),
+        )
+        assertFalse("截斷前綴之後的資料不得出現於 envelope", out.envelope.contains("TAIL_KEYDATA_9527"))
+        assertFalse("截斷前綴之後的資料不得出現於 snippet", out.content.snippet.contains("TAIL_KEYDATA_9527"))
+    }
+
     // ---- I. deadline／線性掃描回歸 ----
 
     @Test fun parseHtmlWithPastDeadlineThrows() {
@@ -1505,10 +1542,11 @@ class WebExtractD4Test {
         val doc = """<html><head><title>RealTitle</title></head><body><scripture>Visible</scripture><script type="text/x">hidden</script>AfterText</body></html>"""
         val content = parseHtml(doc, "https://example.com/")
         assertTrue("parseHtml 應成功，got null", content != null)
-        assertTrue("snippet 必須保留非標籤段落 Visible，got ${content!!.snippet}", content.snippet.contains("Visible"))
-        assertFalse("script 標籤內容必須被剝除", content.snippet.contains("hidden"))
-        assertTrue("title 後的正文必須保留", content.snippet.contains("AfterText"))
-        assertEquals("RealTitle", content.title)
+        assertFalse("短輸入不得回報 inputCapped", content!!.inputCapped)
+        assertTrue("snippet 必須保留非標籤段落 Visible，got ${content.content.snippet}", content.content.snippet.contains("Visible"))
+        assertFalse("script 標籤內容必須被剝除", content.content.snippet.contains("hidden"))
+        assertTrue("title 後的正文必須保留", content.content.snippet.contains("AfterText"))
+        assertEquals("RealTitle", content.content.title)
     }
 
     @Test fun titleTagBoundaryFixture() {
@@ -1517,7 +1555,7 @@ class WebExtractD4Test {
         val doc = """<html><head><titlex>not a title</titlex><title>RealTitle</title></head><body><p>body text</p></body></html>"""
         val content = parseHtml(doc, "https://example.com/")
         assertTrue(content != null)
-        assertEquals("RealTitle", content!!.title)
+        assertEquals("RealTitle", content!!.content.title)
     }
 
     @Test fun metaPublishedLinearFixture() = runBlocking {

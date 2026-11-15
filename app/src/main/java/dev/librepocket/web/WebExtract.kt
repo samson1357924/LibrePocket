@@ -72,6 +72,10 @@ internal class DeadlineExceededException : RuntimeException()
  *  （50k）；超限截斷（UTF-16 surrogate 安全）＋`truncated=true`，非錯誤；
  *   `truncated` 時 envelope 內文為 `capped + "\n[...TRUNCATED AT $effModel CHARS]"`，
  *   且 [WebExtractOutcome.Ok] 仍攜帶 `truncated=true`。
+ *   parser 輸入前綴上限 [PARSE_INPUT_CAP]（256k chars）與 model 預算截斷相互
+ *   獨立；超過時（`inputCapped=true`，見 [ParseResult]）`truncated=true` 且
+ *   envelope 內文為 `capped + "\n[...TRUNCATED INPUT AT $PARSE_INPUT_CAP CHARS]"`
+ *   （input sentinel）；input cap 不隨 maxBytes 放大；任一發生 → truncated=true。
  * - 快取：命中（[WebExtractCache]，TTL [DEFAULT_TTL_MS] 60min；key 含 URL 去 fragment
  *   ＋`maxBytes`＋`maxModelChars`＋policy identity（`policy`＋`configRevision`），
  *   不同 policy/revision 不互撞）零 upstream、`cached=true`；
@@ -194,8 +198,22 @@ object WebExtract {
     /**
      * `truncated` 時 envelope 內文尾端之 sentinel 前綴（精確 `"[...TRUNCATED"`）；
      * 尾端完整形如 `[...TRUNCATED AT $N CHARS]`。Phase-2 測試可據此斷言。
+     *
+     * 亦為 input-cap sentinel（[TRUNCATED_INPUT_SENTINEL_MARK]，形如
+     * `[...TRUNCATED INPUT AT $N CHARS]`）之共同前綴契約——兩個 sentinel 皆以
+     * 此前綴開頭；本常數不得改名。
      */
     internal const val TRUNCATED_SENTINEL_MARK = "[...TRUNCATED"
+
+    /**
+     * parser 輸入前綴截斷（`html.length > PARSE_INPUT_CAP`，見 `parseHtml`）時
+     * envelope sentinel 之前綴；尾端完整形如
+     * `[...TRUNCATED INPUT AT $PARSE_INPUT_CAP CHARS]`（由 `parseHtml` 回報
+     * `inputCapped=true`，見 [ParseResult]）。input cap 與 model 預算截斷相互獨立；
+     * 任一發生即 `truncated=true`。與 [TRUNCATED_SENTINEL_MARK] 共享 `[...TRUNCATED`
+     * 前綴契約。
+     */
+    internal const val TRUNCATED_INPUT_SENTINEL_MARK = "[...TRUNCATED INPUT AT "
 
     // ---- typed details（穩定字串，供 transcript／測試斷言） ----
 
@@ -887,6 +905,8 @@ class WebExtractService(
             }
             // 管線分派：HTML-family 走 parseHtml；其餘已放行 MIME 走 raw-text
             // 管線（不刪 tag、不 unescape；raw `&` 原樣保留）。
+            // RawText 不使用 parser 輸入前綴 cap（inputCapped=false）；
+            // 其工作量由 bytes 上限與 deadline 約束。
             val parsed = when (pipelineOf(contentType)) {
                 Pipeline.Html -> parseHtml(decoded, normalized, deadlineNs)
                 Pipeline.RawText -> {
@@ -898,29 +918,35 @@ class WebExtractService(
                         // snippet 清成空白 → BAD_RESPONSE（鏡照 HTML 管線之契約）。
                         null
                     } else {
-                        WebExtractContent(
-                            title = normalized,
-                            url = normalized,
-                            snippet = snippet,
-                            published = null,
-                            siteName = hostOf(normalized),
+                        ParseResult(
+                            WebExtractContent(
+                                title = normalized,
+                                url = normalized,
+                                snippet = snippet,
+                                published = null,
+                                siteName = hostOf(normalized),
+                            ),
+                            inputCapped = false,
                         )
                     }
                 }
             } ?: return WebExtractOutcome.Failed(WebExtract.DETAIL_BAD_RESPONSE)
 
             // Model 可見截斷（定點清理後、截斷後、envelope 最外；見 cleanField）。
-            val cleanSnippet = WebContentEnvelope.cleanField(parsed.snippet, deadlineNs)
-            val cleanTitle = WebContentEnvelope.cleanField(parsed.title, deadlineNs).takeExtractPrefix(500)
-            val cleanUrl = WebContentEnvelope.cleanField(parsed.url, deadlineNs).takeExtractPrefix(2048)
-            val cleanSiteName = parsed.siteName?.let {
+            val cleanSnippet = WebContentEnvelope.cleanField(parsed.content.snippet, deadlineNs)
+            val cleanTitle = WebContentEnvelope.cleanField(parsed.content.title, deadlineNs).takeExtractPrefix(500)
+            val cleanUrl = WebContentEnvelope.cleanField(parsed.content.url, deadlineNs).takeExtractPrefix(2048)
+            val cleanSiteName = parsed.content.siteName?.let {
                 WebContentEnvelope.cleanField(it, deadlineNs).takeExtractPrefix(253)
             }
-            val cleanPublished = parsed.published?.let {
+            val cleanPublished = parsed.content.published?.let {
                 WebContentEnvelope.cleanField(it, deadlineNs).takeExtractPrefix(128)
             }
             val capped = cleanSnippet.takeExtractPrefix(effModel)
-            val truncated = capped.length < cleanSnippet.length
+            val modelTruncated = capped.length < cleanSnippet.length
+            // input 前綴截斷（parser 輸入 > PARSE_INPUT_CAP）與 model 預算截斷相互獨立；
+            // 任一發生 → truncated=true。
+            val truncated = modelTruncated || parsed.inputCapped
             val content = WebExtractContent(
                 title = cleanTitle,
                 url = cleanUrl,
@@ -928,10 +954,13 @@ class WebExtractService(
                 published = cleanPublished,
                 siteName = cleanSiteName,
             )
-            val envelope = if (truncated) {
+            val envelope = if (!truncated) {
+                WebContentEnvelope.wrap(capped)
+            } else if (modelTruncated) {
                 WebContentEnvelope.wrap(capped + "\n${WebExtract.TRUNCATED_SENTINEL_MARK} AT $effModel CHARS]")
             } else {
-                WebContentEnvelope.wrap(capped)
+                // truncated 僅由 parser 輸入前綴截斷觸發（model 預算未截）：input sentinel。
+                WebContentEnvelope.wrap(capped + "\n${WebExtract.TRUNCATED_INPUT_SENTINEL_MARK}$PARSE_INPUT_CAP CHARS]")
             }
             // pre-Ok gate：預算已耗盡則絕不建構／返回逾越預算之 Ok
             //（parse／gunzip 內部 deadline 檢查之外的最後一道守門）。
@@ -1126,13 +1155,28 @@ internal fun String.takeExtractPrefix(n: Int): String {
     return if (s.isNotEmpty() && s.last().isHighSurrogate()) s.dropLast(1) else s
 }
 
-/** parseHtml 輸入上限（chars）；超過者僅取前 [PARSE_INPUT_CAP] 字元解析。 */
+/**
+ * parseHtml 輸入上限（chars）；超過者僅取前 [PARSE_INPUT_CAP] 字元解析。
+ *
+ * 此為獨立之 CPU／記憶體硬界，與 model 預算截斷（[WebExtract.MAX_MODEL_CHARS]）
+ * 相互獨立，且不隨 `maxBytes` 放大（即使呼叫方放行最大 1 MiB，本值不變）。
+ * 超過時 [parseHtml] 於 [ParseResult.inputCapped] 回報 true → 上層 `truncated=true`
+ * 並於 envelope 內嵌 input sentinel（見 [WebExtract.TRUNCATED_INPUT_SENTINEL_MARK]）。
+ */
 private const val PARSE_INPUT_CAP = 256 * 1024
+
+/**
+ * parseHtml 之結果：正規化後之 [content]，以及 [inputCapped]
+ * （`html.length > PARSE_INPUT_CAP`，即 parser 僅見到 `html` 之前綴）。
+ */
+internal data class ParseResult(val content: WebExtractContent, val inputCapped: Boolean)
 
 /**
  * 最小 HTML→內容解析（無依賴、正規化 schema）。
  *
- * 所有工作皆在 `html.take(PARSE_INPUT_CAP)` 上進行；title 提取與
+ * 所有工作皆在 `html.take(PARSE_INPUT_CAP)` 上進行；`html.length > PARSE_INPUT_CAP`
+ * 時回傳之 [ParseResult.inputCapped] 為 true（input 前綴截斷，與 model 預算截斷
+ * 相互獨立；不隨 maxBytes 放大）。title 提取與
  * `<script>/<style>` 剝除皆為 index-based 線性掃描（不使用 lazy backtracking
  * regex），避免病態輸入觸發災難性回溯。metadata（published）改為單趟、
  * 前向游標的屬性解析器（無 regex），整體 O(n)。
@@ -1148,13 +1192,18 @@ private const val PARSE_INPUT_CAP = 256 * 1024
  * - `siteName`：[hostOf]（失敗回 null，不拋）。
  * - 任何異常 → 回 null（→ `BAD_RESPONSE`）；[DeadlineExceededException] 例外，
  *   原樣上拋。
+ * - 回傳 [ParseResult]：[ParseResult.content] 為正規化內容；
+ *   [ParseResult.inputCapped] 為 `html.length > PARSE_INPUT_CAP`
+ *   （true → 上層 `truncated=true`；若 model 預算未截，envelope 內嵌
+ *   `[...TRUNCATED INPUT AT $PARSE_INPUT_CAP CHARS]` input sentinel）。
  *
  * `<script`／`<style`／`<title` 僅在緊接的字元為 ASCII 空白、`/`、`>` 或 EOF
  * 時才被視為標籤（tag-name 邊界）；如 `<scripture>`／`<titlex>` 不再誤判。
  */
-internal fun parseHtml(html: String, finalUrl: String, deadlineNs: Long = Long.MAX_VALUE): WebExtractContent? {
+internal fun parseHtml(html: String, finalUrl: String, deadlineNs: Long = Long.MAX_VALUE): ParseResult? {
     return try {
         if (System.nanoTime() >= deadlineNs) throw DeadlineExceededException()
+        val inputCapped = html.length > PARSE_INPUT_CAP
         val input = html.take(PARSE_INPUT_CAP)
         // ASCII 摺疊（長度不變）：所有被搜的 needle（`<title`／`<script`／`<style`／
         // `</title>`／`</script>`／`</style>`）皆 ASCII，索引必然不錯位
@@ -1179,12 +1228,15 @@ internal fun parseHtml(html: String, finalUrl: String, deadlineNs: Long = Long.M
             ?.trim()
             ?.takeIf { it.isNotEmpty() }
             ?.takeExtractPrefix(128)
-        WebExtractContent(
-            title = titleText,
-            url = finalUrl,
-            snippet = snippet,
-            published = published,
-            siteName = hostOf(finalUrl),
+        ParseResult(
+            WebExtractContent(
+                title = titleText,
+                url = finalUrl,
+                snippet = snippet,
+                published = published,
+                siteName = hostOf(finalUrl),
+            ),
+            inputCapped,
         )
     } catch (e: DeadlineExceededException) {
         // deadline 耗盡不得被吞沒：原樣上拋給呼叫方（service 映射 Failed(TIMEOUT)）。

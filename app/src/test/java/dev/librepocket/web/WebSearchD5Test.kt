@@ -334,11 +334,32 @@ class WebSearchD5Test {
         val p = FirecrawlSearchProvider(vault, http)
         val out = p.search("x".repeat(600), 5)
         assertTrue(out is WebSearchOutcome.Ok)
-        // v2 `query` 契約上限 500 字元：本層靜默截斷（不送 501+ 字元）。
+        // v2 `query` 契約上限 500 code units：本層靜默截斷（不送 501+）。
         assertTrue(http.lastBody!!.contains("\"query\":\"${"x".repeat(500)}\""))
         assertFalse(http.lastBody!!.contains("x".repeat(501)))
         // count 不受影響。
         assertTrue(http.lastBody!!.contains("\"limit\":5"))
+    }
+
+    @Test fun firecrawlQueryCapDoesNotSplitSurrogatePair() = runBlocking {
+        val vault = FakeVault()
+        vault.putKey(FirecrawlSearchProvider.DEFAULT_KEY_ID, "k-fire".toCharArray())
+        val http = FakePost { _, _ -> ok(body = firecrawlJson) }
+        val p = FirecrawlSearchProvider(vault, http)
+        // 切點（index 499..500）落在 😀（U+1F600，high surrogate at 499）的中間：
+        // 不得送出 unpaired high surrogate（→ JSON 替換／query 毀損）；
+        // takeUtf16Prefix 規則：捨去末尾孤立的 high surrogate，送前 499 個 'a'。
+        val emoji = "\uD83D\uDE00"
+        val out = p.search("a".repeat(499) + emoji, 5)
+        assertTrue(out is WebSearchOutcome.Ok)
+        assertTrue(http.lastBody!!.contains("\"query\":\"${"a".repeat(499)}\""))
+        assertFalse("不得送出 unpaired high surrogate", http.lastBody!!.contains('\uD83D'))
+        // 對照組：pair 完整落入 500 code units（498 個 'a'＋😀）→ 不捨去。
+        http.calls.set(0)
+        http.lastBody = null
+        val out2 = p.search("a".repeat(498) + emoji, 5)
+        assertTrue(out2 is WebSearchOutcome.Ok)
+        assertTrue(http.lastBody!!.contains("\"query\":\"${"a".repeat(498)}${emoji}\""))
     }
 
     @Test fun firecrawlSuccessAsStringIsBadResponse() = runBlocking {

@@ -33,7 +33,7 @@ data class CappedResults(
 )
 
 /** 取前 n 個 UTF-16 code units，但不切斷 surrogate pair：若切點落在 high surrogate 則捨去末字元。 */
-private fun String.takeUtf16Prefix(n: Int): String {
+internal fun String.takeUtf16Prefix(n: Int): String {
     if (n >= length) return this
     if (n <= 0) return ""
     val s = take(n)

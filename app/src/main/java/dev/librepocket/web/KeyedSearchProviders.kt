@@ -546,8 +546,9 @@ internal fun parseExaResults(json: Json, body: String, limitHint: Int = 16): Lis
 /**
  * Firecrawl Search API（POST `{ENDPOINT}`，v2；`Authorization: Bearer` 傳 key）。
  *
- * Body `{"query","limit"}`（`query` 前 500 字元（Firecrawl v2 契約上限），超過靜默截斷於本層
- * （上層未對 query 設長度上限——本截斷即實際防線；query 上限由 Firecrawl v2 契約決定））；回應 `{"success":true,"data":{"web":[{title,url,description}]}}`
+ * Body `{"query","limit"}`（`query` 前 500 個 UTF-16 code units（Firecrawl v2 契約上限），超過靜默截斷於本層
+ * （上層未對 query 設長度上限——本截斷即實際防線；query 上限由 Firecrawl v2 契約決定）；
+ * 截斷不切斷 surrogate pair（與 capResultsForModel 同一 [takeUtf16Prefix] 規則））；回應 `{"success":true,"data":{"web":[{title,url,description}]}}`
  * （v2 的 `data` 為物件、`web` 為陣列，非平陣列；v1 已不再針對）。
  * `success` 缺席／非布林（含字串 "true"/"false"）→ `BAD_RESPONSE`；`true` 才進 `data.web` 解析；
  * `false` → `SUPPLIER_ERROR`。
@@ -577,8 +578,9 @@ class FirecrawlSearchProvider(
 
     override suspend fun searchWithKey(query: String, count: Int, key: String): WebSearchOutcome {
         val body = buildJsonObject {
-            // Firecrawl v2 `query` 契約上限 500 字元：超過靜默截斷於本層（見類別 KDoc）。
-            put("query", query.take(500))
+            // Firecrawl v2 `query` 契約上限 500 字元：超過靜默截斷於本層（見類別 KDoc）；
+            // 截斷不切斷 surrogate pair（與 capResultsForModel 同一 takeUtf16Prefix 規則）。
+            put("query", query.takeUtf16Prefix(500))
             put("limit", count)
         }.toString()
         val response = when (

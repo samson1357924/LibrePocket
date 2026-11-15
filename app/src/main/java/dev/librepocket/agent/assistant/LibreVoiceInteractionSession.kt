@@ -202,22 +202,22 @@ open class LibreVoiceInteractionSession(context: Context) : VoiceInteractionSess
 
     @Synchronized
     private fun clearTaskState() {
-        // Wildcard sentinel for "unspecified task" (matches AssistantVoiceHandoff/VoiceHandoffProvider).
-        // Passing -1 would mean "match only a real task id of -1" (silently nothing); with Int.MIN_VALUE
-        // the sid still disambiguates (task axis wildcards, sid must match).
-        val taskId = activeTaskId ?: Int.MIN_VALUE
+        // Wildcard sentinel for "unspecified task" ([VoiceHandoffContract.WILDCARD_TASK_ID]).
+        // Passing -1 would mean "match only a real task id of -1" (silently nothing); with the
+        // wildcard the sid still disambiguates (task axis wildcards, sid must match).
+        val taskId = activeTaskId ?: VoiceHandoffContract.WILDCARD_TASK_ID
         val sid = sessionInstanceId
         launchPending = false
         activeTaskId = null
         sessionInstanceId = 0L
-        if (sid != 0L || taskId != Int.MIN_VALUE) {
-            // Long.MIN_VALUE is the handoff/provider "unspecified" sentinel for sessionInstanceId:
+        if (sid != 0L || taskId != VoiceHandoffContract.WILDCARD_TASK_ID) {
+            // WILDCARD_SESSION_INSTANCE_ID is the handoff/provider "unspecified" sentinel for sessionInstanceId:
             // treating a missing sid as "0L matches only sid 0" would silently match nothing; the
-            // sentinel wildcard-matches any sid instead. Task axis stays Int.MIN_VALUE.
+            // sentinel wildcard-matches any sid instead. Task axis stays WILDCARD_TASK_ID.
             AssistantVoiceHandoff.clear(
                 context = context,
                 targetTaskId = taskId,
-                sessionInstanceId = if (sid == 0L) Long.MIN_VALUE else sid,
+                sessionInstanceId = if (sid == 0L) VoiceHandoffContract.WILDCARD_SESSION_INSTANCE_ID else sid,
             )
         }
         // Nothing tracked: clear nothing (no clearAll — would wipe a newer/pending gesture token).

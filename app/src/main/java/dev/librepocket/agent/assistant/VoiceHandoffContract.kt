@@ -10,10 +10,9 @@ internal object VoiceHandoffContract {
     /** Same-UID diagnostic read; NOT identity-gated — same-UID callers can observe the entry. */
     const val METHOD_PEEK = "peekRetrigger"
 
-    /**
-     * Drops the pending entry iff it is expired (age < 0 or age > TTL); used by a fresh
-     * session cycle to converge dead prior-cycle residue without touching live entries.
-     */
+    /** Drop the pending entry iff [isExpired] holds for it; used by a fresh session cycle
+     *  to converge dead prior-cycle residue without touching live entries. No arguments,
+     *  no selectivity. */
     const val METHOD_CLEAR_EXPIRED = "clearExpiredRetrigger"
 
     /**
@@ -22,6 +21,33 @@ internal object VoiceHandoffContract {
      * STT long after the user's interaction ended.
      */
     const val RETRIGGER_TTL_MS = 10_000L
+
+    /**
+     * Sentinel value meaning "unspecified axis" (matches any), shared by the facade, provider and session.
+     * A `targetTaskId` equal to this wildcard means "no task axis constraint" — identity/clear
+     * matching skips the task axis instead of comparing against a real task id.
+     */
+    const val WILDCARD_TASK_ID = Int.MIN_VALUE
+
+    /**
+     * Sentinel value meaning "unspecified axis" (matches any), shared by the facade, provider and session.
+     * A `sessionInstanceId` equal to this wildcard means "no session axis constraint" — identity/clear
+     * matching skips the sid axis instead of comparing against a real session instance id.
+     */
+    const val WILDCARD_SESSION_INSTANCE_ID = Long.MIN_VALUE
+
+    /**
+     * True iff [issuedElapsedRealtimeMs] is expired or clock-skewed relative to
+     * [nowElapsedRealtimeMs]: age = now - issued is either negative (clock skew / future-dated
+     * entry) or strictly greater than [RETRIGGER_TTL_MS]. Boundary: age == TTL is FRESH, not
+     * expired. Corrupt-huge `issued` values (e.g. `Long.MIN_VALUE` wrapping, `Long.MAX_VALUE`
+     * naturally) yield a negative age and are treated as expired (fail-closed in every
+     * corrupt-input direction).
+     */
+    fun isExpired(issuedElapsedRealtimeMs: Long, nowElapsedRealtimeMs: Long): Boolean {
+        val age = nowElapsedRealtimeMs - issuedElapsedRealtimeMs
+        return age < 0 || age > RETRIGGER_TTL_MS
+    }
 
     const val KEY_TOKEN = "token"
     const val KEY_TARGET_TASK_ID = "targetTaskId"

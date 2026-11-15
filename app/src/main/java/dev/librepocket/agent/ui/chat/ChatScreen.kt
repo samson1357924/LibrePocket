@@ -170,7 +170,9 @@ fun ChatScreen(
     val contextOmittedCount by viewModel.contextOmittedCount.collectAsStateWithLifecycle()
     val listState = rememberLazyListState()
     val streaming = session.status == ChatStatus.STREAMING
-    var wasActive by remember { mutableStateOf(false) }
+    // rememberSaveable: survives activity recreation so a turn that completes after rotation
+    // still fires onTurnFinished instead of being dropped with the pre-rotation state.
+    var wasActive by rememberSaveable { mutableStateOf(false) }
 
     val inputEnabled = VoiceTools.inputEnabled(userSwitches)
     val outputEnabled = VoiceTools.outputEnabled(userSwitches)

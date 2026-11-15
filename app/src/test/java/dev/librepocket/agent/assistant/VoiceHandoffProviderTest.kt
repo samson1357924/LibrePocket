@@ -175,6 +175,49 @@ class VoiceHandoffProviderTest {
     }
 
     @Test
+    fun peek_ageExactlyTtlBoundary_andClockSkew() {
+        val now = SystemClock.elapsedRealtime()
+
+        // age == TTL: FRESH by contract (strict greater-than).
+        publish(960L, targetTaskId = 10, sessionInstanceId = 7L,
+            issuedElapsedRealtimeMs = now - VoiceHandoffContract.RETRIGGER_TTL_MS)
+        val fresh = newAttachedProvider().call(VoiceHandoffContract.METHOD_PEEK, null, null)!!
+        assertTrue("age == TTL must read fresh at the peek gate", fresh.containsKey(VoiceHandoffContract.KEY_TOKEN))
+
+        // age == TTL + 1: gone.
+        publish(961L, targetTaskId = 10, sessionInstanceId = 7L,
+            issuedElapsedRealtimeMs = now - VoiceHandoffContract.RETRIGGER_TTL_MS - 1)
+        val expired = newAttachedProvider().call(VoiceHandoffContract.METHOD_PEEK, null, null)!!
+        assertFalse(expired.containsKey(VoiceHandoffContract.KEY_TOKEN))
+
+        // Clock skew (future-dated issued): expired regardless of magnitude within TTL.
+        publish(962L, targetTaskId = 10, sessionInstanceId = 7L,
+            issuedElapsedRealtimeMs = now + 2_000L)
+        val skewed = newAttachedProvider().call(VoiceHandoffContract.METHOD_PEEK, null, null)!!
+        assertFalse(skewed.containsKey(VoiceHandoffContract.KEY_TOKEN))
+    }
+
+    @Test
+    fun clearExpired_ageExactlyTtlBoundary_andClockSkew() {
+        val now = SystemClock.elapsedRealtime()
+
+        publish(963L, targetTaskId = 10, sessionInstanceId = 7L,
+            issuedElapsedRealtimeMs = now - VoiceHandoffContract.RETRIGGER_TTL_MS)
+        VoiceHandoffProvider.clearExpired()
+        assertEquals("age == TTL entry must survive clearExpired", 963L, VoiceHandoffProvider.pending.value?.token)
+
+        publish(964L, targetTaskId = 10, sessionInstanceId = 7L,
+            issuedElapsedRealtimeMs = now - VoiceHandoffContract.RETRIGGER_TTL_MS - 1)
+        VoiceHandoffProvider.clearExpired()
+        assertNull("age > TTL entry must be dropped", VoiceHandoffProvider.pending.value)
+
+        publish(965L, targetTaskId = 10, sessionInstanceId = 7L,
+            issuedElapsedRealtimeMs = now + 2_000L)
+        VoiceHandoffProvider.clearExpired()
+        assertNull("future-dated skew entry must be dropped", VoiceHandoffProvider.pending.value)
+    }
+
+    @Test
     fun consume_expiredBeyondTtl_returnsFalseAndDropsEntry() {
         val now = SystemClock.elapsedRealtime()
         publish(900L, targetTaskId = 10, sessionInstanceId = 7L, issuedElapsedRealtimeMs = now - VoiceHandoffContract.RETRIGGER_TTL_MS - 1)

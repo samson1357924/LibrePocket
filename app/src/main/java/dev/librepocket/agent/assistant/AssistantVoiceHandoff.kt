@@ -35,17 +35,17 @@ object AssistantVoiceHandoff {
             try {
                 val b = context.contentResolver.call(uri(context), VoiceHandoffContract.METHOD_PEEK, null, null)
                 b?.toPending()
-            } catch (_: Exception) {
+            } catch (e: Exception) {
+                Log.w(TAG, "voice retrigger peek failed; fail-closed", e)
                 null
             }
         }
         // TTL filter: expired (or clock-skewed, negative-age) retriggers are treated as absent
         // (callers clear; never delivered).
-        if (resolved != null) {
-            val age = SystemClock.elapsedRealtime() - resolved.issuedElapsedRealtimeMs
-            if (age < 0 || age > VoiceHandoffContract.RETRIGGER_TTL_MS) {
-                return null
-            }
+        if (resolved != null &&
+            VoiceHandoffContract.isExpired(resolved.issuedElapsedRealtimeMs, SystemClock.elapsedRealtime())
+        ) {
+            return null
         }
         return resolved
     }
@@ -128,7 +128,8 @@ object AssistantVoiceHandoff {
                     },
                 )
                 b?.getBoolean(VoiceHandoffContract.KEY_OK, false) == true
-            } catch (_: Exception) {
+            } catch (e: Exception) {
+                Log.w(TAG, "voice retrigger consume failed; fail-closed", e)
                 false
             }
         }
@@ -145,11 +146,12 @@ object AssistantVoiceHandoff {
      */
     fun clear(
         context: Context? = null,
-        targetTaskId: Int = Int.MIN_VALUE,
-        sessionInstanceId: Long = Long.MIN_VALUE,
+        targetTaskId: Int = VoiceHandoffContract.WILDCARD_TASK_ID,
+        sessionInstanceId: Long = VoiceHandoffContract.WILDCARD_SESSION_INSTANCE_ID,
         token: Long = 0L,
     ) {
-        val hasIdentity = targetTaskId != Int.MIN_VALUE || sessionInstanceId != Long.MIN_VALUE
+        val hasIdentity = targetTaskId != VoiceHandoffContract.WILDCARD_TASK_ID ||
+            sessionInstanceId != VoiceHandoffContract.WILDCARD_SESSION_INSTANCE_ID
         if (hasIdentity) {
             VoiceHandoffProvider.clearMatching(targetTaskId, sessionInstanceId, token)
         } else if (token != 0L) {
@@ -169,18 +171,20 @@ object AssistantVoiceHandoff {
                         if (token != 0L) putLong(VoiceHandoffContract.KEY_TOKEN, token)
                     },
                 )
-            } catch (_: Exception) {
+            } catch (e: Exception) {
+                Log.w(TAG, "voice retrigger clear failed; fail-closed", e)
             }
         }
     }
 
     /**
      * Expired-only convergence for a fresh session cycle: clears the local pending entry
-     * iff it is expired-or-skewed (age < 0 or age > TTL) and sends a best-effort
+     * iff it is expired-or-skewed (see [VoiceHandoffContract.isExpired]) and sends a best-effort
      * METHOD_CLEAR_EXPIRED over IPC (no extras) so the main-process slot converges too.
      * An unexpired entry published milliseconds ago by another session instance for a
      * surviving voice task is PRESERVED — the TTL is the discriminator, not the caller's
-     * freshness guess. IPC failures are swallowed (same style as [clear]).
+     * freshness guess. IPC failures are logged at warn and swallowed (fail-closed; local
+     * clear still applies).
      */
     fun clearExpired(context: Context? = null) {
         VoiceHandoffProvider.clearExpired()
@@ -192,7 +196,8 @@ object AssistantVoiceHandoff {
                     null,
                     null,
                 )
-            } catch (_: Exception) {
+            } catch (e: Exception) {
+                Log.w(TAG, "voice retrigger clearExpired failed; fail-closed", e)
             }
         }
     }
@@ -219,7 +224,11 @@ object AssistantVoiceHandoff {
     }
 
     private fun identityBundle(targetTaskId: Int, sessionInstanceId: Long): Bundle = Bundle().apply {
-        if (targetTaskId != Int.MIN_VALUE) putInt(VoiceHandoffContract.KEY_TARGET_TASK_ID, targetTaskId)
-        if (sessionInstanceId != Long.MIN_VALUE) putLong(VoiceHandoffContract.KEY_SESSION_INSTANCE_ID, sessionInstanceId)
+        if (targetTaskId != VoiceHandoffContract.WILDCARD_TASK_ID) {
+            putInt(VoiceHandoffContract.KEY_TARGET_TASK_ID, targetTaskId)
+        }
+        if (sessionInstanceId != VoiceHandoffContract.WILDCARD_SESSION_INSTANCE_ID) {
+            putLong(VoiceHandoffContract.KEY_SESSION_INSTANCE_ID, sessionInstanceId)
+        }
     }
 }

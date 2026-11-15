@@ -76,8 +76,8 @@ class VoiceHandoffProvider : ContentProvider() {
                 val issued = SystemClock.elapsedRealtime()
                 // Refuse publishes carrying an undeliverable identity (sentinel/zero axes):
                 // fail-closed at the boundary instead of occupying the slot until TTL.
-                if (token <= 0L || targetTaskId == -1 || targetTaskId == Int.MIN_VALUE ||
-                    sessionInstanceId == 0L || sessionInstanceId == Long.MIN_VALUE
+                if (token <= 0L || targetTaskId == -1 || targetTaskId == VoiceHandoffContract.WILDCARD_TASK_ID ||
+                    sessionInstanceId == 0L || sessionInstanceId == VoiceHandoffContract.WILDCARD_SESSION_INSTANCE_ID
                 ) {
                     return null
                 }
@@ -109,7 +109,9 @@ class VoiceHandoffProvider : ContentProvider() {
                 }
                 val targetTaskId = b.getInt(VoiceHandoffContract.KEY_TARGET_TASK_ID)
                 val sessionInstanceId = b.getLong(VoiceHandoffContract.KEY_SESSION_INSTANCE_ID)
-                if (targetTaskId == Int.MIN_VALUE || sessionInstanceId == Long.MIN_VALUE) {
+                if (targetTaskId == VoiceHandoffContract.WILDCARD_TASK_ID ||
+                    sessionInstanceId == VoiceHandoffContract.WILDCARD_SESSION_INSTANCE_ID
+                ) {
                     return Bundle().apply { putBoolean(VoiceHandoffContract.KEY_OK, false) }
                 }
                 val token = b.getLong(VoiceHandoffContract.KEY_TOKEN, 0L)
@@ -129,8 +131,8 @@ class VoiceHandoffProvider : ContentProvider() {
                         b.containsKey(VoiceHandoffContract.KEY_SESSION_INSTANCE_ID)
                     if (hasTarget) {
                         clearMatching(
-                            b.getInt(VoiceHandoffContract.KEY_TARGET_TASK_ID, Int.MIN_VALUE),
-                            b.getLong(VoiceHandoffContract.KEY_SESSION_INSTANCE_ID, Long.MIN_VALUE),
+                            b.getInt(VoiceHandoffContract.KEY_TARGET_TASK_ID, VoiceHandoffContract.WILDCARD_TASK_ID),
+                            b.getLong(VoiceHandoffContract.KEY_SESSION_INSTANCE_ID, VoiceHandoffContract.WILDCARD_SESSION_INSTANCE_ID),
                             token,
                         )
                     } else if (token != 0L) {
@@ -150,8 +152,9 @@ class VoiceHandoffProvider : ContentProvider() {
                 val p = _pending.value
                 // Same TTL gate as consume: an expired (or clock-skewed) entry must not leak
                 // its token payload to peekers; report it as absent instead.
-                val age = p?.let { SystemClock.elapsedRealtime() - it.issuedElapsedRealtimeMs }
-                if (age != null && (age < 0 || age > VoiceHandoffContract.RETRIGGER_TTL_MS)) {
+                val stale = p != null &&
+                    VoiceHandoffContract.isExpired(p.issuedElapsedRealtimeMs, SystemClock.elapsedRealtime())
+                if (stale) {
                     Bundle.EMPTY
                 } else {
                     Bundle().apply {
@@ -207,7 +210,8 @@ class VoiceHandoffProvider : ContentProvider() {
         }
 
         /**
-         * Same-process/in-process consume; wildcard-capable (MIN_VALUE = "unspecified" axis).
+         * Same-process/in-process consume; wildcard-capable ([VoiceHandoffContract.WILDCARD_TASK_ID] /
+         * [VoiceHandoffContract.WILDCARD_SESSION_INSTANCE_ID] = "unspecified" axis).
          * The IPC boundary ([call]) rejects token-only/wildcard consumes — callers there must
          * carry full identity. This companion path stays permissive for same-process use
          * (e.g. in-process delivery, tests); it never crosses a process boundary.
@@ -216,13 +220,12 @@ class VoiceHandoffProvider : ContentProvider() {
         internal fun consume(token: Long, targetTaskId: Int, sessionInstanceId: Long): Boolean {
             val cur = _pending.value ?: return false
             if (token == 0L || cur.token != token) return false
-            // If caller provides identity constraints, enforce them; MIN_VALUE means "unspecified".
-            if (targetTaskId != Int.MIN_VALUE && cur.targetTaskId != targetTaskId) return false
-            if (sessionInstanceId != Long.MIN_VALUE && cur.sessionInstanceId != sessionInstanceId) return false
+            // If caller provides identity constraints, enforce them; the wildcard means "unspecified".
+            if (targetTaskId != VoiceHandoffContract.WILDCARD_TASK_ID && cur.targetTaskId != targetTaskId) return false
+            if (sessionInstanceId != VoiceHandoffContract.WILDCARD_SESSION_INSTANCE_ID && cur.sessionInstanceId != sessionInstanceId) return false
             // TTL: an expired retrigger must never fire STT; drop it on consume attempt.
             // Negative age (clock skew / bogus issued timestamp) is treated as expired too.
-            val age = SystemClock.elapsedRealtime() - cur.issuedElapsedRealtimeMs
-            if (age < 0 || age > VoiceHandoffContract.RETRIGGER_TTL_MS) {
+            if (VoiceHandoffContract.isExpired(cur.issuedElapsedRealtimeMs, SystemClock.elapsedRealtime())) {
                 _pending.value = null
                 return false
             }
@@ -236,8 +239,9 @@ class VoiceHandoffProvider : ContentProvider() {
             // When a token is supplied, only clear the pending entry if it is exactly that token;
             // never wipe a newer token from the same session cycle.
             if (token != 0L && cur.token != token) return
-            val taskMatches = targetTaskId == Int.MIN_VALUE || cur.targetTaskId == targetTaskId
-            val sessionMatches = sessionInstanceId == Long.MIN_VALUE || cur.sessionInstanceId == sessionInstanceId
+            val taskMatches = targetTaskId == VoiceHandoffContract.WILDCARD_TASK_ID || cur.targetTaskId == targetTaskId
+            val sessionMatches = sessionInstanceId == VoiceHandoffContract.WILDCARD_SESSION_INSTANCE_ID ||
+                cur.sessionInstanceId == sessionInstanceId
             if (taskMatches && sessionMatches) _pending.value = null
         }
 
@@ -255,15 +259,14 @@ class VoiceHandoffProvider : ContentProvider() {
 
         /**
          * Expired-only convergence: drops the pending entry iff it is expired-or-skewed
-         * (age < 0 or age > TTL); an unexpired entry is preserved. No return value.
+         * (see [VoiceHandoffContract.isExpired]); an unexpired entry is preserved. No return value.
          * Used by a fresh session cycle to converge dead prior-cycle residue without
          * touching a live entry another session instance just published.
          */
         @Synchronized
         internal fun clearExpired() {
             val cur = _pending.value ?: return
-            val age = SystemClock.elapsedRealtime() - cur.issuedElapsedRealtimeMs
-            if (age < 0 || age > VoiceHandoffContract.RETRIGGER_TTL_MS) {
+            if (VoiceHandoffContract.isExpired(cur.issuedElapsedRealtimeMs, SystemClock.elapsedRealtime())) {
                 _pending.value = null
             }
         }

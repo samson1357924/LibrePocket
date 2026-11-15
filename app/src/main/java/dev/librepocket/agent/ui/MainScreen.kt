@@ -563,14 +563,13 @@ internal fun RetriggerStaleClearEffect(
     hasEndpoint: Boolean,
     context: Context,
 ) {
-    LaunchedEffect(pending, navLoading, hasEndpoint) {
+    LaunchedEffect(pending, navLoading, hasEndpoint, identity) {
         val p = pending ?: return@LaunchedEffect
         val id = identity
         if (id == null || id.taskId != p.targetTaskId || id.sessionInstanceId != p.sessionInstanceId) {
             return@LaunchedEffect
         }
-        val age = SystemClock.elapsedRealtime() - p.issuedElapsedRealtimeMs
-        val stale = age < 0 || age > VoiceHandoffContract.RETRIGGER_TTL_MS
+        val stale = VoiceHandoffContract.isExpired(p.issuedElapsedRealtimeMs, SystemClock.elapsedRealtime())
         if (stale || (!navLoading && !hasEndpoint)) {
             AssistantVoiceHandoff.clear(context = context, targetTaskId = p.targetTaskId, sessionInstanceId = p.sessionInstanceId, token = p.token)
         }
@@ -630,8 +629,8 @@ internal fun shouldDeliverVoiceToChat(
 /**
  * C2 retrigger 投遞門禁：除 [chatSafeBoundary] 外，還要求此 Activity 的 [identity]
  * （可信 voice task 宿主）與 [pending] entry 綁定的 task/session 完全一致，且 token
- * 未超過 [VoiceHandoffContract.RETRIGGER_TTL_MS]。normal-task 實例（identity == null）
- * 恆不投遞。
+ * 未超過 [VoiceHandoffContract.RETRIGGER_TTL_MS]（age ∈ [0, TTL]，見 [VoiceHandoffContract.isExpired]）。
+ * normal-task 實例（identity == null）恆不投遞。
  */
 internal fun shouldDeliverVoiceRetrigger(
     pending: PendingVoiceRetrigger?,
@@ -647,7 +646,7 @@ internal fun shouldDeliverVoiceRetrigger(
         identity != null &&
         identity.taskId == pending.targetTaskId &&
         identity.sessionInstanceId == pending.sessionInstanceId &&
-        nowElapsedRealtimeMs - pending.issuedElapsedRealtimeMs in 0..VoiceHandoffContract.RETRIGGER_TTL_MS &&
+        !VoiceHandoffContract.isExpired(pending.issuedElapsedRealtimeMs, nowElapsedRealtimeMs) &&
         chatSafeBoundary(currentRoute, hasEndpoint, navLoading, viewedSessionId, drawerState)
 
 /**
@@ -765,6 +764,9 @@ internal fun AssistVoiceRetriggerCoordinator(
     onClearViewedSession: () -> Unit,
     context: Context,
 ) {
+    // NB: identity 不放入 LaunchedEffect key（同 AssistVoiceCoordinator 排除 viewedSessionId／
+    // drawerState 的原則：identity 值每個 activity 實例僅指派一次；且 effect 內不 mutate identity，
+    // 安全靠 pending/hasEndpoint/navLoading/currentRoute 重啟收斂）。
     LaunchedEffect(pending, hasEndpoint, navLoading, currentRoute) {
         val p = pending ?: return@LaunchedEffect
         // Identity gate first: only the owning (identity-matched) instance may converge.
@@ -772,8 +774,7 @@ internal fun AssistVoiceRetriggerCoordinator(
         if (id == null || id.taskId != p.targetTaskId || id.sessionInstanceId != p.sessionInstanceId) {
             return@LaunchedEffect
         }
-        val age = SystemClock.elapsedRealtime() - p.issuedElapsedRealtimeMs
-        if (age < 0 || age > VoiceHandoffContract.RETRIGGER_TTL_MS) {
+        if (VoiceHandoffContract.isExpired(p.issuedElapsedRealtimeMs, SystemClock.elapsedRealtime())) {
             // Expired/future-dated entry: RetriggerStaleClearEffect drops it on this state
             // change; never navigate and never clear from here.
             return@LaunchedEffect

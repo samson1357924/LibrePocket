@@ -146,6 +146,33 @@ class AssistantVoiceHandoffTest {
     }
 
     @Test
+    fun clear_singleAxisTaskIdentity_wildcardSidAxisMatchesAndClears_ipcBundleCarriesTaskKeyOnly() {
+        seedPending(token = 970L, issuedElapsedRealtimeMs = SystemClock.elapsedRealtime(), targetTaskId = 10, sessionInstanceId = 7L)
+
+        // Local-only assertion: single task axis, wildcard sid → matches the seeded entry.
+        AssistantVoiceHandoff.clear(context = null, targetTaskId = 10, sessionInstanceId = VoiceHandoffContract.WILDCARD_SESSION_INSTANCE_ID)
+        assertNull("single-axis identity must wildcard-match the other axis", VoiceHandoffProvider.pending.value)
+
+        // Mismatched task axis: entry preserved.
+        seedPending(token = 971L, issuedElapsedRealtimeMs = SystemClock.elapsedRealtime(), targetTaskId = 10, sessionInstanceId = 7L)
+        AssistantVoiceHandoff.clear(context = null, targetTaskId = 11, sessionInstanceId = VoiceHandoffContract.WILDCARD_SESSION_INSTANCE_ID)
+        assertEquals(971L, VoiceHandoffProvider.pending.value?.token)
+
+        // Wire shape: exactly the task key is put on the bundle; the wildcard sid axis is omitted.
+        VoiceHandoffProvider.resetForTest()
+        val counting = CountingProvider()
+        swapHandoffProvider(counting)
+        try {
+            AssistantVoiceHandoff.clear(context = appContext, targetTaskId = 10, sessionInstanceId = VoiceHandoffContract.WILDCARD_SESSION_INSTANCE_ID)
+            val clearCall = counting.calls.last { it.first == VoiceHandoffContract.METHOD_CLEAR }
+            assertEquals(10, clearCall.second?.getInt(VoiceHandoffContract.KEY_TARGET_TASK_ID))
+            assertFalse(clearCall.second!!.containsKey(VoiceHandoffContract.KEY_SESSION_INSTANCE_ID))
+        } finally {
+            restoreManifestProvider()
+        }
+    }
+
+    @Test
     fun requestRetrigger_success_returnsNonzeroToken_andPublishes() {
         val token = AssistantVoiceHandoff.requestRetrigger(appContext, targetTaskId = 10, sessionInstanceId = 7L)
 

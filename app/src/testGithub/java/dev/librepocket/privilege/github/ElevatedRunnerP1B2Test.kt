@@ -2797,6 +2797,9 @@ class ElevatedRunnerP1B2Test {
                     false
                 },
                 grantCheck = GrantFixtures.allowAlways,
+                execSearchDirs = hermeticExec!!.searchDirs,
+                execAllowedRoots = hermeticExec!!.allowedRoots,
+                execIsWritable = hermeticExec!!.systemOwned,
             )
             resultRef.set(runner.runBinary(ElevatedRequest(listOf("id"), "P1-RAW-SU-LINGER"), 5_000L))
         }.also { it.isDaemon = true; it.start() }

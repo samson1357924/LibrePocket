@@ -28,10 +28,11 @@ import java.text.Normalizer
  *   終止性：NFKC 僅首輪可擴張（展開為單字元有限映射；首輪後無待展開
  *   字元，其後之 nfkc 至多合併／重排，長度不增、碼點數不增）；自第二輪
  *   起每一輪或達不動點、或碼點數嚴格下降，刪除輪次數以首輪正規化後
- *   長度為上界，故必於有限輪內收斂（最壞 O(n²)；病態深層
- *   嵌套 marker 之放大風險已記錄於 WebExtract.kt header KDoc 之「D3 追蹤項」；
- *   html 派生欄位（title／snippet／published）受 PARSE_INPUT_CAP（256k 字元）約束；
- *   url／title fallback／siteName 係 cleanField 後才截斷，分別 2048／500／253）。
+ *   長度為上界，故必於有限輪內收斂（最壞 O(n²) 輪數上界）。
+ * - 所有迴圈受呼叫方傳入的 `deadlineNs` 約束（預設 `Long.MAX_VALUE`，
+ *   語義與先前版本完全一致）：逾時即拋 [DeadlineExceededException]
+ *  （WebExtract.kt 定義；與 CancellationException 區分）。工作由呼叫方的
+ *   解析預算（全程 deadline）有界化；迭代仍為契約上正確的定點。
  * - [wrap] 之輸出形狀為 `BEGIN + "\n" + cleaned + "\n" + END`，不因輸入而變；
  *   語義僅輸出本體內容變化。
  */
@@ -50,7 +51,8 @@ object WebContentEnvelope {
      * 存活進模型可見體；本函式通常於 [cleanField] 之 NFKC 摺疊之後執行，
      * 兼容性（compatibility）相似字（fullwidth／small-form 等）已被摺為 ASCII。
      */
-    fun stripForgedMarkers(text: String): String {
+    fun stripForgedMarkers(text: String, deadlineNs: Long = Long.MAX_VALUE): String {
+        if (System.nanoTime() >= deadlineNs) throw DeadlineExceededException()
         if (text.isEmpty()) return text
         return END_CI.replace(BEGIN_CI.replace(text, ""), "")
     }
@@ -64,17 +66,26 @@ object WebContentEnvelope {
      * 反覆至不動點即返回。終止性：NFKC 僅首輪可擴張（展開為單字元有限映射；
      * 首輪後無待展開字元，其後 nfkc 至多合併／重排，長度不增、碼點數不增）；
      * 自第二輪起每輪或達不動點、或碼點數嚴格下降，刪除輪次數以首輪
-     * 正規化後長度為上界，故必於有限輪內收斂（最壞 O(n²)）。
+     * 正規化後長度為上界，故必於有限輪內收斂（最壞 O(n²) 輪數上界）。
      * 注意：`strip` 非冪等（先剝 BEGIN、後剝 END）：END 之移除可於接縫「造」出
      * 新的 BEGIN（實測例：`<<<EXTERNAL_UNTRUSTED_CONTENT<<<END_EXTERNAL_UNTRUSTED_CONTENT>>>>>>`
      * 單輪後留下 `<<<EXTERNAL_UNTRUSTED_CONTENT>>>`；實測未造出 END），故單輪不足以
      * 收束，由外層迭代至定點吸收；
      * NFKC 摺疊僅施用於此處；parseHtml／entity unescape 不做 NFKC。
+     *
+     * 工作受 `deadlineNs` 約束（預設 `Long.MAX_VALUE`，語義不變）：外層每輪、
+     * 以及 [sanitize] 內每 512 個 codepoint 檢查 deadline；逾時拋
+     * [DeadlineExceededException]（與 CancellationException 區分，呼叫方映射
+     * `Failed(TIMEOUT)`）。逾時即中止，不回傳部分清理結果。
      */
-    fun cleanField(text: String): String {
+    fun cleanField(text: String, deadlineNs: Long = Long.MAX_VALUE): String {
         var s = text
         while (true) {
-            val next = sanitize(stripForgedMarkers(Normalizer.normalize(s, Normalizer.Form.NFKC)))
+            if (System.nanoTime() >= deadlineNs) throw DeadlineExceededException()
+            val next = sanitize(
+                stripForgedMarkers(Normalizer.normalize(s, Normalizer.Form.NFKC), deadlineNs),
+                deadlineNs,
+            )
             if (next == s) return next
             s = next
         }
@@ -90,11 +101,16 @@ object WebContentEnvelope {
      * 等）一律移除，不進模型可見體；U+2028／U+2029 非 Cc 且明列於
      * [EXTRA_STRIP]，亦會被移除（換行語義以 `\n` 表示）。
      */
-    fun sanitize(text: String): String {
+    fun sanitize(text: String, deadlineNs: Long = Long.MAX_VALUE): String {
         if (text.isEmpty()) return text
         val sb = StringBuilder(text.length)
         var i = 0
+        var units = 0
         while (i < text.length) {
+            // 每 512 個 codepoint 檢查一次 deadline（避免逐 char 的時鐘讀取開銷）。
+            if (++units and 511 == 0 && System.nanoTime() >= deadlineNs) {
+                throw DeadlineExceededException()
+            }
             val cp = text.codePointAt(i)
             val type = Character.getType(cp)
             val isControl = type == Character.CONTROL.toInt()

@@ -28,6 +28,17 @@ import kotlinx.coroutines.withTimeout
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 
 /**
+ * 全程 deadline 耗盡時由解析／清理迴圈拋出（CPU-bound 工作之硬界）。
+ *
+ * 刻意**不是** [CancellationException]（不與協程取消混淆）；刻意 unchecked。
+ * 解析階段（parseHtml／HtmlExtract／cleanField 等）內只允許在迴圈頂端／每 512
+ * code unit 檢查 [System.nanoTime] 後拋出此例外；任何不允許逸出的 catch-all
+ * 皆須於其前重拋本例外；最終由 `WebExtractService` 的 deadline 映射 arm 收束為
+ * `Failed(TIMEOUT)`（never cached）。
+ */
+internal class DeadlineExceededException : RuntimeException()
+
+/**
  * D4 `web.extract` 第一版（單 URL；#138 D4；純 JVM，不接線）。
  *
  * - 抓取前（首跳＋每一跳 redirect）必經 [NetworkPolicy.evaluateUrl]
@@ -117,10 +128,11 @@ import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
  *    `configRevision` bump 或 `WebExtractService.invalidate()`）。
  * 2. cache **不解析 `Cache-Control`（含 `no-store`）**：TTL-only，屬刻意
  *    設計（read 工具、無寫副作用）；D3 須決定 honor 或明文件化此行為。
- * 3. `cleanField` 最壞 O(n²)（`snippet` 於 cap 前進入 cleanField，input 可達
- *    [PARSE_INPUT_CAP] 256k 字元；`effModel` 截斷發生於清理之後；病態深層嵌套
- *    marker 之 CPU 放大發生在 15s 預算之外）；url／siteName／title fallback 係
- *    cleanField 後才截斷 — D3 wiring 前須緩解（如 marker 計數前掃）或記錄 accept。
+ * 3. `cleanField` 工作已以全程 deadline 有界（parse 預算，逾時拋
+ *    [DeadlineExceededException]）；迭代仍為契約上正確的定點（最壞 O(n²)
+ *    輪數上界，輪數以首輪 NFKC 正規化後長度為界）；url／siteName／title
+ *    fallback 係 cleanField 後才截斷 — D3 wiring 前須緩解（如 marker 計數前掃）
+ *    或記錄 accept。
  * 4. envelope 僅為標記籬笆，**非授權**；D3 須另行接 `#165` consent/授權
  *    流程，envelope 不擔任 authorization 角色。
  * 5. Follower `await()` 未獨立掛 per-follower deadline（由 leader 預算＋cap-bounded
@@ -165,8 +177,9 @@ object WebExtract {
      * `extract()` 於入口即以單調時鐘（`System.nanoTime()`）計算全程 deadline：
      * per-call 政策重驗（含 DNS preflight）＋`extractUncached`（DNS preflight＋
      * 各 hop 之 HTTP 請求＋解壓）共用此單一單調預算；
-     * decode／parse 不計入 deadline，但受位元組／字元上限約束（cap-bounded）；
-     * 逐跳以剩餘預算執行（見 `extractUncached`）。
+     * parse／清理迴圈受該 deadline 約束（逾時拋 [DeadlineExceededException]，
+     * 映射 `Failed(TIMEOUT)`）；decode 不計入 deadline，但受位元組／字元上限
+     * 約束（cap-bounded）；逐跳以剩餘預算執行（見 `extractUncached`）。
      */
     const val TIMEOUT_MS = 15_000L
 
@@ -322,6 +335,8 @@ internal suspend fun fetchRawWithTimeout(
         currentCoroutineContext().ensureActive()
         return RawFetchOut.Fail(WebExtract.DETAIL_TRANSPORT)
     } catch (_: Exception) {
+        // 刻意不重拋 DeadlineExceededException：parse 階段尚未開始，本函式
+        // 內部絕不產生該例外；fake transport 例外 → fail-closed TRANSPORT。
         currentCoroutineContext().ensureActive()
         return RawFetchOut.Fail(WebExtract.DETAIL_TRANSPORT)
     }
@@ -547,6 +562,8 @@ class WebExtractService(
             } catch (e: CancellationException) {
                 throw e
             } catch (_: Exception) {
+                // 政策評估（pre-parse）不產生 DeadlineExceededException；
+                // evaluateUrl／resolver 之例外一律 fail-closed TRANSPORT。
                 return WebExtractOutcome.Failed(WebExtract.DETAIL_TRANSPORT)
             }
             if (!gate.allowed) {
@@ -595,6 +612,8 @@ class WebExtractService(
                     // 與 leader 路徑（catch Throwable → completeExceptionally(e) → 上拋）對稱。
                     throw e
                 } catch (_: Throwable) {
+                    // m.await() 不執行解析階段，DeadlineExceededException 不會由此逸出；
+                    // leader 異常貫穿時 fail-closed TRANSPORT。
                     return WebExtractOutcome.Failed(WebExtract.DETAIL_TRANSPORT)
                 }
             }
@@ -621,6 +640,10 @@ class WebExtractService(
                 }
                 throw e
             } catch (_: Exception) {
+                // parse 階段的 DeadlineExceededException 會流入此處：
+                // 先以 fail-closed TRANSPORT 收場（m 必須 settle；follower 不得 hang）。
+                // 下一 commit 以獨立 arm 映射為 Failed(TIMEOUT)（audit 語義區分）。
+                // 不得在此直接 rethrow——會讓 m 懸空、follower 永久等待。
                 try {
                     currentCoroutineContext().ensureActive()
                 } catch (ce: CancellationException) {
@@ -631,6 +654,8 @@ class WebExtractService(
                 m.complete(failed)
                 return failed
             } catch (e: Throwable) {
+                // DeadlineExceededException 屬 Exception，不會到達此 arm
+                //（c4 之 DeadlineExceededException arm 亦位於 Exception arm 之前）。
                 m.completeExceptionally(e)
                 throw e
             } finally {
@@ -687,6 +712,8 @@ class WebExtractService(
             } catch (e: CancellationException) {
                 throw e
             } catch (_: Exception) {
+                // 逐跳政策評估（pre-fetch／pre-parse）不產生 DeadlineExceededException；
+                // evaluateUrl／resolver 之例外一律 fail-closed TRANSPORT。
                 return WebExtractOutcome.Failed(WebExtract.DETAIL_TRANSPORT)
             }
             if (!eval.allowed) {
@@ -708,6 +735,7 @@ class WebExtractService(
             val curScheme = try {
                 normalized.toHttpUrlOrNull()?.scheme?.lowercase()
             } catch (_: Exception) {
+                // 純 URL 解析，不產生 DeadlineExceededException；失敗 → null（fail-closed 後續檢查）。
                 null
             }
             if (!first && fromSchemeHttps && curScheme == "http") {
@@ -818,18 +846,18 @@ class WebExtractService(
             if (decoded.isBlank()) {
                 return WebExtractOutcome.Failed(WebExtract.DETAIL_BAD_RESPONSE)
             }
-            val parsed = parseHtml(decoded, normalized)
+            val parsed = parseHtml(decoded, normalized, deadlineNs)
                 ?: return WebExtractOutcome.Failed(WebExtract.DETAIL_BAD_RESPONSE)
 
             // Model 可見截斷（定點清理後、截斷後、envelope 最外；見 cleanField）。
-            val cleanSnippet = WebContentEnvelope.cleanField(parsed.snippet)
-            val cleanTitle = WebContentEnvelope.cleanField(parsed.title).takeExtractPrefix(500)
-            val cleanUrl = WebContentEnvelope.cleanField(parsed.url).takeExtractPrefix(2048)
+            val cleanSnippet = WebContentEnvelope.cleanField(parsed.snippet, deadlineNs)
+            val cleanTitle = WebContentEnvelope.cleanField(parsed.title, deadlineNs).takeExtractPrefix(500)
+            val cleanUrl = WebContentEnvelope.cleanField(parsed.url, deadlineNs).takeExtractPrefix(2048)
             val cleanSiteName = parsed.siteName?.let {
-                WebContentEnvelope.cleanField(it).takeExtractPrefix(253)
+                WebContentEnvelope.cleanField(it, deadlineNs).takeExtractPrefix(253)
             }
             val cleanPublished = parsed.published?.let {
-                WebContentEnvelope.cleanField(it).takeExtractPrefix(128)
+                WebContentEnvelope.cleanField(it, deadlineNs).takeExtractPrefix(128)
             }
             val capped = cleanSnippet.takeExtractPrefix(effModel)
             val truncated = capped.length < cleanSnippet.length
@@ -878,6 +906,7 @@ internal fun resolveRedirect(currentUrl: String, location: String): String? =
     try {
         currentUrl.toHttpUrlOrNull()?.resolve(location)?.toString()
     } catch (_: Exception) {
+        // 純 URL 解析，不產生 DeadlineExceededException；無法解析 → BAD_REDIRECT（fail-closed）。
         null
     }
 
@@ -973,6 +1002,7 @@ internal fun decodeDowngraded(data: ByteArray, charsetName: String?): String {
     val charset: Charset = try {
         if (charsetName.isNullOrBlank()) Charsets.UTF_8 else Charset.forName(charsetName)
     } catch (_: Exception) {
+        // 純 charset 名解析，不產生 DeadlineExceededException；未知 charset → UTF-8 降級。
         Charsets.UTF_8
     }
     return try {
@@ -981,6 +1011,10 @@ internal fun decodeDowngraded(data: ByteArray, charsetName: String?): String {
             .onUnmappableCharacter(CodingErrorAction.REPLACE)
             .decode(ByteBuffer.wrap(data))
             .toString()
+    } catch (e: DeadlineExceededException) {
+        // DeadlineExceededException 不得被吞沒（防禦：decode 本身不產生它，
+        // 此 arm 僅保險接住於 parse 階段內逸出的該例外並原樣上拋）。
+        throw e
     } catch (_: Exception) {
         String(data, Charsets.UTF_8)
     }
@@ -1002,18 +1036,27 @@ private const val PARSE_INPUT_CAP = 256 * 1024
  *
  * 所有工作皆在 `html.take(PARSE_INPUT_CAP)` 上進行；title 提取與
  * `<script>/<style>` 剝除皆為 index-based 線性掃描（不使用 lazy backtracking
- * regex），避免病態輸入觸發災難性回溯。
+ * regex），避免病態輸入觸發災難性回溯。metadata（published）改為單趟、
+ * 前向游標的屬性解析器（無 regex），整體 O(n)。
+ * 所有迴圈受 [deadlineNs] 約束：逾時拋 [DeadlineExceededException]
+ *（不被 catch-all 吞沒，原樣上拋給呼叫方映射為 `Failed(TIMEOUT)`）。
  *
  * - `title`：首個 `<title>` 文本（去 tag＋unescape＋trim）；缺或空白 → 回退 URL。
  * - `snippet`：剔除 `<script>/<style>` 後去 tag＋unescape＋空白收斂；空白 → 回退
  *   title（仍空白即整體空白，由上層判 `BAD_RESPONSE`）。
- * - `published`：`article:published_time`／`datePublished`／`publish_date`／
- *   `<time datetime>` 首個非空；無 → null；空白收斂後截斷至 128 chars。
+ * - `published`：`article:published_time`／`datePublished`／`publish_date`／`pubdate`／
+ *   `dc.date`（`property`／`name` 屬性，大小寫不敏感），或 `<time datetime>`
+ *   首個非空；無 → null；空白收斂後截斷至 128 chars。
  * - `siteName`：[hostOf]（失敗回 null，不拋）。
- * - 全欄位不拋異常；解析期任何異常 → 回 null（→ `BAD_RESPONSE`）。
+ * - 任何異常 → 回 null（→ `BAD_RESPONSE`）；[DeadlineExceededException] 例外，
+ *   原樣上拋。
+ *
+ * `<script`／`<style`／`<title` 僅在緊接的字元為 ASCII 空白、`/`、`>` 或 EOF
+ * 時才被視為標籤（tag-name 邊界）；如 `<scripture>`／`<titlex>` 不再誤判。
  */
-internal fun parseHtml(html: String, finalUrl: String): WebExtractContent? {
+internal fun parseHtml(html: String, finalUrl: String, deadlineNs: Long = Long.MAX_VALUE): WebExtractContent? {
     return try {
+        if (System.nanoTime() >= deadlineNs) throw DeadlineExceededException()
         val input = html.take(PARSE_INPUT_CAP)
         // ASCII 摺疊（長度不變）：所有被搜的 needle（`<title`／`<script`／`<style`／
         // `</title>`／`</script>`／`</style>`）皆 ASCII，索引必然不錯位
@@ -1023,15 +1066,17 @@ internal fun parseHtml(html: String, finalUrl: String): WebExtractContent? {
         }
         // 先剝 script/style，title／published 皆於剝除後的 body 上提取
         //（不得在 script/style 內容中命中 <title> 或 meta published）。
-        val body = HtmlExtract.stripScriptAndStyle(input, lower)
+        val body = HtmlExtract.stripScriptAndStyle(input, lower, deadlineNs)
+        if (System.nanoTime() >= deadlineNs) throw DeadlineExceededException()
         val bodyLower = buildString(body.length) {
             for (c in body) append(if (c in 'A'..'Z') c + 32 else c)
         }
-        val titleRaw = HtmlExtract.titleOf(body, bodyLower)
-        val titleText = HtmlExtract.stripText(titleRaw).trim().takeIf { it.isNotEmpty() } ?: finalUrl
-        val text = HtmlExtract.stripText(body).trim().let { HtmlExtract.Spaces.replace(it, " ") }
+        if (System.nanoTime() >= deadlineNs) throw DeadlineExceededException()
+        val titleRaw = HtmlExtract.titleOf(body, bodyLower, deadlineNs)
+        val titleText = HtmlExtract.stripText(titleRaw, deadlineNs).trim().takeIf { it.isNotEmpty() } ?: finalUrl
+        val text = HtmlExtract.stripText(body, deadlineNs).trim().let { HtmlExtract.Spaces.replace(it, " ") }
         val snippet = text.takeIf { it.isNotEmpty() } ?: titleText
-        val published = HtmlExtract.publishedOf(body)
+        val published = HtmlExtract.publishedOf(body, deadlineNs)
             ?.let { HtmlExtract.Spaces.replace(it, " ") }
             ?.trim()
             ?.takeIf { it.isNotEmpty() }
@@ -1043,6 +1088,9 @@ internal fun parseHtml(html: String, finalUrl: String): WebExtractContent? {
             published = published,
             siteName = hostOf(finalUrl),
         )
+    } catch (e: DeadlineExceededException) {
+        // deadline 耗盡不得被吞沒：原樣上拋給呼叫方（service 映射 Failed(TIMEOUT)）。
+        throw e
     } catch (_: Exception) {
         null
     }
@@ -1050,27 +1098,37 @@ internal fun parseHtml(html: String, finalUrl: String): WebExtractContent? {
 
 private object HtmlExtract {
     val Spaces = Regex("\\s+")
-    val META_PUBLISHED = Regex(
-        """<meta[^>]+(?:property|name)\s*=\s*["']?(?:article:published_time|datePublished|publish_date|pubdate|DC\.date)["']?[^>]*content\s*=\s*["']([^"']+)["']""",
-        RegexOption.IGNORE_CASE,
-    )
-    val META_PUBLISHED_REV = Regex(
-        """<meta[^>]+content\s*=\s*["']([^"']+)["'][^>]*(?:property|name)\s*=\s*["']?(?:article:published_time|datePublished|publish_date|pubdate|DC\.date)["']?""",
-        RegexOption.IGNORE_CASE,
-    )
-    val TIME_DATETIME = Regex(
-        """<time[^>]+datetime\s*=\s*["']([^"']+)["']""",
-        RegexOption.IGNORE_CASE,
-    )
     val NUMERIC_ENTITY = Regex("&#(\\d+);")
     val HEX_ENTITY = Regex("&#x([0-9a-fA-F]+);")
 
+    /** tag-name 邊界：緊接 needle 之 byte 必須為 ASCII 空白、`/`、`>` 或 EOF。 */
+    private fun isTagNameBoundary(lower: String, p: Int): Boolean {
+        if (p >= lower.length) return true // EOF
+        val c = lower[p]
+        return c == ' ' || c == '\t' || c == '\n' || c == '\u000B' ||
+            c == '\u000C' || c == '\r' || c == '/' || c == '>'
+    }
+
     /**
-     * 取首個 `<title>...</title>` 文本（index-based，case-insensitive）；
-     * 任一環節缺失即回空字串（由上層回退 URL）。
+     * 取首個 `<title>...</title>` 文本（index-based，case-insensitive；
+     * tag-name 邊界檢查）；任一環節缺失即回空字串（由上層回退 URL）。
      */
-    fun titleOf(input: String, lower: String): String {
-        val tOpen = lower.indexOf("<title")
+    fun titleOf(input: String, lower: String, deadlineNs: Long = Long.MAX_VALUE): String {
+        if (System.nanoTime() >= deadlineNs) throw DeadlineExceededException()
+        var tOpen = -1
+        var cursor = 0
+        var scanned = 0
+        while (true) {
+            if (++scanned and 511 == 0 && System.nanoTime() >= deadlineNs) throw DeadlineExceededException()
+            val p = lower.indexOf("<title", cursor)
+            if (p < 0) break
+            if (isTagNameBoundary(lower, p + "<title".length)) {
+                tOpen = p
+                break
+            }
+            // 非標籤（如 `<titlex>`）：游標前進一個 past-offending-`<` 之位置續掃。
+            cursor = p + 1
+        }
         if (tOpen < 0) return ""
         val openEnd = lower.indexOf('>', tOpen)
         if (openEnd < 0) return ""
@@ -1081,15 +1139,54 @@ private object HtmlExtract {
 
     /**
      * 線性剝除 `<script>...</script>`／`<style>...</style>`（index-based，
-     * case-insensitive）；無對應關閉標籤者，自開始標籤剝至輸入結尾。
+     * case-insensitive，tag-name 邊界檢查；無對應關閉標籤者，
+     * 自開始標籤剝至輸入結尾）。
      * 以 StringBuilder 逐段拼接，不使用 backtracking regex。
+     * 雙游標（scriptCandidate／styleCandidate）皆單調前進，總工作量 O(n)。
      */
-    fun stripScriptAndStyle(input: String, lower: String): String {
+    fun stripScriptAndStyle(input: String, lower: String, deadlineNs: Long = Long.MAX_VALUE): String {
         val sb = StringBuilder(input.length)
         var i = 0
+        var scriptCandidate = 0
+        var styleCandidate = 0
         while (i < input.length) {
-            val sOpen = lower.indexOf("<script", i)
-            val tOpen = lower.indexOf("<style", i)
+            if (System.nanoTime() >= deadlineNs) throw DeadlineExceededException()
+            var sOpen = -1
+            var scannedCandidates = 0
+            while (true) {
+                if (++scannedCandidates and 511 == 0 && System.nanoTime() >= deadlineNs) {
+                    throw DeadlineExceededException()
+                }
+                val p = lower.indexOf("<script", scriptCandidate)
+                if (p < 0) {
+                    scriptCandidate = lower.length
+                    break
+                }
+                if (isTagNameBoundary(lower, p + "<script".length)) {
+                    sOpen = p
+                    scriptCandidate = p
+                    break
+                }
+                scriptCandidate = p + 1
+            }
+            var tOpen = -1
+            scannedCandidates = 0
+            while (true) {
+                if (++scannedCandidates and 511 == 0 && System.nanoTime() >= deadlineNs) {
+                    throw DeadlineExceededException()
+                }
+                val p = lower.indexOf("<style", styleCandidate)
+                if (p < 0) {
+                    styleCandidate = lower.length
+                    break
+                }
+                if (isTagNameBoundary(lower, p + "<style".length)) {
+                    tOpen = p
+                    styleCandidate = p
+                    break
+                }
+                styleCandidate = p + 1
+            }
             val open: Int
             val tag: String
             if (sOpen < 0 && tOpen < 0) {
@@ -1105,23 +1202,216 @@ private object HtmlExtract {
             sb.append(input, i, open)
             val closeMark = "</$tag>"
             val close = lower.indexOf(closeMark, open)
-            i = if (close < 0) input.length else close + closeMark.length
+            val end = if (close < 0) input.length else close + closeMark.length
+            // 被挪走的區段內不得再命中：兩游標皆不倒退。
+            scriptCandidate = maxOf(scriptCandidate, end)
+            styleCandidate = maxOf(styleCandidate, end)
+            i = end
         }
         return sb.toString()
     }
 
-    fun publishedOf(html: String): String? {
-        META_PUBLISHED.find(html)?.groupValues?.get(1)?.let { return unescapeHtml(it) }
-        META_PUBLISHED_REV.find(html)?.groupValues?.get(1)?.let { return unescapeHtml(it) }
-        TIME_DATETIME.find(html)?.groupValues?.get(1)?.let { return unescapeHtml(it) }
+    // ---- published metadata（單趟、前向游標；無 regex） ----
+
+    private val PUBLISHED_ALIASES = setOf(
+        "article:published_time",
+        "datepublished",
+        "publish_date",
+        "pubdate",
+        "dc.date",
+    )
+
+    private fun isAsciiWs(c: Char): Boolean =
+        c == ' ' || c == '\t' || c == '\n' || c == '\u000B' || c == '\u000C' || c == '\r'
+
+    private fun isNameChar(c: Char): Boolean =
+        c in 'a'..'z' || c in 'A'..'Z' || c in '0'..'9' || c == '-' || c == '_' || c == ':'
+
+    private data class MetaAttrs(val propertyName: String?, val content: String?, val datetime: String?)
+
+    /**
+     * 自 tag 起始處，抽取 `property|name`／`content`／`datetime` 屬性
+     *（key 大小寫不敏感；值以單／雙引號或裸字元表示）。
+     */
+    private fun parseTagAttrs(tag: String, deadlineNs: Long): MetaAttrs {
+        var propertyName: String? = null
+        var content: String? = null
+        var datetime: String? = null
+        var pos = 0
+        var scanned = 0
+        val n = tag.length
+        // 跳過前導 `<meta`／`<time`。
+        while (pos < n && !isAsciiWs(tag[pos]) && tag[pos] != '>') {
+            if (++scanned and 511 == 0 && System.nanoTime() >= deadlineNs) {
+                throw DeadlineExceededException()
+            }
+            pos++
+        }
+        while (pos < n) {
+            if (++scanned and 511 == 0 && System.nanoTime() >= deadlineNs) {
+                throw DeadlineExceededException()
+            }
+            val c = tag[pos]
+            if (c == '>') break
+            if (isAsciiWs(c) || c == '/') {
+                pos++
+                continue
+            }
+            val nameStart = pos
+            while (pos < n && isNameChar(tag[pos])) {
+                if (++scanned and 511 == 0 && System.nanoTime() >= deadlineNs) {
+                    throw DeadlineExceededException()
+                }
+                pos++
+            }
+            if (nameStart == pos) {
+                // 無法作為屬性名首字元：前進一格再同步。
+                pos++
+                continue
+            }
+            val attrName = tag.substring(nameStart, pos).lowercase()
+            while (pos < n && isAsciiWs(tag[pos])) {
+                if (++scanned and 511 == 0 && System.nanoTime() >= deadlineNs) {
+                    throw DeadlineExceededException()
+                }
+                pos++
+            }
+            if (pos < n && tag[pos] == '=') {
+                pos++
+                while (pos < n && isAsciiWs(tag[pos])) {
+                    if (++scanned and 511 == 0 && System.nanoTime() >= deadlineNs) {
+                        throw DeadlineExceededException()
+                    }
+                    pos++
+                }
+                if (pos < n && (tag[pos] == '"' || tag[pos] == '\'')) {
+                    val quote = tag[pos]
+                    pos++
+                    val valStart = pos
+                    while (pos < n && tag[pos] != quote) {
+                        if (++scanned and 511 == 0 && System.nanoTime() >= deadlineNs) {
+                            throw DeadlineExceededException()
+                        }
+                        pos++
+                    }
+                    val value = tag.substring(valStart, pos)
+                    if (pos < n) pos++ // 消耗收尾引號
+                    when (attrName) {
+                        "property", "name" -> propertyName = value
+                        "content" -> content = value
+                        "datetime" -> datetime = value
+                    }
+                } else {
+                    val valStart = pos
+                    while (pos < n && !isAsciiWs(tag[pos]) && tag[pos] != '>') {
+                        if (++scanned and 511 == 0 && System.nanoTime() >= deadlineNs) {
+                            throw DeadlineExceededException()
+                        }
+                        pos++
+                    }
+                    val value = tag.substring(valStart, pos)
+                    when (attrName) {
+                        "property", "name" -> propertyName = value
+                        "content" -> content = value
+                        "datetime" -> datetime = value
+                    }
+                }
+            }
+            // 無值屬性（如 `<meta disabled>`）：略過值解析，繼續。
+        }
+        return MetaAttrs(propertyName, content, datetime)
+    }
+
+    /**
+     * 自 `from` 起尋找 tag 收尾 `>`：引號內的 `>` 不算收尾
+     *（`content="a>>>b"` 是合法 HTML；tag 只在未引號態的 `>` 處結束）。
+     * 無法找到即回 -1（未閉合 tag）；全文掃描 O(n)。
+     */
+    private fun findTagEnd(lower: String, from: Int, deadlineNs: Long): Int {
+        var inQuote: Char? = null
+        var j = from
+        var scanned = 0
+        while (j < lower.length) {
+            if (++scanned and 511 == 0 && System.nanoTime() >= deadlineNs) {
+                throw DeadlineExceededException()
+            }
+            val c = lower[j]
+            val q = inQuote
+            if (q != null) {
+                if (c == q) inQuote = null
+            } else if (c == '"' || c == '\'') {
+                inQuote = c
+            } else if (c == '>') {
+                return j
+            }
+            j++
+        }
+        return -1
+    }
+
+    /**
+     * 單趟、前向游標的 published 抽取器（O(n)；取代先前 META_PUBLISHED／
+     * META_PUBLISHED_REV／TIME_DATETIME 三 regex 的病態回溯風險）。
+     *
+     * 先掃 `<meta` 候選（依文件順序），每候選標籤以引號感知的掃描取得 `>`
+     * 收尾（`content="a>>>b"` 內的 `>` 不算收尾），再切出
+     * `property`／`name`＋`content` 屬性對，`property`／`name` 值（大小寫不
+     * 敏感）與五個 published alias 比對（article:published_time／datePublished／
+     * publish_date／pubdate／dc.date），命中即回 `unescapeHtml(content)`；
+     * 否則續掃。無匹配時再掃 `<time datetime>` 候選同法解析。
+     * 對抗性 `<meta a` 鏈（無 `>`）：首個候選即整段掃描收尾，之後無後續
+     * 候選——整體線性。
+     */
+    fun publishedOf(html: String, deadlineNs: Long = Long.MAX_VALUE): String? {
+        if (System.nanoTime() >= deadlineNs) throw DeadlineExceededException()
+        // ASCII 摺疊（長度不變）：所有 needle 皆 ASCII。
+        val lower = buildString(html.length) {
+            for (c in html) append(if (c in 'A'..'Z') c + 32 else c)
+        }
+        var cursor = 0
+        while (true) {
+            if (System.nanoTime() >= deadlineNs) throw DeadlineExceededException()
+            val p = lower.indexOf("<meta", cursor)
+            if (p < 0) break
+            if (!isTagNameBoundary(lower, p + "<meta".length)) {
+                cursor = p + 1
+                continue
+            }
+            val tagEnd = findTagEnd(lower, p, deadlineNs)
+            if (tagEnd < 0) break // 未閉合 tag：無更多可解析候選
+            val attrs = parseTagAttrs(html.substring(p, tagEnd + 1), deadlineNs)
+            val name = attrs.propertyName?.lowercase()
+            if (name != null && name in PUBLISHED_ALIASES && !attrs.content.isNullOrBlank()) {
+                return unescapeHtml(attrs.content)
+            }
+            cursor = tagEnd + 1
+        }
+        cursor = 0
+        while (true) {
+            if (System.nanoTime() >= deadlineNs) throw DeadlineExceededException()
+            val p = lower.indexOf("<time", cursor)
+            if (p < 0) break
+            if (!isTagNameBoundary(lower, p + "<time".length)) {
+                cursor = p + 1
+                continue
+            }
+            val tagEnd = findTagEnd(lower, p, deadlineNs)
+            if (tagEnd < 0) break
+            val attrs = parseTagAttrs(html.substring(p, tagEnd + 1), deadlineNs)
+            if (!attrs.datetime.isNullOrBlank()) {
+                return unescapeHtml(attrs.datetime)
+            }
+            cursor = tagEnd + 1
+        }
         return null
     }
 
     /** 線性去 tag（無 regex）：`<` 至下一個 `>`（含）視為一個 tag，輸出單一空白；若無 `>` 則捨棄其餘字串。 */
-    private fun stripTags(html: String): String {
+    private fun stripTags(html: String, deadlineNs: Long = Long.MAX_VALUE): String {
         val sb = StringBuilder(html.length)
         var i = 0
         while (i < html.length) {
+            if (System.nanoTime() >= deadlineNs) throw DeadlineExceededException()
             val lt = html.indexOf('<', i)
             if (lt < 0) {
                 sb.append(html, i, html.length)
@@ -1136,8 +1426,8 @@ private object HtmlExtract {
         return sb.toString()
     }
 
-    fun stripText(html: String): String =
-        unescapeHtml(stripTags(html)).let { Spaces.replace(it, " ").trim() }
+    fun stripText(html: String, deadlineNs: Long = Long.MAX_VALUE): String =
+        unescapeHtml(stripTags(html, deadlineNs)).let { Spaces.replace(it, " ").trim() }
 
     private fun decodeCodePoint(cp: Int?): String? =
         if (cp != null && cp in 0..0x10FFFF && (cp < 0xD800 || cp > 0xDFFF)) String(Character.toChars(cp)) else null

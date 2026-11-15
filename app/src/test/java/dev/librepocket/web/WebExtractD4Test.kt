@@ -1413,6 +1413,66 @@ class WebExtractD4Test {
         assertTrue(out.envelope.contains(WebContentEnvelope.END))
     }
 
+    // ---- I. deadline／線性掃描回歸 ----
+
+    @Test fun parseHtmlWithPastDeadlineThrows() {
+        // 內部 parseHtml：deadline 已過 → DeadlineExceededException（不映射、不吞沒）
+        org.junit.Assert.assertThrows(DeadlineExceededException::class.java) {
+            parseHtml(html(), "https://example.com/", System.nanoTime() - 1)
+        }
+    }
+
+    @Test fun cleanFieldPastDeadlineThrows() {
+        // adversarial 嵌套 marker：deadline 已過 → DeadlineExceededException
+        org.junit.Assert.assertThrows(DeadlineExceededException::class.java) {
+            WebContentEnvelope.cleanField(
+                "\u200B".repeat(2048) + WebContentEnvelope.BEGIN.repeat(64),
+                System.nanoTime() - 1,
+            )
+        }
+    }
+
+    @Test fun stripScriptAndStyleBoundaryFixture() {
+        // tag-name 邊界：`<scripture>`／`<scripturex>` 不可誤判為 `<script>`；
+        // 合法 `<script type="text/x">` 必須剝除；title 不受影響。
+        val doc = """<html><head><title>RealTitle</title></head><body><scripture>Visible</scripture><script type="text/x">hidden</script>AfterText</body></html>"""
+        val content = parseHtml(doc, "https://example.com/")
+        assertTrue("parseHtml 應成功，got null", content != null)
+        assertTrue("snippet 必須保留非標籤段落 Visible，got ${content!!.snippet}", content.snippet.contains("Visible"))
+        assertFalse("script 標籤內容必須被剝除", content.snippet.contains("hidden"))
+        assertTrue("title 後的正文必須保留", content.snippet.contains("AfterText"))
+        assertEquals("RealTitle", content.title)
+    }
+
+    @Test fun titleTagBoundaryFixture() {
+        // tag-name 邊界（titleOf 同樣適用）：`<titlex>` 不可誤判為 `<title>`，
+        // 正確的 `<title>` 仍須命中。
+        val doc = """<html><head><titlex>not a title</titlex><title>RealTitle</title></head><body><p>body text</p></body></html>"""
+        val content = parseHtml(doc, "https://example.com/")
+        assertTrue(content != null)
+        assertEquals("RealTitle", content!!.title)
+    }
+
+    @Test fun metaPublishedLinearFixture() = runBlocking {
+        // 44,800 字元、全無 `>` 的 `<meta a` 鏈：舊三-regex 實作於此退化至
+        // 秒級且隨長度二次方增長；新單趟解析器為 O(n)，10s 內完成。
+        // published 必為 null（無任何可解析候選）；其餘 outcome（Ok/Failed）皆接受。
+        val dns = publicDns("example.com")
+        val http = FakeExtract { okResp("<meta a".repeat(6400)) }
+        val svc = WebExtractService(http)
+        val outcome = withTimeout(10_000) {
+            svc.extract("https://example.com/meta", resolver = dns)
+        }
+        assertTrue(
+            "outcome 僅可為 Ok 或 Failed，got $outcome",
+            outcome is WebExtractOutcome.Ok || outcome is WebExtractOutcome.Failed,
+        )
+        (outcome as? WebExtractOutcome.Ok)?.let {
+            assertTrue("published 必為 null，got ${it.content.published}", it.content.published == null)
+        }
+        assertEquals(1, http.calls.get())
+    }
+
     // ---- registry 形狀：executionReady=false、投影存在但模型不可見 ----
 
     @Test fun webExtractRegistryShapeStaysNotExecutable() {

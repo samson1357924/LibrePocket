@@ -270,15 +270,15 @@ class FastRouter(
          * - 完全處理：zero-width／default-ignorable／separator／combining mark／
          *   punctuation／symbol／PUA／Cc/Cf 碼點，Lm modifier letters
          *   （`ˇ` U+02C7、`ˉ` U+02C9、阿拉伯 tatweel U+0640、`々` U+3005 等 400+ 碼點），
-         *   以及所有 Nd/No 數字（含非 ASCII，如 U+09E8（Bengali digit two）等）
+         *   所有 Nd/No/Nl 數字（含非 ASCII 與 NFKC-stable Nl，如 U+2180 羅馬數字），
          *   作為分隔符拆開的 CJK 否定詞，以及全形 Latin/digit 否定句（經 NFKC）
          *   ——皆不執行（澄清或 no-match DENIED）。
          * - 亦已處理：ASCII-alphanumeric in-run splitter
          *   （`不2查`、`別¹查` 類 NFKC digit、`不™查`、`別½查`）——removed pass
          *   剝離後接合回連續 hint。
          * - NOT closed（記錄在案，監測）：
-         *   (a) negation run 中可見的非 Lm CJK 字母（含漢字數字，例如 `不一查`）——無法避免
-         *       （hint 即 letter runs）；
+         *   (a) negation run 中可見的非 Lm 字母（含非 Nl 的 CJK 漢字，
+         *       例如 `不一查`）——無法避免（hint 即 letter runs）；
          *   (b) 混合文字同形字（Cyrillic/Greek lookalikes；例如 `nеver` 用 U+0435）
          *       未折疊——Phase 2/3 再評估 confusable folding；
          *   (c) 英文覆蓋為 best-effort，限於列舉動詞
@@ -577,7 +577,7 @@ class FastRouter(
         // fail-safe 方向）。
         // spaced 維持原樣不動（須保住 ASCII `\b` 以匹配英文 hint；它本就保留
         // `\p{N}` 與 ASCII 字母，EN hint 由本 pass 以 `\b`-錨定匹配）。
-        private val NEGATION_REMOVED = Regex("[^\\p{L}]+|\\p{Lm}+|[A-Za-z0-9]+|[\\u115F\\u1160]+")
+        private val NEGATION_REMOVED = Regex("[^\\p{L}]+|\\p{Lm}+|\\p{Nl}+|[A-Za-z0-9]+|[\\u115F\\u1160]+")
         private val NEGATION_SPACED = Regex("[^\\p{L}\\p{N}]+|[\\u30FC\\u115F\\u1160]+")
 
         /**

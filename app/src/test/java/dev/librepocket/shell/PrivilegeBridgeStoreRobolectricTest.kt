@@ -1,12 +1,18 @@
 package dev.librepocket.shell
 
 import android.content.Context
+import androidx.datastore.core.DataStore
+import androidx.datastore.preferences.core.PreferenceDataStoreFactory
+import androidx.datastore.preferences.core.Preferences
+import androidx.datastore.preferences.core.edit
 import androidx.test.core.app.ApplicationProvider
 import java.io.File
+import java.io.IOException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
 import org.junit.After
 import org.junit.Assert.assertEquals
@@ -88,6 +94,68 @@ class PrivilegeBridgeStoreRobolectricTest {
 
         // 後續 load() 仍為 null
         assertNull(restartStore.load())
+    }
+
+    @Test fun selfHealEditFailure_loadReturnsNullAndMarkerAndJournalRemain() = runBlocking {
+        // self-heal edit 也失敗時：load() 回 null；pending marker 與 journal 必須殘留（下次啟動重試自癒）。
+        val scope = CoroutineScope(Dispatchers.IO + SupervisorJob()).also { testScopes += it }
+        val prefsFile = File(context.noBackupFilesDir, "self_heal_fail.preferences_pb")
+        val markerFile = File(context.noBackupFilesDir, "self_heal_fail.pending")
+        try {
+            val backing = PreferenceDataStoreFactory.create(scope = scope) { prefsFile }
+            backing.edit { prefs ->
+                prefs[PRIVILEGE_GRANT_PROVIDER_ID] = "preset:openai"
+                prefs[PRIVILEGE_GRANT_CONFIG_REVISION] = 5L
+                prefs[PRIVILEGE_GRANT_AT_MS] = 1L
+                prefs[PRIVILEGE_REVOKE_JOURNAL] = true
+            }
+            // 所有寫入皆失敗的 DataStore 假件：self-heal 的 edit 必敗。
+            val failing = object : DataStore<Preferences> by backing {
+                override suspend fun updateData(
+                    transform: suspend (t: Preferences) -> Preferences,
+                ): Preferences = throw IOException("self-heal blocked")
+            }
+            assertTrue(markerFile.createNewFile())
+
+            val store = PrivilegeBridgeStore(failing, revokeMarker = PendingRevokeMarker(markerFile))
+            assertNull("self-heal failure must fail-closed to null", store.load())
+            assertTrue("marker must remain pending when the self-heal edit fails", markerFile.exists())
+            val prefsAfter = backing.data.first()
+            assertEquals(true, prefsAfter[PRIVILEGE_REVOKE_JOURNAL])
+            assertEquals("preset:openai", prefsAfter[PRIVILEGE_GRANT_PROVIDER_ID])
+        } finally {
+            prefsFile.delete()
+            markerFile.delete()
+        }
+    }
+
+    @Test fun journalSelfHealEditFailure_loadReturnsNullAndJournalRemains() = runBlocking {
+        // 無 marker、僅 journal 殘留：journal 自癒 edit 失敗 → null、journal 保留（下次啟動重試自癒）。
+        val scope = CoroutineScope(Dispatchers.IO + SupervisorJob()).also { testScopes += it }
+        val prefsFile = File(context.noBackupFilesDir, "journal_self_heal_fail.preferences_pb")
+        try {
+            val backing = PreferenceDataStoreFactory.create(scope = scope) { prefsFile }
+            backing.edit { prefs ->
+                prefs[PRIVILEGE_GRANT_PROVIDER_ID] = "preset:openai"
+                prefs[PRIVILEGE_GRANT_CONFIG_REVISION] = 5L
+                prefs[PRIVILEGE_GRANT_AT_MS] = 1L
+                prefs[PRIVILEGE_REVOKE_JOURNAL] = true
+            }
+            val failing = object : DataStore<Preferences> by backing {
+                override suspend fun updateData(
+                    transform: suspend (t: Preferences) -> Preferences,
+                ): Preferences = throw IOException("journal self-heal blocked")
+            }
+
+            // in-memory-only marker：isPending()==false，journal 分支必須獨立擋下復活。
+            val store = PrivilegeBridgeStore(failing, revokeMarker = PendingRevokeMarker(null))
+            assertNull("journal self-heal failure must fail-closed to null", store.load())
+            val prefsAfter = backing.data.first()
+            assertEquals(true, prefsAfter[PRIVILEGE_REVOKE_JOURNAL])
+            assertEquals("preset:openai", prefsAfter[PRIVILEGE_GRANT_PROVIDER_ID])
+        } finally {
+            prefsFile.delete()
+        }
     }
 
     @Test fun corruptedPreferencesSelfHealsViaCorruptionHandler() = runBlocking {

@@ -20,8 +20,10 @@ import kotlinx.coroutines.withContext
  *   不得只清表而不關開關。
  *
  * #136-B1 持久化（Store 授權真相源）：
- * - 橋接授權的持久真相源是 [PrivilegeBridgeStore]（DataStore，四鍵：
- *   providerId／configRevision／grantedAt／expiresAt）；記憶體旗標
+ * - 橋接授權的持久真相源是 [PrivilegeBridgeStore]（DataStore，五鍵：
+ *   providerId／configRevision／grantedAt／expiresAt／revoke_journal——
+ *   journal 為撤權意圖日誌：撤銷先寫入、擦除後移除；殘留時 [PrivilegeBridgeStore.load]
+ *   自癒擦除並回 null）；記憶體旗標
  *   [bridgeGranted] 只是快取，唯一同步點是 [grant]／[refresh]／[revoke]：
  *   [grant] 落庫後才置旗，[refresh] 每次重讀 Store 新鮮判定後同步旗標，
  *   [revoke] 先清庫（＋可選跨域 `withdrawScope`）再清記憶體；

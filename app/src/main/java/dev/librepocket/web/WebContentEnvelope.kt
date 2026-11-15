@@ -80,7 +80,7 @@ object WebContentEnvelope {
      * 反覆至不動點即返回。終止性：NFKC 僅首輪可擴張（展開為單字元有限映射；
      * 首輪後無待展開字元，其後 nfkc 至多合併／重排，長度不增、碼點數不增）；
      * 自第二輪起每輪或達不動點、或碼點數嚴格下降，刪除輪次數以首輪
-     * 正規化後長度為上界，故必於有限輪內收斂（最壞 O(n²) 總工作量上界（輪數 ≤ 首輪正規化後長度））。
+     * 正規化後長度為上界，故必於有限輪內收斂（最壞 O(n²) 總工作量上界（輪數 ≤ 首輪正規化後長度；NFKC 冪等））。
      * 注意：`strip` 非冪等（先剝 BEGIN、後剝 END）：END 之移除可於接縫「造」出
      * 新的 BEGIN（實測例：`<<<EXTERNAL_UNTRUSTED_CONTENT<<<END_EXTERNAL_UNTRUSTED_CONTENT>>>>>>`
      * 單輪後留下 `<<<EXTERNAL_UNTRUSTED_CONTENT>>>`；實測未造出 END），故單輪不足以

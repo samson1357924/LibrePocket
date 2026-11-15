@@ -167,7 +167,7 @@ internal class DeadlineExceededException : RuntimeException()
  *    case／percent-encoding 差異會產生重複 key——只是浪費，非正確性問題）
  *    ＋`maxBytes`＋`maxModelChars`＋`policy`＋`configRevision`
  *    ＋**hop-0 已核准位址集合**（[sortedDistinctAddressTokens]：位元組去重＋
- *    `(大小, 位元組序)` 排序＋`hostAddress` join；length-prefix 附於 key 尾端；
+ *    （位元組數, `contentToString()`）排序＋`hostAddress` join；length-prefix 附於 key 尾端；
  *    round-robin 返回答案順序不影響 key）；不同首跳解析答案不互撞——
  *    resolver／endpoint 身份仍**刻意不入 key**，binding 的是當次決策之**結果**
  *    （已核准位址集合），per-call 政策重驗仍是真正的權威；同一 URL 以不同 resolver
@@ -537,8 +537,8 @@ private const val ENTRY_OVERHEAD_BYTES = 256L
  * 記錄該跳**實際被評估並建連**之絕對 URL（fragment 已去除）及當次解析並授權之
  * 位址集合（[sortedDistinctAddressTokens]：去重＋排序之 `hostAddress` 列表）。
  * 逐跳資訊使 cache 命中可逐跳重驗，關閉（僅對 cache 面）redirect 逐跳綁定殘留。
- * token 為 `hostAddress` 字串：PUBLIC／LOOPBACK／PRIVATE 答案之字元集僅 digits／`.`／`:`／`-`
- *（IPv4 dotted／IPv6 冒號 hex）；含 zone id（scoped，如 `fe80::1%eth0`）之位址會攜帶 `%`，
+ * token 為 `hostAddress` 字串：PUBLIC／LOOPBACK／PRIVATE 答案之字元集僅 `0-9 a-f . :`（IPv4 dotted／IPv6 十六進位；無 `%`/`-`，見下）
+ *（IPv4 dotted／IPv6 冒號 hex；`hostAddress` 本身不含 `-`——IPv6 scope id 之介面名（如 `eth0`）可能含字母／`-`，但 link-local scoped 答案一律不會通過政策閘）；含 zone id（scoped，如 `fe80::1%eth0`）之位址會攜帶 `%`，
  * 但 link-local scoped（區域連結）答案一律不會通過政策閘；縱使出現 `%`，
  * length-prefix 編碼不受影響。
  * 任何 token 皆不含 `\u0001`／控制字元，可安全 join 與 length-prefix。
@@ -557,7 +557,7 @@ internal data class CacheHit(
 /**
  * 解析後位址集合之正規化 token 列表：先以位元組 `contentToString()` 去重
  *（同一 seeder 之 round-robin 多次答案不重複計入），再依
- * `(位元組大小, 位元組序)` 排序（大小順序容差：不同答案順序產生相同 token），
+ * （位元組數, `contentToString()`）排序（決定性全序；與解析順序無關），
  * 最後以 `hostAddress` 呈現。cache key 綁定與（後續）鏈式驗證共用同一實作，
  * 避免兩套排序／去重邏輯漂移。
  */
@@ -575,7 +575,7 @@ internal fun sortedDistinctAddressTokens(addresses: List<InetAddress>): List<Str
  *  ＋`maxModelChars`＋policy identity（[EndpointNetworkOptIn.policy]＋
  *  [EndpointNetworkOptIn.configRevision]）
  *  ＋**hop-0 經當次重驗解析並授權之位址集合**（[addressToken]：先以位元組
- *  `contentToString()` 去重，再依 `(位元組大小, 位元組序)` 排序，以 `hostAddress`
+ *  `contentToString()` 去重，再依（位元組數, `contentToString()`）排序，以 `hostAddress`
  *  join 為 `,`；length-prefix 附於 key 尾端）；不同預算／不同 tier／
  *  不同 revision／不同首跳解析答案絕不互撞；`round-robin` 返回答案順序不影響 key；
  *  key 不含 resolver／endpoint 身份（per-call 重驗才是真正的權威），hop-0 位址
@@ -588,14 +588,14 @@ internal fun sortedDistinctAddressTokens(addresses: List<InetAddress>): List<Str
  *   `false` 不變）。
  * - entry 攜帶**逐跳信任上下文鏈**（[HopBinding]：url＋該跳已核准位址集合之
  *   sorted token；空鏈＝internal scaffold `put()` 之條目，無從重驗、沿用舊命中語義）。
- *   命中時（[getHitByKey]）呼叫方（`WebExtractService`）必須逐跳重驗：
+ *   命中時（[getHitByKey]）呼叫方（`WebExtractService`）必須逐跳重驗（攜帶 chain 之條目；
+ *   空鏈 scaffold `put()` 條目無從重驗——point (a) 對之沿用舊命中語義，鎖內直接命中、零 DNS／policy）：
  *   每跳 `evaluateUrl` 必須 allowed、且當次解析之 token 必須與記錄一致；
  *   任一跳不符即視為 miss、重打 upstream 並覆寫 entry——**不得回傳該 Ok**。
  *   代價：每次 hit 額外 L×(DNS+policy) 驗證成本（L＝chain 長度）；見
  *   header「快取」與 header「D3 追蹤項」#1。
  * - 快取命中仍須 per-call 政策重驗（含 DNS preflight，fail-closed）：相同
- *  `policy`＋`configRevision` 但不同首跳解析答案（或不同 resolver／endpoint 安全上下文）
- *  不得重用結果——key 已綁 hop-0 位址集合，不同解析答案根本不會命中；
+ *  `policy`＋`configRevision` 但不同首跳解析答案不得重用結果——key 已綁 hop-0 位址集合，不同解析答案根本不會命中；
  *  redirect 逐跳之信任上下文由 entry 之 [HopBinding] 鏈逐跳重驗把關（不符即 miss），
  *  重驗失敗（denial／TIMEOUT）不讀取快取；重驗本身不 purge
  *   快取；授權撤銷僅能經 `invalidate()`／bump `configRevision` 生效；跨 tier
@@ -664,7 +664,7 @@ class WebExtractCache(
 
     /**
      * hop-0 位址集合之字串 token（去重＋排序後 `hostAddress` join 為 `,`；空集合 → 空字串）。
-     * 僅 supply [key] 使用；token 本身不含分隔符 `\u0001`（hostAddress 只有 digits／`.`／`:`／`,`），
+     * 僅 supply [key] 使用；token 本身不含分隔符 `\u0001`（hostAddress 字元集僅 `0-9 a-f . :`，無 `\u0001` 及控制字元；`,` 為 join 分隔符，非 hostAddress 之字元），
      * 且以 length-prefix 附於 key 尾端，杜絕與 URL／budget 三域互混。
      */
     private fun addressToken(addresses: List<InetAddress>): String =
@@ -809,8 +809,8 @@ class WebExtractCache(
  *   [HopBinding] 鏈逐跳重驗（不符即 miss）；follower 之 chain-face 仍為
  *   D3 pinning-identity 殘留；
  *   快取 key 刻意不含 resolver／endpoint 身份；重驗失敗不讀取快取；
- *   命中前仍須 per-call 政策重驗（含 DNS preflight），不同 resolver／endpoint
- *   同 policy＋revision 不得重用結果；重驗本身不 purge 快取；
+ *   命中前仍須 per-call 政策重驗（含 DNS preflight），不同首跳解析答案
+ *   （同 policy＋revision 亦然）不得重用結果；重驗本身不 purge 快取；
  *   授權撤銷／政策變更後必須 `invalidate()`（或 bump `configRevision`）重綁，
  *   否則舊決策內容仍會命中。
  * - 同 key 併發合流（leader 打、follower `await()`；follower 取消不影響 leader）。
@@ -834,7 +834,7 @@ class WebExtractService(
      * 撤銷原語：revocation primitive。
      *
      * - `cache.clear()`（bump generation epoch 與清空 map 同一 map 臨界區）：
-     *   invalidate() 之前建立之快取條目永遠無法再被回傳。
+     *   invalidate() 完成後，invalidate 前建立之條目任何 lookup 皆 miss（map 已清空＋epoch 已 bump；其後由新 leader Ok 寫入之條目為合法新命中）。
      * - 排空當前 in-flight entries：`inFlight` 內所有 pending leader 之
      *   `CompletableDeferred` 以 `CancellationException("web.extract invalidated")`
      *   完成（exceptionally）。已 detach 之 follower 經 `await()` 收到
@@ -845,7 +845,8 @@ class WebExtractService(
      *   直接 miss 並重打 upstream）；
      *   此外，[verifiedCachedHit] 之逐跳重驗完成、回傳 Ok 之前會再做一次
      *   generation epoch re-check——僅當 `invalidate()` 於該 re-check 執行之前
-     *   已完成，hit 才被抑制；validation 於 revoke 之前開始之 hit
+     *   已完成，hit 才被抑制；除下述 re-check→Ok 交付窗口外，
+     *   validation 於 revoke 之前開始之 hit
      *   亦不得於撤權後藉 THIS 路徑落地（視為 miss，走 caller
      *   之 stale/restart 或 refetch 路徑）。惟 re-check 並非絕對：
      *   若撤權完成於 re-check 之後、`Ok` 交付 caller 之前那段
@@ -857,7 +858,7 @@ class WebExtractService(
      *   (i) 已 join 之 follower 於 drain 之前收到 leader 已完成之 Ok（pre-drain Ok completion）；
      *   (ii) [verifiedCachedHit] 之 post-validation epoch re-check 已通過、revocation
      *   於該 re-check 與交付 caller 之間之窗口內完成之 post-revoke Ok（見上條）。
-     *   此兩者皆為刻意保留之語義，不再經 cache 路徑落地。
+     *   兩者皆發生於交付呼叫端之前的無懸掛點窗口，不經 cache 寫回、不再導致二次落地。
      *   in-flight 路徑依 detached 語義處理：已 join 之 follower 於 drain 前
      *   收到 leader 已完成之 Ok（leader 自身 caller 同理）；drain 時仍 pending
      *   者收到 `CancellationException("web.extract invalidated")` → 映射
@@ -985,9 +986,8 @@ class WebExtractService(
                 //     失敗（absent／token mismatch／policy denial／TIMEOUT）者
                 //     視為不可信，直接走 leader／join election（refetch 覆寫
                 //     entry），**絕不於鎖內重跑 DNS／policy**；
-                //   - 僅空鏈 scaffold 條目（無從重驗、零 DNS 成本）可於鎖內直接
-                //     命中——此路徑僅在 point (a) 之後、election 之前寫入的新
-                //     entry 才可能走到（與 point (a) 對空鏈條目的語義一致）。
+                //   - 僅 internal scaffold `put()` 之空鏈條目可於鎖內直接命中
+                //     （與 point (a) 對空鏈條目的語義一致）。
                 if (cache.currentGeneration != epochAtEntry) {
                     stale = true
                 } else {
@@ -1129,7 +1129,7 @@ class WebExtractService(
      * per-call 重驗合流執行；重驗本身不寫快取、不 purge 快取。本函式**僅於 point (a)
      *（鎖外）呼叫**——鎖內（election 臨界區）不得評估 policy／DNS，僅做廉價的
      * epoch-checked `getHitByKey` 讀取（空鏈條目直接命中；point (a) 已判失敗之攜帶 chain
-     * 條目一律走 leader／join election，fetch 覆寫 entry）。重驗完成、回傳 `Ok` 之前會
+     * 條目一律走 leader／join election，fetch 結果覆寫 entry（Ok 且世代未漂移時））。重驗完成、回傳 `Ok` 之前會
      * 再做一次 generation epoch re-check——僅當 `invalidate()` 於該 re-check 執行之前
      * 已完成，本次 hit 才視為 miss（由 caller 之 stale/restart 或 refetch 路徑處理，
      * 同 [WebExtractCache.putByKey] 之內部 guard 模式）。此為必要而非充分條件：

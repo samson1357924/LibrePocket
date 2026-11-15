@@ -120,7 +120,7 @@ object AssistantVoiceHandoff {
                         putLong(VoiceHandoffContract.KEY_TOKEN, token)
                     },
                 )
-                b?.getBoolean("ok", false) == true
+                b?.getBoolean(VoiceHandoffContract.KEY_OK, false) == true
             } catch (_: Exception) {
                 false
             }

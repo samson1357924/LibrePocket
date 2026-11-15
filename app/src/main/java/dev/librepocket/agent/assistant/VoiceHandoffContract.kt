@@ -17,6 +17,7 @@ internal object VoiceHandoffContract {
     const val KEY_TARGET_TASK_ID = "targetTaskId"
     const val KEY_SESSION_INSTANCE_ID = "sessionInstanceId"
     const val KEY_ISSUED_ELAPSED_REALTIME_MS = "issuedElapsedRealtimeMs"
+    const val KEY_OK = "ok"
 
     fun authority(packageName: String): String = "$packageName.voice.handoff"
 }

@@ -4,7 +4,9 @@ import android.app.Activity
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.speech.RecognizerIntent
+import android.util.Log
 import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.ActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.annotation.VisibleForTesting
 import androidx.compose.foundation.layout.Arrangement
@@ -82,7 +84,10 @@ import dev.librepocket.voice.VoiceTts
 import dev.librepocket.voice.VoiceTtsConfirmState
 import dev.librepocket.voice.TtsConfirmDecision
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+
+private const val TAG = "ChatScreen"
 
 /** User-visible text for a chat notice code; unknown codes fall through raw. */
 internal fun chatNoticeText(code: String): String =
@@ -308,20 +313,54 @@ fun ChatScreen(
             pendingSpeak = null
         }
     }
-    // F1/P2 single-owner 單飛閘（Stage C）：所有 STT 啟動一律經 sttArbiter 決策，
-    // 一次最多一枚 RecognizerIntent；消費仍由呼叫點的一次性 callback 負責。
+    // F1/P2 single-owner 單飛閘（Stage C）：所有 STT 啟動一律經 sttArbiter 決策；
+    // 同時最多一枚 arm 持有閘，watchdog 釋放的懸掛 recognizer 可能與其 successor 並存——
+    // 結果歸屬以各 launch 的 slot（本檔）與 generation（sttArbiter）精確對應；
+    // 消費仍由呼叫點的一次性 callback 負責。
     // sttArbiterState 為 currentInFlight 的 compose 鏡像（arm 承認／result settle 時翻轉，
     // 重觸發上方統一決策效應續行下一 arm）；userVoiceArmed 為 mic 鈕的一次態 arm
     //（閘忙時按住佇列一次，settle 後續行）。
     val sttArbiter = remember { VoiceSttArbiter() }
     var sttArbiterState by remember { mutableStateOf<VoiceSttArmKind?>(null) }
+    // 每枚進行中 launch 各自佔一個回呼 slot（共 2 枚）：slotBusy 標記佔用、slotGen 記錄該 slot 對應的
+    // admit generation（launch 時自 currentGeneration 讀取，即剛承認的那一枚 arm 的 generation）。
+    // result callback 以 slot 歸屬配對——每枚 pending launch 各自佔 slot、歸屬精確，不受回傳順序影響
+    // （先回哪一枚都命中自己的 slot）；never-deliver 的 launch 會留 busy slot，於其最終回傳時釋放，
+    // 或經 watchdog 釋放後由 successor 重新承認（successor 佔另一 slot）；兩 slot 全忙（僅 watchdog
+    // 釋放 successor 後的殘餘 wedge）時，新 launch 降級 launched=false、閘立即釋放。plain remembered
+    // arrays（非 compose state），供 non-compose 回呼與 launchSystemStt() 直接讀寫。
+    /** 兩 slot：watchdog 釋放後懸掛的 launch 與其 successor 並存，各佔一枚；slot 不主動回收——提前歸還會破壞 late return 的結果歸屬，僅由各自 late return 釋放。 */
+    val slotBusy = remember { booleanArrayOf(false, false) }
+    val slotGen = remember { longArrayOf(0L, 0L) }
     var userVoiceArmed by remember { mutableStateOf(false) }
-    val sttLauncher = rememberLauncherForActivityResult(
-        ActivityResultContracts.StartActivityForResult(),
-    ) { result ->
-        // STT 結果回呼一律先結算單飛閘：無論 resultCode／降級路徑，恰一次 onResultSettled()。
-        sttArbiter.onResultSettled()
-        sttArbiterState = null
+    fun handleSttResult(slot: Int, result: ActivityResult) {
+        // STT 結果回呼一律先結算單飛閘：以該 slot 登記的 admit generation 配對
+        // （onResultSettled(gen) 對 watchdog 後承認的 successor gen 是 no-op），無論
+        // resultCode／降級路徑，至多一次 onResultSettled(gen)。鏡像同步自閘（不是無條件清空）
+        // ——stale callback 不得在 successor 仍持有閘時把鏡像清掉；release 簿記不因下方 stale
+        // 判定而跳過。本 slot 隨即釋放。
+        val gen = slotGen[slot]
+        // 「gate 仍歸屬本次啟動」必須在下方 settle 之前擷取：新鮮結果由 settle 釋放 slot
+        // （currentInFlight 隨即為 null），若於 bookkeeping 後才讀取，會把新鮮結果誤判為
+        // stale 而不寫入草稿；這正是 stale（watchdog 釋放、無 successor、generation 不動）
+        // 與 fresh（settle 剛釋放）的分歧點。
+        val stillAdmitting = !isStaleVoiceResult(gen, sttArbiter.currentGeneration, sttArbiter.currentInFlight)
+        if (gen != 0L) sttArbiter.onResultSettled(gen)
+        slotBusy[slot] = false
+        slotGen[slot] = 0L
+        sttArbiterState = sttArbiter.currentInFlight
+        // stale 判定（isStaleVoiceResult，VoiceSttArbiter.kt）：slot generation 落後於當代
+        // admitGeneration（successor 已承認超越），或回呼進入當下 gate 已不歸屬本次啟動
+        // （watchdog 釋放後無 successor——generation 不動、slot 已空）。gen == 0L（本檔每次
+        // launch 皆登記，故不會走入；保守視為 fresh）→ 正常路徑。
+        // STALE-SPECIMENS: stale-result 案例（S3-style watchdog 驅逐、successor 超越、gen==0L 保守 fresh）
+        // 釘在 VoiceSttArbiterTest／isStaleVoiceResult 純述詞層；此處不做 Compose 層 stale 模擬——
+        // screen 的 clock 不可注入（documented limitation）。
+        if (gen != 0L && !stillAdmitting) {
+            // stale result from a watchdog-evicted launch: release bookkeeping happened already
+            // (slot freed above); never let a 2-minute-old transcript overwrite the draft.
+            return
+        }
         // TODO(#137): implement explicit auto-send handling before enabling; do not discard prefill results.
         // Runtime contract today: voice results are prefill-only. Even if AUTO_SEND_AFTER_VOICE is
         // flipped prematurely, never silently drop STT results—prefill/error handling below must still run.
@@ -348,7 +387,13 @@ fun ChatScreen(
         }
         // 非 OK（使用者取消）維持手動輸入，不報錯。
     }
-    // true iff sttLauncher.launch was invoked without throwing (degrade paths and exceptions return false).
+    val slot0Launcher = rememberLauncherForActivityResult(
+        ActivityResultContracts.StartActivityForResult(),
+    ) { result -> handleSttResult(0, result) }
+    val slot1Launcher = rememberLauncherForActivityResult(
+        ActivityResultContracts.StartActivityForResult(),
+    ) { result -> handleSttResult(1, result) }
+    // true iff launchSystemStt() invoked the chosen slot launcher without throwing (degrade paths and exceptions return false).
     fun launchSystemStt(): Boolean {
         val probe = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
         // B1：探測必須帶 MATCH_DEFAULT_ONLY，只認「預設可處理」的辨識服務，
@@ -378,10 +423,26 @@ fun ChatScreen(
             putExtra(RecognizerIntent.EXTRA_LANGUAGE, VoiceStt.LANGUAGE)
             putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, VoiceStt.MAX_RESULTS)
         }
+        // 每次 launch 歸屬一個回呼 slot，兩 slot 結果歸屬精確、不受回傳順序影響；2 分鐘無結果由
+        // watchdog 釋放單飛閘（不消費 arm），wedge slot 仍於其 late return 時釋放。
+        val slotIndex = if (!slotBusy[0]) 0 else if (!slotBusy[1]) 1 else -1
+        if (slotIndex == -1) {
+            // 兩 slot 全忙（僅 watchdog 釋放 successor 後的殘餘 wedge）：與 launch 例外同一降級提示。
+            voiceErrors.onSttFailure(VoiceStt.fallbackMessage(DenyReason.NO_PRIVILEGE, VoiceStt.DETAIL_NO_SERVICE))
+            return false
+        }
+        slotBusy[slotIndex] = true
+        slotGen[slotIndex] = sttArbiter.currentGeneration
         return try {
-            sttLauncher.launch(intent)
+            if (slotIndex == 0) {
+                slot0Launcher.launch(intent)
+            } else {
+                slot1Launcher.launch(intent)
+            }
             true
         } catch (_: Exception) {
+            slotBusy[slotIndex] = false
+            slotGen[slotIndex] = 0L
             voiceErrors.onSttFailure(VoiceStt.fallbackMessage(DenyReason.NO_PRIVILEGE, VoiceStt.DETAIL_NO_SERVICE))
             false
         }
@@ -406,8 +467,9 @@ fun ChatScreen(
                 VoiceSttDecision.Wait, VoiceSttDecision.Idle -> break
                 is VoiceSttDecision.Admit -> {
                     val arm = decision.arm
-                    // 任何非取消例外（消費回呼／launchSystemStt 內部未捕捉等）都必須
-                    // 釋放單飛閘並清同影子區域變數，否則閘永久楔住；取消例外照常傳播。
+                    // 任何例外（消費回呼／launchSystemStt 內部未捕捉等，含 CancellationException）
+                    // 都必須先釋放單飛閘並清同影子區域變數，否則閘永久楔住；釋放後
+                    // CancellationException 原樣 rethrow，其餘降級為 STT 失敗提示（見 catch 區塊）。
                     try {
                         when (arm) {
                             VoiceSttArmKind.INITIAL -> {
@@ -416,7 +478,7 @@ fun ChatScreen(
                                 // launchSystemStt() 內 cleanly 降級為 USER_DISABLED／NO_PRIVILEGE。
                                 onVoiceInputConsumed()
                                 val launched = launchSystemStt()
-                                sttArbiter.onLaunchReported(VoiceSttArmKind.INITIAL, launched)
+                                sttArbiter.onLaunchReported(VoiceSttArmKind.INITIAL, launched, sttArbiter.currentGeneration)
                                 if (launched) {
                                     sttArbiterState = VoiceSttArmKind.INITIAL
                                 }
@@ -425,20 +487,20 @@ fun ChatScreen(
                                 retriggerArmed = false
                                 if (onVoiceRetriggerConsumed(voiceRetriggerToken)) {
                                     val launched = launchSystemStt()
-                                    sttArbiter.onLaunchReported(VoiceSttArmKind.RETRIGGER, launched)
+                                    sttArbiter.onLaunchReported(VoiceSttArmKind.RETRIGGER, launched, sttArbiter.currentGeneration)
                                     if (launched) {
                                         sttArbiterState = VoiceSttArmKind.RETRIGGER
                                     }
                                 } else {
                                     // Consume rejected (TTL／provider race)：不啟動，立即釋放閘。
-                                    sttArbiter.onLaunchReported(VoiceSttArmKind.RETRIGGER, launched = false)
+                                    sttArbiter.onLaunchReported(VoiceSttArmKind.RETRIGGER, launched = false, sttArbiter.currentGeneration)
                                 }
                             }
                             VoiceSttArmKind.USER -> {
                                 userArmed = false
                                 userVoiceArmed = false
                                 val launched = launchSystemStt()
-                                sttArbiter.onLaunchReported(VoiceSttArmKind.USER, launched)
+                                sttArbiter.onLaunchReported(VoiceSttArmKind.USER, launched, sttArbiter.currentGeneration)
                                 if (launched) {
                                     sttArbiterState = VoiceSttArmKind.USER
                                 }
@@ -446,8 +508,11 @@ fun ChatScreen(
                         }
                     } catch (t: Throwable) {
                         // 無論例外類型（含 CancellationException）都先歸零影子變數、
-                        // 釋放閘並同步鏡像——閘必須在 rethrow 前釋放，否則早退路徑
-                        // 會留下 inFlight，整個畫面工作階段的語音功能靜默死鎖。
+                        // 釋放閘並同步鏡像——閘必須先釋放，否則殘留 inFlight 會讓
+                        // 整個畫面工作階段的語音功能靜默死鎖。釋放後才做例外判別：
+                        // CancellationException／Error 原樣 rethrow（不得吞）；其餘未預期
+                        // throwable 記錄 Log.w（只記 throwable 本身，不含 payload）並
+                        // 降級為 STT 失敗提示，避免直接讓整個畫面崩潰。
                         when (arm) {
                             VoiceSttArmKind.INITIAL -> initialRequested = false
                             VoiceSttArmKind.RETRIGGER -> retriggerArmed = false
@@ -456,15 +521,26 @@ fun ChatScreen(
                                 userVoiceArmed = false
                             }
                         }
-                        sttArbiter.onLaunchReported(arm, launched = false)
-                        sttArbiterState = null
-                        throw t
+                        sttArbiter.onLaunchReported(arm, launched = false, sttArbiter.currentGeneration)
+                        sttArbiterState = sttArbiter.currentInFlight
+                        if (t is CancellationException || t is Error) throw t
+                        Log.w(TAG, "unexpected throwable in STT arm; gate released, degrading", t)
+                        voiceErrors.onSttFailure(VoiceStt.fallbackMessage(DenyReason.NO_PRIVILEGE, VoiceStt.DETAIL_NO_SERVICE))
                     }
                 }
             }
         }
-        // 保持鏡像與閘一致（涵蓋完全降級後 currentInFlight == null 的收尾）。
+        // 保持鏡像與閘一致（涵蓋完全降級或 watchdog 釋放後 currentInFlight == null 的收尾）。
         sttArbiterState = sttArbiter.currentInFlight
+    }
+    // watchdog 啟動後的主動喚起：RecognizerActivity 懸掛時 recognizer 永不回呼，
+    // 單靠停用的單飛閘會永久卡在 inFlight。到期後把鏡像落下 (null) 以觸發一次 re-decide；
+    // decide() 會在 slot 到期移除後放行下一個 armed arm。
+    LaunchedEffect(sttArbiterState) {
+        if (sttArbiterState != null) {
+            delay(VoiceSttArbiter.RECOGNIZER_WATCHDOG_NANOS / 1_000_000L + 1_000L)
+            sttArbiterState = null
+        }
     }
 
     LaunchedEffect(messages.size, messages.lastOrNull()?.text?.length, session.status, contextOmittedCount) {

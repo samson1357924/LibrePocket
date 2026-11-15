@@ -15,9 +15,9 @@ import java.util.concurrent.atomic.AtomicLong
  * Defense-in-depth caller check for the app-private handoff provider.
  *
  * Same package (including the `:voice` process, which shares [android.content.Context.packageName])
- * is allowed; in-process/Robolectric direct calls (callingPackage == null) are allowed; any other
- * package is rejected. Exported=false in the manifest is the primary boundary; this is
- * belt-and-suspenders so a same-UID third-party package cannot ride the channel.
+ * is allowed; in-process/Robolectric direct calls (callingPackage == null) are allowed; a different
+ * package (even one sharing the app's UID or signing key) is rejected. Exported=false via the
+ * manifest remains the hard boundary; this is belt-and-suspenders so it is not the only one.
  */
 internal fun isCallerAllowed(callerPackage: String?, ownPackage: String?): Boolean =
     callerPackage == null || callerPackage == ownPackage
@@ -62,7 +62,7 @@ class VoiceHandoffProvider : ContentProvider() {
                 val targetTaskId = b.getInt(VoiceHandoffContract.KEY_TARGET_TASK_ID, Int.MIN_VALUE)
                 val sessionInstanceId = b.getLong(VoiceHandoffContract.KEY_SESSION_INSTANCE_ID, Long.MIN_VALUE)
                 val ok = consume(token, targetTaskId, sessionInstanceId)
-                Bundle().apply { putBoolean("ok", ok) }
+                Bundle().apply { putBoolean(VoiceHandoffContract.KEY_OK, ok) }
             }
             VoiceHandoffContract.METHOD_CLEAR -> {
                 val b = extras ?: Bundle()

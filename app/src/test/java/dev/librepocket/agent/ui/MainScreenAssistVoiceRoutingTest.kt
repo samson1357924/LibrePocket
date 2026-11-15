@@ -88,7 +88,8 @@ import org.robolectric.annotation.Config
 
 // Harness for MainScreen voice-routing integration tests. Each piece shares its production
 // counterpart's source of truth rather than mirroring it:
-//   - delivery gate: shouldDeliverVoiceRetrigger import (same function MainScreen uses),
+//   - delivery gate + token derivation: shouldDeliverVoiceRetrigger / voiceRetriggerTokenFor
+//     imports (same functions MainScreen uses),
 //   - pending retrigger source: AssistantVoiceHandoff.pendingFlow() (real provider, not a harness
 //     stand-in MutableStateFlow),
 //   - onVoiceRetriggerConsumed: consumeVoiceRetrigger (production function, the exact code path
@@ -311,21 +312,15 @@ class MainScreenAssistVoiceRoutingTest {
             val currentRoute = backStack?.destination?.route
             val hasEndpoint = g is EndpointGate.Ready
             val navLoading = startupEffectiveLoading(g is EndpointGate.Loading, p)
-            val voiceRetriggerToken = if (
-                shouldDeliverVoiceRetrigger(
-                    pending = pendingRetrigger,
-                    identity = voiceTaskIdentity,
-                    currentRoute = currentRoute,
-                    hasEndpoint = hasEndpoint,
-                    navLoading = navLoading,
-                    viewedSessionId = viewed,
-                    drawerState = drawerState,
-                )
-            ) {
-                pendingRetrigger?.token ?: 0L
-            } else {
-                0L
-            }
+            val voiceRetriggerToken = voiceRetriggerTokenFor(
+                pending = pendingRetrigger,
+                identity = voiceTaskIdentity,
+                currentRoute = currentRoute,
+                hasEndpoint = hasEndpoint,
+                navLoading = navLoading,
+                viewedSessionId = viewed,
+                drawerState = drawerState,
+            )
             val owner = object : ActivityResultRegistryOwner {
                 override val activityResultRegistry: ActivityResultRegistry = registry
             }

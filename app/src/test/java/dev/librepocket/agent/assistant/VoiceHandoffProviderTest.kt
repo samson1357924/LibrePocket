@@ -151,6 +151,23 @@ class VoiceHandoffProviderTest {
     }
 
     @Test
+    fun peekExpired_returnsEmptyBundle() {
+        val now = SystemClock.uptimeMillis()
+        publish(950L, targetTaskId = 10, sessionInstanceId = 7L, issuedUptimeMs = now)
+
+        val freshPeek = newAttachedProvider().call(VoiceHandoffContract.METHOD_PEEK, null, null)!!
+        assertTrue(freshPeek.containsKey(VoiceHandoffContract.KEY_TOKEN))
+        assertEquals(950L, freshPeek.getLong(VoiceHandoffContract.KEY_TOKEN))
+
+        publish(951L, targetTaskId = 10, sessionInstanceId = 7L, issuedUptimeMs = SystemClock.uptimeMillis() - VoiceHandoffContract.RETRIGGER_TTL_MS - 1)
+
+        val expiredPeek = newAttachedProvider().call(VoiceHandoffContract.METHOD_PEEK, null, null)!!
+        assertEquals(0L, expiredPeek.getLong(VoiceHandoffContract.KEY_TOKEN, 0L))
+        assertFalse(expiredPeek.containsKey(VoiceHandoffContract.KEY_TOKEN))
+        assertEquals(0, expiredPeek.keySet().size)
+    }
+
+    @Test
     fun consume_expiredBeyondTtl_returnsFalseAndDropsEntry() {
         val now = SystemClock.uptimeMillis()
         publish(900L, targetTaskId = 10, sessionInstanceId = 7L, issuedUptimeMs = now - VoiceHandoffContract.RETRIGGER_TTL_MS - 1)

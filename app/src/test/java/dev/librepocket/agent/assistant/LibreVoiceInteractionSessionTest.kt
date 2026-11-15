@@ -120,6 +120,11 @@ class LibreVoiceInteractionSessionTest {
             assertEquals(1, session.startedIntents.size)
             assertEquals(0, session.hideCalls)
             assertTrue(session.keepAwakeCalls.contains(false))
+
+            // Task binding survives the keepAwake failure: the finish path still hides exactly once.
+            session.onTaskStarted(null, 42)
+            session.onTaskFinished(null, 42)
+            assertEquals(1, session.hideCalls)
         } finally {
             session.throwOnKeepAwakeOnce = false
         }

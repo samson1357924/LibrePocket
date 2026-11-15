@@ -84,12 +84,19 @@ class VoiceHandoffProvider : ContentProvider() {
             }
             VoiceHandoffContract.METHOD_PEEK -> {
                 val p = _pending.value
-                Bundle().apply {
-                    if (p != null) {
-                        putLong(VoiceHandoffContract.KEY_TOKEN, p.token)
-                        putInt(VoiceHandoffContract.KEY_TARGET_TASK_ID, p.targetTaskId)
-                        putLong(VoiceHandoffContract.KEY_SESSION_INSTANCE_ID, p.sessionInstanceId)
-                        putLong(VoiceHandoffContract.KEY_ISSUED_UPTIME_MS, p.issuedUptimeMs)
+                // Same TTL gate as consume: an expired (or clock-skewed) entry must not leak
+                // its token payload to peekers; report it as absent instead.
+                val age = p?.let { SystemClock.uptimeMillis() - it.issuedUptimeMs }
+                if (age != null && (age < 0 || age > VoiceHandoffContract.RETRIGGER_TTL_MS)) {
+                    Bundle.EMPTY
+                } else {
+                    Bundle().apply {
+                        if (p != null) {
+                            putLong(VoiceHandoffContract.KEY_TOKEN, p.token)
+                            putInt(VoiceHandoffContract.KEY_TARGET_TASK_ID, p.targetTaskId)
+                            putLong(VoiceHandoffContract.KEY_SESSION_INSTANCE_ID, p.sessionInstanceId)
+                            putLong(VoiceHandoffContract.KEY_ISSUED_UPTIME_MS, p.issuedUptimeMs)
+                        }
                     }
                 }
             }

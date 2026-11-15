@@ -222,7 +222,7 @@ fun MainScreen(
     // this activity's identity matches the pending entry's bound task/session AND under the same
     // chat-safe boundary as initial voice delivery.
     val pendingVoiceRetrigger by AssistantVoiceHandoff.pendingFlow().collectAsStateWithLifecycle(initialValue = null)
-    val deliverVoiceRetrigger = shouldDeliverVoiceRetrigger(
+    val voiceRetriggerToken = voiceRetriggerTokenFor(
         pending = pendingVoiceRetrigger,
         identity = voiceTaskIdentity,
         currentRoute = currentRoute,
@@ -231,7 +231,6 @@ fun MainScreen(
         viewedSessionId = viewedSessionId,
         drawerState = drawerState,
     )
-    val voiceRetriggerToken = if (deliverVoiceRetrigger) pendingVoiceRetrigger?.token ?: 0L else 0L
 
     // C2 retrigger 過期/無法投遞收斂：token 超過 TTL 或端點落定後仍不可投遞 → 清除，避免日後 CHAT 進入時補彈 STT。
     // Both instances (normal task + voice task) observe the same flow; only the owning
@@ -633,6 +632,34 @@ internal fun shouldDeliverVoiceRetrigger(
         identity.sessionInstanceId == pending.sessionInstanceId &&
         nowUptimeMs - pending.issuedUptimeMs in 0..VoiceHandoffContract.RETRIGGER_TTL_MS &&
         chatSafeBoundary(currentRoute, hasEndpoint, navLoading, viewedSessionId, drawerState)
+
+/**
+ * C2 retrigger 投遞 token 推導（MainScreen 與接線測試共用單一來源）：
+ * 門禁通過時回傳 pending entry 的 token，否則回傳 0L（ChatScreen 視為無 retrigger）。
+ */
+internal fun voiceRetriggerTokenFor(
+    pending: PendingVoiceRetrigger?,
+    identity: VoiceTaskIdentity?,
+    currentRoute: String?,
+    hasEndpoint: Boolean,
+    navLoading: Boolean,
+    viewedSessionId: String?,
+    drawerState: DrawerState,
+): Long = if (
+    shouldDeliverVoiceRetrigger(
+        pending = pending,
+        identity = identity,
+        currentRoute = currentRoute,
+        hasEndpoint = hasEndpoint,
+        navLoading = navLoading,
+        viewedSessionId = viewedSessionId,
+        drawerState = drawerState,
+    )
+) {
+    pending?.token ?: 0L
+} else {
+    0L
+}
 
 /**
  * C2 session 語音喚起路由與邊界守衛（MainScreen 與接線測試共用單一來源）：

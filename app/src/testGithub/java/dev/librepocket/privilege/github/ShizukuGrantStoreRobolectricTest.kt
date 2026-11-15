@@ -51,19 +51,16 @@ class ShizukuGrantStoreRobolectricTest {
     }
 
     @After fun tearDown() {
+        // 先 cancel scopes 再刪檔（同 bridge 側：避免 in-flight tmp→rename 於刪除後復活檔案）。
+        testScopes.forEach { it.cancel() }
+        testScopes.clear()
         val markerFile = File(context.noBackupFilesDir, SHIZUKU_PENDING_REVOKE_FILE_NAME)
         if (markerFile.exists()) markerFile.delete()
         val corruptedFile = File(context.filesDir, "shizuku_corrupted_test.preferences_pb")
         if (corruptedFile.exists()) corruptedFile.delete()
         // context-constructor 共用的預設 DataStore（preferencesDataStore 落 filesDir/datastore/）：
         // 測試間若殘留授權鍵會跨案例污染自癒斷言，必須刪除。
-        val grantStoreFile = File(context.filesDir, "datastore/librepocket_shizuku_grant.preferences_pb")
-        if (grantStoreFile.exists()) grantStoreFile.delete()
-        val grantStoreTmp = File(context.filesDir, "datastore/librepocket_shizuku_grant.preferences_pb.tmp")
-        if (grantStoreTmp.exists()) grantStoreTmp.delete()
         deleteSharedDataStores()
-        testScopes.forEach { it.cancel() }
-        testScopes.clear()
     }
 
     /** 與 [dev.librepocket.shell.PrivilegeBridgeStoreRobolectricTest] 對稱：setUp／tearDown 皆須刪除兩套授權 DataStore（+.tmp）。 */

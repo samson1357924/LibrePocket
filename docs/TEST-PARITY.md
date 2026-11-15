@@ -10,7 +10,7 @@
 新增測試必須成對新增，並在本檔同步登記（同 PR 更新）。刻意分歧須登錄於下方
 「已知分歧」一節並附理由；未登記的分歧視為缺陷。**
 
-行號以本文檔合入時的 HEAD（d2c9a385）為準；測試檔改動時本檔行號須同步更新。
+行號以本文檔當前對應的測試檔內容為準（本檔建立於 9ec6ac61 後）；測試檔改動時本檔行號須於同一 PR 同步更新（重建方式見附錄）。
 重建對照方式見文末附錄。
 
 ## 表 1 — Store／policy 邏輯鏡像（同名測試；`PrivilegeBridgeGrantTest` ↔ `ShizukuGrantTest`）
@@ -46,13 +46,13 @@ Shizuku 檔案行號：`app/src/testGithub/java/dev/librepocket/privilege/github
 
 | # | bridge 側（file:line） | Shizuku 側（file:line） | 意圖 |
 |---|------------------------|------------------------|------|
-| R1 | `:74` contextConstructorUsesNoBackupFilesDirForPendingRevokeMarker | `:67` 同名 | context-constructor marker 落 noBackupFilesDir |
-| R2 | `:81` contextConstructorNoBackupFilesDirUnavailable_markerInMemoryOnly | `:74` 同名 | noBackupFilesDir 不可用 → in-memory-only、不落備份域 |
-| R3 | `:100` realContextRoundTripAndClear | `:93` 同名 | 真實 context round-trip＋clear |
-| R4 | `:113` pendingRevokeMarkerSelfHealsAcrossRestarts | `:106` 同名 | 跨重啟 marker self-heal |
-| R5 | `:138` selfHealEditFailure_loadReturnsNullAndMarkerAndJournalRemain | `:131` 同名 | self-heal edit 失敗 → null、marker/journal 殘留 |
-| R6 | `:171` journalSelfHealEditFailure_loadReturnsNullAndJournalRemains | `:197` 同名（行號差大於其他行：Shizuku 版位於檔尾） | 無 marker 僅 journal：heal 失敗 → null、journal 保留 |
-| R7 | `:200` corruptedPreferencesSelfHealsViaCorruptionHandler | `:165` 同名 | ReplaceFileCorruptionHandler 損毀修復（行號順序互換，測試本體同構） |
+| R1 | `:75` contextConstructorUsesNoBackupFilesDirForPendingRevokeMarker | `:83` 同名 | context-constructor marker 落 noBackupFilesDir |
+| R2 | `:82` contextConstructorNoBackupFilesDirUnavailable_markerInMemoryOnly | `:90` 同名 | noBackupFilesDir 不可用 → in-memory-only、不落備份域 |
+| R3 | `:101` realContextRoundTripAndClear | `:109` 同名 | 真實 context round-trip＋clear |
+| R4 | `:114` pendingRevokeMarkerSelfHealsAcrossRestarts | `:122` 同名 | 跨重啟 marker self-heal |
+| R5 | `:139` selfHealEditFailure_loadReturnsNullAndMarkerAndJournalRemain | `:147` 同名 | self-heal edit 失敗 → null、marker/journal 殘留 |
+| R6 | `:172` journalSelfHealEditFailure_loadReturnsNullAndJournalRemains | `:213` 同名（行號差大於其他行：Shizuku 版位於檔尾） | 無 marker 僅 journal：heal 失敗 → null、journal 保留 |
+| R7 | `:201` corruptedPreferencesSelfHealsViaCorruptionHandler | `:181` 同名 | ReplaceFileCorruptionHandler 損毀修復（行號順序互換，測試本體同構） |
 
 （bridge 檔案：`app/src/test/java/dev/librepocket/shell/PrivilegeBridgeStoreRobolectricTest.kt`；
 Shizuku 檔案：`app/src/testGithub/java/dev/librepocket/privilege/github/ShizukuGrantStoreRobolectricTest.kt`。）
@@ -68,7 +68,7 @@ Shizuku 檔案：`app/src/testGithub/java/dev/librepocket/privilege/github/Shizu
 | **`FlavorPrivilegeScope`** 與各 flavor scope：github 側＝detach→clear 合成；play/foss＝no-op | 源集差異；合成語義測試僅 github flavor 有意義（見 `FlavorPrivilegeScopeTest`） |
 | **`AT_MS_IN_FUTURE` 等 bridge 專屬碼**（`grantWithFutureAtMs_failsFast`／`AT_MS_IN_FUTURE`／`PRIVILEGE_GRANT_REVOKED_CONCURRENTLY` 等）僅 bridge 側 | github 側無 atMs 過去/未來判定（授權簽發語義不同） |
 | **`ttlExpiryBoundary`／`ttlOverflowThrows`／`negativeTtlFailsFast`／`nullTtlNeverExpires`／`zeroTtlExpiresImmediately`／`storeRoundTripWithoutExpiry`／`clockRollbackInvalidatesGrant`／`checkEvaluatesClockAfterLoadCompletes`／`refreshAndCheck_withPendingMarker_returnInvalid`**：bridge-only | 同「TTL／時鐘注入」；Shizuku 側 policy 無對應概念 |
-| **`journalSelfHealEditFailure…` 行號 158（bridge）vs 197（Shizuku）；`corruptedPreferencesSelfHealsViaCorruptionHandler` 順序互換** | 檔內測試排序不同，測試本體同構；非語義分歧 |
+| **`journalSelfHealEditFailure…` 行號 172（bridge）vs 213（Shizuku）；`corruptedPreferencesSelfHealsViaCorruptionHandler` 順序互換** | 檔內測試排序不同，測試本體同構；非語義分歧 |
 
 ## 未鏡像／缺口（誠實列缺）
 

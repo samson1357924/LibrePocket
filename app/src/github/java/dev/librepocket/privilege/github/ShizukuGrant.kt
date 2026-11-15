@@ -175,7 +175,9 @@ object ShizukuGrantPolicy {
  *     heal 解除，僅 save() 可清（OR 語義）。
  * (iv) 跨 Store 實例共享 marker 檔競態：一方 heal 的 clearPending 可刪掉另一方 clear()
  *     剛落盤的 marker（該方記憶體旗標仍置位，fail-closed；但跨重啟 marker 保障削弱）。
- * (v) ReplaceFileCorruptionHandler 損毀 ⇒ journal 一併消失 ⇒ 表現為「從未授權」（fail-closed）。
+ * (v) ReplaceFileCorruptionHandler 損毀 ⇒ journal 一併消失 ⇒ 表現為「從未授權」（fail-closed）；
+ *     save() 於 edit 之後、clearPending() 之前進程死亡 ⇒ 殘留 marker 讓 load() 即使授權已落盤亦回 null
+ *     （fail-closed、可用性損失，非復活路徑；與 (i) 同族，併 #136-B3 處理）。
  * (vi) heal/wipe 失敗僅 logcat 一行，無 audit 計數。
  * (vii) 本檔測試以單執行緒注入 seam 釘住順序語義；未證明真並行 interleaving 的行為；
  *     並行 save() vs load()-heal 的完整化併 #136-B3 generation fence。

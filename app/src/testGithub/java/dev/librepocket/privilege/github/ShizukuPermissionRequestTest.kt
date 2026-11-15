@@ -366,6 +366,12 @@ class ShizukuPermissionRequestTest {
         // 回呼已回滾：表空，結果到達也不觸發
         requests.emitResult(1001, PackageManager.PERMISSION_GRANTED)
         assertFalse(callbackFired)
+        // CE 路徑照燒碼：回滾只撤回呼，不撤 requestCode 使用權
+        var sent = false
+        assertFalse("CE 路徑燒的碼不得復用 requestWithCallback", requests.requestWithCallback(1001, { }) { sent = true })
+        assertFalse("CE 路徑燒的碼不得復用裸 request", requests.request(1001) { sent = true })
+        assertFalse("CE 路徑燒的碼不得再登記 onResult", requests.onResult(1001) { })
+        assertFalse(sent)
     }
 
     @Test fun detach_removeListenerThrows_doesNotPropagate_andDetaches() {
@@ -411,6 +417,30 @@ class ShizukuPermissionRequestTest {
             org.junit.Assert.fail("expected CancellationException")
         } catch (_: CancellationException) {
             // expected：rethrow，不得吞成 false
+        }
+        // CE 路徑照燒碼：裸請求取消前已 burn，此碼不得再送出／登記
+        var sent = false
+        assertFalse("CE 路徑燒的碼不得再送裸請求", requests.request(1001) { sent = true })
+        assertFalse("CE 路徑燒的碼不得再進 requestWithCallback", requests.requestWithCallback(1001, { }) { sent = true })
+        assertFalse(sent)
+    }
+
+    @Test fun seedRequestCodeCounterForTest_rejectsNonPositiveAndRegress() {
+        val requests = ShizukuPermissionRequests()
+        try {
+            requests.seedRequestCodeCounterForTest(0)
+            org.junit.Assert.fail("expected SEED_MUST_BE_POSITIVE")
+        } catch (e: IllegalArgumentException) {
+            assertEquals("SEED_MUST_BE_POSITIVE", e.message)
+        }
+        val seeded = ShizukuPermissionRequests()
+        seeded.seedRequestCodeCounterForTest(999)
+        assertEquals(999, seeded.allocateRequestCode())
+        try {
+            seeded.seedRequestCodeCounterForTest(500)
+            org.junit.Assert.fail("expected SEED_MUST_NOT_REGRESS_COUNTER")
+        } catch (e: IllegalArgumentException) {
+            assertEquals("SEED_MUST_NOT_REGRESS_COUNTER", e.message)
         }
     }
 

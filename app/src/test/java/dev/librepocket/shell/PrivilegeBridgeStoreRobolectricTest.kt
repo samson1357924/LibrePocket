@@ -45,13 +45,15 @@ class PrivilegeBridgeStoreRobolectricTest {
     }
 
     @After fun tearDown() {
+        // 先 cancel scopes 再刪檔：DataStore 仍有進行中寫入時刪 .preferences_pb
+        // 會讓 in-flight tmp→rename 在刪除後復活檔案——先取消再刪除。
+        testScopes.forEach { it.cancel() }
+        testScopes.clear()
         val markerFile = File(context.noBackupFilesDir, PRIVILEGE_PENDING_REVOKE_FILE_NAME)
         if (markerFile.exists()) markerFile.delete()
         val corruptedFile = File(context.filesDir, "corrupted_test.preferences_pb")
         if (corruptedFile.exists()) corruptedFile.delete()
         deleteSharedDataStores()
-        testScopes.forEach { it.cancel() }
-        testScopes.clear()
     }
 
     /**

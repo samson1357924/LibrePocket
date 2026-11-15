@@ -802,6 +802,94 @@ class PrivilegeBridgeStateTest {
         assertFalse(state.bridgeGranted)
     }
 
+    @Test fun revokeStoreClearCancellation_withWithdrawScopeCancellation_bothCatastrophic() = runBlocking {
+        // store.clear() 拋 CE＋withdrawScope 拋 CE → CE 原樣上拋（非包裝、非 ISE）；
+        // scope 的 CE 以 suppressed 併入主失敗（primary = store 的 CE）。
+        val backing = PreferenceDataStoreFactory.create(scope = scope) {
+            File(dir, "ce_ce.preferences_pb")
+        }
+        val ceStore = PrivilegeBridgeStore(object : DataStore<Preferences> by backing {
+            override suspend fun updateData(transform: suspend (t: Preferences) -> Preferences): Preferences {
+                throw CancellationException("simulated store cancellation")
+            }
+        })
+        val state = PrivilegeBridgeState(
+            bridgeSwitchOn = true,
+            bridgeGranted = true,
+        )
+        state.audit.record(listOf("id"), "B1-ce-ce", "DENY")
+
+        val scopeBoom = CancellationException("simulated scope cancellation")
+        val error = assertThrows(CancellationException::class.java) {
+            runBlocking { state.revoke(ceStore) { throw scopeBoom } }
+        }
+        assertEquals("主失敗必為 store 的 CE", "simulated store cancellation", error.message)
+        // kotlinx 除錯模式把跨 coroutine 失敗邊界的例外複製：呼叫端拿到的副本
+        // suppressed=[]，原件（帶合併的 suppressed）位於 cause 鏈——以 throwableChain
+        // 定位（與 revokeStoreTimeout_withWithdrawScopeIllegalState 同一模式）。
+        // 註：本 runtime（kotlinx-coroutines debug 複製）下，scope 併入的例外在
+        // 呼叫端不可觀測（實測鏈=[scope boom 不可見]）；suppressed 合併機制的
+        // 確定性 pin 見 revokeStoreTimeout_withWithdrawScopeIllegalState_scopeExceptionAsSuppressed。
+        // 此處只釘：CE 以原型別＋訊息逃出、旗標落 false。
+        assertFalse(state.bridgeSwitchOn)
+        assertFalse(state.bridgeGranted)
+    }
+
+    @Test fun revokeStoreClearCancellation_withWithdrawScopeRuntimeFailure_primaryIsCancellation() = runBlocking {
+        // store.clear() 拋 CE＋withdrawScope 拋 IllegalStateException →
+        // CE 原樣上拋；scope 的 ISE 以 suppressed 併入（主失敗維持 CE-first）。
+        val backing = PreferenceDataStoreFactory.create(scope = scope) {
+            File(dir, "ce_ise.preferences_pb")
+        }
+        val ceStore = PrivilegeBridgeStore(object : DataStore<Preferences> by backing {
+            override suspend fun updateData(transform: suspend (t: Preferences) -> Preferences): Preferences {
+                throw CancellationException("simulated store cancellation")
+            }
+        })
+        val state = PrivilegeBridgeState(
+            bridgeSwitchOn = true,
+            bridgeGranted = true,
+        )
+        state.audit.record(listOf("id"), "B1-ce-ise", "DENY")
+
+        val scopeBoom = IllegalStateException("simulated scope boom")
+        val error = assertThrows(CancellationException::class.java) {
+            runBlocking { state.revoke(ceStore) { throw scopeBoom } }
+        }
+        assertEquals("主失敗必為 store 的 CE", "simulated store cancellation", error.message)
+        // 同上註：scope 併入的 ISE 在呼叫端不可觀測；只釘 CE-first 語義與旗標。
+        assertFalse(state.bridgeSwitchOn)
+        assertFalse(state.bridgeGranted)
+    }
+
+    @Test fun revokeStoreClearRuntimeFailure_withWithdrawScopeCancellation_primaryIsRuntimeFailure() = runBlocking {
+        // store.clear() 拋 RuntimeException＋withdrawScope 拋 CE →
+        // 主失敗為 store 的 RuntimeException；scope 的 CE 以 suppressed 併入。
+        val backing = PreferenceDataStoreFactory.create(scope = scope) {
+            File(dir, "re_ce.preferences_pb")
+        }
+        val reStore = PrivilegeBridgeStore(object : DataStore<Preferences> by backing {
+            override suspend fun updateData(transform: suspend (t: Preferences) -> Preferences): Preferences {
+                throw RuntimeException("simulated clear boom")
+            }
+        })
+        val state = PrivilegeBridgeState(
+            bridgeSwitchOn = true,
+            bridgeGranted = true,
+        )
+        state.audit.record(listOf("id"), "B1-re-ce", "DENY")
+
+        val scopeBoom = CancellationException("simulated scope cancellation")
+        val error = assertThrows(RuntimeException::class.java) {
+            runBlocking { state.revoke(reStore) { throw scopeBoom } }
+        }
+        assertEquals("主失敗必為 store 的 RuntimeException", "simulated clear boom", error.message)
+        assertFalse("主失敗不得為 CancellationException", error is CancellationException)
+        // 同上註：scope 併入的 CE 在呼叫端不可觀測；只釘主失敗為 store 的 RuntimeException 與旗標。
+        assertFalse(state.bridgeSwitchOn)
+        assertFalse(state.bridgeGranted)
+    }
+
     @Test fun revokeStoreClearRuntimeFailure_withWithdrawScopeIllegalState_primaryIsRuntimeFailure() = runBlocking {
         // store.clear() 拋 RuntimeException＋withdrawScope 拋 IllegalStateException →
         // 主失敗為該 RuntimeException（不包裝、不折成 ISE、非 CE）。

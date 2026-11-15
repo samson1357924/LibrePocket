@@ -104,7 +104,8 @@ class PrivilegeBridgeState @VisibleForTesting internal constructor(
         message = "In-memory only. Use suspend revoke(store, withdrawScope) in production to ensure DataStore is cleared.",
         replaceWith = ReplaceWith("revoke(store, withdrawScope)"),
     )
-    fun revoke(): Int {
+    @VisibleForTesting(otherwise = VisibleForTesting.PRIVATE)
+    internal fun revoke(): Int {
         revokeEpoch.incrementAndGet()
         bridgeSwitchOn = false
         bridgeGranted = false
@@ -114,8 +115,8 @@ class PrivilegeBridgeState @VisibleForTesting internal constructor(
     /**
      * 僅單測隔離用：記憶體收回（不碰磁碟）。
      */
-    @VisibleForTesting
-    fun revokeInMemoryForTest(): Int = revoke()
+    @VisibleForTesting(otherwise = VisibleForTesting.PRIVATE)
+    internal fun revokeInMemoryForTest(): Int = revoke()
 
     /**
      * 僅單測使用：推進 [revokeEpoch]（不寫任何旗標）；production 不得調用。
@@ -245,7 +246,9 @@ class PrivilegeBridgeState @VisibleForTesting internal constructor(
     /**
      * 新鮮重估：每次重讀 [PrivilegeBridgeStore]（單發射，不快取）＋
      * [PrivilegeGrantPolicy.check] 判定後同步 [bridgeGranted]
-     *（Valid 即 true，其餘一律 false，fail-closed）。
+     *（Valid 即 true，其餘一律 false，fail-closed；與 revoke 併發時旗標由
+     * [publishBridgeGranted] 雙重檢查壓為 false——回傳的 check 與旗標可能不一致，
+     * 以旗標為準）。
      *
      * epoch 不符 ⇒ 視同從未授權（[PrivilegeGrantPolicy.REASON_NEVER_GRANTED]，
      * 保守語義：並發撤銷時折疊為既有理由碼，非真從未授權）。

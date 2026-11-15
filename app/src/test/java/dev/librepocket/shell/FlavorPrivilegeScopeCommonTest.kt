@@ -76,7 +76,13 @@ class FlavorPrivilegeScopeCommonTest {
         try {
             val cls = Class.forName("dev.librepocket.privilege.github.ShizukuPermissionRequests")
             val companion = cls.getDeclaredField("Companion").apply { isAccessible = true }.get(null)
-            companion.javaClass.getMethod("resetProcessForTest").invoke(companion)
+            // internal 成員在 JVM 名含模組後綴（name\$module），以 startsWith 掃描；
+            // 不得依賴無 mangle 的宣告名。
+            val target = companion.javaClass.declaredMethods.firstOrNull {
+                it.name == "resetProcessForTest" || it.name.startsWith("resetProcessForTest\$")
+            } ?: throw AssertionError("resetProcessForTest not found on Companion: ${companion.javaClass.declaredMethods.map { it.name }}")
+            target.isAccessible = true
+            target.invoke(companion)
         } catch (_: ClassNotFoundException) {
             // play/foss：無此類，略過。
         } catch (t: Throwable) {

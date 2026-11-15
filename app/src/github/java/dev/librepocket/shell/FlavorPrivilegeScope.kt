@@ -15,7 +15,9 @@ import dev.librepocket.privilege.github.ShizukuPermissionRequests
  * Context 寫入舊 filesDir 的 marker。撤權語義不變（每次呼叫仍完整執行
  * marker → journal → 擦除序列；復用實例的記憶體 pending 旗標與全新實例的
  * marker 檔分支皆 fail-closed）。傳入不同 applicationContext（如測試環境多個
- * Application 實例）時，以身分檢查換綁全新 Store。
+ * Application 實例）時，以身分檢查換綁全新 Store——舊實例的記憶體 pending 旗標
+ * 隨之丟棄，但 preferencesDataStore 的 journal 為跨實例兜底，跨重啟語義不變；
+ * 舊實例的 pending 狀態不透過任何 production API 外露（測試環境專屬情境）。
  *
  * 失敗合成（fail-closed）：detach 與 clear 各自隔離 try/catch；clear 無論
  * detach 是否失敗皆執行；兩者皆失敗時 detach 的失敗為主失敗、clear 的失敗

@@ -3,8 +3,9 @@ package dev.librepocket.shell
 /**
  * #136-B1 提權橋錯誤碼常量（typed error codes）。
  *
- * 值與既有字串一致（tests／docs 以字串釘住，不得改值）；throw 端一律經此引用，
- * 避免字串漂移。github 源集專用碼（REQUEST_CODE_SPACE_EXHAUSTED）留在該源集
+ * 值與既有字串一致（tests／docs 以字串釘住，不得改值）；PrivilegeBridgeState 的
+ * IllegalStateException 錯誤碼與 grant() 的 AT_MS_IN_FUTURE 一律經此引用，
+ * 避免字串漂移（Policy 理由碼與 require() 校驗碼維持原定義點，刻意不集中）。github 源集專用碼（REQUEST_CODE_SPACE_EXHAUSTED）留在該源集
  * 內（見 ShizukuPermissionRequest.kt 的 ShizukuRequestErrors）——兩個命名空間
  * 各自按源集歸位，不跨源集耦合。
  */

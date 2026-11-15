@@ -92,8 +92,8 @@ class ShizukuPermissionRequests(
                 processInstance ?: ShizukuPermissionRequests().also { processInstance = it }
             }
 
-        @VisibleForTesting
-        fun resetProcessForTest() {
+        @VisibleForTesting(otherwise = VisibleForTesting.PRIVATE)
+        internal fun resetProcessForTest() {
             synchronized(this) {
                 processInstance?.detach()
                 processInstance = null
@@ -315,8 +315,8 @@ class ShizukuPermissionRequests(
      *
      * 僅測試用；production 請用 [detach]（同時反註冊上游 listener，避免上游殘留）。
      */
-    @VisibleForTesting
-    fun invalidatePending() {
+    @VisibleForTesting(otherwise = VisibleForTesting.PRIVATE)
+    internal fun invalidatePending() {
         synchronized(lock) {
             activeEpoch++
             callbacks.clear()
@@ -484,8 +484,11 @@ class ShizukuPermissionRequests(
     /**
      * 解除接線：反註冊上游 listener 並清空本地回呼表、丟棄暫存引用、重置守衛。
      * 鎖反轉防禦：在鎖內清空狀態並取出 listener 引用，在鎖外呼叫 [removeListener]。
-     * detach 不向外抛出（removeListener 失敗僅記錄日誌）：呼叫端無法得知上游
-     * 反註冊是否成功，語義安全由三道閘保證（epoch 作廢／守衛重置／listener 身份檢查）。
+     * [removeListener] 抛出 Exception 或 LinkageError 時僅記錄日誌（呼叫端無法得知
+     * 上游反註冊是否成功）：語義安全由三道閘保證（epoch 作廢／守衛重置／listener
+     * 身份檢查）。其他 Throwable（如 AssertionError）刻意原樣上拋（fail-loud）——
+     * 呼叫端不得假設本函數全域不拋；[FlavorPrivilegeScope.withdraw] 即依賴此行為
+     * 走 detach→clear 失敗合成。
      */
     fun detach() {
         val staged: Shizuku.OnRequestPermissionResultListener?

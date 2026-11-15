@@ -2631,10 +2631,12 @@ def main(argv: list[str] | None = None) -> int:
         default="optional",
         help=(
             "github mode: 'required' demands exactly one ShizukuProvider "
-            "surface (manifest-detected or DEX-evidenced, deduplicated by "
-            "name; release/debug gate fail-closed); 'optional' (default) "
-            "checks provider attributes only when a ShizukuProvider is "
-            "present (including DEX-evidenced renamed subclasses)"
+            "surface (manifest-detected or DEX-evidenced; block-identity "
+            "multiset counting - duplicate android:name among detected "
+            "blocks fails closed; suffix matches never consume; exact FQN "
+            "consumption); 'optional' (default) checks provider attributes "
+            "only when a ShizukuProvider is present (including "
+            "DEX-evidenced renamed subclasses)"
         ),
     )
     args = parser.parse_args(argv)

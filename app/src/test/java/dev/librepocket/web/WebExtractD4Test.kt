@@ -1734,9 +1734,29 @@ class WebExtractD4Test {
         assertFalse(ToolRegistry.visibleTools(on).any { it.name == WebExtract.TOOL_NAME })
     }
 
+    @Test fun cacheReadSideEpochGuardPinsStaleEntries() {
+        // 直接 pin read-side getByKey(k, epoch)：invalidate() 之後，以入口世代
+        // 捕獲值呼叫 getByKey 必須 miss（不得讀回 pre-invalidate 條目）；新世代
+        // 亦 miss（map 已空）；post-invalidate put 之條目以新世代可讀回——
+        // guard 只封死陳舊條目，不禁止全新世代。
+        val cache = WebExtractCache(ttlMs = 60_000, clockMs = { 1_000L })
+        val optIn = EndpointNetworkOptIn()
+        val e0 = cache.currentGeneration
+        val k = cache.key("https://e.com/r1", WebExtract.DEFAULT_MAX_BYTES, WebExtract.DEFAULT_MODEL_CHARS, optIn)
+        cache.put("https://e.com/r1", WebExtract.DEFAULT_MAX_BYTES, WebExtract.DEFAULT_MODEL_CHARS, optIn, byteCacheOk("revoke me", "envelope"))
+        assertTrue("同一世代條目必須可讀回", cache.getByKey(k, e0) != null)
+        cache.clear()
+        assertEquals(e0 + 1L, cache.currentGeneration)
+        assertEquals("陳舊世代不得讀回", null, cache.getByKey(k, e0))
+        assertEquals("清空後任何查詢必須 miss", null, cache.getByKey(k))
+        cache.put("https://e.com/r1", WebExtract.DEFAULT_MAX_BYTES, WebExtract.DEFAULT_MODEL_CHARS, optIn, byteCacheOk("fresh generation content", "envelope2"))
+        assertTrue("post-invalidate 之新世代條目必須可讀回", cache.getByKey(k, cache.currentGeneration) != null)
+    }
+
     @Test fun invalidateMakesPreRevokeContentUnreachable() = runBlocking {
         // invalidate() 之後：pre-revoke 之 cache 條目不得被後續呼叫讀回
-        //（read-side epoch guard）；必須重打 upstream、不得以撤權限前之內容作答。
+        //（read-side epoch guard）。本測試釘住端到端「必須重打 upstream」語義；
+        // read-side guard 之直接 API-level 釘於 cacheReadSideEpochGuardPinsStaleEntries。
         val dns = publicDns("example.com")
         val http = FakeExtract { okResp(html()) }
         val svc = WebExtractService(http)
@@ -1750,7 +1770,7 @@ class WebExtractD4Test {
 
     @Test fun findTagTimeAndQuotedContentFixture() = runBlocking {
         // findTagEnd 為引號感知：content="a>>>b" 之 `>` 不算 tag 收尾，published 必須原樣取出；
-        // 未閉合引號（content="unterminated，無收尾引號）→ 無可解析 <meta> 候選，
+        // 未閉合引號（content="unterminated，無收尾引號）→ findTagEnd 回 -1、無可解析 <meta> 候選，
         // extract 仍成功、published 為 null（不得 crash）。
         val dns = publicDns("example.com")
         val docQuoted = """<html><head><title>T</title></head><body><meta property="article:published_time" content="a>>>b"></body></html>"""
@@ -1780,7 +1800,7 @@ class WebExtractD4Test {
 
     @Test fun cacheOverwriteAccountingPin() {
         // 同 key 覆寫（小→大）：舊 entry 權重必須扣除，不得雙計、不得洩漏；
-        // 之後再放入第三個 key，逐出順序必須是 {K, other} 之最舊者（K 先於 other1 寫入，K 最舊）。
+        // 覆寫讀回 K 把 K 提升為 MRU（accessOrder LinkedHashMap），故之後逐出最舊者為 other1。
         val optIn = EndpointNetworkOptIn()
         val snippetA = "a".repeat(100)
         val envelopeA = "a".repeat(100)
@@ -1800,16 +1820,21 @@ class WebExtractD4Test {
         assertEquals("覆寫同 key 後 size 必須為 1", 1, cache.size)
         cache.put(other1, WebExtract.DEFAULT_MAX_BYTES, WebExtract.DEFAULT_MODEL_CHARS, optIn, byteCacheOk(snippetA, envelopeA))
         assertEquals("覆寫後之 bytes 計數必須容得下 other1（舊 entry 權重已扣除）", 2, cache.size)
-        // 再放入 other2：必須逐出最舊者 K（K 先於 other1 寫入；other1 為 MRU）
+        // 讀回 K：pin 覆寫扣除語義（K 此刻必須仍在）；get 同時把 K 提升為 MRU（accessOrder）。
+        assertTrue(
+            "覆寫後 K 必須仍可讀回（舊 entry 權重已扣除）",
+            cache.get(kUrl, WebExtract.DEFAULT_MAX_BYTES, WebExtract.DEFAULT_MODEL_CHARS, optIn) != null,
+        )
+        // accessOrder：[other1, K] → put(other2) 使容量超 → 逐出最舊者 other1。
         cache.put(other2, WebExtract.DEFAULT_MAX_BYTES, WebExtract.DEFAULT_MODEL_CHARS, optIn, byteCacheOk(snippetA, envelopeA))
         assertEquals(2, cache.size)
         assertTrue(
-            "最舊者（K）應被逐出",
-            cache.get(kUrl, WebExtract.DEFAULT_MAX_BYTES, WebExtract.DEFAULT_MODEL_CHARS, optIn) == null,
+            "K 經 get 提升為 MRU，應仍在快取",
+            cache.get(kUrl, WebExtract.DEFAULT_MAX_BYTES, WebExtract.DEFAULT_MODEL_CHARS, optIn) != null,
         )
         assertTrue(
-            "other1 應在快取",
-            cache.get(other1, WebExtract.DEFAULT_MAX_BYTES, WebExtract.DEFAULT_MODEL_CHARS, optIn) != null,
+            "other1 為最舊者（K 曾被 get 提升），應被逐出",
+            cache.get(other1, WebExtract.DEFAULT_MAX_BYTES, WebExtract.DEFAULT_MODEL_CHARS, optIn) == null,
         )
         assertTrue(
             "other2 應在快取",
@@ -1825,6 +1850,20 @@ class WebExtractD4Test {
         }
         val svc = WebExtractService(http)
         val out = svc.extract("https://example.com/blank", resolver = dns)
+        assertTrue("expected Failed, got $out", out is WebExtractOutcome.Failed)
+        assertEquals(WebExtract.DETAIL_BAD_RESPONSE, (out as WebExtractOutcome.Failed).detail)
+    }
+
+    @Test fun rawTextCfOnlyBodyFailsBadResponse() = runBlocking {
+        // text/plain、body 全為 Cf（U+200B 零寬）：isBlank 閘放行（U+200B 非 isWhitespace），
+        // cleanField 全剝 → snippet 空 → raw-text 管線自身的 blank→BAD_RESPONSE arm
+        //（而非 E 的共享 isBlank 閘）。釘此分支，防其被刪除後測試仍全綠。
+        val dns = publicDns("example.com")
+        val http = FakeExtract {
+            okResp("\u200B\u200B\u200B", headers = mapOf("Content-Type" to "text/plain; charset=utf-8"))
+        }
+        val svc = WebExtractService(http)
+        val out = svc.extract("https://example.com/cf-only", resolver = dns)
         assertTrue("expected Failed, got $out", out is WebExtractOutcome.Failed)
         assertEquals(WebExtract.DETAIL_BAD_RESPONSE, (out as WebExtractOutcome.Failed).detail)
     }

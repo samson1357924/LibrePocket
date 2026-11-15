@@ -61,8 +61,9 @@ import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
  *   ＋`maxBytes`＋`maxModelChars`＋policy identity（`policy`＋`configRevision`），
  *   不同 policy/revision 不互撞）零 upstream、`cached=true`；
  *   `Failed`／`Unavailable`／取消一律不寫。
- *   快取命中依構造（same policy＋revision ⇒ same 決策）旁路 per-call 政策評估；
- *   授權撤銷必須 bump `configRevision` 或呼叫 [WebExtractService.invalidate] 重綁。
+ *   快取命中仍須 per-call 政策重驗（含 DNS preflight），不旁路當次政策評估；
+ *   不同 resolver／endpoint（同 policy＋revision 之下）不得重用結果；
+ *   重驗本身不 purge 快取；授權撤銷僅能經 `invalidate()`／bump `configRevision`。
  *   rebind 時（identity＋revision 變更）呼叫方必須 `invalidate()`。
  *   跨 tier 內容永不共用。
  * - `inFlight` single-flight map：無界，但受 per-key timeout 有界（leader 受
@@ -161,8 +162,9 @@ object WebExtract {
     /**
      * 全程超時預算（15s）。
      *
-     * `extractUncached` 於起始即以單調時鐘（`System.nanoTime()`）計算全程 deadline：
-     * DNS preflight＋各 hop 之 HTTP 請求＋解壓共用此單一單調預算；
+     * `extract()` 於入口即以單調時鐘（`System.nanoTime()`）計算全程 deadline：
+     * per-call 政策重驗（含 DNS preflight）＋`extractUncached`（DNS preflight＋
+     * 各 hop 之 HTTP 請求＋解壓）共用此單一單調預算；
      * decode／parse 不計入 deadline，但受位元組／字元上限約束（cap-bounded）；
      * 逐跳以剩餘預算執行（見 `extractUncached`）。
      */
@@ -338,9 +340,9 @@ internal suspend fun fetchRawWithTimeout(
  *   為 `false`，讀回時正規化為 `true`（快取內一律以 `cached=false` 儲存，
  *   讀出一律以 `cached=true` 呈現；[WebExtractOutcome.Ok.cached] 預設
  *   `false` 不變）。
- * - 快取命中**依構造旁路當次 policy 評估**（same policy＋revision ⇒ same
- *   決策），與 per-call `[NetworkPolicy.evaluateUrl]` 無關；授權撤銷或政策
- *   變更必須 bump `configRevision` 或呼叫 `invalidate()` 才生效；跨 tier
+ * - 快取命中仍須 per-call 政策重驗（含 DNS preflight）：相同 `policy`＋`configRevision`
+ *  但不同 resolver／endpoint 安全上下文不得重用結果；重驗本身不 purge
+ *   快取；授權撤銷僅能經 `invalidate()`／bump `configRevision` 生效；跨 tier
  *  （不同 `policy`／`configRevision`）內容永不共用。
  * - 時鐘可注入，TTL 到期 lazy 淘汰＋`put` 順手掃；有界 LRU
  *  （[WebExtract.MAX_CACHE_ENTRIES]）。
@@ -422,8 +424,9 @@ class WebExtractCache(
  *
  * 與 [WebSearchService] 同併發姿態：
  * - 命中快取 → `cached=true` 零 upstream（[WebExtractCache.getByKey] 回傳副本即
- *   正規化 `cached=true`）；快取 key 含 policy identity（`policy`＋`configRevision`），
- *   命中依構造旁路 per-call policy 評估（same policy＋revision ⇒ same 決策）；
+ *   正規化 `cached=true`）；快取 key 含 policy identity（`policy`＋`configRevision`）；
+ *   命中前仍須 per-call 政策重驗（含 DNS preflight），不同 resolver／endpoint
+ *   同 policy＋revision 不得重用結果；重驗本身不 purge 快取；
  *   授權撤銷／政策變更後必須 `invalidate()`（或 bump `configRevision`）重綁，
  *   否則舊決策內容仍會命中。
  * - 同 key 併發合流（leader 打、follower `await()`；follower 取消不影響 leader）。
@@ -471,8 +474,44 @@ class WebExtractService(
         }
         val effBytes = maxBytes.coerceIn(1, WebExtract.ABSOLUTE_MAX_BYTES)
         val effModel = maxModelChars.coerceIn(1, WebExtract.MAX_MODEL_CHARS)
-        val k = cache.key(stripFragment(rawUrl.trim()), effBytes, effModel, optIn)
+        // 全程單一單調 deadline：per-call 政策重驗（含 DNS preflight）＋
+        // `extractUncached`（DNS preflight＋逐跳 HTTP＋解壓）共用此單一單調預算。
+        val deadlineNs = System.nanoTime() + timeoutMs.coerceAtLeast(1) * 1_000_000L
+        val hop0 = stripFragment(rawUrl.trim())
+        val k = cache.key(hop0, effBytes, effModel, optIn)
         while (true) {
+            // per-call 政策重驗（含 DNS preflight），fail-closed；必須在 cache／
+            // inFlight 存取之前完成——initial peek、lateHit（mutex 內）、follower join
+            // 三個返回點皆位於此檢查之後，單次重驗覆蓋全部三者；通過後才觸 cache。
+            val gate = try {
+                if (NetworkPolicy.requiresDnsLookup(hop0, optIn)) {
+                    when (
+                        val pre = NetworkPolicy.runPreflightSuspend(deadlineNs) {
+                            NetworkPolicy.evaluateUrl(hop0, optIn, resolver)
+                        }
+                    ) {
+                        is NetworkPolicy.PreflightOutcome.Completed -> pre.value
+                        NetworkPolicy.PreflightOutcome.TimedOut ->
+                            return WebExtractOutcome.Failed(WebExtract.DETAIL_TIMEOUT)
+                        NetworkPolicy.PreflightOutcome.OverloadRejected ->
+                            return WebExtractOutcome.Failed(WebExtract.DETAIL_TRANSPORT)
+                    }
+                } else {
+                    // 純 pre-DNS 決策（literal IP 或不需查 DNS）：直接評估，不阻塞。
+                    NetworkPolicy.evaluateUrl(hop0, optIn, resolver)
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (_: Exception) {
+                return WebExtractOutcome.Failed(WebExtract.DETAIL_TRANSPORT)
+            }
+            if (!gate.allowed) {
+                // 與跳０ policy 拒絕同一映射；fail-closed、不觸 network、不寫快取。
+                return WebExtractOutcome.Unavailable(
+                    gate.denyCode?.name ?: NetworkDenyCode.INVALID_HOST.name,
+                    gate.denyCode,
+                )
+            }
             cache.getByKey(k)?.let { return it }
 
             var lateHit: WebExtractOutcome.Ok? = null
@@ -518,7 +557,7 @@ class WebExtractService(
 
             var okForFollowers: WebExtractOutcome.Ok? = null
             try {
-                val outcome = extractUncached(rawUrl, optIn, resolver, effBytes, effModel)
+                val outcome = extractUncached(rawUrl, optIn, resolver, effBytes, effModel, deadlineNs)
                 if (outcome is WebExtractOutcome.Ok) okForFollowers = outcome
                 currentCoroutineContext().ensureActive()
                 if (outcome is WebExtractOutcome.Ok) {
@@ -563,9 +602,10 @@ class WebExtractService(
         resolver: HostResolver,
         effBytes: Int,
         effModel: Int,
+        deadlineNs: Long,
     ): WebExtractOutcome {
-        // 全程單一單調 deadline：DNS preflight＋所有 redirect hop＋解壓共用。
-        val deadlineNs = System.nanoTime() + timeoutMs.coerceAtLeast(1) * 1_000_000L
+        // 全程單一單調 deadline（由 extract() 入口計算並傳入）：DNS preflight
+        // ＋所有 redirect hop＋解壓共用；與 per-call 政策重驗共享同一預算。
         var current = stripFragment(rawUrl.trim())
         // 有效 opt-in：跨 origin 跳轉即不可逆降級為預設 `HTTPS_ONLY` 姿態
         //（見 downgradedOptInForRedirect）。

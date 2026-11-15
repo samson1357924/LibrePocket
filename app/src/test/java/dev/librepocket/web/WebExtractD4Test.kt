@@ -106,8 +106,87 @@ class WebExtractD4Test {
         assertEquals(1, first.envelope.split(WebContentEnvelope.BEGIN).size - 1)
         assertEquals(1, first.envelope.split(WebContentEnvelope.END).size - 1)
         assertTrue(first.envelope.contains(first.content.snippet))
+        // 注意：第二次呼叫仍會執行 per-call 政策重驗（含 DNS preflight）——
+        // publicDns fixture 立即解析故不增加可觀察延遲；快取僅在重驗通過後命中。
         val second = svc.extract("https://example.com/a", resolver = dns) as WebExtractOutcome.Ok
         assertTrue(second.cached)
+        assertEquals(1, http.calls.get())
+    }
+
+    @Test fun cacheHitCrossResolverSameRevisionDenied() = runBlocking {
+        // 同 URL + 同 policy + 同 revision，resolver A（公網）命中後，
+        // resolver B（metadata 位址）之第二次呼叫不得命中快取；
+        // per-call 重驗必須先擋下（METADATA_ADDRESS_BLOCKED），零 upstream。
+        val dnsA = publicDns("split.example")
+        val dnsB = fakeDns("split.example" to listOf("169.254.169.254"))
+        val http = FakeExtract { okResp(html()) }
+        val svc = WebExtractService(http)
+        val first = svc.extract("https://split.example/data", resolver = dnsA) as WebExtractOutcome.Ok
+        assertFalse(first.cached)
+        val out = svc.extract("https://split.example/data", resolver = dnsB)
+        assertTrue("expected Unavailable, got $out", out is WebExtractOutcome.Unavailable)
+        val u = out as WebExtractOutcome.Unavailable
+        assertEquals(NetworkDenyCode.METADATA_ADDRESS_BLOCKED, u.denyCode)
+        assertEquals(1, http.calls.get())
+    }
+
+    @Test fun followerJoinCrossResolverSameRevisionDenied() = runBlocking {
+        // 同 URL + 同 policy + 同 revision，resolver A 的 leader 在飛行中；
+        // resolver B（metadata 位址）之 follower 必須被其自身的 per-call 重驗擋下，
+        // 不得加入 leader 的 inFlight entry、亦不得透過 cache 洩漏。
+        val dnsA = publicDns("split.example")
+        val dnsB = fakeDns("split.example" to listOf("169.254.169.254"))
+        val http = FakeExtract {
+            delay(150)
+            okResp(html())
+        }
+        val svc = WebExtractService(http)
+        val leader = async { svc.extract("https://split.example/follow", resolver = dnsA) }
+        withTimeout(5_000) { while (http.calls.get() < 1) delay(1) }
+        val followerOut = svc.extract("https://split.example/follow", resolver = dnsB)
+        assertTrue("expected Unavailable, got $followerOut", followerOut is WebExtractOutcome.Unavailable)
+        assertEquals(
+            NetworkDenyCode.METADATA_ADDRESS_BLOCKED,
+            (followerOut as WebExtractOutcome.Unavailable).denyCode,
+        )
+        val leaderOut = withTimeout(5_000) { leader.await() }
+        assertTrue("leader 應照常完成 Ok，got $leaderOut", leaderOut is WebExtractOutcome.Ok)
+        assertEquals(1, http.calls.get())
+    }
+
+    @Test fun cacheHitDnsThrowsFailsClosed() = runBlocking {
+        // 快取中有條目，但當次呼叫的 resolver 拋例外：fail-closed Unavailable(INVALID_HOST)，
+        // 快取不得被消費（calls 不增加）。
+        val dnsA = publicDns("boom.example")
+        val http = FakeExtract { okResp(html()) }
+        val svc = WebExtractService(http)
+        val first = svc.extract("https://boom.example/x", resolver = dnsA) as WebExtractOutcome.Ok
+        assertFalse(first.cached)
+        val boom = HostResolver { throw RuntimeException("boom") }
+        val out = svc.extract("https://boom.example/x", resolver = boom)
+        assertTrue("expected Unavailable, got $out", out is WebExtractOutcome.Unavailable)
+        val u = out as WebExtractOutcome.Unavailable
+        assertEquals(NetworkDenyCode.INVALID_HOST, u.denyCode)
+        assertEquals(1, http.calls.get())
+    }
+
+    @Test fun cacheHitDnsTimeoutFailsClosed() = runBlocking {
+        // 快取中有條目，但當次呼叫的 DNS preflight 逾時：Failed(TIMEOUT)，
+        // 快取不得被消費（calls 不增加）。
+        val dnsA = publicDns("slowdns.example")
+        val dnsSlow = HostResolver {
+            Thread.sleep(5_000)
+            listOf(InetAddress.getByName("203.0.113.10"))
+        }
+        val http = FakeExtract { okResp(html()) }
+        val svc = WebExtractService(http, timeoutMs = 150)
+        val first = svc.extract("https://slowdns.example/x", resolver = dnsA) as WebExtractOutcome.Ok
+        assertFalse(first.cached)
+        val out = withTimeout(10_000) {
+            svc.extract("https://slowdns.example/x", resolver = dnsSlow)
+        }
+        assertTrue("expected Failed, got $out", out is WebExtractOutcome.Failed)
+        assertEquals(WebExtract.DETAIL_TIMEOUT, (out as WebExtractOutcome.Failed).detail)
         assertEquals(1, http.calls.get())
     }
 

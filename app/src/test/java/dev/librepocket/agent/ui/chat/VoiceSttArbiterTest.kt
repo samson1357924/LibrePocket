@@ -465,6 +465,32 @@ class VoiceSttArbiterTest {
     }
 
     @Test
+    fun `hardReset drops the in-flight arm but keeps the generation watermark monotonic`() {
+        val arbiter = VoiceSttArbiter(clockNanos = { 5_000L })
+        assertEquals(
+            VoiceSttDecision.Admit(VoiceSttArmKind.INITIAL),
+            decideLoaded(arbiter, initial = true),
+        )
+        val admitted = arbiter.currentGeneration
+        assertEquals(1L, admitted)
+
+        arbiter.hardReset()
+
+        assertNull(arbiter.currentInFlight)
+        // The watermark is never zeroed by a hard reset: every generation issued so far stays < watermark + 1.
+        assertEquals(admitted, arbiter.currentGeneration)
+        // The next admit mints strictly above the pre-reset watermark — never re-minting a pre-reset generation.
+        assertEquals(
+            VoiceSttDecision.Admit(VoiceSttArmKind.USER),
+            decideLoaded(arbiter, user = true),
+        )
+        assertEquals(admitted + 1, arbiter.currentGeneration)
+        // And a stale pre-reset settle for the reset generation cannot release the successor.
+        arbiter.onResultSettled(admitted)
+        assertSame(VoiceSttArmKind.USER, arbiter.currentInFlight)
+    }
+
+    @Test
     fun arbiter_watchdogCycle_preservesGenerationPairingAboveThree() {
         var now = 1_000_000_000L
         val arbiter = VoiceSttArbiter(clockNanos = { now })

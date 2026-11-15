@@ -182,6 +182,9 @@ fun ChatScreen(
     // voice_output 關閉時清除（見 VoiceErrorState）。
     val context = LocalContext.current
     val voiceErrors = remember { VoiceErrorState() }
+    // 「語音辨識無回應」提示的重設鈕開關：只有無 slot 可派的降級路徑才設 true，
+    // 成功預留 slot（launch 實際佔位）時設回 false；控制底部重設鈕的顯示。
+    var showVoiceReset by remember { mutableStateOf(false) }
     // #2 確認編排（await 寫入 → 按結果行動；寫入中禁用確認鈕防連打），
     // 兼 TTS 引擎回呼的主線程投遞（見 speaker 接線）。
     val ttsConfirm = remember { VoiceTtsConfirmState() }
@@ -347,6 +350,11 @@ fun ChatScreen(
     }
     // 鏡像初始值取自還原快照：閘還原後鏡像立即一致（不等首次效應），之後仍由效應翻轉覆寫。
     var sttArbiterState by remember { mutableStateOf(sttLaunchSnapshot.inFlightName?.let(VoiceSttArmKind::valueOf)) }
+    // settle 計數器：每完成一次 slot 結算（含 stale/late return）＋1。stale settle 不翻轉
+    // sttArbiterState（鏡像本來就是 null），少了此旗標，slot 釋放後佇列中的未消費 arm
+    // （如兩 slot 楔住時未消費的 INITIAL）會擱淺到下一次無關的狀態翻轉；以此旗標作為決策
+    // 效應的 key，讓 settle 確定性地喚起一次重裁決。
+    var sttSettleSeq by remember { mutableStateOf(0) }
     // 每枚進行中 launch 各自佔一個回呼 slot（共 2 枚）：slotBusy 標記佔用、slotGen 記錄該 slot 對應的
     // admit generation（launch 時自 currentGeneration 讀取，即剛承認的那一枚 arm 的 generation）。
     // result callback 以 slot 歸屬配對——每枚 pending launch 各自佔 slot、歸屬精確，不受回傳順序影響
@@ -358,6 +366,8 @@ fun ChatScreen(
     /** 兩 slot：watchdog 釋放後懸掛的 launch 與其 successor 並存，各佔一枚；slot 不主動回收——提前歸還會破壞 late return 的結果歸屬，僅由各自 late return 釋放。 */
     val slotBusy = remember { booleanArrayOf(sttLaunchSnapshot.slotBusy[0], sttLaunchSnapshot.slotBusy[1]) }
     val slotGen = remember { longArrayOf(sttLaunchSnapshot.slotGen[0], sttLaunchSnapshot.slotGen[1]) }
+    /** 是否還有一枚回呼 slot 可供新 launch 歸屬（true = 可派；false = 兩 slot 皆被懸掛 recognizer 佔用）。 */
+    fun hasFreeSttSlot(): Boolean = !slotBusy[0] || !slotBusy[1]
     // 狀態快照寫入 rememberSaveable：admit／降級／settle／watchdog 釋放後皆更新，
     // 使 activity 重建時能還原 slot 歸屬與閘的 in-flight／generation 水位。
     fun persistLaunchState() {
@@ -370,6 +380,27 @@ fun ChatScreen(
         )
     }
     var userVoiceArmed by remember { mutableStateOf(false) }
+
+    // 使用者明確觸發的硬重設（語音楔住恢復鈕）：清空 slot 表與閘、保留 generation 水位與
+    // 一次性 pending arm（INITIAL／RETRIGGER 由宿主持有，不得被本函式靜默丟棄）；mic（USER）
+    // 一次性 arm 由使用者明確放棄。重設後，重設前 launch 的晚到結果只在「該 slot 尚未被新 launch
+    // 重新佔用」時才 fail-closed 丟棄；一旦 slot 被重新佔用，重設前的晚到結果在 OS 回呼邊界上
+    // 與新結果無法區分，可能被歸給新 launch（含 prefill／提早釋放其閘）——此為明確接受、僅限
+    // 使用者主動重設觸發的殘餘邊界（launcher request code 是每 slot 非每 launch，無法在回呼
+    // 邊界再區分）。sttSettleSeq 遞增使 pending arm 確定性續行裁決。
+    fun resetVoiceSttCluster() {
+        slotBusy[0] = false
+        slotBusy[1] = false
+        slotGen[0] = 0L
+        slotGen[1] = 0L
+        sttArbiter.hardReset()
+        sttArbiterState = null
+        userVoiceArmed = false
+        sttSettleSeq += 1
+        persistLaunchState()
+        voiceErrors.clearSttError()
+        showVoiceReset = false
+    }
     fun handleSttResult(slot: Int, result: ActivityResult) {
         // STT 結果回呼一律先結算單飛閘：以該 slot 登記的 admit generation 配對
         // （onResultSettled(gen) 對 watchdog 後承認的 successor gen 是 no-op），無論
@@ -394,6 +425,7 @@ fun ChatScreen(
         slotBusy[slot] = false
         slotGen[slot] = 0L
         sttArbiterState = sttArbiter.currentInFlight
+        sttSettleSeq += 1
         persistLaunchState()
         // stale 判定（isStaleVoiceResult，VoiceSttArbiter.kt）：slot generation 落後於當代
         // admitGeneration（successor 已承認超越），或回呼進入當下 gate 已不歸屬本次啟動
@@ -462,6 +494,8 @@ fun ChatScreen(
                 VoiceStt.DETAIL_NO_SERVICE
             }
             voiceErrors.onSttFailure(VoiceStt.fallbackMessage(reason, detail))
+            // Not a wedge: no reset affordance for SWITCH_OFF / no-service degrades.
+            showVoiceReset = false
             return false
         }
         val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
@@ -473,12 +507,15 @@ fun ChatScreen(
         // watchdog 釋放單飛閘（不消費 arm），wedge slot 仍於其 late return 時釋放。
         val slotIndex = if (!slotBusy[0]) 0 else if (!slotBusy[1]) 1 else -1
         if (slotIndex == -1) {
-            // 兩 slot 全忙（僅 watchdog 釋放 successor 後的殘餘 wedge）：與 launch 例外同一降級提示。
-            voiceErrors.onSttFailure(VoiceStt.fallbackMessage(DenyReason.NO_PRIVILEGE, VoiceStt.DETAIL_NO_SERVICE))
+            // 兩 slot 全忙：recognizer 服務在、但回不來（never-callback 懸掛）。
+            // 僅作為與呼叫端預檢之間的競態安全網；不消費任何一次性旗標／token。
+            voiceErrors.onSttFailure(VoiceStt.fallbackMessage(DenyReason.NO_PRIVILEGE, VoiceStt.DETAIL_RECOGNIZER_UNRESPONSIVE))
+            showVoiceReset = true
             return false
         }
         slotBusy[slotIndex] = true
         slotGen[slotIndex] = sttArbiter.currentGeneration
+        showVoiceReset = false
         persistLaunchState()
         return try {
             if (slotIndex == 0) {
@@ -492,6 +529,8 @@ fun ChatScreen(
             slotGen[slotIndex] = 0L
             persistLaunchState()
             voiceErrors.onSttFailure(VoiceStt.fallbackMessage(DenyReason.NO_PRIVILEGE, VoiceStt.DETAIL_NO_SERVICE))
+            // Wedge flag is unrelated to a launch exception; do not show the reset affordance.
+            showVoiceReset = false
             false
         }
     }
@@ -501,7 +540,7 @@ fun ChatScreen(
     // 交出下一個已 arm 的 arm；降級（launch 回 false）亦在同一幀繼續裁決下一 arm。
     // settle（STT result callback 第一行 onResultSettled）經 sttArbiterState 重觸發本效應，
     // 確定性地續行下一 arm。效應內以本地旗標影子參數，避免同幀內重複消費 stale 快照。
-    LaunchedEffect(voiceInputRequested, voiceRetriggerToken, voiceSwitchesLoaded, sttArbiterState, userVoiceArmed) {
+    LaunchedEffect(voiceInputRequested, voiceRetriggerToken, voiceSwitchesLoaded, sttArbiterState, userVoiceArmed, sttSettleSeq) {
         var initialRequested = voiceInputRequested
         var retriggerArmed = isRetriggerArmed(voiceRetriggerToken)
         var userArmed = userVoiceArmed
@@ -525,6 +564,19 @@ fun ChatScreen(
                     try {
                         when (arm) {
                             VoiceSttArmKind.INITIAL -> {
+                                // reserve-before-consume：兩 slot 都被 never-callback 的 recognizer 佔用時，
+                                // 這枚 arm 沒有可歸屬的回呼 slot——先消費會把 voiceInputRequested 一次性旗標
+                                // 燒進 no-op，且使用者毫無感知。此處釋放閘、提示、保持 arm 未消費
+                                // （下次狀態翻轉時重試），並 break 跳出 while——同一幀續行裁決會以同一 arm
+                                // 自旋，故旗標必須留存、由下一次 decide 重試。
+                                if (!hasFreeSttSlot()) {
+                                    voiceErrors.onSttFailure(VoiceStt.fallbackMessage(DenyReason.NO_PRIVILEGE, VoiceStt.DETAIL_RECOGNIZER_UNRESPONSIVE))
+                                    showVoiceReset = true
+                                    sttArbiter.onLaunchReported(VoiceSttArmKind.INITIAL, launched = false, sttArbiter.currentGeneration)
+                                    sttArbiterState = sttArbiter.currentInFlight
+                                    persistLaunchState()
+                                    break
+                                }
                                 initialRequested = false
                                 // 先消費再啟動：啟動後重組不再重放；開關關閉或 loadFailed 時，
                                 // launchSystemStt() 內 cleanly 降級為 USER_DISABLED／NO_PRIVILEGE。
@@ -536,6 +588,17 @@ fun ChatScreen(
                                 }
                             }
                             VoiceSttArmKind.RETRIGGER -> {
+                                // reserve-before-consume：無 slot 可派時不呼叫 onVoiceRetriggerConsumed，
+                                // retrigger token 保留至 TTL 到期前仍可重試；釋放閘並 break 跳出 while
+                                // （同一幀續裁決會自旋），arm 保持未消費留待下次狀態翻轉重試。
+                                if (!hasFreeSttSlot()) {
+                                    voiceErrors.onSttFailure(VoiceStt.fallbackMessage(DenyReason.NO_PRIVILEGE, VoiceStt.DETAIL_RECOGNIZER_UNRESPONSIVE))
+                                    showVoiceReset = true
+                                    sttArbiter.onLaunchReported(VoiceSttArmKind.RETRIGGER, launched = false, sttArbiter.currentGeneration)
+                                    sttArbiterState = sttArbiter.currentInFlight
+                                    persistLaunchState()
+                                    break
+                                }
                                 retriggerArmed = false
                                 if (onVoiceRetriggerConsumed(voiceRetriggerToken)) {
                                     val launched = launchSystemStt()
@@ -549,6 +612,17 @@ fun ChatScreen(
                                 }
                             }
                             VoiceSttArmKind.USER -> {
+                                // reserve-before-consume：無 slot 可派時不清 userVoiceArmed，
+                                // mic arm 保持一次態留待下次狀態翻轉重試；釋放閘並 break 跳出 while
+                                // （同一幀續裁決會自旋）。
+                                if (!hasFreeSttSlot()) {
+                                    voiceErrors.onSttFailure(VoiceStt.fallbackMessage(DenyReason.NO_PRIVILEGE, VoiceStt.DETAIL_RECOGNIZER_UNRESPONSIVE))
+                                    showVoiceReset = true
+                                    sttArbiter.onLaunchReported(VoiceSttArmKind.USER, launched = false, sttArbiter.currentGeneration)
+                                    sttArbiterState = sttArbiter.currentInFlight
+                                    persistLaunchState()
+                                    break
+                                }
                                 userArmed = false
                                 userVoiceArmed = false
                                 val launched = launchSystemStt()
@@ -582,6 +656,7 @@ fun ChatScreen(
                         }
                         Log.w(TAG, "unexpected throwable in STT arm; gate released, degrading", t)
                         voiceErrors.onSttFailure(VoiceStt.fallbackMessage(DenyReason.NO_PRIVILEGE, VoiceStt.DETAIL_NO_SERVICE))
+                        showVoiceReset = false
                     }
                     // admit／false 路徑（含 watchdog 驅逐）收尾：落快照供 activity 重建還原。
                     persistLaunchState()
@@ -846,12 +921,35 @@ fun ChatScreen(
         ) {
             // #7 雙錯誤通道分別顯示（STT／TTS 各管各的，不互相清除）。
             voiceErrors.sttError?.let {
-                Text(
-                    text = it,
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.error,
-                    modifier = Modifier.padding(horizontal = 16.dp),
-                )
+                if (showVoiceReset) {
+                    // 無 slot 可派（兩 slot 皆被懸掛 recognizer 佔用）時附重設鈕：使用者觸發的
+                    // 硬重設——清空 slot 表與閘、保留 generation 水位。語義是「放棄未返回的辨識
+                    // 結果（晚到者在 slot 未被重新佔用前 fail-closed 丟棄；slot 一旦重新佔用即
+                    // 不可區分，見 resetVoiceSttCluster 註解）」，不是「修好卡住的辨識器」。
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 8.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text(
+                            text = it,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.error,
+                            modifier = Modifier
+                                .weight(1f)
+                                .padding(start = 8.dp),
+                        )
+                        TextButton(onClick = { resetVoiceSttCluster() }) { Text("重設語音辨識") }
+                    }
+                } else {
+                    Text(
+                        text = it,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.error,
+                        modifier = Modifier.padding(horizontal = 16.dp),
+                    )
+                }
             }
 
             voiceErrors.ttsError?.let {

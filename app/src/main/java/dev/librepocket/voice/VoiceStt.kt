@@ -31,6 +31,10 @@ object VoiceStt {
     const val EXTRA_RESULTS = "android.speech.extra.RESULTS"
 
     const val DETAIL_NO_SERVICE = "NO_RECOGNITION_SERVICE"
+    // 辨識服務存在、但兩個回呼 slot 都被 never-callback 的 recognizer 佔用時的誠實話術：
+    // 與 DETAIL_NO_SERVICE（系統根本沒有辨識服務）語意區分——這裡是「有服務卻回不來」，
+    // 需使用者按「重設語音辨識」（in-place 硬重設，非系統重建 activity）後方可恢復。
+    const val DETAIL_RECOGNIZER_UNRESPONSIVE = "RECOGNIZER_UNRESPONSIVE"
     const val DETAIL_SWITCH_OFF = "SWITCH_OFF"
     const val DETAIL_EMPTY_RESULT = "EMPTY_RESULT"
 

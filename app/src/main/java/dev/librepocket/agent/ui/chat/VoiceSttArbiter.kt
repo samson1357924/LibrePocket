@@ -137,6 +137,24 @@ internal class VoiceSttArbiter(
     }
 
     /**
+     * User-triggered hard reset for a wedged session (voice recovery affordance): drop any
+     * in-flight arm and its admit timestamp, but keep the generation watermark monotonic — a
+     * post-reset admit can never reuse a pre-reset generation. Used ONLY by the explicit user
+     * recovery action; never by internal bookkeeping.
+     *
+     * Attribution caveat (honest): after the shell clears its slot tables, a pre-reset late
+     * result is unattributable ONLY while its slot stays unoccupied (slot tables read 0L →
+     * fail-closed drop). Once the slot is re-occupied post-reset, a pre-reset late result is
+     * indistinguishable from the new occupant's at the OS callback boundary and may prefill /
+     * settle the new launch early. Accepted by explicit user action; documented here and in
+     * the shell reset notes.
+     */
+    fun hardReset() {
+        inFlight = null
+        admittedAtNanos = 0L
+    }
+
+    /**
      * Decide the next arm to admit given the pending arms, or a [VoiceSttDecision.Wait] /
      * [VoiceSttDecision.Idle]. Never decides a switch while [switchesLoaded] is false; never
      * admits while a previous launch is still in flight. Admitting marks the gate in flight;

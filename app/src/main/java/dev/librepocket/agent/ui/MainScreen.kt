@@ -391,10 +391,9 @@ internal fun MainScreen(
                                 privilegeState.revoke(privilegeStore) {
                                     FlavorPrivilegeScope.withdraw(app)
                                 }
-                            } catch (e: CancellationException) {
-                                throw e
-                            } catch (e: Exception) {
-                                Log.w(TAG, "privilege revoke failed", e)
+                            } catch (t: Throwable) {
+                                if (t is CancellationException || t is VirtualMachineError) throw t
+                                Log.w(TAG, "privilege revoke failed", t)
                                 privilegeRevokeError = true
                             } finally {
                                 privilegeRevokeInFlight = false

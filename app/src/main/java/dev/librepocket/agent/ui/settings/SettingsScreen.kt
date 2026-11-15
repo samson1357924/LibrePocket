@@ -579,7 +579,7 @@ fun SettingsScreen(
                         if (privilegeRevokeError) {
                             Spacer(modifier = Modifier.height(4.dp))
                             Text(
-                                "收回授權失敗，請重試",
+                                "收回失敗，持久授權可能仍在，請重試",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.error,
                             )

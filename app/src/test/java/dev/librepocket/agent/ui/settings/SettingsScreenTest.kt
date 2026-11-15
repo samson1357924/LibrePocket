@@ -717,7 +717,7 @@ class SettingsScreenTest {
         }
         composeRule.onNodeWithText("目前審計筆數：3", substring = true).performScrollTo().assertIsDisplayed()
         onLogoutArea("一鍵收回提權授權並清空審計").assertIsDisplayed().assertIsEnabled()
-        composeRule.onAllNodesWithText("收回授權失敗，請重試").assertCountEquals(0)
+        composeRule.onAllNodesWithText("收回失敗，持久授權可能仍在，請重試").assertCountEquals(0)
         composeRule.onAllNodesWithText("收回中…").assertCountEquals(0)
 
         onLogoutArea("一鍵收回提權授權並清空審計").performClick()
@@ -750,7 +750,7 @@ class SettingsScreenTest {
                 onRevokePrivilege = { retryClicked = true },
             )
         }
-        onLogoutArea("收回授權失敗，請重試").assertIsDisplayed()
+        onLogoutArea("收回失敗，持久授權可能仍在，請重試").assertIsDisplayed()
         onLogoutArea("一鍵收回提權授權並清空審計").assertIsDisplayed().assertIsEnabled().performClick()
         assertTrue(retryClicked)
     }

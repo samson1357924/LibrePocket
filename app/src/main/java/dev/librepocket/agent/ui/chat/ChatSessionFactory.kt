@@ -72,15 +72,17 @@ private const val HISTORY_PAGE = 200
  * incomplete marker, never a truncated half prefix — see
  * [snapshotSwitchHistory]).
  *
- * Known inconsistency (B1, declared — unification is Target B2): [openImpl]
- * retains the declared B1 inconsistency (`MaxMessages(HISTORY_LOAD_CAP)`
- * for the 2000-row DB tail load) until B2 hydration-tail unification lands,
- * while [openForked] now uses `HistoryWindowCap.DEFAULT` (since it starts a
- * fresh empty session) matching [buildSession]'s default — and
- * [dev.librepocket.chat.TurnController]'s — bounded `HistoryWindowCap.DEFAULT`
- * (200 msgs / 60k chars). Thus only [openImpl] retains this divergence, so a
- * resumed long dialogue windows harder on create-path semantics than on the
- * open path until B2.
+ * Known inconsistency (B1, declared — closed by B2): [openImpl] previously
+ * travelled `MaxMessages(HISTORY_LOAD_CAP)` for the 2000-row DB tail while
+ * [openForked]/[buildSession]/[dev.librepocket.chat.TurnController] used
+ * bounded `HistoryWindowCap.DEFAULT` (200 msgs / 60k chars). B2 unifies the
+ * travelling cap: [openImpl] now passes `HistoryWindowCap.DEFAULT`, so
+ * create/resume share one window. The DB backward scan itself stays bounded
+ * by [HISTORY_LOAD_CAP] (2000) as an I/O upper bound for the
+ * reasoning-marker collection (R23/R24/R25: adjacent + far probes) — larger
+ * than the window, so extra rows are dropped by the window downstream
+ * (observable via `droppedHistoryCount`/`droppedHistoryChars`), never
+ * shipped. Device-heap validation of the 2000-row scan stays B3.
  */
 internal object SnapshotBudget {
     internal const val HISTORY_LOAD_CAP = 2000
@@ -420,9 +422,11 @@ data class CreatedSession(
      */
     val historyWithheld: Boolean = false,
     /**
-     * Stage E: exact number of older history rows omitted by the tail cap.
-     * 0 when everything fit. Observable truncation: callers surface
-     * "已省略N則" instead of resuming silently short-context.
+     * Stage E: exact number of older history rows omitted by the tail cap
+     * (DB-tail omission only; the scan keeps the newest HISTORY_LOAD_CAP
+     * rows). 0 when everything fit. Disjoint from the provider-request
+     * context omission (window + per-request trim legs), which is surfaced
+     * via `session.contextOmission` — never summed.
      */
     val historyDroppedCount: Int = 0,
 )
@@ -883,14 +887,17 @@ class ChatSessionFactory(
             backfillInterrupted(store, sessionId)
         }
         // Stage E: tail load (newest kept) with an exact dropped count; the
-        // cap also travels as MaxMessages so TurnController.droppedHistoryCount
-        // observes the same truncation (defense in depth: the prefix already
-        // saturates the cap, so each new live turn evicts the oldest prefix
-        // row to hold the combined request total at cap).
-        // B1 known divergence (see [SnapshotBudget]): only openImpl retains
-        // the declared B1 inconsistency (MaxMessages(HISTORY_LOAD_CAP) for
-        // the 2000-row DB tail) until B2 hydration-tail unification; openForked
-        // now uses HistoryWindowCap.DEFAULT (starts fresh empty session).
+        // count reports the DB-tail omission only (provider-context omission
+        // travels via session.contextOmission).
+        // B2 hydration-tail unification (done): the prefix travels
+        // HistoryWindowCap.DEFAULT (200 msgs / 60k chars), same as create /
+        // openForked / TurnController default, so a resumed long dialogue
+        // windows identically to a fresh one. The backward scan inside
+        // loadModelHistory stays bounded by HISTORY_LOAD_CAP (2000) as the
+        // I/O upper bound for
+        // reasoning-marker collection; extra rows are dropped by the window
+        // downstream (TurnController.droppedHistoryCount/droppedHistoryChars),
+        // never shipped.
         val loaded = loadModelHistory(store, sessionId)
         requireCurrentBinding(keyIsCurrent)
         val model = modelFor(endpoint)
@@ -919,7 +926,7 @@ class ChatSessionFactory(
                 systemZone,
                 sessionStart,
                 loaded.messages,
-                HistoryWindowCap.MaxMessages(SnapshotBudget.HISTORY_LOAD_CAP),
+                HistoryWindowCap.DEFAULT,
             )
             session = openedSession
             requireCurrentBinding(keyIsCurrent)

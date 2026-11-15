@@ -291,6 +291,10 @@ internal fun requireNoReasoningHistory(request: ChatRequest) {
  * 3. this assistant-image gate third,
  * 4. [validateToolPairing] fourth.
  *
+ * AnthropicProvider additionally inserts a first-non-system-role=user
+ * precheck between 3 and 4 (`FIRST_MESSAGE_MUST_BE_USER`); other adapters
+ * skip it.
+ *
  * Only `role == "assistant"` with non-empty `images` is rejected
  * (`ProviderFailure(retryable=false, "ASSISTANT_IMAGES_NOT_SUPPORTED")`);
  * user images still flow to the multimodal paths; system images keep the

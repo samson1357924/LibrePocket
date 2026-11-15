@@ -13,6 +13,7 @@ import dev.librepocket.tool.ToolRegistry
 import dev.librepocket.provider.AnthropicProvider
 import dev.librepocket.provider.ChatCompletionsProvider
 import dev.librepocket.provider.ChatRequest
+import dev.librepocket.provider.ChatMessage
 import dev.librepocket.provider.ProviderConfig
 import dev.librepocket.provider.ProviderProtocol
 import dev.librepocket.provider.ResponsesProvider
@@ -1783,7 +1784,15 @@ class SafeToolSliceTest {
             assertEquals(root, 2, msgs.size)
             assertEquals(root, """{"echo":"args redacted/capped"}""", msgs[0].toolCalls.single().argumentsJson)
             // Every adapter must accept the round and carry an OBJECT.
-            val request = ChatRequest(model = "test-model", messages = msgs, tools = listOf(schema))
+            // Anthropic's adapter prechecks that the first non-system message
+            // is role=user, so the dynamically built [assistant, tool]
+            // continuation is fed behind a leading user turn at the request
+            // boundary (the continuation itself is unchanged).
+            val request = ChatRequest(
+                model = "test-model",
+                messages = listOf(ChatMessage("user", "hi")) + msgs,
+                tools = listOf(schema),
+            )
             val wires = listOf(
                 "chat" to chatWireArguments(chat.buildBody(request)),
                 "responses" to responsesWireArguments(responses.buildBody(request)),
@@ -1804,7 +1813,13 @@ class SafeToolSliceTest {
         assertFalse(benignResults.single().denied)
         val benignMsgs = s.continuationMessages(benignCalls, benignResults)
         assertEquals("""{"query":"Foo"}""", benignMsgs[0].toolCalls.single().argumentsJson)
-        val benignRequest = ChatRequest(model = "test-model", messages = benignMsgs, tools = listOf(schema))
+        // Leading user turn: Anthropic's adapter prechecks first non-system
+        // role=user (the continuation itself is unchanged).
+        val benignRequest = ChatRequest(
+            model = "test-model",
+            messages = listOf(ChatMessage("user", "hi")) + benignMsgs,
+            tools = listOf(schema),
+        )
         assertEquals("Foo", chatWireArguments(chat.buildBody(benignRequest))["query"]!!.jsonPrimitive.content)
         assertEquals("Foo", responsesWireArguments(responses.buildBody(benignRequest))["query"]!!.jsonPrimitive.content)
         assertEquals("Foo", anthropicWireInput(anthropic.buildBody(benignRequest))["query"]!!.jsonPrimitive.content)

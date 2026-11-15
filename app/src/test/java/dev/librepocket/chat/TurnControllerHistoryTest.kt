@@ -204,20 +204,20 @@ class TurnControllerHistoryTest {
             // Total-window semantics: the cap bounds the combined
             // (capped prefix + live) request copy, newest kept. Load caps the
             // 4-row prefix to [keep-q2, keep-a2] (seed drop 2); the first send
-            // appends q3 (combined 3) so the window evicts one more oldest
-            // prefix row (keep-q2) to hold the total at 2. The load-time seed
-            // is replaced by this request's window drop (1); the load-time
+            // appends q3 (combined 3) so the naive cut evicts keep-q2, and the
+            // user-boundary snap re-aligns onto the next user row, evicting
+            // keep-a2 too — the request ships only the live row. The load-time
+            // seed is replaced by this request's window drop (2); the load-time
             // total stays observable separately via the factory's
             // historyDroppedCount.
             runBlocking { c.send("q3") }
             val req = provider.seenRequests.single()
             assertEquals(
-                listOf("assistant", "user"),
+                listOf("user"),
                 req.messages.map { it.role },
             )
-            assertEquals("keep-a2", req.messages[0].text)
-            assertTrue(req.messages[1].text.startsWith("q3"))
-            assertEquals(1, c.droppedHistoryCount)
+            assertTrue(req.messages[0].text.startsWith("q3"))
+            assertEquals(2, c.droppedHistoryCount)
         } finally {
             c.close()
         }

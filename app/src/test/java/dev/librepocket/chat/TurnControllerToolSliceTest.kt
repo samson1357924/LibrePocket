@@ -4,6 +4,7 @@ import dev.librepocket.policy.InMemoryPolicyStore
 import dev.librepocket.policy.PolicyRule
 import dev.librepocket.policy.PolicyStore
 import dev.librepocket.policy.Verdict
+import dev.librepocket.provider.ChatMessage
 import dev.librepocket.provider.ChatRequest
 import dev.librepocket.provider.ChatCompletionsProvider
 import dev.librepocket.provider.LlmProvider
@@ -223,6 +224,7 @@ class TurnControllerToolSliceTest {
         sink: TranscriptSink,
         toolSlice: SafeToolSlice?,
         historyCap: HistoryWindowCap = HistoryWindowCap.DEFAULT,
+        initialHistory: List<ChatMessage> = emptyList(),
     ): TurnController {
         var n = 0
         return TurnController(
@@ -235,6 +237,7 @@ class TurnControllerToolSliceTest {
             newId = { "slice-${n++}" },
             historyCap = historyCap,
             toolSlice = toolSlice,
+            initialHistory = initialHistory,
         )
     }
 
@@ -1176,9 +1179,19 @@ class TurnControllerToolSliceTest {
         val c = controller(provider, pol, sink, loop(pol, backend), HistoryWindowCap.Unbounded)
         val nearCapHistory = "a".repeat(98_500)
         val echoArgs = """{"query":"${"x".repeat(4_000)}"}"""
+        var baseOmission = -1
+        var baseTrimmed = -1
         var responses = 0
         provider.handler = { _ ->
             responses++
+            if (responses == 2) {
+                // The tool-round request has just been built and published:
+                // record the base (pre-continuation) cells so the post-turn
+                // assertions can split base publish from the continuation
+                // top-up.
+                baseOmission = c.contextOmission.value
+                baseTrimmed = c.requestTrimmedCount.value
+            }
             flow {
                 when (responses) {
                     1 -> {
@@ -1220,9 +1233,146 @@ class TurnControllerToolSliceTest {
         val payload = cont.messages.sumOf { it.wirePayloadChars() }
         assertTrue(payload <= TurnController.MAX_REQUEST_CHARS)
         assertTrue("continuation must head-trim once the args echo rides along", c.requestTrimmedCount.value > 0)
+        // B2 symmetry: buildToolContinuation tops contextOmission up on top
+        // of the base request's publish (base + the continuation prefix
+        // drop), mirroring the requestTrimmedCount contract above. The base
+        // leg contributes 0 here (Unbounded cap; ~98.6k text stays under the
+        // 100k send-time cap, and the resume window never bound), so the
+        // top-up alone accounts for the whole total.
+        assertTrue(
+            "continuation must top up contextOmission above the base publish " +
+                "(base=$baseOmission, got=${c.contextOmission.value})",
+            c.contextOmission.value >= baseOmission + 1,
+        )
+        assertEquals(
+            "contextOmission top-up must equal the base publish plus the continuation prefix trim",
+            baseOmission + (c.requestTrimmedCount.value - baseTrimmed),
+            c.contextOmission.value,
+        )
         assertEquals(ChatStatus.IDLE, c.uiState.value.status)
         assertEquals(2, sink.succeeded.size)
         assertTrue(sink.succeeded.last().second.contains("trimmed answer"))
+    }
+
+    // NOTE: the guard's two branches (drop > 0 && first non-system != user;
+    // firstNonSystem == null) are unreachable by construction — buildRequest
+    // carries the live user row at the base tail and both snaps use
+    // limit = baseMessages.size - 1, so the head always resolves to a user
+    // row when drop > 0. Pinning them would need an internal seam; they are
+    // deliberately untested (KDoc: "unreachable by construction", kept as
+    // belt-and-braces). See TurnController.kt guard comment.
+    @Test fun toolContinuationShipsSystemPrefixedBaseUnbounded() = runBlocking {
+        // Regression (P2, Finding #1): a system-prefixed base must NOT be
+        // refused by the continuation defense-in-depth guard. With drop == 0
+        // the retained base is the exact shape the attempt round already
+        // shipped (provider accepted or already rejected it there), so the
+        // guard is skipped entirely and the legal [system, user] prefix
+        // survives the continuation untouched.
+        val provider = SliceProvider()
+        val sink = SliceSink()
+        val backend = CountingBackend()
+        val pol = slicePolicy()
+        val c = controller(
+            provider,
+            pol,
+            sink,
+            loop(pol, backend),
+            HistoryWindowCap.Unbounded,
+            initialHistory = listOf(ChatMessage("system", "instruction")),
+        )
+        provider.handler = { request ->
+            flow {
+                if (request.messages.none { it.role == "tool" }) {
+                    emit(
+                        StreamEvent.ToolDone(
+                            toolIndex = 0,
+                            id = "call-1",
+                            name = "lsp.symbols",
+                            argumentsJson = """{"query":"Foo"}""",
+                        ),
+                    )
+                    emit(StreamEvent.Done("tool_calls"))
+                } else {
+                    emit(StreamEvent.TextDelta(0, 0, "answer"))
+                    emit(StreamEvent.Done("stop"))
+                }
+            }
+        }
+        c.send("u1")
+
+        assertEquals(2, provider.seenRequests.size)
+        // The attempt round already shipped the same legal shape (system-led
+        // head) — that is why the continuation must not be newly refused.
+        assertEquals("system", provider.seenRequests[0].messages.first().role)
+        assertTrue(provider.seenRequests[0].tools.isNotEmpty())
+        val cont = provider.seenRequests[1]
+        assertEquals("system", cont.messages.first().role)
+        assertEquals("user", cont.messages.first { it.role != "system" }.role)
+        assertTrue(cont.tools.isEmpty())
+        assertEquals(1, backend.invocations.get())
+        assertEquals(ChatStatus.IDLE, c.uiState.value.status)
+        assertEquals(1, sink.succeeded.size)
+    }
+
+    @Test fun toolContinuationShipsSystemPrefixedBaseMaxMessages() = runBlocking {
+        // Same Finding #1 regression under a MaxMessages cap: the combined
+        // window (system + u0 + a0 + live = 4 rows) stays under 10, so nothing
+        // is cut and the head system row survives the whole turn. (Deliberately
+        // NOT a ≤4-row cap — that would drop the system row, which is the
+        // Finding #2 windowing semantics, not this test's subject.)
+        val provider = SliceProvider()
+        val sink = SliceSink()
+        val backend = CountingBackend()
+        val pol = slicePolicy()
+        val c = controller(
+            provider,
+            pol,
+            sink,
+            loop(pol, backend),
+            HistoryWindowCap.MaxMessages(10),
+            initialHistory = listOf(
+                ChatMessage("system", "instruction"),
+                ChatMessage("user", "u0…"),
+                ChatMessage("assistant", "a0…"),
+            ),
+        )
+        provider.handler = { request ->
+            flow {
+                if (request.messages.none { it.role == "tool" }) {
+                    emit(
+                        StreamEvent.ToolDone(
+                            toolIndex = 0,
+                            id = "call-1",
+                            name = "lsp.symbols",
+                            argumentsJson = """{"query":"Foo"}""",
+                        ),
+                    )
+                    emit(StreamEvent.Done("tool_calls"))
+                } else {
+                    emit(StreamEvent.TextDelta(0, 0, "answer"))
+                    emit(StreamEvent.Done("stop"))
+                }
+            }
+        }
+        c.send("u1")
+
+        assertEquals(2, provider.seenRequests.size)
+        // The attempt round already shipped the same legal shape (system-led
+        // head, nothing cut — 4 rows under MaxMessages(10)) — that is why
+        // the continuation must not be newly refused.
+        assertEquals(
+            listOf("system", "user", "assistant", "user"),
+            provider.seenRequests[0].messages.map { it.role },
+        )
+        assertTrue(provider.seenRequests[0].tools.isNotEmpty())
+        val cont = provider.seenRequests[1]
+        assertEquals("system", cont.messages.first().role)
+        assertEquals(6, cont.messages.size) // system + u0 + a0 + u1 (time-blocked) + assistant + tool
+        assertEquals("user", cont.messages.first { it.role != "system" }.role)
+        assertTrue(cont.tools.isEmpty())
+        assertEquals(1, backend.invocations.get())
+        assertEquals(ChatStatus.IDLE, c.uiState.value.status)
+        assertEquals(1, sink.succeeded.size)
     }
 
     @Test fun continuationUntrimmableOverBudgetFailsClosedWithoutSending() = runBlocking {
@@ -1275,6 +1425,10 @@ class TurnControllerToolSliceTest {
         assertTrue(failedRecord.isFinal)
         assertEquals("continuation request over budget", failedRecord.error)
         assertTrue(failedRecord.partialText.contains("[tool-result:lsp.symbols"))
+        // The continuation threw before publishing: the flow retains the base
+        // request's published value (0 here — a single fat live row ships
+        // whole; no top-up leaks into contextOmission on the throw path).
+        assertEquals(0, c.contextOmission.value)
     }
 
     @Test fun continuationRoundLevelBudgetFailsClosedWithEightMaxCalls() = runBlocking {

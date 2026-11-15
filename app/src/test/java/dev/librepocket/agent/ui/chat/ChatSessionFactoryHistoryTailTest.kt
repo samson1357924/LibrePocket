@@ -41,9 +41,14 @@ private class TailFakeProvider(
  * Stage E history-tail regressions (all fake data).
  *
  * - Model history keeps the NEWEST rows (tail), oldest-first restored, with
- *   an exact dropped count ([CreatedSession.historyDroppedCount]).
+ *   an exact dropped count ([CreatedSession.historyDroppedCount] counts the
+ *   DB-tail drop beyond the 2000-row scan; the DEFAULT request window
+ *   (200 msgs / 60k chars) bounds the outgoing copy downstream —
+ *   B2 unification, see `ChatSessionFactoryHydrationB2Test`).
  * - The outgoing cap windows the combined (prefix + live) total, so the
- *   first send after a full tail evicts one more oldest row to hold 2000.
+ *   first send after a full tail evicts oldest rows to hold ~200 (199
+ *   after the user-boundary snap re-aligns the cut onto the next user
+ *   row — see `snapHistoryToUserBoundary`).
  * - A giant single row is truncated with a visible marker (fail-closed, never
  *   a silent unbounded payload).
  */
@@ -111,18 +116,27 @@ class ChatSessionFactoryHistoryTailTest {
         }
         val opened = factoryWith(transcripts, provider).open(sampleEndpoint(), sid)
         try {
-            // 2002 qualifying rows, cap 2000: oldest pair (u0,a0) omitted at load.
+            // B2: DB tail still drops the oldest pair (u0,a0) at load
+            // (2002 rows, 2000-row scan cap), then the DEFAULT window
+            // (200 msgs) bounds the request copy downstream.
             assertEquals(2, opened.historyDroppedCount)
             opened.session.send("q-new")
             val req = provider.seenRequests.single()
-            // Total-window semantics: the outgoing cap bounds the combined
-            // (2000-row prefix + 1 live) copy at 2000, so the new turn evicts
-            // one more oldest prefix row (u1). Request holds [a1..a1000, q-new].
-            assertEquals(2000, req.messages.size)
-            assertEquals("a1", req.messages.first().text)
-            assertEquals("a1000", req.messages[2000 - 2].text)
+            // Combined (200 prefix + 1 live) windows to 199: naive ~200
+            // then snap → 199. The naive cut (201 - 200 = 1) drops u901;
+            // user-boundary snap drops one more
+            // (a901, the assistant row the cut landed on), so the request
+            // holds [u902..a1000, q-new] (newest 99 turns of the 2000-row
+            // tail + live row).
+            assertEquals(199, req.messages.size)
+            assertEquals("u902", req.messages.first().text)
+            // Re-anchored post-B2 content pins: alternating fixture, so [1] is
+            // the assistant row (a902) and [2] is the next user row (u903).
+            assertEquals("a902", req.messages[1].text)
+            assertEquals("u903", req.messages[2].text)
+            assertEquals("a1000", req.messages[197].text)
             assertTrue(req.messages.last().text.startsWith("q-new"))
-            assertTrue(req.messages.none { it.text == "u0" || it.text == "a0" || it.text == "u1" })
+            assertTrue(req.messages.none { it.text == "u0" || it.text == "a0" || it.text == "u901" || it.text == "a901" })
         } finally {
             opened.session.close()
         }
@@ -453,8 +467,32 @@ class ChatSessionFactoryHistoryTailTest {
         assertTrue("newest in-window marker must restore the flag", assistants.last().hasReasoning)
         assertEquals("a-newest", assistants.last().text)
         assertTrue("older plain turns must stay unflagged", assistants.dropLast(1).none { it.hasReasoning })
-        // The marker itself never enters model context.
-        assertTrue(loaded.messages.none { it.text.isEmpty() && it.role == "reasoning" })
+        assertTrue("the marker itself never enters model context", loaded.messages.none { it.text.isEmpty() && it.role == "reasoning" })
+    }
+
+    /**
+     * #16/B2: `system` runtime rows (interrupted/failure/usage notices) are
+     * transcript- and replay-only. `loadModelHistoryScan` keeps only
+     * non-partial `user`/`assistant` rows and `loadModelHistory` maps those
+     * — a caller constructing `initialHistory` directly is the only source of
+     * inline system rows in model context.
+     */
+    @Test fun hydrationSkipsSystemRows() = runBlocking {
+        val transcripts = FakeSessionStore()
+        val sid = transcripts.createSession("old chat", "preset:openai@https://api.openai.com/gpt-4o-mini")
+        transcripts.appendEvent(event(sid, "s1", "system", "turn interrupted"))
+        transcripts.appendEvent(event(sid, "u1", "user", "u1"))
+        transcripts.appendEvent(event(sid, "s2", "system", "resume notice"))
+        transcripts.appendEvent(event(sid, "a1", "assistant", "a1"))
+        transcripts.appendEvent(event(sid, "s3", "system", "usage notice"))
+
+        val scan = loadModelHistoryScan(transcripts, sid)
+        assertTrue("system rows never enter the scan", scan.events.all { it.kind != "system" })
+
+        val loaded = loadModelHistory(transcripts, sid)
+        assertEquals(2, loaded.messages.size)
+        assertTrue(loaded.messages.none { it.role == "system" || it.role == "reasoning" })
+        assertEquals(listOf("u1", "a1"), loaded.messages.map { it.text })
     }
 
     /**

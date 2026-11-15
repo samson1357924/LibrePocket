@@ -124,6 +124,11 @@ class ApprovalRequiredException : Exception("chat.send approval required")
  * attachment can never trip this exception on byte volume alone; image
  * size/rejection is governed separately (spec §4 byte caps and
  * ImageFallbackPolicy).
+ *
+ * Throw path observability: on throw the controller's context-omission flow
+ * retains the base request's published value — that value corresponds to a
+ * request that was never shipped; it is kept for observation only, and the
+ * next [buildRequest] re-publishes per request.
  */
 class ContinuationOverBudgetException : Exception("continuation request over budget")
 
@@ -174,7 +179,8 @@ class ContinuationOverBudgetException : Exception("continuation request over bud
  * delta.
  *
  * The default is [Bounded] ([HistoryWindowCap.DEFAULT]: at most 200 messages
- * and 60_000 chars, oldest-first, whole-message, pair-atomic — see below).
+ * and 60_000 chars, oldest-first, whole-message, pair-atomic and
+ * turn-aligned — see below).
  * Synthetic JVM measurement basis (fake provider/policy, no network/device):
  * 20 x ~500-char rows ship ~10k chars while 100 x ~500-char rows ship ~50k
  * chars under explicit [Unbounded] (linear, unbounded — both fit the 100k
@@ -189,9 +195,23 @@ class ContinuationOverBudgetException : Exception("continuation request over bud
  * tiny-message floods are still count-bounded). Ordinary sessions never trip
  * either leg; long dialogues window oldest-first and stay observable.
  * [Unbounded] is retained as an explicit opt-in for tests/scaffolds that
- * need the full history. Hydration-tail unification (the 2000-row DB tail
- * still loads before this window) and any token/context measurement stay
- * Target for B2.
+ * need the full history. B2 hydration-tail unification (done): `open`
+ * travels this same [DEFAULT] (200/60k), so create/resume share one window;
+ * the 2000-row DB backward scan stays as the I/O upper bound for
+ * reasoning-marker collection (R23/R24/R25) and the extra rows are dropped
+ * by this window downstream, never shipped. Device-heap validation of that
+ * scan stays B3.
+ *
+ * Token layer (B2, honest char-based, no tokenizer dependency): all legs
+ * above are `String.length` (UTF-16 code units). Interim conversion assumes
+ * ~4 chars/token for running text (English ~3.5-4; CJK/dense symbols vary
+ * widely; counts are UTF-16 code units so emoji surrogate pairs inflate
+ * the count; this is an order-of-magnitude budget aid, never a billing or
+ * model-context guarantee): 60k chars ≈ 15k tokens, 100k
+ * ([MAX_REQUEST_CHARS]) ≈ 25k tokens, one 20k interim row ≈ 5k tokens.
+ * Real token/heap measurement and budget tuning stay Target (B3 device
+ * validation); until then the char bound is the interim cap and every trim
+ * stays observable via the counters above.
  *
  * Pair atomicity (B1): truncation never splits a legal tool-call/result
  * pairing. When a naive head cut (count/char/dual) falls inside a valid,
@@ -206,14 +226,51 @@ class ContinuationOverBudgetException : Exception("continuation request over bud
  * runs to the end of history and would otherwise be split. Discarded
  * unwindowed prefixes are NOT validated: an invalid message or malformed
  * batch wholly within the discarded prefix never disables pair-atomic
- * snapping for valid tool batches later in the history. The
+ * snapping for valid tool batches later in the history. A batch at or after
+ * `naiveStart` is never evaluated at all — the cut is kept simply by the
+ * scan bound. The
  * single-newest-whole-message rule is preserved for plain histories (a lone
  * newest user/assistant row is never a tool batch, so it survives even over a
  * char budget). When an invalid or unpaired part survives into the retained
  * slice (such as an orphan `tool` row, a dangling batch, or an ambiguous
- * blank `toolCallId` within or straddling the retained window), the window
- * never repairs or drops it: it keeps the naive cut and fails closed
- * downstream in `ProviderJson.validateToolPairing`.
+ * blank `toolCallId` within or straddling the retained window), the pair
+ * snap never repairs or drops it by itself: it keeps the naive cut for the
+ * pair decision and lets the pairing fail closed downstream in
+ * `ProviderJson.validateToolPairing`. (The separate turn-boundary snap may
+ * still drop such rows wholesale when a `role == "user"` row follows them —
+ * it aligns boundaries, it never repairs pairing.)
+ *
+ * Turn-boundary snap (B2, #16): even after the pair snap, a naive head cut
+ * can open the retained slice on an orphan assistant (or tool) row, and the
+ * Anthropic Messages API rejects a first non-system message whose role is not
+ * `user` (HTTP 400 equivalent); OpenAI has no hard rejection but mis-reads the
+ * context / wastes window. After the pair
+ * snap, [snapHistoryToUserBoundary] advances the cut to the next
+ * `role == "user"` row (never beyond the caller's `limit`), dropping the
+ * orphan rows whole. If no `role == "user"` row lies within `[start, limit]`
+ * the cut is kept as-is (fail-closed): the window never repairs *pairing*;
+ * leading invalid/unpaired slices may be dropped wholesale by boundary
+ * alignment (counted in the drop); only the no-user-row-follows case keeps
+ * the slice: a pairing violation still fails closed downstream in
+ * `ProviderJson.validateToolPairing`; a pure assistant/tool first row with
+ * no pairing violation is refused at the provider side (Anthropic `FIRST_MESSAGE_MUST_BE_USER` typed
+ * precheck, zero HTTP; OpenAI has no hard rejection and mis-reads
+ * the context) — mirroring the pair-atomic policy. A
+ * legal tool batch never straddles a user row, and a batch wholly before the
+ * cut is dropped together with its user row, so tool-pair integrity is
+ * unaffected.
+ *
+ * Canonical note (B1 review, mirror-canonical drift): the pairing rule here
+ * mirrors the downstream gate `ProviderJson.validateToolPairing(...,
+ * allowChatBackfill = true)` (assistant `toolCalls` open, matching `tool`
+ * ids drain, single-pending blank-id backfill) via [snapHistoryToPairBoundary]
+ * + [completeToolBatchEnd], shared by the window, the send-time
+ * `MAX_REQUEST_CHARS` trim, and the continuation prefix trim. The gate is
+ * canonical; this window is a mirror only. On any drift the window stays
+ * strict (naive cut, never a repair) so the gate still fails closed on the
+ * shipped shape. The Responses/Anthropic gates do not apply the chat
+ * backfill mirror — a blank `toolCallId` always fails closed
+ * (`TOOL_OUTPUT_MISSING_ID`); the mirror above covers the chat path only.
  */
 sealed interface HistoryWindowCap {
   data object Unbounded : HistoryWindowCap
@@ -230,7 +287,8 @@ sealed interface HistoryWindowCap {
   /**
    * B1 (#16) dual-track bound: the request copy must satisfy BOTH legs
    * (newest kept). The naive head cut is `max(count-leg cut, char-leg cut)`
-   * and then snaps forward to the next tool-pair boundary (see above).
+   * and then snaps forward to the next tool-pair boundary (see above), and
+   * finally to the next user row (turn boundary) per [snapHistoryToUserBoundary].
    */
   data class Bounded(val maxMessages: Int, val maxChars: Int) : HistoryWindowCap {
     init {
@@ -268,9 +326,24 @@ sealed interface HistoryWindowCap {
  * messages, never splits one — so at least the newest message always survives.
  * When an invalid or unpaired part survives into the retained slice (e.g., an
  * orphan `tool` row, a dangling batch, or an ambiguous blank `toolCallId`
- * within the retained window), it is never repaired or dropped here: the
- * window keeps the naive cut and fails closed downstream in
- * `ProviderJson.validateToolPairing`.
+ * within the retained window), it is never repaired or dropped here by
+ * pair-atomic logic: the pair decision keeps the naive cut and fails closed
+ * downstream in `ProviderJson.validateToolPairing`.
+ *
+ * Turn boundary (B2, #16): after the pair snap, the cut may still land on an
+ * orphan assistant (or tool) row, and the Anthropic Messages API rejects a
+ * first non-system message whose role is not `user` (HTTP 400 equivalent). The cut then
+ * snaps forward to the next `role == "user"` row via
+ * [snapHistoryToUserBoundary] — dropping the leading non-user rows whole —
+ * with fail-closed semantics: if no user row
+ * follows within the allowed window the naive cut is kept. The window never
+ * repairs *pairing*; leading invalid/unpaired slices may be dropped
+ * wholesale by boundary alignment (counted in the drop); only the
+ * no-user-row-follows case keeps the slice: a pairing violation still fails
+ * closed downstream in `ProviderJson.validateToolPairing`; a pure
+ * assistant/tool first row with no pairing violation is refused at the
+ * provider side (Anthropic `FIRST_MESSAGE_MUST_BE_USER` typed precheck (zero HTTP); OpenAI
+ * has no hard rejection and mis-reads the context).
  */
 internal fun applyHistoryCap(history: List<ChatMessage>, cap: HistoryWindowCap): List<ChatMessage> {
   if (history.isEmpty()) return history
@@ -278,15 +351,15 @@ internal fun applyHistoryCap(history: List<ChatMessage>, cap: HistoryWindowCap):
     is HistoryWindowCap.Unbounded -> history
     is HistoryWindowCap.MaxMessages -> {
       val naiveStart = (history.size - cap.maxMessages).coerceAtLeast(0)
-      history.drop(snapHistoryToPairBoundary(history, naiveStart))
+      history.drop(snapHistoryToUserBoundary(history, snapHistoryToPairBoundary(history, naiveStart)))
     }
     is HistoryWindowCap.MaxChars -> {
-      history.drop(snapHistoryToPairBoundary(history, charWindowStart(history, cap.maxChars)))
+      history.drop(snapHistoryToUserBoundary(history, snapHistoryToPairBoundary(history, charWindowStart(history, cap.maxChars))))
     }
     is HistoryWindowCap.Bounded -> {
       val countStart = (history.size - cap.maxMessages).coerceAtLeast(0)
       val charStart = charWindowStart(history, cap.maxChars)
-      history.drop(snapHistoryToPairBoundary(history, maxOf(countStart, charStart)))
+      history.drop(snapHistoryToUserBoundary(history, snapHistoryToPairBoundary(history, maxOf(countStart, charStart))))
     }
   }
 }
@@ -304,13 +377,16 @@ private fun charWindowStart(history: List<ChatMessage>, maxChars: Int): Int {
 }
 
 /**
- * Turn-boundary snap for [applyHistoryCap] (and send-time prefix trimming;
- * B1 pair atomicity).
+ * Tool-pair boundary snap for [applyHistoryCap] (and send-time prefix
+ * trimming; B1 pair atomicity). Callers apply [snapHistoryToUserBoundary]
+ * afterwards; the two snaps compose.
  *
  * Scans `0 until naiveStart` for any assistant message with `toolCalls` whose
  * valid, complete tool-call/output batch (per [completeToolBatchEnd])
  * straddles [naiveStart] (`batchEnd > naiveStart`), snapping forward to
- * `batchEnd` so a legal batch is never split.
+ * `batchEnd` so a legal batch is never split. (A batch at or after
+ * `[naiveStart]` is never evaluated at all — the cut is kept simply by the
+ * scan bound.)
  *
  * Discarded unwindowed prefixes are NOT validated: an invalid message,
  * orphan `tool` row, or malformed batch wholly before [naiveStart] is simply
@@ -320,8 +396,16 @@ private fun charWindowStart(history: List<ChatMessage>, maxChars: Int): Int {
  * dangling batch, or an ambiguous blank `toolCallId` within or straddling
  * the retained window), [completeToolBatchEnd] returns `-1` for malformed/incomplete
  * batches and [snapHistoryToPairBoundary] returns [naiveStart] unchanged — the
- * window never repairs invalid history and fails closed downstream in
- * `ProviderJson.validateToolPairing`.
+ * pair snap only holds the naive cut and never repairs *pairing*. Whether
+ * that cut ships is decided by [snapHistoryToUserBoundary]: when a
+ * `role == "user"` row follows within `[start, limit]` the leading
+ * invalid/unpaired slice is dropped wholesale (counted in the drop); only
+ * when no user row lies within `[start, limit]` is the cut kept: a pairing
+ * violation still fails closed downstream in
+ * `ProviderJson.validateToolPairing`; a pure assistant/tool first row with
+ * no pairing violation is refused at the provider side (Anthropic `FIRST_MESSAGE_MUST_BE_USER` typed
+ * precheck, zero HTTP; OpenAI has no hard rejection and mis-reads
+ * the context).
  */
 private fun snapHistoryToPairBoundary(history: List<ChatMessage>, naiveStart: Int): Int {
   if (naiveStart <= 0) return 0
@@ -345,7 +429,85 @@ private fun snapHistoryToPairBoundary(history: List<ChatMessage>, naiveStart: In
 }
 
 /**
- * If [history] at [start] opens a valid, complete tool-call/output batch
+ * Turn-boundary snap for [applyHistoryCap] and the send-time head trims
+ * (B2, #16): after the naive/pair-snapped head cut at [start], advance to
+ * the next `role == "user"` row so the retained slice never opens on an
+ * orphan assistant (or tool) row. The Anthropic Messages API rejects a
+ * first non-system message whose role is not `user` (HTTP 400 equivalent); OpenAI has
+ * no hard rejection but mis-reads the context / wastes window. The
+ * pair-atomic snap only protects
+ * structured tool batches and cannot align plain user/assistant turn
+ * boundaries — this snap closes that gap. A legal tool-call/output batch
+ * never straddles a user row, and a batch wholly before [start] is dropped
+ * together with its user row, so tool-pair integrity is unaffected.
+ *
+ * Semantics:
+ * 1. `start <= 0` or `start >= history.size` returns [start] unchanged
+ *    (no cap pressure; an empty request is never "fixed").
+ * 2. `history[start].role == "user"` returns [start] unchanged.
+ * 3. Otherwise returns the index of the first `role == "user"` row after
+ *    [start], never beyond [limit]. [limit] is the caller-side upper bound
+ *    on the returned index (inclusive; default [history.size], i.e. no
+ *    limit). The send-time trims pass their last-user/newest-row protection
+ *    limit so the snap can never consume the row the trim must preserve.
+ * 4. No `role == "user"` row within `[start, limit]` returns [start]
+ *    (fail-closed: keeps the naive cut; a pairing violation still fails
+ *    closed downstream in `ProviderJson.validateToolPairing`; a pure
+ *    assistant/tool first row with no pairing violation is refused at the
+ *    provider side — Anthropic `FIRST_MESSAGE_MUST_BE_USER` typed precheck (zero HTTP);
+ *    OpenAI has no hard rejection and mis-reads the context — mirroring
+ *    the pair-atomic policy, the window never repairs *pairing*).
+ * 5. Forward-only, never backwards; whole rows are dropped.
+ * 6. System rows are treated exactly like any other non-user row: they
+ *    neither stop the snap nor by themselves keep the slice; they are
+ *    dropped only when a `role == "user"` row follows within
+ *    `[start, limit]` (otherwise the cut is kept — see point 4).
+ *
+ * Inline `role="system"` rows are not exempt from windowing: one leading a
+ * non-user run is dropped wholesale with the run (counted in
+ * `droppedHistoryCount`/`droppedHistoryChars`/`contextOmission`), never
+ * kept to "protect" instructions. `systemPromptOverride` exists at the
+ * `ChatRequest` adapter layer only: each adapter serializes a non-null
+ * value into its own system slot (Anthropic top-level `system`,
+ * Responses top-level `instructions`, ChatCompletions a leading `system`
+ * message), none of which is a transcript row and none of which any window
+ * leg touches. It is NOT a chat-session configuration available today:
+ * `buildRequest` constructs `ChatRequest(model, messages, tools)` without
+ * passing an override, and neither `ChatSession` nor the controller
+ * constructor accepts or exposes one — `systemPromptOverride` is an
+ * adapter-level escape hatch, not a durable-instruction feature. The
+ * hydration path (`loadModelHistory`) never restores system rows (it only
+ * projects non-partial user/assistant rows), so this shape arises only
+ * when a caller constructs `initialHistory` directly; an inline system row
+ * carrying an instruction is a caller bug the window will not accommodate.
+ * A future "persistent system instructions" feature must be specified and
+ * wired as its own change (ChatSession API, a `buildRequest` parameter,
+ * adapter-semantics consistency); this PR does not commit to it.
+ *
+ * The window never repairs *pairing*; leading invalid/unpaired slices may
+ * be dropped wholesale by boundary alignment (counted in the drop); only
+ * the no-user-row-follows case keeps the slice: a pairing violation still
+ * fails closed downstream in `ProviderJson.validateToolPairing`; a pure
+ * assistant/tool first row with no pairing violation is refused at the
+ * provider side (Anthropic `FIRST_MESSAGE_MUST_BE_USER` typed precheck (zero HTTP); OpenAI
+ * has no hard rejection and mis-reads the context).
+ */
+internal fun snapHistoryToUserBoundary(
+  history: List<ChatMessage>,
+  start: Int,
+  limit: Int = history.size,
+): Int {
+  if (start <= 0 || start >= history.size) return start
+  if (history[start].role == "user") return start
+  val last = limit.coerceAtMost(history.size - 1)
+  for (i in start + 1..last) {
+    if (history[i].role == "user") return i
+  }
+  return start
+}
+
+/**
+ * If a valid, complete tool-call/output batch
  * (assistant `toolCalls` with non-blank, batch-unique ids/names immediately
  * followed by matching `tool` rows, including single-pending backfill
  * matching `ProviderJson.validateToolPairing(..., allowChatBackfill = true)`),
@@ -580,8 +742,10 @@ internal enum class DurableAdmission {
  * flush commits).
  *
  * Context window: the outgoing request carries [historyCap] (default
- * [HistoryWindowCap.DEFAULT] — bounded, pair-atomic); truncation is
- * oldest-first, whole-message, tool-pair-atomic, and counted on
+ * [HistoryWindowCap.DEFAULT] — bounded, pair-atomic and turn-aligned);
+ * truncation is
+ * oldest-first, whole-message, tool-pair-atomic and user-boundary-aligned,
+ * and counted on
  * [droppedHistoryCount]/[droppedHistoryChars]. The resumed prefix below is
  * part of that windowed history. [HistoryWindowCap.Unbounded] remains as an
  * explicit opt-in for tests/scaffolds only.
@@ -591,8 +755,10 @@ internal enum class DurableAdmission {
  * excluded by the caller — they replay in the UI flagged, but never read as
  * completed model context, mirroring the live `!isPartial` filter below).
  * [historyCap] bounds that prefix oldest-first at whole-message boundaries
- * ([HistoryWindowCap]); hydration-tail unification (DB tail paging) stays
- * Target for B2. Every outgoing [ChatRequest] is history-prefix + live
+ * ([HistoryWindowCap]); B2 hydration-tail unification (done): `open` travels
+ * [HistoryWindowCap.DEFAULT], so create/resume share one window (the DB
+ * 2000-row scan stays as the I/O upper bound, windowed downstream). Every
+ * outgoing [ChatRequest] is history-prefix + live
  * messages, so the first request after resume already sees the prior
  * conversation.
  *
@@ -1021,17 +1187,22 @@ class TurnController(
   /** Resumed-history prefix after [historyCap] (oldest-first, whole messages). */
   private val cappedHistory: List<ChatMessage> = applyHistoryCap(initialHistory, historyCap)
 
+  /** Constructor-time resumed prefix size; lets [buildRequest] publish [contextOmission] without re-touching the constructor param. */
+  private val initialHistorySize: Int = initialHistory.size
+
   /**
-   * Messages dropped from the last outgoing request by [historyCap], seeded
-   * with the resumed-prefix drops at load time (0 when nothing is dropped,
-   * e.g. explicit [HistoryWindowCap.Unbounded]). The observable counterpart
-   * to context truncation: the request copy never silently loses history.
-   * Updated on
-   * every [buildRequest] to that request's combined-window drop
-   * (`combined - base`, capped prefix + live); the seed is then replaced, so
-   * a resumed session at cap reports a growing send-time count while the
-   * load-time total stays observable separately via the factory's
-   * historyDroppedCount. The UI list and transcript keep everything.
+   * Per-request combined-window drop by [historyCap] for the last outgoing
+   * request (capped prefix + live, oldest-first): how many rows the window
+   * removed from the combined segment, **not** the load-time resumed-prefix
+   * seed. Seeded with the resumed-prefix drops at construction time (0 when
+   * nothing is dropped, e.g. explicit [HistoryWindowCap.Unbounded]), then
+   * replaced on every [buildRequest] with that request's combined-window
+   * drop (`combined - base`). The construction-time seed is therefore NOT
+   * observable here after the first send — the total omission against the
+   * full (resumed + live) history is published on [contextOmission]
+   * instead. DB-tail drops (rows never loaded into [initialHistory]) are
+   * observed separately via the factory's `historyDroppedCount` / VM
+   * `historyOmittedCount`; the two are disjoint sets of rows — never sum.
    */
   @Volatile var droppedHistoryCount: Int = (initialHistory.size - cappedHistory.size).coerceAtLeast(0)
     private set
@@ -1045,13 +1216,62 @@ class TurnController(
    * dropped, e.g. explicit [HistoryWindowCap.Unbounded]), replaced on every [buildRequest] with that
    * request's combined-window drop (time-block excluded: the ephemeral block
    * is suffixed after the window trim, so it never inflates this cell — see
-   * the [HistoryWindowCap] reconciliation note). The UI list and transcript
+   * the [HistoryWindowCap] reconciliation note). Per-request combined-window
+   * drop only, like [droppedHistoryCount] — the construction-time seed is
+   * excluded; the count-side total omission is published on
+   * [contextOmission] (no char counterpart). The UI list and transcript
    * keep everything; only the outgoing request copy is windowed. Read-only
    * observability: never gates truncation, never changes the request.
    */
   @Volatile var droppedHistoryChars: Long =
     (initialHistory.sumOf { it.text.length.toLong() } - cappedHistory.sumOf { it.text.length.toLong() }).coerceAtLeast(0L)
     private set
+
+  /**
+   * Provider-request context omission total: how many rows the windowing
+   * legs keep out of the outgoing request, unified across legs. The
+   * windowing legs (the construction-time history window seed and the
+   * per-request combined window) drop only original rows; their send-time
+   * [MAX_REQUEST_CHARS] head trim also drops only original rows; synthesized
+   * tool-round rows are never dropped and never counted. For the base request the
+   * counted set is the original rows (the resumed [initialHistory] + this send's
+   * live rows) removed by the windowing legs — the construction-time
+   * history window (seed, `initialHistory.size - cappedHistory.size`), the
+   * per-request combined window (capped prefix + live, oldest-first), and
+   * the send-time [MAX_REQUEST_CHARS] head trim (whose leg is also
+   * published separately on [requestTrimmedCount] / [lastRequestTrimmedCount]
+   * for debug — a subset of this total, never additive).
+   *
+   * Published synchronously on every [buildRequest] as
+   * `(initialHistory.size + live.size - outgoingMessages.size).coerceAtLeast(0)`.
+   * Count caveat: with no user row in the windowed base, [buildRequest] appends one
+   * empty-text image row after the cap — the total may low-report by exactly that row.
+   * A tool continuation ([buildToolContinuation]) additionally emits its
+   * own prefix trim on top, mirroring [requestTrimmedCount]'s continuation
+   * contract (the continuation top-up only adds the prefix trim — rows the
+   * prefix trim removes are likewise all original rows; synthesized
+   * tool-round rows are never dropped and never counted). Throw path:
+   * [ContinuationOverBudgetException] leaves this flow at the base
+   * request's published value (that value corresponds to a request that was
+   * never shipped — the continuation was never sent). Rejections
+   * before any request leave the last published value (the construction-time
+   * seed until the first [buildRequest] publishes; from the second send on,
+   * the previous request's published value is retained).
+   *
+   * Orthogonal to the DB-tail omission (factory
+   * `CreatedSession.historyDroppedCount` / VM `historyOmittedCount`, which
+   * counts rows never loaded into [initialHistory]): the two are disjoint
+   * sets of rows — never sum them, and never add them into UI copy. The
+   * seed carries the resume-time init-window drop so a resumed long
+   * conversation reports a non-zero badge before the first send.
+   * Pairing-gate scope: the Responses/Anthropic gates do not apply the chat
+   * backfill mirror — a blank `toolCallId` always fails closed
+   * (`TOOL_OUTPUT_MISSING_ID`); the mirror note covers the chat path only.
+   * Read-only observability: never gates truncation, never changes the
+   * request.
+   */
+  private val _contextOmission = MutableStateFlow((initialHistorySize - cappedHistory.size).coerceAtLeast(0))
+  val contextOmission: StateFlow<Int> = _contextOmission.asStateFlow()
 
   /**
    * Visible-text deltas collected this controller lifetime (text + reasoning).
@@ -1230,7 +1450,7 @@ class TurnController(
    * continuation (`buildToolContinuation`) additionally emits its total once
    * per tool round, adding the continuation's own prefix trim on top of the
    * base request's count. Distinct from
-   * the load-time [droppedHistoryCount] (DB tail cap): this counts send-time
+   * the hydration-window drop (init seed / per-request combined window), not a DB tail cap — DB tail lives in the factory: this counts send-time
    * per-request 100k-char trims. Never summed with resume omission; surfaced
    * via ChatSession/VM as `requestTrimmedCount`. Rejections before any request
    * (oversize input, UNKNOWN admission) leave the last emitted value untouched.
@@ -5997,9 +6217,18 @@ class TurnController(
    *
    * When the structured round pushes the request past [MAX_REQUEST_CHARS],
    * history-prefix trimming (oldest-first, whole messages, tool pairing kept
-   * atomic by snapping forward via [snapHistoryToPairBoundary], the structured payload counted) is additionally published on
-   * [lastRequestTrimmedCount]/[requestTrimmedCount] (counts) and
-   * [lastRequestTrimmedChars]/[lastRequestChars] (chars)
+   * atomic by snapping forward via [snapHistoryToPairBoundary], the structured payload counted;
+   * the cut then re-aligns to the next user row via [snapHistoryToUserBoundary] so the retained
+   * prefix never opens on an orphan assistant/tool row — the slice is kept only
+   * when no user row follows within `[start, limit]` (a pairing violation then
+   * fails closed downstream in `ProviderJson.validateToolPairing`; a head whose
+   * first non-system row is not `user` — same shape as the Anthropic
+   * `FIRST_MESSAGE_MUST_BE_USER` precheck — is refused at the provider side;
+   * OpenAI has no hard rejection and mis-reads the context); otherwise the leading
+   * orphan rows are dropped wholesale) is additionally published on
+   * [lastRequestTrimmedCount]/[requestTrimmedCount] (counts),
+   * [lastRequestTrimmedChars]/[lastRequestChars] (chars), and on top of the
+   * base request's [contextOmission] value
    * as the total head trim of the outgoing request (added on top of the
    * base request's own emission) — never silent. Wire-vs-text: the drop
    * *decision* sums wire-estimate units (`requestWireEstimate`, wrapper +
@@ -6023,7 +6252,9 @@ class TurnController(
     val contMessages = loop.continuationMessages(calls, results)
     // Keep tool-call/tool-result pairing atomic: trim only the history prefix
     // when the structured round pushes the request over MAX_REQUEST_CHARS,
-    // snapping forward via snapHistoryToPairBoundary.
+    // snapping forward via snapHistoryToPairBoundary; then re-align the cut
+    // to the next user row via snapHistoryToUserBoundary so the retained
+    // prefix never opens on an orphan assistant/tool row.
     // Payload accounting is the conservative full-request estimate
     // (`requestWireEstimate`: per-message terms for the base AND the
     // structured round, plus the request envelope once) and includes the
@@ -6044,6 +6275,12 @@ class TurnController(
       if (snapped <= baseMessages.size - 1) {
         drop = snapped
       }
+      // Always true given the while-loop bound (drop <= size - 1) and the
+      // pair-snap rejection path above (a snap past size - 1 is refused, so
+      // drop never exceeds it here); kept as belt-and-braces.
+      if (drop <= baseMessages.size - 1) {
+        drop = snapHistoryToUserBoundary(baseMessages, drop, baseMessages.size - 1)
+      }
     }
     if (drop > 0) {
       totalChars = requestWireEstimate(baseMessages.drop(drop) + contMessages, base.model)
@@ -6056,11 +6293,41 @@ class TurnController(
       // silently shipping an over-cap request.
       // Trim-count contract: on this throw path requestTrimmedCount
       // retains only the base request's published dropCount (the request
-      // was never shipped); the next build resets it per request. Char
-      // cells likewise keep the base values (mirrors the count contract).
+      // was never shipped); contextOmission likewise keeps the base
+      // request's published value; the next build resets it per request.
+      // Char cells likewise keep the base values (mirrors the count contract).
       throw ContinuationOverBudgetException()
     }
     val finalBase = if (drop > 0) baseMessages.drop(drop) else baseMessages
+    // Defense-in-depth (LOW-2), mirroring the Anthropic provider precheck
+    // (`FIRST_MESSAGE_MUST_BE_USER`: the first non-system message must be
+    // `role=user`). Fail closed (typed, non-retryable) instead of shipping a
+    // head the provider would refuse/mis-read. The check is scoped to
+    // `drop > 0` deliberately: with `drop == 0` the retained base is the
+    // exact shape the attempt round already shipped — the provider either
+    // accepted it (attempt was emitted and only the continuation is new) or
+    // already rejected it there — so a legal `[system, user]` prefix must
+    // PASS here; a `first().role`-style check would wrongly refuse it. With
+    // `drop > 0` the cut can have consumed a leading slice and left an
+    // orphan non-user head; the guard then mirrors the provider rule (the
+    // first non-system row must be `user`). A fully system-prefixed head
+    // (`firstOrNull { it.role != "system" } == null`) fails closed too,
+    // consistent with the provider gate. Belt-and-braces: unreachable by
+    // construction today — `buildRequest` always carries the live user row at
+    // the tail of the base whenever any user row survives the window, and
+    // both snaps (pair, then user-boundary with limit `baseMessages.size - 1`)
+    // cover it, so the retained head's first non-system row is an invariant
+    // constant (`user`); the guard pins that invariant (if the window ever
+    // removes every user row, the guard fires and fails closed). `finalBase`
+    // is guaranteed non-empty here: the while bound is
+    // `drop < baseMessages.size - 1` and both snaps refuse to push `drop`
+    // past `baseMessages.size - 1`, so at least the newest base row survives.
+    if (drop > 0 && finalBase.firstOrNull { it.role != "system" }?.role != "user") {
+      // The trim exhausted the prefix down to a non-user head (or an all-
+      // system head): shipping it would be rejected by the provider. Fail
+      // closed (typed, non-retryable).
+      throw ContinuationOverBudgetException()
+    }
     // Publish the continuation's own prefix trim (never silent): buildRequest
     // already emitted the base request's context-window trim, so this adds on
     // top — lastRequestTrimmedCount then reflects the TOTAL head trim of the
@@ -6068,11 +6335,15 @@ class TurnController(
     // read-add-set is exact, char side likewise (text.length units, never the
     // wire-estimate units that drove the drop decision); lastRequestChars is
     // refreshed to the shipped continuation size (finalBase + structured
-    // round). Observability only.
+    // round); contextOmission likewise tops up with the continuation's own
+    // prefix trim (the continuation only ADDS synthesized round rows on top;
+    // every row its prefix trim removes — all original rows — is an
+    // omission). Observability only.
     if (drop > 0) {
       val total = _lastRequestTrimmedCount.get() + drop
       _lastRequestTrimmedCount.set(total)
       _requestTrimmedCount.value = total
+      _contextOmission.value = _contextOmission.value + drop
       var contTrimmedChars = 0L
       for (i in 0 until drop) contTrimmedChars += baseMessages[i].text.length
       // Single-writer (same coroutine as the base trim): read-add-set is exact.
@@ -6132,7 +6403,15 @@ class TurnController(
    * with the final size on [lastRequestChars] (see [HistoryWindowCap] for the
    * reconciliation formula). The send-time [MAX_REQUEST_CHARS] trim is also
    * pair-atomic, snapping forward via [snapHistoryToPairBoundary] so tool
-   * call/result pairs are never fractured.
+   * call/result pairs are never fractured; the cut then re-aligns to the
+   * next user row via [snapHistoryToUserBoundary] (never beyond the
+   * last-user protection limit) so the retained slice never opens on an
+   * orphan assistant/tool row — an illegal retained slice is kept only when
+   * no user row follows within `[start, limit]` (a pairing violation then
+   * fails closed downstream in `ProviderJson.validateToolPairing`; a pure
+   * assistant/tool first row with no pairing violation is refused at the
+   * provider side — Anthropic `FIRST_MESSAGE_MUST_BE_USER` typed precheck (zero HTTP); OpenAI
+   * has no hard rejection and mis-reads the context).
    *
    * Ephemeral time context: a [buildRuntimeTimeContext] block is appended to a
    * copy of the last user message only. No user message means no injection
@@ -6191,10 +6470,16 @@ class TurnController(
       if (snapped <= maxDropLimit) {
         dropCount = snapped
       }
+      dropCount = snapHistoryToUserBoundary(base, dropCount, maxDropLimit)
     }
     _lastRequestTrimmedCount.set(dropCount)
     _requestTrimmedCount.value = dropCount
     val finalMessages = if (dropCount > 0) base.drop(dropCount) else base
+    // Provider-request context omission total (init window + combined window +
+    // 100k trim): rows absent from the shipped request (original rows for the
+    // base; the continuation top-up adds its own dropped rows). `live` is the
+    // local reference to this send's live rows (same source as `combined`).
+    _contextOmission.value = (initialHistorySize + live.size - finalMessages.size).coerceAtLeast(0)
     // H1 char reconciliation (observability only): MAX_REQUEST_CHARS trim in
     // text chars (head trim only — maxDropLimit stops before the time-blocked
     // last-user row suffixed above, so the block lands in the final size as

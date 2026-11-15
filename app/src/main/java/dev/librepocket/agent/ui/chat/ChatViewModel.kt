@@ -249,23 +249,45 @@ class ChatViewModel(
     private val _history = MutableStateFlow<List<UiMessage>>(emptyList())
 
     /**
-     * Stage E: exact number of older replay rows omitted by the tail cap.
-     * Observable truncation (never silent): surfaces "已省略N則" without a
-     * new UI flow. Reset alongside [_history] on every load path.
+     * Stage E: exact number of older replay rows omitted by the tail cap
+     * (DB-tail scan, `includePartial=true`). VM-level observability only:
+     * the UI-replay DB-tail count; no UI consumer — the user-visible badge
+     * is [contextOmittedCount] (provider-request omission); never summed
+     * with either counter. Reset alongside [_history] on every load path.
      */
     private val _historyOmittedCount = MutableStateFlow(0)
     val historyOmittedCount: StateFlow<Int> = _historyOmittedCount.asStateFlow()
 
     /**
      * R5-5: send-time per-request trim count, collected from the attached
-     * [ChatSession.requestTrimmedCount]. Load-time resume omission
-     * ([historyOmittedCount], DB tail cap) and this send-time trim are
-     * orthogonal counters — never summed, reset independently. Reset to 0 on
-     * every attach (new session starts untrimmed) and on lifecycle/endpoint
-     * invalidation (the owning session is detached).
+     * [ChatSession.requestTrimmedCount]. Load-time DB-tail replay omission
+     * ([historyOmittedCount]) and this send-time trim are orthogonal
+     * counters — never summed, reset independently. Reset to 0 on every
+     * attach (new session starts untrimmed) and on lifecycle/endpoint
+     * invalidation (the owning session is detached). Kept for debug: the
+     * user-facing provider-request omission total (this leg plus the
+     * history-window legs) is [contextOmittedCount].
      */
     private val _requestTrimmedCount = MutableStateFlow(0)
     val requestTrimmedCount: StateFlow<Int> = _requestTrimmedCount.asStateFlow()
+
+    /**
+     * Provider-request context omission total, collected from the attached
+     * [ChatSession.contextOmission]: how many of the original rows (resumed
+     * history prefix + this send's live rows) are absent from the outgoing
+     * request after every windowing leg — the construction-time history
+     * window, the per-request combined window, and the send-time
+     * MAX_REQUEST_CHARS head trim (a tool continuation additionally tops up
+     * its own prefix trim). Orthogonal to [historyOmittedCount] (DB-tail
+     * replay count; DB-tail rows are never part of the model prefix —
+     * disjoint sets, never summed) and to [requestTrimmedCount] (the
+     * send-time 100k-trim leg alone, a subset of this total, kept for
+     * debug). Reset to 0 on every attach (new session starts untrimmed) and
+     * on every detach/invalidation path (openSession pre-clear, pending
+     * ledger fence, endpoint invalidation, lifecycle clearChat).
+     */
+    private val _contextOmittedCount = MutableStateFlow(0)
+    val contextOmittedCount: StateFlow<Int> = _contextOmittedCount.asStateFlow()
 
     /**
      * Phase-3 test seam: atomic projection generation for [messages]. The
@@ -396,6 +418,7 @@ class ChatViewModel(
     private var currentSessionGeneration: Long? = null
     private var sessionCollectJob: Job? = null
     private var requestTrimCollectJob: Job? = null
+    private var contextOmissionCollectJob: Job? = null
     private var openJob: Job? = null
     // One-shot key.read consent (ASK path). Minted by [confirmKeyRead] from a
     // suspending context and taken by [authorizeEndpoint] on Main, so all
@@ -1669,6 +1692,7 @@ class ChatViewModel(
         _history.value = emptyList()
         _historyOmittedCount.value = 0
         _requestTrimmedCount.value = 0
+        _contextOmittedCount.value = 0
         _currentSessionId.value = null
         pendingOps.clear()
         recoverableOps.clear()
@@ -3129,6 +3153,7 @@ class ChatViewModel(
             // zero now so a failed/slow replacement cannot leave a stale badge
             // (mirrors invalidateForEndpointChange).
             _requestTrimmedCount.value = 0
+            _contextOmittedCount.value = 0
             absorbDrainedQueued(queuedBeforeReplace, fillInput = false, includePending = false)
         } else {
             // No live mismatched, but a prior invalidate may have parked a
@@ -3301,6 +3326,7 @@ class ChatViewModel(
         // R5-5: the new session starts untrimmed; clear any stale count from
         // the detached incumbent before the live flow re-emits.
         _requestTrimmedCount.value = 0
+        _contextOmittedCount.value = 0
         sessionCollectJob?.cancel()
         sessionCollectJob = viewModelScope.launch {
             created.session.uiState.collect { state ->
@@ -3319,6 +3345,14 @@ class ChatViewModel(
             created.session.requestTrimmedCount.collect { trimmed ->
                 if (isGenerationCurrent(generation) && currentSession === created.session) {
                     _requestTrimmedCount.value = trimmed
+                }
+            }
+        }
+        contextOmissionCollectJob?.cancel()
+        contextOmissionCollectJob = viewModelScope.launch {
+            created.session.contextOmission.collect { omitted ->
+                if (isGenerationCurrent(generation) && currentSession === created.session) {
+                    _contextOmittedCount.value = omitted
                 }
             }
         }
@@ -3535,6 +3569,7 @@ class ChatViewModel(
         // unconditionally (unlike _history, which survives a non-null switch
         // via snapshotLiveToHistory): the next attach re-emits from zero.
         _requestTrimmedCount.value = 0
+        _contextOmittedCount.value = 0
         if (binding == null) {
             // R8-2: no endpoint means the history is abandoned (mirrors
             // clearChat): move the parked slot into the per-session
@@ -3697,6 +3732,7 @@ class ChatViewModel(
             // R5-5: the owning session is detached; a later attach restarts
             // the trim count from zero.
             _requestTrimmedCount.value = 0
+            _contextOmittedCount.value = 0
             _currentSessionId.value = null
             pendingOpen = null
             _pendingOpenSessionId.value = null
@@ -4086,6 +4122,8 @@ class ChatViewModel(
         sessionCollectJob = null
         requestTrimCollectJob?.cancel()
         requestTrimCollectJob = null
+        contextOmissionCollectJob?.cancel()
+        contextOmissionCollectJob = null
         try {
             currentSession?.close()
         } catch (_: Exception) {
@@ -4144,6 +4182,8 @@ class ChatViewModel(
             sessionCollectJob = null
             requestTrimCollectJob?.cancel()
             requestTrimCollectJob = null
+            contextOmissionCollectJob?.cancel()
+            contextOmissionCollectJob = null
             currentSession = null
             currentBinding = null
             currentSessionGeneration = null

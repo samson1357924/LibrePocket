@@ -59,33 +59,65 @@ private class DefCapAllowPolicy : PolicyStore {
  *   takeLast splits the tool pair) and turn green after B1.
  * - [defaultCharLegBounds150RowDialogue] is the char-leg counterpart
  *   (the 150 x 500-char fixture cited by the HistoryWindowCap KDoc):
- *   precise load seed (30 / 15,000), post-send drop (1 / 500), zero
+ *   precise load seed (30 / 15,000), post-send drop (2 / 1,000), zero
  *   send-time trim, and char reconciliation.
  * - [boundedTakesMaxLegThenSnapsForwardOverPair],
  *   [multiCallBatchSnapsForwardWhole], [orphanNewestToolRowRetainedForDownstreamReject],
- *   [globallyUnpairedHistoryFallsBackToNaiveCut], [singlePendingBackfillSnapsPairAtomically],
+ *   [globallyUnpairedHistoryDropsLeadingInvalidSlice], [singlePendingBackfillSnapsPairAtomically],
  *   [degenerateSnapPastEndYieldsEmptyList],
  *   [multiTurnSequentialToolRoundsSnapCleanlyToIntermediateBoundary], and
  *   [outOfOrderBatchToolResultsResolveToCleanTurnBoundary] pin the snap semantics:
  *   dual-leg max, whole-batch snap, single-pending backfill matching ProviderJson,
  *   out-of-order result resolution, sequential round boundaries, degenerate snap-past-end,
  *   no orphan special-case in the window (retain + downstream `validateToolPairing` fail-closed),
- *   and naive-cut fallback for globally unpaired histories.
+ *   and the #16 turn-boundary snap dropping an invalid leading slice wholesale for
+ *   globally unpaired histories (naive cut kept only when no user row follows).
  * - [sendTimeTrimPreservesToolPairAtomicityUnderUnbounded] and
- *   [sendTimeTrimRetainsIntactPairWhenHeadPlainMessageDrops] pin the second trim layer
- *   (send-time MAX_REQUEST_CHARS) pair-atomicity under Unbounded historyCap.
+ *   [sendTimeTrimAlignsToUserBoundaryWhenHeadPlainMessageDrops] pin the second trim layer
+ *   (send-time MAX_REQUEST_CHARS) pair-atomicity under Unbounded historyCap;
+ *   the latter additionally pins the `requestTrimmedCount` /
+ *   `lastRequestTrimmedChars` / `contextOmission` publication for a
+ *   user-boundary-aligned trim.
  * - [orphanPrefixOutsideWindowIsDroppedWhileValidTailSucceeds] pins that an orphan
  *   prefix outside the window is dropped without error while valid tail succeeds,
  *   and fails closed with TOOL_OUTPUT_ORPHAN_ID if kept in-window.
  * - [invalidDiscardedPrefixDoesNotBreakLaterPairSnapping],
  *   [invalidDiscardedPrefixUnderBoundedCapAndSendTimeTrim], and
  *   [malformedBatchAndToolRowWithToolCallsFailClosed] pin Phase A local batch
- *   boundary snapping: invalid or malformed prefixes wholly before the cut do not
- *   disable pair-atomic snapping for later valid batches (under count, bounded char,
- *   and send-time `MAX_REQUEST_CHARS` trims), while `role == "tool"` rows carrying
- *   `toolCalls` or malformed retained batches fail closed downstream.
+ *   boundary snapping: under count, bounded char, and send-time
+ *   `MAX_REQUEST_CHARS` trims, later valid pairs are always dropped wholesale
+ *   (counted in the drop), never half a batch, split, or repaired — while
+ *   `role == "tool"` rows carrying `toolCalls` fail closed at the gate
+ *   (`TOOL_CALLS_ROLE_MUST_BE_ASSISTANT`).
+ * - [userBoundarySnapAdvancesOntoNextUser], [userBoundarySnapKeepsUserStartAndZeroStart],
+ *   [userBoundarySnapLimitClampsToNextUser], [userBoundarySnapEmptyAndOutOfRangeAreSafe],
+ *   [userBoundarySnapComposesWithPairSnap], [userBoundarySnapNeverExceedsLimit], and
+ *   [userBoundarySnapEdgeGuards] pin the #16 turn-boundary snap semantics:
+ *   forward-only advance onto the next `role == "user"` row, unchanged for
+ *   user/zero starts, `limit` clamping (fail-closed to `start` when no user
+ *   row lies within `[start, limit]`), empty/out-of-range safety, edge guards
+ *   (zero/below-start/beyond-size limits, terminal assistant row), and
+ *   composition with the pair snap.
+ * - [windowPairDropCountsAsOmission] pins that a wholesale-dropped
+ *   tool-pair slice is counted row-by-row in `droppedHistoryCount` /
+ *   `droppedHistoryChars` and folds into `contextOmission` — a legal
+ *   pair-drop is never a silent omission.
+ * - [windowToGateComposeOnAmbiguousBlankToolId],
+ *   [validateToolPairingRejectsAmbiguousBlankToolIdWithMultiPending], and
+ *   [loneBlankToolRetainedFailsGateWithMissingId] pin the blank-`toolCallId`
+ *   fail-closed boundary: the window retains the illegal slice (pair snap
+ *   cannot complete, no user row follows) and the gate throws
+ *   `TOOL_OUTPUT_AMBIGUOUS_ID` (multi pending) or — for a lone retained
+ *   blank tool row — `TOOL_OUTPUT_MISSING_ID`.
  * - [exactMessageCapBoundaries] and [exactCharCapBoundaries] pin exact message and
- *   char count boundaries for history windowing.
+ *   char count boundaries for history windowing; [charLegBoundaryAtSixtyThousand]
+ *   and [charLegGiantNewestSingleRowSurvives] pin the 60k char leg's strict-greater
+ *   boundary (exactly 60,000 kept; 60,001 binds) and the `kept > 0` safeguard
+ *   (an over-budget NEWEST single row survives whole);
+ *   [charLegGiantOldRowEvictedBeforeNewestSmall] pins the mirror image of
+ *   the same safeguard: an over-budget OLD row is evicted oldest-first,
+ *   never kept over the newer small row (`kept > 0` protects only the
+ *   newest row).
  */
 class TurnControllerDefaultCapTest {
 
@@ -163,14 +195,16 @@ class TurnControllerDefaultCapTest {
     // B1 count-leg pin, end-to-end: 250 tiny rows vs the 200-msg default leg
     // (the char leg never binds: ~2.5k chars total << 60k). Load windows the
     // 250-row prefix to the newest 200 (seed drop 50); the live row then
-    // evicts exactly one more, so the post-send drop is precisely 1 with the
-    // char counterpart equal to that single evicted row.
+    // evicts one more on the naive combined cut, and the user-boundary snap
+    // evicts the leading assistant row behind it (#16): the post-send drop
+    // is precisely 2 with the char counterpart equal to both evicted rows.
     val history = (0 until 250).map { i ->
       val role = if (i % 2 == 0) "user" else "assistant"
       ChatMessage(role = role, text = "m$i:" + "v".repeat(6))
     }
-    // Oldest load-surviving row: the post-send eviction drops exactly it.
-    val evictedLen = history[50].text.length.toLong()
+    // The load-time seed keeps rows 50..249; the post-send eviction drops
+    // rows 50 (the naive combined cut) and 51 (the user-boundary snap).
+    val evictedLen = (history[50].text.length + history[51].text.length).toLong()
     val provider = DefCapFakeProvider(doneOnce())
     val c = controller(provider, history)
     try {
@@ -180,8 +214,10 @@ class TurnControllerDefaultCapTest {
       val req = provider.seenRequests.single()
       assertEquals(0, c.lastRequestTrimmedCount)
       assertEquals(0L, c.lastRequestTrimmedChars)
-      // Combined (200 prefix + live = 201) windows to 200: evict one.
-      assertEquals(1, c.droppedHistoryCount)
+      // Combined (200 prefix + live = 201) windows to 199: the naive cut
+      // drops row 50 (m50, user) and the user-boundary snap re-aligns onto
+      // the next user row, dropping row 51 (m51, assistant) too.
+      assertEquals(2, c.droppedHistoryCount)
       assertEquals(evictedLen, c.droppedHistoryChars)
       assertEquals(req.messages.sumOf { it.text.length }.toLong(), c.lastRequestChars)
       // Newest (the live tail) always survives.
@@ -348,12 +384,13 @@ class TurnControllerDefaultCapTest {
       )
       runBlocking { c.send("q3") }
       val req = provider.seenRequests.single()
-      // Combined (2 prefix + live q3 = 3) windows to 2: evict oldest prefix row.
-      assertEquals(1, c.droppedHistoryCount)
-      assertEquals("keep-q2".length.toLong(), c.droppedHistoryChars)
-      assertEquals(listOf("assistant", "user"), req.messages.map { it.role })
-      assertEquals("keep-a2", req.messages[0].text)
-      assertTrue(req.messages[1].text.startsWith("q3"))
+      // Combined (2 prefix + live q3 = 3) windows to 1: naive cut evicts
+      // keep-q2, and the user-boundary snap evicts the assistant row the
+      // cut landed on (keep-a2) too -> the live row ships alone.
+      assertEquals(2, c.droppedHistoryCount)
+      assertEquals(("keep-q2".length + "keep-a2".length).toLong(), c.droppedHistoryChars)
+      assertEquals(listOf("user"), req.messages.map { it.role })
+      assertTrue(req.messages[0].text.startsWith("q3"))
       assertEquals(req.messages.sumOf { it.text.length }.toLong(), c.lastRequestChars)
     } finally {
       c.close()
@@ -366,8 +403,9 @@ class TurnControllerDefaultCapTest {
     // over the 60k default char leg but under the 100k send-time cap, with
     // the 200-msg count leg never binding (150/121 rows). Load keeps the
     // newest 120 rows (120 x 500 = 60,000; one more would exceed) with seed
-    // drop 30 / 15,000 chars; the live row then evicts exactly one more, the
-    // send-time trim stays at 0, and the chars reconcile.
+    // drop 30 / 15,000 chars; the live row then evicts two more (the naive
+    // cut's leading user row and the assistant row the user-boundary snap
+    // drops), the send-time trim stays at 0, and the chars reconcile.
     val history = (0 until 150).map { i ->
       val role = if (i % 2 == 0) "user" else "assistant"
       ChatMessage(role = role, text = "h" + i.toString().padStart(4, '0') + ":" + "v".repeat(494))
@@ -385,9 +423,10 @@ class TurnControllerDefaultCapTest {
       assertEquals(0, c.lastRequestTrimmedCount)
       assertEquals(0L, c.lastRequestTrimmedChars)
       // Combined (120 prefix + live = 121 rows / 60,006 chars) windows to
-      // 120 rows: evict exactly the oldest prefix row (500 chars).
-      assertEquals(1, c.droppedHistoryCount)
-      assertEquals(500L, c.droppedHistoryChars)
+      // 119 rows: the naive cut evicts h0030 (user), and the user-boundary
+      // snap evicts the assistant row behind it (h0031) too.
+      assertEquals(2, c.droppedHistoryCount)
+      assertEquals(1_000L, c.droppedHistoryChars)
       assertEquals(req.messages.sumOf { it.text.length }.toLong(), c.lastRequestChars)
       // Newest (the live tail) always survives.
       assertTrue(req.messages.last().text.startsWith("tail-q"))
@@ -395,9 +434,9 @@ class TurnControllerDefaultCapTest {
       // ephemeral time-block delta == dropped + trimmed + final. Base
       // windowed sum before the time block is combined - dropped.
       val combinedChars = 120 * 500L + "tail-q".length
-      val timeDelta = c.lastRequestChars - (combinedChars - 500L)
+      val timeDelta = c.lastRequestChars - (combinedChars - 1_000L)
       assertTrue("only the ephemeral time block may differ, got $timeDelta", timeDelta in 1..10_000)
-      assertEquals(combinedChars + timeDelta, 500L + 0L + c.lastRequestChars)
+      assertEquals(combinedChars + timeDelta, 1_000L + 0L + c.lastRequestChars)
     } finally {
       c.close()
     }
@@ -410,9 +449,11 @@ class TurnControllerDefaultCapTest {
     // newest 2 (10 + 10 <= 25, a third row would exceed) so naive start = 5;
     // max(3, 5) = 5 lands between call and result (the legal history's
     // boundaries are [0, 1, 2, 3, 4, 6, 7]) and snaps FORWARD to 6, so
-    // exactly [tail] survives. The count leg alone (naive 3) would keep
-    // [p3, call, result, tail] whole — the char leg forces the deeper cut
-    // and pair atomicity drops the split pair whole instead of shipping half.
+    // exactly [tail] survives. The char leg forces the deeper cut and pair
+    // atomicity drops the split pair whole instead of shipping half.
+    // (The count-leg-only case also changes with #16: its naive cut lands on
+    // the assistant row p3, so the user-boundary snap re-aligns it onto the
+    // next user row — [tail] — instead of [p3, call, result, tail].)
     val plains = (0..3).map { i ->
       val role = if (i % 2 == 0) "user" else "assistant"
       ChatMessage(role = role, text = "p$i" + "v".repeat(8))
@@ -427,8 +468,12 @@ class TurnControllerDefaultCapTest {
     val tail = ChatMessage(role = "user", text = tailText)
     val history = plains + call + result + tail
     assertTrue("fixture must be fixed-width 10-char rows", history.all { it.text.length == 10 })
+    // Count leg alone (naive 3, landing on assistant p3) now re-aligns to
+    // the next user row too: [tail] survives, the whole pre-user slice
+    // (p3, call, result) drops — the window never opening on an assistant
+    // row (#16 turn-boundary snap).
     assertEquals(
-      listOf("p3" + "v".repeat(8), "call-" + "x".repeat(5), "out-" + "y".repeat(6), tailText),
+      listOf(tailText),
       applyHistoryCap(history, HistoryWindowCap.MaxMessages(4)).map { it.text },
     )
     assertEquals(
@@ -466,12 +511,17 @@ class TurnControllerDefaultCapTest {
     }
   }
 
-  @Test(timeout = 30_000) fun globallyUnpairedHistoryFallsBackToNaiveCut() {
+  @Test(timeout = 30_000) fun globallyUnpairedHistoryDropsLeadingInvalidSlice() {
     // Negative pin: a history that is already globally unpaired is NOT
-    // repaired by the window — the naive cut ships as-is and the downstream
-    // validator fails closed on the shipped shape.
+    // repaired by the window. Case 1 ships the naive cut as-is (no user
+    // row follows it) and the downstream validator fails closed on the
+    // shipped shape; Case 2 shows the #16 turn-boundary snap drops the
+    // invalid leading slice wholesale (never retaining the naive cut) when
+    // a user row does follow it — boundary alignment, never pairing
+    // repair. The naive cut is kept only when no user row lies within
+    // [start, limit].
     // Case 1: dangling trailing batch (call with no result). Naive
-    // MaxMessages(1) keeps [call]; the snap must not move or repair it.
+    // MaxMessages(1) keeps [call]; the snaps must not move or repair it.
     val danglingCall = ChatMessage(
       role = "assistant",
       text = "calling",
@@ -492,8 +542,14 @@ class TurnControllerDefaultCapTest {
       )
     }
     // Case 2: blank toolCallId with multiple pending calls. Since pending.size == 2,
-    // backfill is ambiguous and fails, so the history is globally unpaired and the
-    // naive MaxMessages(2) cut [tool(blank), tail] is preserved as-is.
+    // backfill is ambiguous and fails; the naive MaxMessages(2) cut lands on
+    // the tool row, and the user-boundary snap then drops the whole leading
+    // invalid slice (blankCall + blankTool) and advances to the next user
+    // row — the window ships [tail], not the unpaired pair and not the
+    // naive cut. The naive cut is kept only when no user row lies within
+    // [start, limit] (Case 1).
+    // (Pre-#16 the window shipped [tool(blank), tail] and the downstream
+    // validator failed closed with the blank-id rejection.)
     val blankCall = ChatMessage(
       role = "assistant",
       text = "calling",
@@ -508,12 +564,103 @@ class TurnControllerDefaultCapTest {
       listOf(blankCall, blankTool, blankTail),
       HistoryWindowCap.MaxMessages(2),
     )
-    assertEquals(listOf("tool", "user"), keptBlank.map { it.role })
+    assertEquals(listOf("user"), keptBlank.map { it.role })
+    assertEquals(listOf("tail"), keptBlank.map { it.text })
+    // No tool rows remain: the gate must accept the shipped shape.
+    assertEquals(listOf<String?>(null), validateToolPairing(keptBlank, true))
+  }
+
+  @Test(timeout = 30_000) fun windowToGateComposeOnAmbiguousBlankToolId() {
+    // B-2: naive MaxMessages(2) cut is index 1 (naiveStart = 3 - 2 = 1,
+    // the assistant blankCall row); the pair snap only scans `0 until naiveStart`
+    // (index 0, the plain user row) and never evaluates index 1's batch, so it
+    // returns the naive cut unchanged; the user-boundary snap then finds no
+    // `user` row within `[start, limit]` either (only the tool row follows), so
+    // the window retains [blankCall, blankTool] untouched.
+    // Fail-closed happens downstream at the gate with the exact code.
+    val u0 = ChatMessage(role = "user", text = "u0")
+    val blankCall = ChatMessage(
+      role = "assistant",
+      text = "calling",
+      toolCalls = listOf(
+        ToolCall(id = "c1", name = "lsp.symbols", argumentsJson = """{"query":"E1"}"""),
+        ToolCall(id = "c2", name = "lsp.symbols", argumentsJson = """{"query":"E2"}"""),
+      ),
+    )
+    val blankTool = ChatMessage(role = "tool", text = "out", toolCallId = "")
+    val retained = applyHistoryCap(
+      listOf(u0, blankCall, blankTool),
+      HistoryWindowCap.MaxMessages(2),
+    )
+    assertEquals(listOf("assistant", "tool"), retained.map { it.role })
     try {
-      validateToolPairing(keptBlank, true)
-      org.junit.Assert.fail("expected blank-id rejection")
-    } catch (_: ProviderFailure) {
-      // expected: the naive cut is still unpaired, downstream fails closed.
+      validateToolPairing(retained, true)
+      org.junit.Assert.fail("expected TOOL_OUTPUT_AMBIGUOUS_ID")
+    } catch (e: ProviderFailure) {
+      assertTrue(
+        "gate must fail closed with TOOL_OUTPUT_AMBIGUOUS_ID, got ${e.message}",
+        (e.message ?: "").contains("TOOL_OUTPUT_AMBIGUOUS_ID"),
+      )
+    }
+  }
+
+  @Test(timeout = 30_000) fun validateToolPairingRejectsAmbiguousBlankToolIdWithMultiPending() {
+    // B-2 gate-level exact-code pin: a blank toolCallId tool row cannot be
+    // backfilled when the assistant turn left two calls pending (size != 1),
+    // so the Chat-path gate throws TOOL_OUTPUT_AMBIGUOUS_ID. (With
+    // allowChatBackfill = false the same shape fails earlier with
+    // TOOL_OUTPUT_MISSING_ID — the Chat path is what the window mirrors.)
+    val blankCall = ChatMessage(
+      role = "assistant",
+      text = "calling",
+      toolCalls = listOf(
+        ToolCall(id = "c1", name = "lsp.symbols", argumentsJson = """{"query":"E1"}"""),
+        ToolCall(id = "c2", name = "lsp.symbols", argumentsJson = """{"query":"E2"}"""),
+      ),
+    )
+    val blankTool = ChatMessage(role = "tool", text = "out", toolCallId = "   ")
+    try {
+      validateToolPairing(listOf(blankCall, blankTool), true)
+      org.junit.Assert.fail("expected TOOL_OUTPUT_AMBIGUOUS_ID")
+    } catch (e: ProviderFailure) {
+      assertTrue(
+        "gate must fail closed with TOOL_OUTPUT_AMBIGUOUS_ID, got ${e.message}",
+        (e.message ?: "").contains("TOOL_OUTPUT_AMBIGUOUS_ID"),
+      )
+    }
+  }
+
+  @Test(timeout = 30_000) fun loneBlankToolRetainedFailsGateWithMissingId() {
+    // B-2 variant: the MaxMessages(1) naive cut lands on the lone blankTool
+    // row itself (the split pair is dropped whole by the pair-atomic/user-
+    // boundary snaps only when a batch is *complete*; this one is not), so
+    // the window ships [blankTool] alone. With NOTHING pending the blank id
+    // cannot be backfilled and the gate fails closed with
+    // TOOL_OUTPUT_MISSING_ID — not AMBIGUOUS_ID (ambiguity requires > 1
+    // pending); pinned here so the missing-id/ambiguous-id boundary stays
+    // explicit.
+    val blankCall = ChatMessage(
+      role = "assistant",
+      text = "calling",
+      toolCalls = listOf(
+        ToolCall(id = "c1", name = "lsp.symbols", argumentsJson = """{"query":"E1"}"""),
+        ToolCall(id = "c2", name = "lsp.symbols", argumentsJson = """{"query":"E2"}"""),
+      ),
+    )
+    val blankTool = ChatMessage(role = "tool", text = "out", toolCallId = "")
+    val shipped = applyHistoryCap(
+      listOf(blankCall, blankTool),
+      HistoryWindowCap.MaxMessages(1),
+    )
+    assertEquals(listOf("tool"), shipped.map { it.role })
+    try {
+      validateToolPairing(shipped, true)
+      org.junit.Assert.fail("expected TOOL_OUTPUT_MISSING_ID")
+    } catch (e: ProviderFailure) {
+      assertTrue(
+        "lone blank tool row must fail closed with TOOL_OUTPUT_MISSING_ID, got ${e.message}",
+        (e.message ?: "").contains("TOOL_OUTPUT_MISSING_ID"),
+      )
     }
   }
 
@@ -661,7 +808,13 @@ class TurnControllerDefaultCapTest {
     }
   }
 
-  @Test(timeout = 30_000) fun sendTimeTrimRetainsIntactPairWhenHeadPlainMessageDrops() {
+  @Test(timeout = 30_000) fun sendTimeTrimAlignsToUserBoundaryWhenHeadPlainMessageDrops() {
+    // #16: the send-time cut's char decision drops only the head plain row
+    // (u0), leaving the retained slice opening on the assistant `call` row —
+    // Anthropic-invalid. The user-boundary snap re-aligns the cut to the
+    // next user row (the live tail), dropping the intact pair whole: the
+    // pair is never fractured (it is dropped entirely, which the tool-pair
+    // gate requires) but its retention is sacrificed to the turn boundary.
     val u0 = ChatMessage(role = "user", text = "u0:" + "a".repeat(30_000))
     val call = ChatMessage(
       role = "assistant",
@@ -674,13 +827,18 @@ class TurnControllerDefaultCapTest {
     val c = controller(provider, listOf(u0, call, result), HistoryWindowCap.Unbounded)
     try {
       runBlocking { c.send(tail) }
-      assertEquals(1, c.lastRequestTrimmedCount)
+      // Pair snap leaves the cut at 1 (u0 only); the user-boundary snap then
+      // advances it past the whole pair to the live user row -> 3 trimmed.
+      assertEquals(3, c.lastRequestTrimmedCount)
+      assertEquals(3, c.requestTrimmedCount.value)
+      // Trimmed rows (u0 30_003 + call 20_005 + result 20_004) sum to 70_012.
+      assertEquals(70_012L, c.lastRequestTrimmedChars)
+      // omission = initial(3) + live(1) - final(1) — the trimmed rows never shipped.
+      assertEquals(3, c.contextOmission.value)
       val req = provider.seenRequests.single()
-      assertEquals(3, req.messages.size)
-      assertEquals(listOf("assistant", "tool", "user"), req.messages.map { it.role })
-      assertEquals(call.text, req.messages[0].text)
-      assertEquals(result.text, req.messages[1].text)
-      assertTrue(req.messages[2].text.startsWith("tail:"))
+      assertEquals(1, req.messages.size)
+      assertEquals("user", req.messages.single().role)
+      assertTrue(req.messages.single().text.startsWith("tail:"))
       validateToolPairing(req.messages, true)
     } finally {
       c.close()
@@ -752,6 +910,56 @@ class TurnControllerDefaultCapTest {
     assertEquals(listOf(m41), applyHistoryCap(listOf(m1, m41), cap40))
   }
 
+  @Test(timeout = 30_000) fun charLegBoundaryAtSixtyThousand() {
+    fun msg(text: String) = ChatMessage(role = "user", text = text)
+    val cap60k = HistoryWindowCap.MaxChars(60_000)
+
+    // Exactly 60_000 chars are retained: the char leg binds only when
+    // `chars + m.text.length > maxChars` (strictly greater), so a total of
+    // exactly the cap never trips it.
+    val exact = listOf(msg("a".repeat(20_000)), msg("b".repeat(20_000)), msg("c".repeat(20_000)))
+    assertEquals(exact, applyHistoryCap(exact, cap60k))
+
+    // One extra char (60_001 total): the oldest row no longer fits and drops,
+    // oldest-first — the char leg is strict-greater, not greater-or-equal.
+    val over = listOf(msg("a".repeat(20_000)), msg("b".repeat(20_000)), msg("c".repeat(20_000)), msg("d"))
+    assertEquals(listOf(exact[1], exact[2], msg("d")), applyHistoryCap(over, cap60k))
+  }
+
+  @Test(timeout = 30_000) fun charLegGiantNewestSingleRowSurvives() {
+    fun msg(text: String) = ChatMessage(role = "user", text = text)
+    val cap60k = HistoryWindowCap.MaxChars(60_000)
+    val giant = msg("g".repeat(61_000))
+
+    // kept > 0 safeguard: a single row larger than the char budget is still
+    // kept whole (truncation drops messages, never splits one) — the NEWEST
+    // row always survives.
+    assertEquals(listOf(giant), applyHistoryCap(listOf(giant), cap60k))
+
+    // With an older row present, the old row evicts oldest-first and the
+    // over-budget NEWEST row survives.
+    assertEquals(listOf(giant), applyHistoryCap(listOf(msg("u".repeat(10)), giant), cap60k))
+
+    // The DEFAULT dual cap keeps it too (the count leg is unaffected).
+    assertEquals(listOf(giant), applyHistoryCap(listOf(giant), HistoryWindowCap.DEFAULT))
+  }
+
+  @Test(timeout = 30_000) fun charLegGiantOldRowEvictedBeforeNewestSmall() {
+    fun msg(text: String) = ChatMessage(role = "user", text = text)
+    val cap60k = HistoryWindowCap.MaxChars(60_000)
+    val giantOld = msg("g".repeat(61_000))
+    val small = msg("s".repeat(10))
+
+    // Oldest-first eviction: the 61k-char OLD row never fits alongside the
+    // newest row under the 60k char budget, so the OLD row drops oldest-first;
+    // the kept>0 rule retains only the NEWEST (small) row — an over-budget
+    // old row is never kept over a newer one.
+    assertEquals(listOf(small), applyHistoryCap(listOf(giantOld, small), cap60k))
+
+    // The DEFAULT dual cap keeps it too (the count leg is unaffected).
+    assertEquals(listOf(small), applyHistoryCap(listOf(giantOld, small), HistoryWindowCap.DEFAULT))
+  }
+
   @Test(timeout = 30_000) fun invalidDiscardedPrefixDoesNotBreakLaterPairSnapping() {
     val orphan = ChatMessage(role = "tool", text = "orphan", toolCallId = "unknown")
     val call = ChatMessage(
@@ -775,9 +983,12 @@ class TurnControllerDefaultCapTest {
       )
     }
 
+    // #16: the naive MaxMessages(3) cut lands on the assistant `call` row,
+    // so the user-boundary snap re-aligns onto the next user row — [tail]
+    // ships, pairing drops whole (boundary alignment, not pairing repair).
     val kept3 = applyHistoryCap(history, HistoryWindowCap.MaxMessages(3))
-    assertEquals(listOf(call, answer, tail), kept3)
-    assertEquals(listOf(null, "a", null), validateToolPairing(kept3, true))
+    assertEquals(listOf(tail), kept3)
+    assertEquals(listOf(null), validateToolPairing(kept3, true))
 
     val kept2 = applyHistoryCap(history, HistoryWindowCap.MaxMessages(2))
     assertEquals(listOf(tail), kept2)
@@ -842,6 +1053,8 @@ class TurnControllerDefaultCapTest {
       runBlocking { c.send(liveTail) }
       val req = provider.seenRequests.single()
       assertEquals(3, c.lastRequestTrimmedCount)
+      // omission = initial(3) + live(1) - final(1) — all trimmed rows count.
+      assertEquals(3, c.contextOmission.value)
       assertEquals(0, c.droppedHistoryCount)
       assertEquals(1, req.messages.size)
       assertEquals("user", req.messages.single().role)
@@ -852,9 +1065,109 @@ class TurnControllerDefaultCapTest {
     }
   }
 
+  @Test(timeout = 30_000) fun windowPairDropCountsAsOmission() {
+    // #16 + B-1: the MaxMessages(2) naive head cut lands INSIDE a legal
+    // tool batch (index 2, on the tool row); the pair snap moves it FORWARD
+    // past the whole batch (index 3, on u3) and the user-boundary snap keeps
+    // it (user row). The dropped slice — user row + intact pair — must be
+    // counted row-by-row in droppedHistoryCount/droppedHistoryChars and fold
+    // into contextOmission; a legal pair-drop is never a silent omission.
+    val u0 = ChatMessage(role = "user", text = "u0:" + "u".repeat(100))
+    val call = ChatMessage(
+      role = "assistant",
+      text = "call:" + "x".repeat(40),
+      toolCalls = listOf(ToolCall(id = "c1", name = "fn", argumentsJson = "{}")),
+    )
+    val result = ChatMessage(role = "tool", text = "out:" + "y".repeat(60), toolCallId = "c1")
+    val u3 = ChatMessage(role = "user", text = "u3:" + "u".repeat(100))
+    val provider = DefCapFakeProvider(doneOnce())
+    val c = controller(provider, listOf(u0, call, result, u3), HistoryWindowCap.MaxMessages(2))
+    try {
+      // Load-time seed: naive cut = 4 - 2 = 2 -> pair snap -> 3 (u3) ->
+      // user snap stays. [u0, call, result] drops wholesale.
+      assertEquals(3, c.droppedHistoryCount)
+      assertEquals(
+        (u0.text.length + call.text.length + result.text.length).toLong(),
+        c.droppedHistoryChars,
+      )
+      assertEquals(3, c.contextOmission.value)
+      runBlocking { c.send("q") }
+      val req = provider.seenRequests.single()
+      assertEquals(0, c.lastRequestTrimmedCount)
+      assertEquals(0L, c.lastRequestTrimmedChars)
+      assertEquals(2, req.messages.size)
+      assertEquals(listOf("user", "user"), req.messages.map { it.role })
+      assertTrue(req.messages.last().text.startsWith("q"))
+      // After the send the combined window ([u3] + live "q" = 2 rows) fits
+      // the cap, so the per-request cells drop back to 0 — the construction
+      // seed is not observable on them after the first buildRequest (it is
+      // replaced, not accumulated). contextOmission still reports the total:
+      // initial(4) + live(1) - final == [u3, q] (2) = 3.
+      assertEquals(0, c.droppedHistoryCount)
+      assertEquals(0L, c.droppedHistoryChars)
+      assertEquals(3, c.contextOmission.value)
+    } finally {
+      c.close()
+    }
+  }
+
+  @Test(timeout = 30_000) fun combinedWindowSnapsPastLeadingSystemRun() {
+    // (α) decision pin (Finding #2): inline role="system" rows are NOT
+    // snap-exempt. In the combined send-time window they behave like any
+    // other non-user row: the naive MaxMessages(3) cut lands after u0
+    // (index 1, the system row), the user-boundary snap finds no user row
+    // until the live tail, and the whole leading non-user run
+    // (u0 + system + a0) is dropped wholesale — the system instruction is
+    // never kept to "protect" it. Durable instructions can survive window
+    // trims only via the adapter-level ChatRequest.systemPromptOverride
+    // (not a chat-session setting today; hydration never restores system
+    // rows), so this shape arises only via direct initialHistory
+    // construction.
+    val history = listOf(
+      ChatMessage(role = "user", text = "u0"),
+      ChatMessage(role = "system", text = "important-instruction"),
+      ChatMessage(role = "assistant", text = "a0"),
+    )
+    val provider = DefCapFakeProvider(doneOnce())
+    val c = controller(provider, history, HistoryWindowCap.MaxMessages(3))
+    try {
+      // Construction-time seed keeps everything (naiveStart = 0, no cut).
+      assertEquals(0, c.droppedHistoryCount)
+      runBlocking { c.send("u1") }
+      val req = provider.seenRequests.single()
+      assertEquals(listOf("user"), req.messages.map { it.role })
+      assertTrue(req.messages.single().text.startsWith("u1"))
+      assertEquals(3, c.droppedHistoryCount)
+      assertEquals(history.sumOf { it.text.length }.toLong(), c.droppedHistoryChars)
+      // contextOmission is a publish-time formula (initial=3 + live=1 -
+      // final=1 = 3); the cell is only re-published when buildRequest
+      // re-runs, never grown by UI state between sends.
+      assertEquals(3, c.contextOmission.value)
+      assertEquals(0, c.lastRequestTrimmedCount)
+    } finally {
+      c.close()
+    }
+  }
+
+  @Test(timeout = 30_000) fun constructionTimeApplyHistoryCapKeepsLeadingSystemRun() {
+    // Construction-time leg of the same (α) pin: with a 3-row history and a
+    // 3-row cap the naive cut is 0, so applyHistoryCap keeps all 3 rows —
+    // the load path does not trim at all; only the combined send-time
+    // window drops the leading non-user run. Pinning both legs keeps the
+    // "construction keeps / combined window drops" split explicit.
+    val history = listOf(
+      ChatMessage(role = "user", text = "u0"),
+      ChatMessage(role = "system", text = "important-instruction"),
+      ChatMessage(role = "assistant", text = "a0"),
+    )
+    assertEquals(history, applyHistoryCap(history, HistoryWindowCap.MaxMessages(3)))
+  }
+
   @Test(timeout = 30_000) fun malformedBatchAndToolRowWithToolCallsFailClosed() {
     // Part 1: role == "tool" row carrying non-empty toolCalls causes completeToolBatchEnd to
-    // return -1; MaxMessages(2) keeps [tool, tail] and downstream fails closed.
+    // return -1; the naive MaxMessages(2) cut lands on the tool row and the
+    // user-boundary snap (#16) advances past it to the next user row, so
+    // [tail] ships instead of an unpairable leading tool row.
     val callA1 = ChatMessage(
       role = "assistant",
       text = "call-a",
@@ -871,13 +1184,16 @@ class TurnControllerDefaultCapTest {
       listOf(callA1, toolWithCalls, tail1),
       HistoryWindowCap.MaxMessages(2),
     )
-    assertEquals(listOf(toolWithCalls, tail1), kept1)
+    // The window ships only the user row; the gate still fails closed on
+    // the raw malformed shape (single source of truth for rejection).
+    assertEquals(listOf(tail1), kept1)
+    assertEquals(listOf(null), validateToolPairing(kept1, true))
     try {
-      validateToolPairing(kept1, true)
+      validateToolPairing(listOf(toolWithCalls), true)
       org.junit.Assert.fail("expected TOOL_CALLS_ROLE_MUST_BE_ASSISTANT rejection")
     } catch (e: ProviderFailure) {
       assertTrue(
-        "downstream must fail closed with TOOL_CALLS_ROLE_MUST_BE_ASSISTANT, got ${e.message}",
+        "gate must fail closed with TOOL_CALLS_ROLE_MUST_BE_ASSISTANT, got ${e.message}",
         (e.message ?: "").contains("TOOL_CALLS_ROLE_MUST_BE_ASSISTANT"),
       )
     }
@@ -902,5 +1218,159 @@ class TurnControllerDefaultCapTest {
     )
     assertEquals(listOf(tail2), kept2)
     assertEquals(listOf(null), validateToolPairing(kept2, true))
+  }
+
+  // --- #16 user-boundary snap pins (snapHistoryToUserBoundary) ---
+
+  @Test(timeout = 30_000) fun userBoundarySnapAdvancesOntoNextUser() {
+    // Naive cut lands on an assistant row: advance to the next user row,
+    // dropping the orphan assistant whole. Rows are call-free so the pair
+    // snap is not involved.
+    val history = listOf(
+      ChatMessage(role = "user", text = "u0"),
+      ChatMessage(role = "assistant", text = "a1"),
+      ChatMessage(role = "assistant", text = "a2"),
+      ChatMessage(role = "user", text = "u3"),
+      ChatMessage(role = "assistant", text = "a4"),
+    )
+    assertEquals(3, snapHistoryToUserBoundary(history, 1))
+    assertEquals(3, snapHistoryToUserBoundary(history, 2))
+    // A tool row also re-aligns to the next user row.
+    val withTool = listOf(
+      ChatMessage(role = "user", text = "u0"),
+      ChatMessage(role = "tool", text = "orphan", toolCallId = "x"),
+      ChatMessage(role = "user", text = "u2"),
+    )
+    assertEquals(2, snapHistoryToUserBoundary(withTool, 1))
+  }
+
+  @Test(timeout = 30_000) fun userBoundarySnapKeepsUserStartAndZeroStart() {
+    val history = listOf(
+      ChatMessage(role = "user", text = "u0"),
+      ChatMessage(role = "assistant", text = "a1"),
+      ChatMessage(role = "user", text = "u2"),
+    )
+    // Cut lands on a user row: untouched.
+    assertEquals(0, snapHistoryToUserBoundary(history, 0))
+    assertEquals(2, snapHistoryToUserBoundary(history, 2))
+    // Negative starts are a no-op (never backwards).
+    assertEquals(-1, snapHistoryToUserBoundary(history, -1))
+  }
+
+  @Test(timeout = 30_000) fun userBoundarySnapLimitClampsToNextUser() {
+    val history = listOf(
+      ChatMessage(role = "user", text = "u0"),
+      ChatMessage(role = "assistant", text = "a1"),
+      ChatMessage(role = "assistant", text = "a2"),
+      ChatMessage(role = "user", text = "u3"),
+    )
+    // A user row exists beyond [start, limit]: fail closed to [start].
+    assertEquals(1, snapHistoryToUserBoundary(history, 1, limit = 2))
+    // Same cut with the limit extended: the next user row is returned.
+    assertEquals(3, snapHistoryToUserBoundary(history, 1, limit = 3))
+    // No user row anywhere in [start, limit]: fail closed to [start].
+    val onlyAssistants = listOf(
+      ChatMessage(role = "user", text = "u0"),
+      ChatMessage(role = "assistant", text = "a1"),
+      ChatMessage(role = "tool", text = "t2", toolCallId = "x"),
+    )
+    assertEquals(1, snapHistoryToUserBoundary(onlyAssistants, 1, limit = onlyAssistants.size - 1))
+  }
+
+  @Test(timeout = 30_000) fun userBoundarySnapEmptyAndOutOfRangeAreSafe() {
+    assertEquals(0, snapHistoryToUserBoundary(emptyList(), 0))
+    val history = listOf(
+      ChatMessage(role = "user", text = "u0"),
+      ChatMessage(role = "assistant", text = "a1"),
+    )
+    assertEquals(2, snapHistoryToUserBoundary(history, 2))
+    assertEquals(3, snapHistoryToUserBoundary(history, 3))
+    // start beyond the history is returned as-is (no cap pressure to fix).
+    assertEquals(history.size, snapHistoryToUserBoundary(history, history.size))
+  }
+
+  @Test(timeout = 30_000) fun userBoundarySnapComposesWithPairSnap() {
+    // Cut lands INSIDE a legal tool batch -> pair snap forward past the
+    // batch -> lands on an assistant row -> user-boundary snap advances to
+    // the next user row.
+    val history = listOf(
+      ChatMessage(role = "user", text = "u0"),
+      ChatMessage(
+        role = "assistant",
+        text = "call-1",
+        toolCalls = listOf(ToolCall(id = "c1", name = "fn", argumentsJson = "{}")),
+      ),
+      ChatMessage(role = "tool", text = "res-1", toolCallId = "c1"),
+      ChatMessage(role = "assistant", text = "a-mid"),
+      ChatMessage(role = "user", text = "tail"),
+    )
+    // Naive MaxMessages(3) cut = 2 (inside the batch) -> pair snap -> 3
+    // (a-mid, assistant) -> user snap -> 4 (tail). The whole pre-user
+    // slice, batch included, drops.
+    assertEquals(
+      listOf("tail"),
+      applyHistoryCap(history, HistoryWindowCap.MaxMessages(3)).map { it.text },
+    )
+    // Pair snap pushes past the end (no trailing user row at all): the
+    // user-boundary snap returns the pair-aligned cut unchanged via its
+    // `start >= history.size` branch (NOT its no-user-follows branch —
+    // there is nothing left to scan), so the empty list ships as-is.
+    val noUserTail = history.take(3)
+    assertEquals(
+      emptyList<ChatMessage>(),
+      applyHistoryCap(noUserTail, HistoryWindowCap.MaxMessages(1)),
+    )
+  }
+
+  @Test(timeout = 30_000) fun userBoundarySnapNeverExceedsLimit() {
+    // Synthesize a history where the ONLY user row sits at the end; pass a
+    // limit that excludes it: the snap must return [start], never the
+    // protected/out-of-window user row.
+    val history = listOf(
+      ChatMessage(role = "user", text = "u0"),
+      ChatMessage(role = "assistant", text = "a1"),
+      ChatMessage(role = "tool", text = "t2", toolCallId = "x"),
+      ChatMessage(role = "user", text = "u3"),
+    )
+    assertEquals(1, snapHistoryToUserBoundary(history, 1, limit = history.size - 2))
+    // limit exactly at the user row: reachable.
+    assertEquals(3, snapHistoryToUserBoundary(history, 1, limit = 3))
+    // Restrictive limit equal to start: no advance possible, returns start.
+    assertEquals(1, snapHistoryToUserBoundary(history, 1, limit = 1))
+  }
+
+  @Test(timeout = 30_000) fun userBoundarySnapEdgeGuards() {
+    // Edge guards: the forward scan never throws and fails closed to [start]
+    // whenever the scan window is empty or clamped away.
+    val history = listOf(
+      ChatMessage(role = "user", text = "u0"),
+      ChatMessage(role = "assistant", text = "a1"),
+      ChatMessage(role = "user", text = "u2"),
+    )
+    // limit == 0 with a positive start: the scan collapses; [start].
+    assertEquals(1, snapHistoryToUserBoundary(history, 1, limit = 0))
+    // Cut on the terminal assistant row (start == history.size - 1):
+    // nothing follows; [start].
+    val assistantTail = listOf(
+      ChatMessage(role = "user", text = "u0"),
+      ChatMessage(role = "assistant", text = "a1"),
+    )
+    assertEquals(1, snapHistoryToUserBoundary(assistantTail, 1))
+    // limit beyond the history clamps to the last index; the next user row.
+    val chain = listOf(
+      ChatMessage(role = "user", text = "u0"),
+      ChatMessage(role = "assistant", text = "a1"),
+      ChatMessage(role = "assistant", text = "a2"),
+      ChatMessage(role = "user", text = "u3"),
+    )
+    assertEquals(3, snapHistoryToUserBoundary(chain, 1, limit = 99))
+    // limit below start: the scan window is empty; [start]. A negative
+    // limit behaves the same.
+    assertEquals(2, snapHistoryToUserBoundary(chain, 2, limit = 1))
+    assertEquals(2, snapHistoryToUserBoundary(chain, 2, limit = -1))
+    // limit == start + 1 and the very next row is a user row: reachable.
+    assertEquals(2, snapHistoryToUserBoundary(history, 1, limit = 2))
+    // Empty history with a positive start: nothing to align; [start].
+    assertEquals(2, snapHistoryToUserBoundary(emptyList(), 2))
   }
 }

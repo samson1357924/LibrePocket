@@ -136,10 +136,9 @@ fun ChatScreen(
     val currentSessionId by viewModel.currentSessionId.collectAsStateWithLifecycle()
     // S2: pending history open retained across ConfirmRequired (explicit resume target).
     val pendingOpenSid by viewModel.pendingOpenSessionId.collectAsStateWithLifecycle()
-    // R5-5: send-time per-request trim (oldest-first messages dropped to fit
-    // the request budget). Orthogonal to load-time resume omission; shown as
-    // a persistent badge, never summed with any other count.
-    val requestTrimmedCount by viewModel.requestTrimmedCount.collectAsStateWithLifecycle()
+    // R5-5: provider-request context omission（window＋100k-trim 總腿；
+    // 100k 單腿 debug 計數保留在 VM 層 requestTrimmedCount）
+    val contextOmittedCount by viewModel.contextOmittedCount.collectAsStateWithLifecycle()
     val listState = rememberLazyListState()
     val streaming = session.status == ChatStatus.STREAMING
     var wasActive by remember { mutableStateOf(false) }
@@ -337,13 +336,13 @@ fun ChatScreen(
         }
     }
 
-    LaunchedEffect(messages.size, messages.lastOrNull()?.text?.length, session.status, requestTrimmedCount) {
+    LaunchedEffect(messages.size, messages.lastOrNull()?.text?.length, session.status, contextOmittedCount) {
         if (messages.isNotEmpty()) {
             try {
-                // R5-5: the request-trim badge (when visible) occupies list
-                // index 0, so the last message sits at messages.size, not
-                // messages.size - 1.
-                listState.scrollToItem(if (requestTrimmedCount > 0) messages.size else messages.size - 1)
+                // R5-5: the context-omission badge (when visible) occupies
+                // list index 0, so the last message sits at messages.size,
+                // not messages.size - 1.
+                listState.scrollToItem(if (contextOmittedCount > 0) messages.size else messages.size - 1)
             } catch (_: IllegalArgumentException) {
                 // List not laid out yet; next recomposition will settle.
             }
@@ -405,15 +404,20 @@ fun ChatScreen(
                 contentPadding = PaddingValues(horizontal = 16.dp, vertical = 12.dp),
                 verticalArrangement = Arrangement.spacedBy(10.dp),
             ) {
-                // R5-5: persistent request-trim badge pinned to the top of the
-                // history list (N > 0 only). bodySmall + onSurfaceVariant, same
-                // as the pending-steer badge below the list.
-                if (requestTrimmedCount > 0) {
-                    item(key = "request-trim-badge") {
+                // R5-5: persistent context-omission badge pinned to the top
+                // of the history list (N > 0 only). bodySmall +
+                // onSurfaceVariant, same as the pending-steer badge below
+                // the list. N counts rows absent from the outgoing request
+                // (window + send-time trim legs).
+                if (contextOmittedCount > 0) {
+                    item(key = "context-omission-badge") {
                         Text(
-                            text = "有 $requestTrimmedCount 則較早歷史未送出模型",
+                            text = "有 $contextOmittedCount 則較早歷史未送出模型",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.semantics {
+                                liveRegion = androidx.compose.ui.semantics.LiveRegionMode.Polite
+                            },
                         )
                     }
                 }

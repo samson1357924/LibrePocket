@@ -70,8 +70,9 @@ class ShellTrustedExecE2ETest {
 
     @Test fun absoluteIdResolvesAndActuallyRuns() {
         assumeTrue("writability gate is only meaningful for non-root uid", !File("/").canWrite())
-        for (candidate in listOf("/usr/bin/id", "/bin/id")) {
-            assumeTrue("$candidate not executable on this host", File(candidate).canExecute())
+        val candidates = listOf("/usr/bin/id", "/bin/id")
+        assumeTrue("at least one absolute id executable present for this test", candidates.any { File(it).canExecute() })
+        for (candidate in candidates.filter { File(it).canExecute() }) {
             val exec = ShellExecutables.resolve(candidate)
             assertNotNull("$candidate must resolve", exec)
             assertNull("$candidate is dispatched via argv[0] basename (uutils), not the argv[1] MULTICALL_BINARIES form; applet must stay null", exec!!.applet)

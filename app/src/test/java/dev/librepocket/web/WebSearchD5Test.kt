@@ -769,6 +769,27 @@ class WebSearchD5Test {
         assertEquals(1, http.calls.get())
     }
 
+    @Test fun throwingCacheRevisionIsUncacheableAndFailClosed() = runBlocking {
+        val delegate = object : WebSearchProvider {
+            override val id: String = "custom-keyed"
+            override val capabilities: Set<WebCapability> = emptySet()
+            var calls = 0; var revCalls = 0
+            override suspend fun probe(): WebProbe = WebProbe.Ready
+            override suspend fun search(query: String, count: Int): WebSearchOutcome {
+                calls++
+                return WebSearchOutcome.Ok(emptyList())
+            }
+            override suspend fun cacheRevision(): String? = throw IllegalStateException("boom")
+        }
+        val svc = WebSearchService(delegate)
+        val out = svc.search("q", 5)
+        assertTrue("rev 拋出不得原樣逃出：$out", out is WebSearchOutcome.Ok)
+        assertEquals(1, delegate.calls)
+        // 旁路不寫快取：第二次照樣打 upstream
+        svc.search("q", 5)
+        assertEquals(2, delegate.calls)
+    }
+
     // ---- 預設註冊 ----
 
     @Test fun defaultFactoryRegistryOk() {

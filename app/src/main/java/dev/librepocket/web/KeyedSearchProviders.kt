@@ -190,6 +190,11 @@ abstract class BaseKeyedSearchProvider(
             val digest = java.security.MessageDigest.getInstance("SHA-256")
             digest.update(buf)
             return digest.digest().joinToString("") { "%02x".format(it) }.take(16)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Exception) {
+            // 指紋計算失敗（含理論上的 NoSuchAlgorithmException）→ 哨兵，不 raw throw。
+            return WebSearchProvider.REV_UNAVAILABLE
         } finally {
             raw.fill('\u0000')
             buf.fill(0)
@@ -268,8 +273,6 @@ class BraveSearchProvider(
         return finishOk(parseBraveResults(json, response.body, count), count)
     }
 
-    internal fun parseBraveResults(body: String, limitHint: Int = 16): List<WebSearchResult>? =
-        parseBraveResults(json, body, limitHint)
 }
 
 internal fun parseBraveResults(json: Json, body: String, limitHint: Int = 16): List<WebSearchResult>? {
@@ -358,8 +361,6 @@ class TavilySearchProvider(
         return finishOk(parseTavilyResults(json, response.body, count), count)
     }
 
-    internal fun parseTavilyResults(body: String, limitHint: Int = 16): List<WebSearchResult>? =
-        parseTavilyResults(json, body, limitHint)
 }
 
 internal fun parseTavilyResults(json: Json, body: String, limitHint: Int = 16): List<WebSearchResult>? {
@@ -450,8 +451,6 @@ class ExaSearchProvider(
         return finishOk(parseExaResults(json, response.body, count), count)
     }
 
-    internal fun parseExaResults(body: String, limitHint: Int = 16): List<WebSearchResult>? =
-        parseExaResults(json, body, limitHint)
 }
 
 internal fun parseExaResults(json: Json, body: String, limitHint: Int = 16): List<WebSearchResult>? {

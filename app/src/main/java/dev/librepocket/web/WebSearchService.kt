@@ -77,9 +77,25 @@ class WebSearchService(
         // Keyed provider 以 credential revision 綁定 cache identity：輪換／刪除憑證自然 miss 舊列；
         // rev==null（非 keyed）→ plain key，行為不變；REV_UNAVAILABLE（keyed vault 暫時故障／缺 key）
         // → 完全旁路快取，不讀不寫（uncacheable）。
-        val rev = delegate.cacheRevision()
+        // 非符合契約之 delegate 若 rev probe 拋出 raw Exception：CE 原樣透傳、
+        // 其他一律映射為旁路（REV_UNAVAILABLE），不把例外直接拋給呼叫端。
+        val rev = try {
+            delegate.cacheRevision()
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Exception) {
+            WebSearchProvider.REV_UNAVAILABLE
+        }
         if (rev == WebSearchProvider.REV_UNAVAILABLE) {
-            return delegate.search(query, n)  // 不查快取、不 single-flight、不寫快取（uncacheable）
+            // 不查快取、不 single-flight、不寫快取（uncacheable）；
+            // 對 delegate 的 raw Exception 映射為 Failed(TRANSPORT)（fail-closed），CE 原樣透傳。
+            return try {
+                delegate.search(query, n)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (_: Exception) {
+                WebSearchOutcome.Failed(WebFailureReason.TRANSPORT)
+            }
         }
         val cacheKey = cache.key(delegate.cacheNamespace, query, n).let { if (rev != null) "$it#rev:$rev" else it }
         while (true) {

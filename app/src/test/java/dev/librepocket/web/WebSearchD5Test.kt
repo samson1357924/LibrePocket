@@ -2256,6 +2256,288 @@ class WebSearchD5Test {
         assertEquals(listOf("key-A", "key-B"), sentTokens.toList())
     }
 
+    // ---- R6-1 revision-change pin 測試（#138 巢狀 sticky × 憑證輪換） ----
+
+    @Test fun nestedRevisionChangeRebindsOuterCacheIdentity() = runBlocking {
+        // R6-1 THE pin（侵入性 pin；R6-1 機制）：
+        // leader 於 HTTP 中被取消、vault 已輪換 A→B；follower 重選時 inner 退回當前 vault
+        // 重解析，但 fingerprint 與進入時（fp(A)）不符 → inner 拋出內部標記例外（module-internal
+        // CredentialRevisionChangedException）→ outer 層 leader CE 分支捕捉並以當前憑證（B）
+        // 重綁 cache identity 重執行自己的迭代。
+        // 結果：fp(B) 列取得 B-title（非 cached）；fp(A) 列絕不被寫入 B 的資料——
+        // 輪換回 A 後 out2 必須 miss 並以上游 key-A 重打（A-title、cached=false），
+        // out3 才命中 fp(A) 快取（A-title、cached=true）。
+        // 注意：回應 body 以 token 分派（`if (token == "key-A") "A-title" else "B-title"`）；
+        // 規格原始 size-based 條件（`sentTokens.size == 1`）在第三次呼叫（out2）時 size==3，
+        // 會回 B-title 而永遠過不了 post-fix 斷言（見 PR 回報）。token-based 分派保留
+        // pre-fix 失敗簽章（Ok(cached=true, B-title)）。
+        val release = CompletableDeferred<Unit>()
+        val entered = CompletableDeferred<Unit>()
+        val sentTokens = CopyOnWriteArrayList<String?>()
+        val vault = FakeVault()
+        vault.putKey(BraveSearchProvider.DEFAULT_KEY_ID, "key-A".toCharArray())
+        val http = FakeGetWithHeaders { _, headers ->
+            val token = headers["X-Subscription-Token"]
+            sentTokens.add(token)
+            entered.complete(Unit)
+            release.await()
+            ok(body = braveJsonFor(if (token == "key-A") "A-title" else "B-title"))
+        }
+        val inner = WebSearchService(BraveSearchProvider(vault, http, timeoutMs = 60_000))
+        val outer1 = WebSearchService(inner)
+        val outer2 = WebSearchService(inner)
+
+        val leader = async { outer1.search("kotlin", 5) }
+        withTimeout(5_000) { entered.await() }
+        // UNDISPATCHED：return 時 follower 已掛上 inner 的 shared deferred。
+        val follower = async(start = CoroutineStart.UNDISPATCHED) { outer2.search("kotlin", 5) }
+        vault.putKey(BraveSearchProvider.DEFAULT_KEY_ID, "key-B".toCharArray())
+        leader.cancel()
+        release.complete(Unit)
+        try { withTimeout(5_000) { leader.await() }; fail("leader must throw CE") } catch (_: CancellationException) { /* expected */ }
+
+        val out = withTimeout(5_000) { follower.await() }
+        assertTrue(out is WebSearchOutcome.Ok)
+        assertEquals("B-title", (out as WebSearchOutcome.Ok).results[0].title)
+        assertFalse((out as WebSearchOutcome.Ok).cached)
+        // 輪換回 A：fp(A) 列不得含 B 資料（pre-fix 此處回 cached=true/B-title）。
+        vault.putKey(BraveSearchProvider.DEFAULT_KEY_ID, "key-A".toCharArray())
+        val out2 = withTimeout(5_000) { outer2.search("kotlin", 5) }
+        assertTrue(out2 is WebSearchOutcome.Ok)
+        assertEquals("A-title", (out2 as WebSearchOutcome.Ok).results[0].title)
+        assertFalse("fp(A) 列不得提供 B 的資料：$out2", (out2 as WebSearchOutcome.Ok).cached)
+        val out3 = withTimeout(5_000) { outer2.search("kotlin", 5) }
+        assertTrue((out3 as WebSearchOutcome.Ok).cached)
+        assertEquals("A-title", (out3 as WebSearchOutcome.Ok).results[0].title)
+        assertEquals(listOf("key-A", "key-B", "key-A"), sentTokens.toList())
+    }
+
+    @Test fun nestedRevisionSignalNeverEscapesAsException() = runBlocking {
+        // nestedRevisionChangeRebindsOuterCacheIdentity 的公開入口 pin：runner 重跑同一流程，
+        // 要求搜尋的公開呼叫端（outer2.search）永遠不會觀察到內部標記例外／CE／Failed——
+        // 標記只在 outer 層 leader CE 分支內被吸收並重綁，最終結果與一般成功搜尋無異。
+        val release = CompletableDeferred<Unit>()
+        val entered = CompletableDeferred<Unit>()
+        val sentTokens = CopyOnWriteArrayList<String?>()
+        val vault = FakeVault()
+        vault.putKey(BraveSearchProvider.DEFAULT_KEY_ID, "key-A".toCharArray())
+        val http = FakeGetWithHeaders { _, headers ->
+            val token = headers["X-Subscription-Token"]
+            sentTokens.add(token)
+            entered.complete(Unit)
+            release.await()
+            ok(body = braveJsonFor(if (token == "key-A") "A-title" else "B-title"))
+        }
+        val inner = WebSearchService(BraveSearchProvider(vault, http, timeoutMs = 60_000))
+        val outer1 = WebSearchService(inner)
+        val outer2 = WebSearchService(inner)
+        val leader = async { outer1.search("kotlin", 5) }
+        withTimeout(5_000) { entered.await() }
+        val follower = async(start = CoroutineStart.UNDISPATCHED) { outer2.search("kotlin", 5) }
+        vault.putKey(BraveSearchProvider.DEFAULT_KEY_ID, "key-B".toCharArray())
+        leader.cancel()
+        release.complete(Unit)
+        try { withTimeout(5_000) { leader.await() }; fail("leader must throw CE") } catch (_: CancellationException) { /* expected */ }
+
+        // 公開入口必須正常返回（zero CE / zero Failed）；例外會直接從 await() 拋出使測試失敗。
+        val out = withTimeout(5_000) { follower.await() }
+        assertTrue("outer2.search 公開入口不得拋出或回傳 Failed：$out", out is WebSearchOutcome.Ok)
+        assertEquals("B-title", (out as WebSearchOutcome.Ok).results[0].title)
+
+        // 輪換回 A 後的公開呼叫同樣不得觀察到標記（out2 必須 miss 並以上游重打；out3 命中 fp(A)）。
+        vault.putKey(BraveSearchProvider.DEFAULT_KEY_ID, "key-A".toCharArray())
+        val out2 = withTimeout(5_000) { outer2.search("kotlin", 5) }
+        assertTrue("out2 公開入口回傳必須為 Ok：$out2", out2 is WebSearchOutcome.Ok)
+        assertEquals("A-title", (out2 as WebSearchOutcome.Ok).results[0].title)
+        assertFalse((out2 as WebSearchOutcome.Ok).cached)
+    }
+
+    @Test fun threeLevelNestingBubblesRevisionSignal() = runBlocking {
+        // 三層巢狀 outerTopA／outerTopB → middle → inner → provider：
+        // leader 於 HTTP 中被取消、vault 輪換 A→B；inner 的 demoting 重解析指紋不符 →
+        // 標記向上信號；middle 層吸收並以 fp(B) 重綁重執行；最外層 outerTopB 完成。
+        val release = CompletableDeferred<Unit>()
+        val entered = CompletableDeferred<Unit>()
+        val sentTokens = CopyOnWriteArrayList<String?>()
+        val vault = FakeVault()
+        vault.putKey(BraveSearchProvider.DEFAULT_KEY_ID, "key-A".toCharArray())
+        val http = FakeGetWithHeaders { _, headers ->
+            val token = headers["X-Subscription-Token"]
+            sentTokens.add(token)
+            entered.complete(Unit)
+            release.await()
+            ok(body = braveJsonFor(if (token == "key-A") "A-title" else "B-title"))
+        }
+        val inner = WebSearchService(BraveSearchProvider(vault, http, timeoutMs = 60_000))
+        val middle = WebSearchService(inner)
+        val outerTopA = WebSearchService(middle)
+        val outerTopB = WebSearchService(middle)
+
+        val leader = async { outerTopA.search("kotlin", 5) }
+        withTimeout(5_000) { entered.await() }
+        val follower = async(start = CoroutineStart.UNDISPATCHED) { outerTopB.search("kotlin", 5) }
+        vault.putKey(BraveSearchProvider.DEFAULT_KEY_ID, "key-B".toCharArray())
+        leader.cancel()
+        release.complete(Unit)
+        try { withTimeout(5_000) { leader.await() }; fail("leader must throw CE") } catch (_: CancellationException) { /* expected */ }
+
+        val out = withTimeout(5_000) { follower.await() }
+        assertTrue(out is WebSearchOutcome.Ok)
+        assertEquals("B-title", (out as WebSearchOutcome.Ok).results[0].title)
+        assertFalse((out as WebSearchOutcome.Ok).cached)
+        assertEquals(2, http.calls.get())
+        assertEquals(listOf("key-A", "key-B"), sentTokens.toList())
+    }
+
+    @Test fun sameRevisionDemotionProducesNoSignal() = runBlocking {
+        // 同一 revision（delete + re-put 相同 key-A，fingerprint 不變）：follower 重選後
+        // demoting 重解析得到同指紋 → gate 通過、無標記信號；結果以當前（相同）key-A 重打上游，
+        // 恰好兩次 upstream（N1 retry 本身），不得有 revision restart 造成的重複請求。
+        val release = CompletableDeferred<Unit>()
+        val entered = CompletableDeferred<Unit>()
+        val sentTokens = CopyOnWriteArrayList<String?>()
+        val vault = FakeVault()
+        vault.putKey(BraveSearchProvider.DEFAULT_KEY_ID, "key-A".toCharArray())
+        val http = FakeGetWithHeaders { _, headers ->
+            val token = headers["X-Subscription-Token"]
+            sentTokens.add(token)
+            entered.complete(Unit)
+            release.await()
+            ok(body = braveJsonFor(if (token == "key-A") "A-title" else "B-title"))
+        }
+        val inner = WebSearchService(BraveSearchProvider(vault, http, timeoutMs = 60_000))
+        val outer1 = WebSearchService(inner)
+        val outer2 = WebSearchService(inner)
+        val leader = async { outer1.search("kotlin", 5) }
+        withTimeout(5_000) { entered.await() }
+        val follower = async(start = CoroutineStart.UNDISPATCHED) { outer2.search("kotlin", 5) }
+        // 刪除後重新寫入「相同」key-A：fingerprint 不變 → demotion 不得產生標記。
+        vault.deleteKey(BraveSearchProvider.DEFAULT_KEY_ID)
+        vault.putKey(BraveSearchProvider.DEFAULT_KEY_ID, "key-A".toCharArray())
+        leader.cancel()
+        release.complete(Unit)
+        try { withTimeout(5_000) { leader.await() }; fail("leader must throw CE") } catch (_: CancellationException) { /* expected */ }
+
+        val out = withTimeout(5_000) { follower.await() }
+        assertTrue("同 revision demotion 不得產生標記重試：$out", out is WebSearchOutcome.Ok)
+        assertEquals("A-title", (out as WebSearchOutcome.Ok).results[0].title)
+        assertFalse((out as WebSearchOutcome.Ok).cached)
+        // 恰好兩次上游（leader + N1 retry）；revision restart 不得被觸發。
+        assertEquals(listOf("key-A", "key-A"), sentTokens.toList())
+        assertEquals(2, http.calls.get())
+    }
+
+    @Test fun demotionWipeUnwrapAccounting() = runBlocking {
+        // R6-1 × R6-2 交界：demote 路徑（gate 拋 CredentialRevisionChangedException）上
+        // self-resolved 的 mid-flight-B snapshot 由 inner 的 finally 負責 wipe（此時 stickyIter == null，
+        // ownership 為本層 self-owned）；全程每一次 getKey 發出的 buffer 於最外層 finally
+        // 收斂後皆須為全零（含 inner gate 路徑那份 B buffer 與 outer2 重綁後那份 B2 buffer）。
+        // 注意：TrackingVault 的 getKey 回傳共享參照（putKey 亦不 copy），wipe 會把 vault 內
+        // 存儲的同一參照清零，後續 resolve 會得到全零 key 而回 MISSING_KEY——無法承載此流程；
+        // 故此測試以 RecordingVault（copy-on-read＋全量記錄）取代，語義同 TrackingVault 但避開共享參照。
+        val recording = RecordingVault()
+        recording.putKey(BraveSearchProvider.DEFAULT_KEY_ID, "key-A".toCharArray())
+        val release = CompletableDeferred<Unit>()
+        val entered = CompletableDeferred<Unit>()
+        val sentTokens = CopyOnWriteArrayList<String?>()
+        val http = FakeGetWithHeaders { _, headers ->
+            val token = headers["X-Subscription-Token"]
+            sentTokens.add(token)
+            entered.complete(Unit)
+            release.await()
+            ok(body = braveJsonFor(if (token == "key-A") "A-title" else "B-title"))
+        }
+        val inner = WebSearchService(BraveSearchProvider(recording, http, timeoutMs = 60_000))
+        val outer1 = WebSearchService(inner)
+        val outer2 = WebSearchService(inner)
+        val leader = async { outer1.search("kotlin", 5) }
+        withTimeout(5_000) { entered.await() }
+        val follower = async(start = CoroutineStart.UNDISPATCHED) { outer2.search("kotlin", 5) }
+        recording.putKey(BraveSearchProvider.DEFAULT_KEY_ID, "key-B".toCharArray())
+        leader.cancel()
+        release.complete(Unit)
+        try { withTimeout(5_000) { leader.await() }; fail("leader must throw CE") } catch (_: CancellationException) { /* expected */ }
+
+        val out = withTimeout(5_000) { follower.await() }
+        assertTrue(out is WebSearchOutcome.Ok)
+        assertEquals("B-title", (out as WebSearchOutcome.Ok).results[0].title)
+        // 至少涵蓋：leader self-resolve（A）、follower self-resolve（A）、
+        // inner gate demote self-resolve（B）、outer2 revision restart self-resolve（B）＝ 4 份 buffer。
+        assertTrue("應記錄到至少 4 份 getKey buffer：${recording.capturedAll.size}", recording.capturedAll.size >= 4)
+        assertTrue(
+            "demote 路徑與全程所有 recorded buffer 皆必須被 wipe（全零）：${recording.capturedAll.map { b -> b.count { it != '\u0000' } }}",
+            recording.capturedAll.all { buf -> buf.all { it == '\u0000' } },
+        )
+    }
+
+    @Test fun revisionRestartBudgetExhaustionFailsClosed() = runBlocking {
+        // R6-1 護欄（ARM-ORDER pin）：delegate 每次呼叫都回報憑證已修訂（內部標記）→
+        // CE 分支先行、以當前憑證重綁重執行；重試 3 次（MAX_REVISION_RESTARTS）後 fail-closed
+        // 回 Failed(TRANSPORT)。
+        // ARM-ORDER 說明：若誤落入非 CE 的一般 Exception 分支，標記會被直接映射為
+        // Failed(TRANSPORT) 而不會重試——delegate 呼叫次數即為判別依據（此處必為 4＝1＋3 次 restart）；
+        // Exception arm 先行會使 calls == 1，budget 機制從未啟動。
+        // 注意：純 vault rotation（每讀輪換 A/B/C/D）無法製造本路徑——top-level entryFingerprint == null
+        // 的層級永遠不會拋 gate 標記，restart 後的 re-resolve 會直接綁定新 fp 而成功；
+        // 每次 demotion 的 follower-death 為單次事件，restart 鏈不會自我複製。
+        // 故以「每次 searchWithSnapshot/search 皆拋內部標記」的 delegate 固定重現預算耗盡。
+        // （規格原始描述「requiresKey 序列 AtomicInteger＋固定陣列週期」的 vault 下，
+        // follower 初始 resolve 即綁定 fp(B)，與 leader 的 fp(A) 不再合流，不會產生 demotion，
+        // 亦不可能回 Failed(TRANSPORT)——見 PR 回報。）
+        val marker = RevisionMarkerAlwaysDelegate()
+        val service = WebSearchService(marker)
+
+        val out = withTimeout(5_000) { service.search("kotlin", 5) }
+        assertTrue("預算耗盡必須 fail-closed 回 Failed：$out", out is WebSearchOutcome.Failed)
+        assertEquals(WebFailureReason.TRANSPORT, (out as WebSearchOutcome.Failed).reason)
+        assertEquals("CE arm 必須重試 3 次（1＋3＝4 次 delegate 呼叫）：${marker.calls.get()}", 4, marker.calls.get())
+
+        // 不得寫入任何 cache 列：切換為穩定行為後，第一次搜尋必須再次打上游（calls 持續增長）。
+        marker.markerMode = false
+        val out2 = withTimeout(5_000) { service.search("kotlin", 5) }
+        assertTrue(out2 is WebSearchOutcome.Ok)
+        assertFalse("budget 耗盡不得焊死 cache 列：$out2", (out2 as WebSearchOutcome.Ok).cached)
+        assertEquals(5, marker.calls.get())
+    }
+
+    @Test fun genuineCancellationWinsOverRevisionRetry() = runBlocking {
+        // R6-1 delta 3：並發取消（genuine）優先於 revision restart。
+        // T1 shape，但在 follower 醒來前同時取消外層兩個 Service（leader 與 follower）——
+        // follower await() 醒來 ensureActive 直接失敗，CE 原樣透傳：
+        // 絕不、絕不映射為 Failed、絕不回傳 Ok（leader flight 也不該被吃掉）。
+        val release = CompletableDeferred<Unit>()
+        val entered = CompletableDeferred<Unit>()
+        val sentTokens = CopyOnWriteArrayList<String?>()
+        val vault = FakeVault()
+        vault.putKey(BraveSearchProvider.DEFAULT_KEY_ID, "key-A".toCharArray())
+        val http = FakeGetWithHeaders { _, headers ->
+            val token = headers["X-Subscription-Token"]
+            sentTokens.add(token)
+            entered.complete(Unit)
+            release.await()
+            ok(body = braveJsonFor(if (token == "key-A") "A-title" else "B-title"))
+        }
+        val inner = WebSearchService(BraveSearchProvider(vault, http, timeoutMs = 60_000))
+        val outer1 = WebSearchService(inner)
+        val outer2 = WebSearchService(inner)
+        val leader = async { outer1.search("kotlin", 5) }
+        withTimeout(5_000) { entered.await() }
+        val follower = async(start = CoroutineStart.UNDISPATCHED) { outer2.search("kotlin", 5) }
+        vault.putKey(BraveSearchProvider.DEFAULT_KEY_ID, "key-B".toCharArray())
+        // 在 follower 醒來之前，同時取消 leader 與 follower。
+        leader.cancel()
+        follower.cancel()
+        release.complete(Unit)
+        try { withTimeout(5_000) { leader.await() }; fail("leader must throw CE") } catch (_: CancellationException) { /* expected */ }
+        try {
+            withTimeout(5_000) { follower.await() }
+            fail("follower must throw plain CE")
+        } catch (e: CancellationException) {
+            // 並發取消優先：絕不回傳 Failed／Ok；且絕不攜帶內部標記（該標記不可達於並發取消路徑）。
+            assertTrue("genuine 並發取消不得映射為內部 revision 標記：$e", e !is CredentialRevisionChangedException)
+        }
+    }
+
     @Test fun cancellationDuringCacheableNotApplicableSearchPropagatesCe() = runBlocking {
         // 壞 delegate：credentialState 吞掉 CE 仍「正常返回」NotApplicable（已取消仍回值）。
         // fix 生效 → state 解析後的 ensureActive() 拋 CE → result 從不完成；
@@ -3437,6 +3719,66 @@ class WebSearchD5Test {
         override suspend fun hasKey(providerId: String): Boolean {
             seenHas.add(providerId)
             return keys.containsKey(providerId)
+        }
+    }
+
+    /**
+     * 測試專用 vault：copy-on-read 的 TrackingVault 變體——每次 getKey 發出的拷貝
+     * 皆記錄進 [capturedAll]（最後一次亦同入 [captured]），putKey 亦 copyOf。
+     * 用於 R6-1 demote 路徑：TrackingVault 的共享參照語義會讓 wipe 抹掉 vault 內部
+     * 存儲的同一份 buffer，後續 resolve 會拿到全零 key（MISSING_KEY），無法承載流程；
+     * 此變體保留「可觀測每一份發出 buffer」的能力且不破壞 vault 狀態。
+     */
+    private class RecordingVault : KeyVault {
+        private val keys = mutableMapOf<String, CharArray>()
+        val capturedAll = mutableListOf<CharArray>()
+        var captured: CharArray? = null
+            private set
+
+        override suspend fun putKey(providerId: String, apiKey: CharArray) {
+            keys[providerId] = apiKey.copyOf()
+        }
+
+        override suspend fun getKey(providerId: String): CharArray? =
+            keys[providerId]?.copyOf()?.also { captured = it; capturedAll.add(it) }
+
+        override suspend fun deleteKey(providerId: String) {
+            keys.remove(providerId)
+        }
+
+        override suspend fun hasKey(providerId: String): Boolean = keys.containsKey(providerId)
+    }
+
+    /**
+     * 測試專用 delegate（marker 模式下每次 search／searchWithSnapshot 皆拋出
+     * module-internal 的 CredentialRevisionChangedException）：
+     * 用於驗證 R6-1 重試預算——CE 分支吸收標記並以當前憑證重綁重執行，
+     * 重試 MAX_REVISION_RESTARTS 次後 fail-closed 回 Failed(TRANSPORT)；絕不 raw throw、絕不寫 cache。
+     * markerMode = false 時改回穩定行為（Ok），用於斷言預算耗盡後不會焊死 cache。
+     */
+    private class RevisionMarkerAlwaysDelegate : WebSearchProvider {
+        val calls = AtomicInteger(0)
+        var markerMode = true
+
+        override val id: String = "revision-marker-always"
+        override val cacheNamespace: String get() = id
+        override val capabilities: Set<WebCapability> = setOf(WebCapability.REQUIRES_KEY)
+
+        override suspend fun probe(): WebProbe = WebProbe.Ready
+
+        override suspend fun credentialState(): CredentialState =
+            CredentialState.Ready(CredentialSnapshot("fixed-key".toCharArray(), "fp-fixed"))
+
+        override suspend fun search(query: String, count: Int): WebSearchOutcome {
+            calls.incrementAndGet()
+            if (markerMode) throw CredentialRevisionChangedException()
+            return WebSearchOutcome.Ok(emptyList())
+        }
+
+        override suspend fun searchWithSnapshot(snapshot: CredentialSnapshot, query: String, count: Int): WebSearchOutcome {
+            calls.incrementAndGet()
+            if (markerMode) throw CredentialRevisionChangedException()
+            return WebSearchOutcome.Ok(emptyList())
         }
     }
 }

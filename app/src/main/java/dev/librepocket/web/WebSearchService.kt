@@ -10,6 +10,16 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 
 /**
+ * 內部標記例外（module-internal；不得 export、不得出現在任何 public 簽名）。
+ * 攜帶零 key material——僅為「巢狀 sticky 於 follower 重選後重解析，
+ * 但當前憑證與進入時 fingerprint 不符（或不可用／NotApplicable／未來 subtype）」的控制流標記。
+ * 各層 leader CE 分支捕捉後以當前憑證重執行自己的迭代；絕不穿透到 search() 呼叫端。
+ * 刻意子類化 CancellationException：every tier 既有的 CE 通道
+ * （ensureActive／await／m.completeExceptionally／NonCancellable cleanup）對它行為一致。
+ */
+internal class CredentialRevisionChangedException : CancellationException("credential revised mid-flight")
+
+/**
  * D2 cache＋single-flight 包裝（#138 Scope：同 query 第二次零 upstream、`cached=true`；
  * 併發同 query 合流為一次 upstream；純 JVM，不接線）。
  *
@@ -30,10 +40,12 @@ import kotlinx.coroutines.withContext
  *   follower 重選時同樣退回 [WebSearchProvider.credentialState] 重驗（N1 修復），
  *   已刪除憑證在巢狀路徑同樣不會被重送。in-flight 移除
  *   仍在 `NonCancellable` finally 內，殘留已取消的 deferred 不會焊住後續同 key。
+ *   巢狀 sticky 於 follower 重選後重解析，若當前憑證與進入時 fingerprint 不符（或不可用／NotApplicable／未來 subtype），本層拋出內部標記例外（CredentialRevisionChangedException，module-internal）；上層 leader 分支捕捉後以當前憑證重綁 cache identity 並重執行自己的迭代——呼叫端不會觀察到該標記；最終結果與一般成功搜尋無異。重試上限 MAX_REVISION_RESTARTS = 3（per frame 呼叫），超限 Failed(TRANSPORT)（不快取）。
  * - 抹除不變式（R6-2）：searchInternal 每個迭代先將 self-resolved snapshot 指派進局部欄位、次執行 ensureActive()、最後分派；wipe 僅有一處（唯一 finally、以 stickyIter == null 為準），涵蓋 cache hit／follower／leader／例外／retry／state 解析後取消；sticky 絕不由本層 wipe。
  * - leader 已拿到值才觀察到取消（delegate 回 `Ok` 後 `ensureActive()` 失敗）：
  *   不寫快取、leader 仍拋 [CancellationException]，但已在等待的 follower 仍以該
  *   `Ok`（非 cached）完成，不陪葬重打。
+ *   marker-from-delegate 於 ok == null 時 ⇒ 以當前 vault 重綁並重執行（不是呼叫端可見的失敗）；ok != null 時該標記不可達。
  * - 非取消異常（delegate 拋 `Exception`，如吞掉取消的壞 delegate 或程式錯誤）映射為
  *   `Failed(TRANSPORT)` 值回傳（fail-closed，允許非 pinned fallback），不 raw throw；
  *   `Error` 仍 `completeExceptionally` 後原樣拋出。
@@ -43,6 +55,7 @@ import kotlinx.coroutines.withContext
  *   （request 與 cache identity 同源）；[CredentialState.Unavailable]（keyed vault 暫時故障／缺 key，
  *   憑證狀態未知）→ 完全旁路快取（不讀不寫、不進 single-flight、不寫快取，uncacheable）；
  *   [CredentialState.NotApplicable]（非 keyed provider）→ plain cache key，行為完全不變。
+ *   revision restart 同樣遵守「request credential 與 cache fingerprint 同源」——每次迭代頂部重新解析綁定。
  * - Follower 重選會重讀「當前」vault：重試時 [WebSearchProvider.credentialState] 重新解析，
  *   不沿用已輪換／已刪除的舊憑證；刪除的憑證絕不會在重試時被重送（resolve 不到 → 旁路 → delegate `search()`
  *   回 MISSING_KEY）。刪除憑證由 keyed delegate 零網路收斂。巢狀 sticky 在重選時同樣退回當前 vault 重解析。
@@ -71,6 +84,11 @@ class WebSearchService(
     private val delegate: WebSearchProvider,
     private val cache: WebSearchCache = WebSearchCache(),
 ) : WebSearchProvider {
+    private companion object {
+        /** R6-1：同一 searchInternal 呼叫內修訂重選的上限；超限 fail-closed。 */
+        const val MAX_REVISION_RESTARTS = 3
+    }
+
     override val id: String get() = delegate.id
 
     override val cacheNamespace: String get() = delegate.cacheNamespace
@@ -134,6 +152,7 @@ class WebSearchService(
      * 首輪沿用外層 snapshot 即本層的 cache identity 與 HTTP 依據（不重讀 vault）；
      * 唯 follower 重選（inner leader 取消）後，本層退回當前 vault 重解析——已刪除的憑證不會被重送，見 [searchInternal] 與 N1 修復。
      * 非符合契約之 keyed 子類務必覆寫 searchWithSnapshot（預設實作回 `Unavailable(MISSING_KEY)`、零 HTTP——功能性靜默失效，非安全漏洞）。
+     * 本層 delegate 若於 in-flight 偵測到憑證輪換（fingerprint 不符／vault 不可用），會以 module-internal CredentialRevisionChangedException 向上 signal；巢狀 WebSearchService 的 leader 分支吸收它並重綁，非 Service 的 delegate 回傳值契約不受影響。
      */
     override suspend fun searchWithSnapshot(
         snapshot: CredentialSnapshot,
@@ -161,6 +180,8 @@ class WebSearchService(
         // follower 重選代表上游已死，最低限度的重驗方式是轉回當前 vault 重解析，
         // 絕不以未重驗的過期 snapshot 再次 egress。
         var iterationSticky = sticky
+        val entryFingerprint: String? = sticky?.fingerprint   // != null ⟺ 本次為巢狀呼叫（進入時有指紋）
+        var revisionRestarts = 0
         while (true) {
             val stickyIter = iterationSticky
             val state = if (stickyIter != null) {
@@ -190,6 +211,19 @@ class WebSearchService(
                 // CE-swallowing delegate 在已取消 context 下 credentialState() 仍「正常返回」時，
                 // 此 ensureActive() 讓取消原樣透傳（覆蓋 bypass／cache 查找／cache hit 與其下游所有路徑）。
                 currentCoroutineContext().ensureActive()
+                // ── R6-1 revision gate ──
+                // 本迭代若為「巢狀進入後被降級重解析」（stickyIter == null 且進入時有指紋），
+                // 當前 vault 的狀態必須與進入時同源——同 fingerprint 才允許沿用，
+                // 否則（不同 fingerprint／Unavailable／NotApplicable／未來 subtype）不得把上層的舊 binding
+                // 帶進這一次的 HTTP／cache／in-flight：拋出內部標記例外，迫使上層層級
+                // 以當前憑證重執行自己的迭代。snapshot 已於上方指派，finally 負責 wipe（此 throw 路徑下 self-owned）。
+                val demotingFingerprint = if (stickyIter == null) entryFingerprint else null
+                if (demotingFingerprint != null) {
+                    val stateMatch = (state as? CredentialState.Ready)?.snapshot?.fingerprint == demotingFingerprint
+                    if (!stateMatch) {
+                        throw CredentialRevisionChangedException()
+                    }
+                }
                 when (state) {
                     CredentialState.Unavailable -> return bypass(query, n)
                     CredentialState.NotApplicable -> Unit // plain cache key；snapshot 保持 null，行為不變
@@ -282,15 +316,45 @@ class WebSearchService(
                         m.complete(outcome)
                         return outcome
                     } catch (e: CancellationException) {
-                        // Leader 已拿到 Ok 才觀察到取消：follower 仍值得該值（不寫 cache），
-                        // leader 自己拋 CE；否則 follower 會重試，不污染。
+                        // 真實取消優先（R6-1）：genuine 並發取消仍以 CE 原樣透傳；
+                        // 此 arm 的第一個動作必須是 ensureActive()，不得省略。
+                        try {
+                            currentCoroutineContext().ensureActive()
+                        } catch (real: CancellationException) {
+                            // 併發取消（非 revision signal）：follower 仍值得 Ok（若有）；否則以 real CE 完成 deferred。
+                            val okReal = okForFollowers
+                            if (okReal != null) {
+                                m.complete(okReal)
+                            } else {
+                                m.completeExceptionally(real)
+                            }
+                            throw real
+                        }
                         val ok = okForFollowers
                         if (ok != null) {
+                            // delegate 已回 Ok 才觀察到取消：follower 仍值得該值（不寫 cache），leader 拋 CE。
+                            // 修訂標記在 ok != null 時不可達（delegate 不會在輪換後回值）。
                             m.complete(ok)
+                            throw e
+                        }
+                        if (e is CredentialRevisionChangedException) {
+                            // R6-1：delegate 於 in-flight 期間回報憑證已輪換／vault 不可用／無法綁定。
+                            // abandoned fp 的 flight 以此 CE 完成（等待中的 follower 醒來 ensureActive 通過後
+                            // 以當前 vault 重選、重新綁定）；本層 abandoned inFlight 條目於下方 NonCancellable finally 移除。
+                            if (revisionRestarts >= MAX_REVISION_RESTARTS) {
+                                // 護欄：仍無法綁定——fail-closed 值回傳（不寫 cache；與 TRANSPORT fallback 語義一致）。
+                                val failed = WebSearchOutcome.Failed(WebFailureReason.TRANSPORT)
+                                m.complete(failed)
+                                return failed
+                            }
+                            m.completeExceptionally(e)
+                            revisionRestarts += 1
+                            iterationSticky = null // 一律退回當前 vault 重解析（即使 entryFingerprint 非空也重走 gate 驗證）
+                            retry = true
                         } else {
                             m.completeExceptionally(e)
+                            throw e
                         }
-                        throw e
                     } catch (_: Exception) {
                         try {
                             currentCoroutineContext().ensureActive()

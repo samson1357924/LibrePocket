@@ -58,6 +58,7 @@ class ElevatedCleanupTrackerB2Test {
         val leakedQuarantine = ElevatedCleanupTracker.quarantinedCount()
         ElevatedCleanupTracker.clearUnverified()
         // 有界強制收斂：避免無界 while 在洩漏時卡死 CI；pollOutstandingTo(0) 隨後仍 fail-fast 報錯。
+        // leak 斷言本身仍由下方 poll fail-fast 把關（與其他測試類一致）。
         val forcedDeadline = System.currentTimeMillis() + 5_000L
         while (ElevatedCleanupTracker.outstanding() > 0 && System.currentTimeMillis() < forcedDeadline) {
             ElevatedCleanupTracker.releaseSlot()
@@ -1133,7 +1134,7 @@ class ElevatedCleanupTrackerB2Test {
             repeat(prefilled) { ElevatedCleanupTracker.releaseSlot() }
             prefilled = 0
             pollOutstandingTo(0)
-            // 歸零後並行准入：gate 6（quarantine）於 debt==0 時獨力封死 fail-open 窗口。
+            // 歸零後並行准入：gate 7（quarantine）於 debt==0 時獨力封死 fail-open 窗口。
             assertEquals(
                 ElevatedCleanupTracker.Admission.QUARANTINE,
                 ElevatedCleanupTracker.tryEnterReserved(),

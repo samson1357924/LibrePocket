@@ -59,6 +59,7 @@ class ElevatedCleanupTrackerRegistrationFailureTest {
         val leakedQuarantine = ElevatedCleanupTracker.quarantinedCount()
         ElevatedCleanupTracker.clearUnverified()
         // 有界強制收斂：避免無界 while 在洩漏時卡死 CI；pollOutstandingTo(0) 隨後仍 fail-fast 報錯。
+        // leak 斷言本身仍由下方 poll fail-fast 把關（與其他測試類一致）。
         val forcedDeadline = System.currentTimeMillis() + 5_000L
         while (ElevatedCleanupTracker.outstanding() > 0 && System.currentTimeMillis() < forcedDeadline) {
             ElevatedCleanupTracker.releaseSlot()

@@ -155,6 +155,9 @@ import java.util.concurrent.TimeUnit
  *   cleanupIncomplete 含殘留 gobbler／stdin；正常完成且全域無殘留仍 noteClean，
  *   不誤判良性；讀失敗不計入
  *   連續計數 —— 無資源殘留，verdict 已 Failed，避免數據錯誤誤觸熔斷）。
+ *
+ * Round-6 政策：只讀診斷／測試用途的 internal 宣告一律標 `@VisibleForTesting`
+ * （`pidReuseSignalAllowed` 等被產品讀取者除外；`note*` 寫入點不標）。
  */
 internal object ElevatedCleanupTracker {
     /**

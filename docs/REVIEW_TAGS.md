@@ -18,12 +18,12 @@
 | `AA1-slot` | cleanup worker 槽 custody（跨 post-kill verify 持有／thread-bound 轉移） | `runCleanupBounded` |
 | `M1` | 飽和臂 quarantine 原子登記：`acquireSlotOrQuarantine`（同一鎖二選一） | `ElevatedCleanupTracker.acquireSlotOrQuarantine` |
 | `P1-A1/A2/A3/P1-4` | Round 的 P1 修正編號：原子二選一、untracked Residual 遙測、kill-never-attempted、飽和即拒 | `acquireSlotOrQuarantine`／`untrackedResidual` |
-| `Round-6 IR-P1` | 飽和無槽 lingering worker 會被 sweep 放行／准入重開的 IR（independent re-review）P1 | `lingerDebt`、gate 5（`classifyAdmissionLocked`） |
+| `Round-6 IR-P1` | 飽和無槽 lingering worker 會被 sweep 放行／准入重開的 IR（independent re-review）P1 | `lingerDebt`、gate 6（`classifyAdmissionLocked`） |
 | `Round-6 IR-P2` | 登記雙失敗（無槽＋雙登記皆拋）⇒ admission 無訊號 | `registrationFailedSticky`、`Admission.REGISTRATION_FAILED` |
 | `Round-6 D-A1..D-E7` | 子代碼複審發現編號（A=併發、B=提權執行安全、C=測試、D=架構/KDoc、E=scope/CI） | 本檔末 P1 段＋`pr167-review-aggregation.md`（repo 外彙整表） |
 | `Round-6 PG-#` | PocketGuard bot 發現（BLOCK/WARN/SUGGESTION） | 同上 |
 | `drainFailClosedDrained` | drain 內部逃逸時的 catch-all 收斂臂：killTree best-effort＋中斷 thread＋登記 quarantine＋計數；outstanding 不釋放（B3＝重啟恢復） | `ElevatedProcessIo.drainWithThreadStarter`／`drainFailClosedDrained` |
-| `Stage 1/2/3/4（本 PR 的 Round-6 提交階梯）` | 20af2877 linger-debt seal → ed1f8d81 sticky brick＋catch-all backstop → ff509999 遙測/文件 →（本 PR 最终 review commit） | git log |
+| `Stage 1/2/3/4（本 PR 的 Round-6 提交階梯）` | 20af2877 linger-debt seal → ed1f8d81 sticky brick＋catch-all backstop → ff509999 遙測/文件 → 9d5ad1e7 有界 tearDown/本檔 | git log |
 | `quarantine（閘）／QUARANTINE` | 未驗證死亡 handle 的持久登記，admission 末門 QUARANTINE（fail-closed） | `ElevatedCleanupTracker.quarantineUnverified` |
 | `sweep／verify-only sweep` | 以 `waitFor(0ms)` 有界驗證後才移除 quarantine 條目 | `verifyQuarantinedOneBounded` |
 | `AB1` | 呼叫級准入（activeCalls / tryEnterReserved），上限 MAX_CONCURRENT_CALLS=4 | `tryEnterReserved` |
@@ -32,7 +32,7 @@
 ## 四態／五態 state 詞彙（worker/heartbeat 三態修正歷史的注記）
 
 - `state==0` init、`1` held、`2` done-no-debt、`3` done-debt（Round-6 起 markLingering／cleanup cell）。
-- `outstanding` = cleanup 槽佔用；`lingerDebt` = 飽和無槽 worker 的密封債務（gate 5）。
+- `outstanding` = cleanup 槽佔用；`lingerDebt` = 飽和無槽 worker 的密封債務（gate 6）。
 - `cleanupSlotState`（custody 狀態機）維持三態（0→1→2），與 markLingering 四態不同。
 
 ## 復原與恢復政策（誠實邊界）

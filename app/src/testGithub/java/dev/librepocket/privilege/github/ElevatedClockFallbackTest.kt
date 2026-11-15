@@ -71,6 +71,25 @@ class ElevatedClockFallbackTest {
         )
     }
 
+    @Test fun awaitSpawnClockThrowYieldsExpiredNoSpawn() {
+        // awaitSpawn 入口 preflight：budget 已盡即不提交 spawn（零特權進程、block 從不執行）。
+        // 注入拋鐘 ⇒ preExpired=true（call site try/catch→true）⇒ Expired(hasLinger=false)，
+        // killer／block 皆不執行（晚補償缺口誤報 cleaned 不可能發生）。
+        var killerCalled = false
+        var blockCalled = false
+        val r = ElevatedCallSupervisor.awaitSpawn(
+            deadlineNanos = 0L,
+            isCancelled = { false },
+            killer = { killerCalled = true },
+            nowNanos = { throw RuntimeException("clock boom") },
+            block = { blockCalled = true; KillableImmediateProcess() },
+        )
+        assertTrue("throwing clock must converge to Expired (was $r)", r is ElevatedCallSupervisor.Res.Expired)
+        assertEquals(false, (r as ElevatedCallSupervisor.Res.Expired).hasLinger)
+        assertEquals(false, killerCalled)
+        assertEquals(false, blockCalled)
+    }
+
     @Test fun drainEntryThrowingClockEntersClockFailedConvergesFailClosed() {
         // drainWithThreadStarter 入口 computeDeadlineNanos 拋鐘 ⇒ entryClockFailed ⇒
         // preflightExpired 直接 kill 臂：有界返回 Drained(timedOut=true)（不偽造成功、

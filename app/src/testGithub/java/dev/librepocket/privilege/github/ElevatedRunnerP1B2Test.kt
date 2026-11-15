@@ -1202,13 +1202,13 @@ class ElevatedRunnerP1B2Test {
                 ElevatedCleanupTracker.outstanding(),
             )
             // 先釋預填槽（與 saturatedDrainKillSweepRestoresAdmission 同式）——outstanding 歸零後
-            // gate 1 通過；debt 已於 catch 臂同步收斂（== debtBefore），gate 5 亦通過。
+            // gate 1 通過；debt 已於 catch 臂同步收斂（== debtBefore），gate 6 亦通過。
             repeat(prefilled) { ElevatedCleanupTracker.releaseSlot() }
             prefilled = 0
             pollOutstandingTo(0)
             // 迴歸註記（F5）：sweep 移除 `waitFor(0)==true` 條目為同一鎖內原子操作，與 admission
             // 判定同鎖；方向 fail-closed（僅 verified-death 方移除；飽和 stalled 條目持續殘留）。
-            // gate 5 不觸發（debt==0）；gate 6（quarantine）於 debt==0 時獨力封死。
+            // gate 6 不觸發（debt==0）；gate 7（quarantine）於 debt==0 時獨力封死。
             assertEquals(ElevatedCleanupTracker.Admission.QUARANTINE, ElevatedCleanupTracker.tryEnterReserved())
             assertEquals(0, ElevatedCleanupTracker.activeCalls())
         } finally {
@@ -1279,7 +1279,7 @@ class ElevatedRunnerP1B2Test {
             pollTrue("cleanup worker must unwind linger debt", 10_000L) {
                 ElevatedCleanupTracker.lingerDebtCount() == 0
             }
-            // 密封此刻仍在位（gate 6（quarantine）於 debt==0 時獨力封死）。
+            // 密封此刻仍在位（gate 7（quarantine）於 debt==0 時獨力封死）。
             assertEquals(
                 ElevatedCleanupTracker.Admission.QUARANTINE,
                 ElevatedCleanupTracker.tryEnterReserved(),
@@ -1360,7 +1360,7 @@ class ElevatedRunnerP1B2Test {
             repeat(prefilled) { ElevatedCleanupTracker.releaseSlot() }
             prefilled = 0
             pollOutstandingTo(0)
-            // 密封此刻已在位（debt gate 5 先於 quarantine gate 6；debt==1 ⇒ BACKLOG_FULL）。
+            // 密封此刻已在位（debt gate 6 先於 quarantine gate 7；debt==1 ⇒ BACKLOG_FULL）。
             assertEquals(
                 "pre-sweep admission must refuse (debt gate)",
                 ElevatedCleanupTracker.Admission.BACKLOG_FULL,
@@ -1447,7 +1447,7 @@ class ElevatedRunnerP1B2Test {
                 0,
                 victim.destroyCalls,
             )
-            // 密封此刻仍在位（gate 6（quarantine）於 debt==0 時獨力封死；tryEnterReserved 拒入即不佔席）。
+            // 密封此刻仍在位（gate 7（quarantine）於 debt==0 時獨力封死；tryEnterReserved 拒入即不佔席）。
             assertEquals(
                 ElevatedCleanupTracker.Admission.QUARANTINE,
                 ElevatedCleanupTracker.tryEnterReserved(),
@@ -1480,7 +1480,7 @@ class ElevatedRunnerP1B2Test {
     /**
      * Stage 5（I6，late-飽和臂 → sweep 鏈式迴歸）：caller CAS 認領 late Process 時
      * 槽全滿 ⇒ `startLateDaemon` 飽和臂經 `acquireSlotOrQuarantine` 原子轉入
-     * quarantine（零 kill、不發 daemon）；釋預填槽後 gate 6（quarantine）於 debt==0 時獨力封死，
+     * quarantine（零 kill、不發 daemon）；釋預填槽後 gate 7（quarantine）於 debt==0 時獨力封死，
      * admission-triggered `kickSweepAsync` 經 `waitFor(0, MILLISECONDS)` 有界驗證
      * （NaturalDeathProcess＝確死 fixture）即解除登記，admission 恢復 OK（seal 未永久化）。
      * harness 結構同 PhaseB 飽和認領 pin（spawn→worker publish→預填→cancelGate 放行），
@@ -1573,7 +1573,7 @@ class ElevatedRunnerP1B2Test {
                 quarantineBefore + 1,
                 ElevatedCleanupTracker.quarantinedCount(),
             )
-            // 釋預填槽（victim 仍封印中），gate 6（quarantine）於 debt==0 時獨力封死新 spawn。
+            // 釋預填槽（victim 仍封印中），gate 7（quarantine）於 debt==0 時獨力封死新 spawn。
             repeat(prefilled) { ElevatedCleanupTracker.releaseSlot() }
             prefilled = 0
             pollOutstandingTo(0)

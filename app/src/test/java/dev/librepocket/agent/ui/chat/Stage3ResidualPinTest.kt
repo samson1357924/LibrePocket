@@ -351,7 +351,7 @@ class Stage3ResidualPinTest {
      * (199 after the user-boundary snap re-aligns the naive cut; B2) — the
      * full 2000-row prefix no longer reaches the request.
      */
-    @Test fun exactCap2000ViaFactoryOpen_reportsZeroDropped() = runBlocking {
+    @Test fun exactCap2000ViaFactoryOpen_windowsFirstSendToDefault() = runBlocking {
         val transcripts = FakeSessionStore()
         val sid = transcripts.createSession("old chat", "preset:openai@https://api.openai.com/gpt-4o-mini")
         for (i in 0 until 1000) {

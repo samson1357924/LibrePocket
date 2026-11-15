@@ -136,9 +136,8 @@ fun ChatScreen(
     val currentSessionId by viewModel.currentSessionId.collectAsStateWithLifecycle()
     // S2: pending history open retained across ConfirmRequired (explicit resume target).
     val pendingOpenSid by viewModel.pendingOpenSessionId.collectAsStateWithLifecycle()
-    // R5-5: send-time 100k-char trim (debug). Orthogonal to load-time resume
-    // omission; kept for diagnostics only — the user-facing badge binds
-    // contextOmittedCount (its superset: window + 100k-trim legs).
+    // R5-5: provider-request context omission（window＋100k-trim 總腿；
+    // 100k 單腿 debug 計數保留在 VM 層 requestTrimmedCount）
     val contextOmittedCount by viewModel.contextOmittedCount.collectAsStateWithLifecycle()
     val listState = rememberLazyListState()
     val streaming = session.status == ChatStatus.STREAMING

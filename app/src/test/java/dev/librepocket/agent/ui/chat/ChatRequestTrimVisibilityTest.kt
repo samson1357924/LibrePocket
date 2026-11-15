@@ -70,18 +70,32 @@ private class TrimAllowPolicy : PolicyStore {
 /**
  * R5-5 request-level trim visibility (pure JVM, all fake data).
  *
- * - A large resumed history never reaches the send-time MAX_REQUEST_CHARS
- *   trim: the DEFAULT window preempts it at load/combined (trimmed stays 0),
+ * Window preempt semantics: under the fixed B2 DEFAULT window (200 messages
+ * / 60k chars, oldest-first, whole rows, pair-atomic + user-boundary snap),
+ * a large replay history is cut by the window at load/combined time. For a
+ * live row within the post-window headroom (~40k chars, since the windowed
+ * prefix is ≤ 60k and the send-time cap is 100k) the send-time MAX_REQUEST_CHARS
+ * trim never runs: trimmed stays 0 while the provider sees the cropped
+ * request. An oversize live row (approaching the admission cap) can still
+ * push the combined request over 100k after the window and trip the
+ * send-time trim. Send-time trim coverage therefore lives in the
+ * Unbounded-cap tests (`sessionImpl_mirrorsControllerTrimFlow`
+ * here; the Unbounded cases in `TurnControllerHistoryTest`).
+ *
+ * - A large resumed history with a live row inside the post-window headroom
+ *   never reaches the send-time MAX_REQUEST_CHARS trim: the DEFAULT window
+ *   preempts it at load/combined (trimmed stays 0),
  *   the provider sees the cropped request, and the omitted-row total surfaces
  *   via [ChatViewModel.contextOmittedCount] while the load-time
  *   [ChatViewModel.historyOmittedCount] stays 0 (orthogonal).
- * - A 2002-row small history omits 2 rows at load (tail cap) but trims
- *   nothing per request (control: omitted == 2, requestTrim == 0).
- * - [ChatSessionImpl.requestTrimmedCount] mirrors the controller flow.
+ * - A 2002-row small history omits 2 rows at load (the 2000-row DB scan
+ *   cap) but trims nothing per request (control: omitted == 2, requestTrim == 0).
+ * - [ChatSessionImpl.requestTrimmedCount] mirrors the controller flow
+ *   (pinned with [HistoryWindowCap.Unbounded] so the send-time trim runs).
  *
  * Fixed clock/zone pins the ephemeral time block so trim math is exact;
  * history rows stay under MODEL_HISTORY_MAX_CHARS_PER_MESSAGE (no read-path
- * truncation) and under HISTORY_CAP (no tail omission in the trim test).
+ * truncation) and under the 2000-row DB scan cap.
  */
 class ChatRequestTrimVisibilityTest {
 
@@ -198,9 +212,10 @@ class ChatRequestTrimVisibilityTest {
             // so DB-tail omission stays 0. B2: the DEFAULT window (60k char
             // leg) keeps the newest 3 rows (57k) at load, then the
             // user-boundary snap drops the leading assistant row (a1) too,
-            // leaving [u2, a2]; the send-time trim stays 0
-            // (window preempts it — send-time coverage lives in the
-            // Unbounded unit tests).
+            // leaving [u2, a2]; the send-time trim stays 0 (the window
+            // preempts it for this tiny live row — send-time coverage lives
+            // in the Unbounded unit tests; an oversize live row can still
+            // trip the send-time trim).
             for (i in 0 until 3) {
                 transcripts.appendEvent(
                     TranscriptEvent(sessionId = id, runId = "r$i", kind = "user", text = bigRow("u$i:"), createdAt = 1L),
@@ -238,7 +253,6 @@ class ChatRequestTrimVisibilityTest {
 
         // Window preempts send-time: trimmed stays 0, contextOmittedCount == 4
         // (6 resumed rows + 1 live - 3 shipped = 4).
-        awaitTrue { vm.sessionState.value.status == ChatStatus.IDLE }
         awaitTrue { vm.contextOmittedCount.value == 4 }
         assertEquals(0, vm.requestTrimmedCount.value)
         assertEquals(0, vm.historyOmittedCount.value)
@@ -319,7 +333,8 @@ class ChatRequestTrimVisibilityTest {
         awaitTrue { vm.sessionState.value.status == ChatStatus.IDLE && vm.messages.value.size == 8 }
         assertEquals(0, vm.requestTrimmedCount.value)
 
-        // Fence baseline while still on the big session (post-trim): the big
+        // Fence baseline while still on the big session (post-send; window
+        // preempt, no trim): the big
         // session's projections are never empty, so under the quiet premise
         // (nothing else mutates history/session state between this capture and
         // the fence) the first newer empty generation is the fresh attach's

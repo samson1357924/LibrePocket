@@ -108,7 +108,14 @@ private class DefCapAllowPolicy : PolicyStore {
  *   `TOOL_OUTPUT_AMBIGUOUS_ID` (multi pending) or — for a lone retained
  *   blank tool row — `TOOL_OUTPUT_MISSING_ID`.
  * - [exactMessageCapBoundaries] and [exactCharCapBoundaries] pin exact message and
- *   char count boundaries for history windowing.
+ *   char count boundaries for history windowing; [charLegBoundaryAtSixtyThousand]
+ *   and [charLegGiantNewestSingleRowSurvives] pin the 60k char leg's strict-greater
+ *   boundary (exactly 60,000 kept; 60,001 binds) and the `kept > 0` safeguard
+ *   (an over-budget NEWEST single row survives whole);
+ *   [charLegGiantOldRowEvictedBeforeNewestSmall] pins the mirror image of
+ *   the same safeguard: an over-budget OLD row is evicted oldest-first,
+ *   never kept over the newer small row (`kept > 0` protects only the
+ *   newest row).
  */
 class TurnControllerDefaultCapTest {
 
@@ -893,6 +900,56 @@ class TurnControllerDefaultCapTest {
     val m41 = msg("x".repeat(41))
     assertEquals(listOf(m41), applyHistoryCap(listOf(m41), cap40))
     assertEquals(listOf(m41), applyHistoryCap(listOf(m1, m41), cap40))
+  }
+
+  @Test(timeout = 30_000) fun charLegBoundaryAtSixtyThousand() {
+    fun msg(text: String) = ChatMessage(role = "user", text = text)
+    val cap60k = HistoryWindowCap.MaxChars(60_000)
+
+    // Exactly 60_000 chars are retained: the char leg binds only when
+    // `chars + m.text.length > maxChars` (strictly greater), so a total of
+    // exactly the cap never trips it.
+    val exact = listOf(msg("a".repeat(20_000)), msg("b".repeat(20_000)), msg("c".repeat(20_000)))
+    assertEquals(exact, applyHistoryCap(exact, cap60k))
+
+    // One extra char (60_001 total): the oldest row no longer fits and drops,
+    // oldest-first — the char leg is strict-greater, not greater-or-equal.
+    val over = listOf(msg("a".repeat(20_000)), msg("b".repeat(20_000)), msg("c".repeat(20_000)), msg("d"))
+    assertEquals(listOf(exact[1], exact[2], msg("d")), applyHistoryCap(over, cap60k))
+  }
+
+  @Test(timeout = 30_000) fun charLegGiantNewestSingleRowSurvives() {
+    fun msg(text: String) = ChatMessage(role = "user", text = text)
+    val cap60k = HistoryWindowCap.MaxChars(60_000)
+    val giant = msg("g".repeat(61_000))
+
+    // kept > 0 safeguard: a single row larger than the char budget is still
+    // kept whole (truncation drops messages, never splits one) — the NEWEST
+    // row always survives.
+    assertEquals(listOf(giant), applyHistoryCap(listOf(giant), cap60k))
+
+    // With an older row present, the old row evicts oldest-first and the
+    // over-budget NEWEST row survives.
+    assertEquals(listOf(giant), applyHistoryCap(listOf(msg("u".repeat(10)), giant), cap60k))
+
+    // The DEFAULT dual cap keeps it too (the count leg is unaffected).
+    assertEquals(listOf(giant), applyHistoryCap(listOf(giant), HistoryWindowCap.DEFAULT))
+  }
+
+  @Test(timeout = 30_000) fun charLegGiantOldRowEvictedBeforeNewestSmall() {
+    fun msg(text: String) = ChatMessage(role = "user", text = text)
+    val cap60k = HistoryWindowCap.MaxChars(60_000)
+    val giantOld = msg("g".repeat(61_000))
+    val small = msg("s".repeat(10))
+
+    // Oldest-first eviction: the 61k-char OLD row never fits alongside the
+    // newest row under the 60k char budget, so the OLD row drops oldest-first;
+    // the kept>0 rule retains only the NEWEST (small) row — an over-budget
+    // old row is never kept over a newer one.
+    assertEquals(listOf(small), applyHistoryCap(listOf(giantOld, small), cap60k))
+
+    // The DEFAULT dual cap keeps it too (the count leg is unaffected).
+    assertEquals(listOf(small), applyHistoryCap(listOf(giantOld, small), HistoryWindowCap.DEFAULT))
   }
 
   @Test(timeout = 30_000) fun invalidDiscardedPrefixDoesNotBreakLaterPairSnapping() {

@@ -130,6 +130,10 @@ class ChatSessionFactoryHistoryTailTest {
             // tail + live row).
             assertEquals(199, req.messages.size)
             assertEquals("u902", req.messages.first().text)
+            // Re-anchored post-B2 content pins: alternating fixture, so [1] is
+            // the assistant row (a902) and [2] is the next user row (u903).
+            assertEquals("a902", req.messages[1].text)
+            assertEquals("u903", req.messages[2].text)
             assertEquals("a1000", req.messages[197].text)
             assertTrue(req.messages.last().text.startsWith("q-new"))
             assertTrue(req.messages.none { it.text == "u0" || it.text == "a0" || it.text == "u901" || it.text == "a901" })

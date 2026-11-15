@@ -29,18 +29,23 @@ interface ChatSession {
   /**
    * R5-5: send-time per-request trim count (oldest-first messages dropped to
    * fit MAX_REQUEST_CHARS), published by the controller on every attempt.
-   * Distinct from load-time resume omission (DB tail cap): never summed with
-   * it. Default is a shared zero flow so test fakes stay source-compatible;
+   * Distinct from resume omission — resume omission is the hydration-window
+   * leg, not a DB tail cap: never summed with it (the hydration-window
+   * omission in [contextOmission]). Default is a shared zero
+   * flow so test fakes stay source-compatible;
    * production ([ChatSessionImpl]) overrides with the live controller flow.
    */
   val requestTrimmedCount: StateFlow<Int> get() = ZeroRequestTrimmedCount
 
   /**
    * Provider-request context omission total: how many rows the windowing legs
-   * keep out of the outgoing request, unified across legs — any row a leg
-   * removes counts, synthesized tool-round rows included (the legs drop only
-   * original rows today; the continuation's top-up counts every row its own
-   * prefix trim removes). The base legs count the original rows
+   * keep out of the outgoing request, unified across legs. The two send legs
+   * (the construction-time history window and the per-request combined
+   * window, plus the send-time MAX_REQUEST_CHARS head trim) drop only
+   * original rows; synthesized tool-round rows are never dropped and never
+   * counted; the continuation top-up only adds the prefix trim (rows the
+   * prefix trim removes are likewise all original rows). The base legs count
+   * the original rows
    * (the resumed history prefix + this send's live rows) after every
    * windowing leg — the construction-time
    * history window, the per-request combined window, and the send-time
@@ -48,12 +53,13 @@ interface ChatSession {
    * its own prefix trim). A tool continuation throw leaves the last
    * published value (the base request's publish — a request that was never
    * shipped, retained for observation). Rejections before any request leave
-   * the last published value too — the shared zero default until the first
+   * the last published value too — the construction-time seed (production) /
+   * the shared zero default (fakes) until the first
    * publish; from the second send on, the previous request's published
    * value is retained.
    *
    * Orthogonal to [requestTrimmedCount] (the send-time MAX_REQUEST_CHARS
-   * leg alone — a strict subset of this total, kept for debug) and to the
+   * leg alone — a subset of this total, kept for debug) and to the
    * DB-tail omission (factory `CreatedSession.historyDroppedCount` / VM
    * `historyOmittedCount`, which counts rows never loaded into the model
    * prefix): the two are disjoint sets of rows — never summed. Default is

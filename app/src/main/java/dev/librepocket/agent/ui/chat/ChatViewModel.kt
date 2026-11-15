@@ -283,7 +283,7 @@ class ChatViewModel(
      * its own prefix trim). Orthogonal to [historyOmittedCount] (DB tail
      * cap; DB-tail rows are never part of the model prefix — disjoint sets,
      * never summed) and to [requestTrimmedCount] (the send-time 100k-trim
-     * leg alone, a strict subset of this total, kept for debug). Reset to 0
+     * leg alone, a subset of this total, kept for debug). Reset to 0
      * on every attach (new session starts untrimmed) and on lifecycle/
      * endpoint invalidation (the owning session is detached).
      */

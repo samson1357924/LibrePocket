@@ -226,7 +226,9 @@ class ContinuationOverBudgetException : Exception("continuation request over bud
  * runs to the end of history and would otherwise be split. Discarded
  * unwindowed prefixes are NOT validated: an invalid message or malformed
  * batch wholly within the discarded prefix never disables pair-atomic
- * snapping for valid tool batches later in the history. The
+ * snapping for valid tool batches later in the history. A batch at or after
+ * `naiveStart` is never evaluated at all — the cut is kept simply by the
+ * scan bound. The
  * single-newest-whole-message rule is preserved for plain histories (a lone
  * newest user/assistant row is never a tool batch, so it survives even over a
  * char budget). When an invalid or unpaired part survives into the retained
@@ -263,7 +265,9 @@ class ContinuationOverBudgetException : Exception("continuation request over bud
  * `MAX_REQUEST_CHARS` trim, and the continuation prefix trim. The gate is
  * canonical; this window is a mirror only. On any drift the window stays
  * strict (naive cut, never a repair) so the gate still fails closed on the
- * shipped shape.
+ * shipped shape. The Responses/Anthropic gates do not apply the chat
+ * backfill mirror — a blank `toolCallId` always fails closed
+ * (`TOOL_OUTPUT_MISSING_ID`); the mirror above covers the chat path only.
  */
 sealed interface HistoryWindowCap {
   data object Unbounded : HistoryWindowCap
@@ -374,7 +378,9 @@ private fun charWindowStart(history: List<ChatMessage>, maxChars: Int): Int {
  * Scans `0 until naiveStart` for any assistant message with `toolCalls` whose
  * valid, complete tool-call/output batch (per [completeToolBatchEnd])
  * straddles [naiveStart] (`batchEnd > naiveStart`), snapping forward to
- * `batchEnd` so a legal batch is never split.
+ * `batchEnd` so a legal batch is never split. (A batch at or after
+ * `[naiveStart]` is never evaluated at all — the cut is kept simply by the
+ * scan bound.)
  *
  * Discarded unwindowed prefixes are NOT validated: an invalid message,
  * orphan `tool` row, or malformed batch wholly before [naiveStart] is simply
@@ -439,8 +445,10 @@ private fun snapHistoryToPairBoundary(history: List<ChatMessage>, naiveStart: In
  *    `ProviderJson.validateToolPairing` fail closed downstream — mirroring
  *    the pair-atomic policy, the window never repairs *pairing*).
  * 5. Forward-only, never backwards; whole rows are dropped.
- * 6. System rows are NOT exempt — a leading `role == "system"` row at the
- *    cut is dropped like any non-user row (only `role == "user"` stops it).
+ * 6. System rows are treated exactly like any other non-user row: they
+ *    neither stop the snap nor by themselves keep the slice; they are
+ *    dropped only when a `role == "user"` row follows within
+ *    `[start, limit]` (otherwise the cut is kept — see point 4).
  *
  * The window never repairs *pairing*; leading invalid/unpaired slices may
  * be dropped wholesale by boundary alignment (counted in the drop); only
@@ -1185,15 +1193,18 @@ class TurnController(
 
   /**
    * Provider-request context omission total: how many rows the windowing legs
-   * keep out of the outgoing request, unified across legs — any row a leg
-   * removes counts, synthesized tool-round rows included. For the base request the
+   * keep out of the outgoing request, unified across legs. The two send legs
+   * (the construction-time history window seed and the per-request combined
+   * window) drop only original rows; their send-time
+   * [MAX_REQUEST_CHARS] head trim also drops only original rows; synthesized
+   * tool-round rows are never dropped and never counted. For the base request the
    * counted set is the original rows (the resumed [initialHistory] + this send's
    * live rows) removed by the windowing legs — the construction-time
    * history window (seed, `initialHistory.size - cappedHistory.size`), the
    * per-request combined window (capped prefix + live, oldest-first), and
    * the send-time [MAX_REQUEST_CHARS] head trim (whose leg is also
    * published separately on [requestTrimmedCount] / [lastRequestTrimmedCount]
-   * for debug — a strict subset of this total, never additive).
+   * for debug — a subset of this total, never additive).
    *
    * Published synchronously on every [buildRequest] as
    * `(initialHistory.size + live.size - outgoingMessages.size).coerceAtLeast(0)`.
@@ -1201,9 +1212,9 @@ class TurnController(
    * empty-text image row after the cap — the total may low-report by exactly that row.
    * A tool continuation ([buildToolContinuation]) additionally emits its
    * own prefix trim on top, mirroring [requestTrimmedCount]'s continuation
-   * contract (the continuation only adds synthesized round rows on top of the
-   * trimmed prefix; every row its prefix trim removes — synthesized tool rows
-   * included — counts as an omission). Throw path:
+   * contract (the continuation top-up only adds the prefix trim — rows the
+   * prefix trim removes are likewise all original rows; synthesized
+   * tool-round rows are never dropped and never counted). Throw path:
    * [ContinuationOverBudgetException] leaves this flow at the base
    * request's published value (that value corresponds to a request that was
    * never shipped — the continuation was never sent). Rejections
@@ -1217,6 +1228,9 @@ class TurnController(
    * sets of rows — never sum them, and never add them into UI copy. The
    * seed carries the resume-time init-window drop so a resumed long
    * conversation reports a non-zero badge before the first send.
+   * Pairing-gate scope: the Responses/Anthropic gates do not apply the chat
+   * backfill mirror — a blank `toolCallId` always fails closed
+   * (`TOOL_OUTPUT_MISSING_ID`); the mirror note covers the chat path only.
    * Read-only observability: never gates truncation, never changes the
    * request.
    */
@@ -1400,7 +1414,7 @@ class TurnController(
    * continuation (`buildToolContinuation`) additionally emits its total once
    * per tool round, adding the continuation's own prefix trim on top of the
    * base request's count. Distinct from
-   * the load-time [droppedHistoryCount] (DB tail cap): this counts send-time
+   * the hydration-window drop (init seed / per-request combined window), not a DB tail cap — DB tail lives in the factory: this counts send-time
    * per-request 100k-char trims. Never summed with resume omission; surfaced
    * via ChatSession/VM as `requestTrimmedCount`. Rejections before any request
    * (oversize input, UNKNOWN admission) leave the last emitted value untouched.
@@ -6169,8 +6183,9 @@ class TurnController(
    * history-prefix trimming (oldest-first, whole messages, tool pairing kept
    * atomic by snapping forward via [snapHistoryToPairBoundary], the structured payload counted;
    * the cut then re-aligns to the next user row via [snapHistoryToUserBoundary] so the retained
-   * prefix never opens on an orphan assistant/tool row — an illegal retained slice still fails
-   * closed downstream (only when no user row follows within `[start, limit]`)) is additionally published on
+   * prefix never opens on an orphan assistant/tool row — the slice fails closed downstream only
+   * when no user row follows within `[start, limit]`; otherwise the leading orphan rows are
+   * dropped wholesale) is additionally published on
    * [lastRequestTrimmedCount]/[requestTrimmedCount] (counts),
    * [lastRequestTrimmedChars]/[lastRequestChars] (chars), and on top of the
    * base request's [contextOmission] value
@@ -6253,8 +6268,8 @@ class TurnController(
     // refreshed to the shipped continuation size (finalBase + structured
     // round); contextOmission likewise tops up with the continuation's own
     // prefix trim (the continuation only ADDS synthesized round rows on top;
-    // every row its prefix trim removes — synthesized tool rows included —
-    // is an omission). Observability only.
+    // every row its prefix trim removes — all original rows — is an
+    // omission). Observability only.
     if (drop > 0) {
       val total = _lastRequestTrimmedCount.get() + drop
       _lastRequestTrimmedCount.set(total)

@@ -3,6 +3,7 @@ package dev.librepocket.web
 import dev.librepocket.keystore.KeyVault
 import dev.librepocket.provider.ServerToolTranscript
 import java.io.IOException
+import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
@@ -891,6 +892,89 @@ class WebSearchD5Test {
         assertEquals(2, delegate.calls)
     }
 
+    // ---- 快取讀寫故障注入（clockMs fault injection；pin 住「cache 是純最佳化層」契約） ----
+
+    @Test fun cacheReadFaultDegradesToMissAndServesUpstream() = runBlocking {
+        // 讀側故障注入：clockMs 在 entry 存在時才被呼叫；故障一律視為 miss（降級），
+        // 上游照常打、回傳 Ok（cached=false），不把故障寫進回傳值。
+        var clockBroken = false
+        val cache = WebSearchCache(clockMs = {
+            if (clockBroken) throw IllegalStateException("clock broken") else 1_000L
+        })
+        val vault = FakeVault()
+        vault.putKey(BraveSearchProvider.DEFAULT_KEY_ID, "key-A".toCharArray())
+        val http = FakeGet { ok(body = braveJsonFor("T")) }
+        val svc = WebSearchService(BraveSearchProvider(vault, http, timeoutMs = 60_000), cache)
+        withTimeout(5_000) {
+            val first = svc.search("kotlin", 5)
+            assertTrue(first is WebSearchOutcome.Ok)
+            assertEquals(1, http.calls.get())
+            clockBroken = true
+            val second = svc.search("kotlin", 5)
+            // 讀失敗 → miss → 再打 upstream；不得回傳 cache 值
+            assertFalse("clock 故障不得命中 cache：$second", (second as WebSearchOutcome.Ok).cached)
+            assertEquals("讀失敗必須降級為 miss 重打上游", 2, http.calls.get())
+        }
+    }
+
+    @Test fun cacheWriteFaultPreservesUpstreamOk() = runBlocking {
+        // 寫側故障注入：fresh cache 的 clock 永遠拋 ISE；get 在空 map 上不呼叫 clock → miss；
+        // delegate 回 Ok → put 靜默失敗（R3：一般 Exception 不拋出）→ 回傳值仍是 Ok。
+        val cache = WebSearchCache(clockMs = { throw IllegalStateException("clock broken") })
+        val vault = FakeVault()
+        vault.putKey(BraveSearchProvider.DEFAULT_KEY_ID, "key-A".toCharArray())
+        val http = FakeGet { ok(body = braveJsonFor("T")) }
+        val svc = WebSearchService(BraveSearchProvider(vault, http, timeoutMs = 60_000), cache)
+        withTimeout(5_000) {
+            val out = svc.search("kotlin", 5)
+            assertTrue("寫入故障不得把 Ok 改寫成 Failed：$out", out is WebSearchOutcome.Ok)
+            assertEquals(1, http.calls.get())
+        }
+    }
+
+    @Test fun cacheReadCancellationFaultPropagates() = runBlocking {
+        // 讀側 CE：entry 存在時 clockMs 拋 CE → safeGet 原樣透傳（取消絕不降級為 miss）。
+        var clockCancel = false
+        val cache = WebSearchCache(clockMs = {
+            if (clockCancel) throw CancellationException("clock cancelled") else 1_000L
+        })
+        val vault = FakeVault()
+        vault.putKey(BraveSearchProvider.DEFAULT_KEY_ID, "key-A".toCharArray())
+        val http = FakeGet { ok(body = braveJsonFor("T")) }
+        val svc = WebSearchService(BraveSearchProvider(vault, http, timeoutMs = 60_000), cache)
+        withTimeout(5_000) {
+            svc.search("kotlin", 5) // 種入一列（正常時鐘）
+            clockCancel = true
+            try {
+                svc.search("kotlin", 5)
+                fail("讀側 CE 故障必須原樣透傳（不得降級為 miss）")
+            } catch (_: CancellationException) {
+                // expected
+            }
+            assertEquals("CE 透傳時不得重打上游", 1, http.calls.get())
+        }
+    }
+
+    @Test fun cacheWriteCancellationFaultPropagates() = runBlocking {
+        // 寫側 CE：fresh cache 的 clock 永遠拋 CE；get 在空 map 上不呼叫 clock → miss →
+        // delegate 回 Ok → putByKey 拋 CE → leader 的 CE 分支以 okForFollowers 完成 follower，
+        // leader 自身重拋 CE → 呼叫端必須收到 CE。
+        val cache = WebSearchCache(clockMs = { throw CancellationException("clock cancelled") })
+        val vault = FakeVault()
+        vault.putKey(BraveSearchProvider.DEFAULT_KEY_ID, "key-A".toCharArray())
+        val http = FakeGet { ok(body = braveJsonFor("T")) }
+        val svc = WebSearchService(BraveSearchProvider(vault, http, timeoutMs = 60_000), cache)
+        withTimeout(5_000) {
+            try {
+                svc.search("kotlin", 5)
+                fail("寫側 CE 故障必須原樣透傳（leader 的 CE 分支完成 follower 後自身重拋）")
+            } catch (_: CancellationException) {
+                // expected
+            }
+            assertEquals(1, http.calls.get())
+        }
+    }
+
     // ---- 旁路（Unavailable）取消語義：delegate 吞取消的防禦 ----
 
     @Test fun cancellationSwallowingDelegateOnBypassPathPropagatesCe() = runBlocking {
@@ -1685,6 +1769,169 @@ class WebSearchD5Test {
         assertEquals(1, http.calls.get()) // 只有 leader 的那一次；retry 沒發任何請求
     }
 
+    @Test fun nestedInnerLeaderDeathAfterDeleteNeverResendsDeletedKey() = runBlocking {
+        // 巢狀：outer1／outer2 共用 inner Service；outer1 在 HTTP（帶 key-A）中被取消 →
+        // inner leader CE；outer2 follower 醒來重選時不得沿用 sticky，必須回當前 vault
+        // 重解析 → key 已刪除 → 旁路 → Unavailable(MISSING_KEY)，零第二次上游，
+        // 已刪除的憑證絕不會以第二次請求重送。
+        val release = CompletableDeferred<Unit>()
+        val entered = CompletableDeferred<Unit>()
+        val sentTokens = CopyOnWriteArrayList<String?>()
+        val vault = FakeVault()
+        vault.putKey(BraveSearchProvider.DEFAULT_KEY_ID, "key-A".toCharArray())
+        val http = FakeGetWithHeaders { _, headers ->
+            sentTokens.add(headers["X-Subscription-Token"])
+            entered.complete(Unit)
+            release.await()
+            ok(body = braveJsonFor("A-title"))
+        }
+        val inner = WebSearchService(BraveSearchProvider(vault, http, timeoutMs = 60_000))
+        val outer1 = WebSearchService(inner)
+        val outer2 = WebSearchService(inner)
+        val leader = async { outer1.search("kotlin", 5) }
+        withTimeout(5_000) { entered.await() }
+        // UNDISPATCHED：return 時 follower 已掛上 inner 的 shared deferred。
+        val follower = async(start = CoroutineStart.UNDISPATCHED) { outer2.search("kotlin", 5) }
+        delay(50)
+        vault.deleteKey(BraveSearchProvider.DEFAULT_KEY_ID)
+        leader.cancel()
+        release.complete(Unit)
+        try {
+            withTimeout(5_000) { leader.await() }
+            fail("leader must throw CancellationException")
+        } catch (_: CancellationException) {
+            // expected：leader 取消，inner shared deferred completeExceptionally
+        }
+        val out = withTimeout(5_000) { follower.await() }
+        // fix 生效：follower 重選 resolve 不到憑證 → 旁路 → provider vault 讀取無 key →
+        // Unavailable(MISSING_KEY)，零網路；不得以 key-A 重送。
+        assertTrue("follower 重選必須看見 key 已刪除（零網路 MISSING_KEY）：$out", out is WebSearchOutcome.Unavailable)
+        assertEquals(WebUnavailableReason.MISSING_KEY, (out as WebSearchOutcome.Unavailable).reason)
+        assertEquals(1, http.calls.get()) // 只有 leader 那一次；retry 沒發任何請求
+        assertEquals(listOf<String?>("key-A"), sentTokens.toList())
+    }
+
+    @Test fun nestedRetryAfterLeaderDeathUsesCurrentRotatedKey() = runBlocking {
+        // 巢狀：leader 死亡前 key 已輪換 A→B；follower 重選 resolve 得「當前」key-B，
+        // 必須以 B 重打上游（fresh 憑證），不得沿用 A。
+        val release = CompletableDeferred<Unit>()
+        val entered = CompletableDeferred<Unit>()
+        val sentTokens = CopyOnWriteArrayList<String?>()
+        val vault = FakeVault()
+        vault.putKey(BraveSearchProvider.DEFAULT_KEY_ID, "key-A".toCharArray())
+        val http = FakeGetWithHeaders { _, headers ->
+            val token = headers["X-Subscription-Token"]
+            sentTokens.add(token)
+            entered.complete(Unit)
+            release.await()
+            ok(body = braveJsonFor(if (token == "key-B") "B-title" else "A-title"))
+        }
+        val inner = WebSearchService(BraveSearchProvider(vault, http, timeoutMs = 60_000))
+        val outer1 = WebSearchService(inner)
+        val outer2 = WebSearchService(inner)
+        val leader = async { outer1.search("kotlin", 5) }
+        withTimeout(5_000) { entered.await() }
+        // UNDISPATCHED：return 時 follower 已掛上 inner 的 shared deferred。
+        val follower = async(start = CoroutineStart.UNDISPATCHED) { outer2.search("kotlin", 5) }
+        delay(50)
+        vault.putKey(BraveSearchProvider.DEFAULT_KEY_ID, "key-B".toCharArray())
+        leader.cancel()
+        release.complete(Unit)
+        try {
+            withTimeout(5_000) { leader.await() }
+            fail("leader must throw CancellationException")
+        } catch (_: CancellationException) {
+            // expected：leader 取消，inner shared deferred completeExceptionally
+        }
+        val out = withTimeout(5_000) { follower.await() }
+        // fix 生效：follower 重選 resolve 得 key-B（fp-B miss）→ 以上游重打一次，帶 key-B。
+        assertTrue("follower 重選必須以當前 key-B 重打上游：$out", out is WebSearchOutcome.Ok)
+        assertFalse((out as WebSearchOutcome.Ok).cached)
+        assertEquals("重選後上游必須收到 key-B 並回 B-title", "B-title", (out as WebSearchOutcome.Ok).results[0].title)
+        assertEquals(2, http.calls.get())
+        assertEquals(listOf("key-A", "key-B"), sentTokens.toList())
+    }
+
+    @Test fun cancellationDuringCacheableNotApplicableSearchPropagatesCe() = runBlocking {
+        // 壞 delegate：credentialState 吞掉 CE 仍「正常返回」NotApplicable（已取消仍回值）。
+        // fix 生效 → state 解析後的 ensureActive() 拋 CE → result 從不完成；
+        // pre-fix → cache hit 直接回 Ok(cached=true) → result.complete(Ok) → isCompleted == true。
+        var swallow = false
+        val delegate = object : WebSearchProvider {
+            override val id: String = "cancellation-swallower-na"
+            override val capabilities: Set<WebCapability> = emptySet()
+            override suspend fun probe(): WebProbe = WebProbe.Ready
+            override suspend fun search(query: String, count: Int): WebSearchOutcome =
+                WebSearchOutcome.Ok(emptyList())
+            override suspend fun credentialState(): CredentialState =
+                if (!swallow) {
+                    CredentialState.NotApplicable
+                } else {
+                    try {
+                        delay(60_000)
+                        CredentialState.NotApplicable
+                    } catch (_: CancellationException) {
+                        CredentialState.NotApplicable // 吞掉取消仍「正常返回」
+                    }
+                }
+        }
+        val svc = WebSearchService(delegate)
+        // 先以正常呼叫種入 plain cache 列（cached=false）。
+        val seeded = svc.search("kotlin", 5)
+        assertTrue(seeded is WebSearchOutcome.Ok)
+        assertFalse((seeded as WebSearchOutcome.Ok).cached)
+        swallow = true
+        val result = CompletableDeferred<WebSearchOutcome>()
+        val job = launch(start = CoroutineStart.UNDISPATCHED) { result.complete(svc.search("kotlin", 5)) }
+        job.cancel()
+        withTimeout(5_000) { job.join() }
+        assertFalse("cache hit 路徑不得回傳已取消呼叫端的值（state 解析後 ensureActive() 必須拋 CE）：$result", result.isCompleted)
+    }
+
+    @Test fun cancellationDuringCacheableReadySearchPropagatesCe() = runBlocking {
+        // 真 keyed stack：TrackingVault 先以 key-A 種入 cache（#rev:<fp>）；吞掉 CE 的 vault
+        // 在已取消 context 下仍回 key-A → state「正常返回」Ready。
+        // fix 生效 → state 解析後 ensureActive() 拋 CE → result 從不完成；
+        // pre-fix → cache hit 回 Ok(cached=true) → isCompleted == true。
+        val vault = CancellationSwallowingVault()
+        vault.putKey(BraveSearchProvider.DEFAULT_KEY_ID, "key-A".toCharArray())
+        val http = FakeGet { ok(body = braveJson) }
+        val svc = WebSearchService(BraveSearchProvider(vault, http, timeoutMs = 60_000))
+        val seeded = svc.search("kotlin", 5)
+        assertTrue(seeded is WebSearchOutcome.Ok)
+        assertFalse((seeded as WebSearchOutcome.Ok).cached)
+        assertEquals(1, http.calls.get())
+        vault.swallow = true
+        val result = CompletableDeferred<WebSearchOutcome>()
+        val job = launch(start = CoroutineStart.UNDISPATCHED) { result.complete(svc.search("kotlin", 5)) }
+        job.cancel()
+        withTimeout(5_000) { job.join() }
+        assertFalse("keyed cache hit 路徑不得回傳已取消呼叫端的值（state 解析後 ensureActive() 必須拋 CE）：$result", result.isCompleted)
+        assertEquals(1, http.calls.get()) // 零額外上游
+    }
+
+    @Test fun blankQueryCancelledCallerNeverReceivesDelegateValue() = runBlocking {
+        // 壞 delegate：search 內取消呼叫端後仍「正常返回」Ok（吞掉 CE 的壞 delegate，不掛起直接回值）；
+        // fix → 空 query 旁路的 post-call ensureActive() 拋 CE → result 從不完成；
+        // pre-fix → delegate 的 Ok 直接回傳 → result.complete(Ok) → isCompleted == true。
+        val delegate = object : WebSearchProvider {
+            override val id: String = "blank-cancellation-swallower"
+            override val capabilities: Set<WebCapability> = emptySet()
+            override suspend fun probe(): WebProbe = WebProbe.Ready
+            override suspend fun search(query: String, count: Int): WebSearchOutcome {
+                kotlin.coroutines.coroutineContext[kotlinx.coroutines.Job]?.cancel() // 在 delegate 內取消呼叫端
+                return WebSearchOutcome.Ok(emptyList())
+            }
+            override suspend fun credentialState(): CredentialState = CredentialState.NotApplicable
+        }
+        val svc = WebSearchService(delegate)
+        val result = CompletableDeferred<WebSearchOutcome>()
+        val job = launch(start = CoroutineStart.UNDISPATCHED) { result.complete(svc.search("  ", 5)) }
+        job.cancel()
+        withTimeout(5_000) { job.join() }
+        assertFalse("空 query 已取消的呼叫端不得收到 delegate 的值（bypass ensureActive() 必須拋 CE）：$result", result.isCompleted)
+    }
+
     // ---- keyed CharArray 抹除（TrackingVault：getKey 直接參照回傳） ----
 
     @Test fun keyArrayWipedOnSuccess() = runBlocking {
@@ -2219,6 +2466,36 @@ class WebSearchD5Test {
         assertEquals(0, httpGet.calls.get())
         assertEquals(0, httpPost.calls.get())
         assertTrue(vault.seenGet.isEmpty())
+    }
+
+    /**
+     * 測試專用 vault：swallow=false 時正常回傳 key 拷貝；swallow=true 時 delay(60_000)
+     * 後即使已取消仍回 key 拷貝（吞掉 CE 的壞 vault），用於驗證 keyed cache-hit 路徑
+     * 的 ensureActive() 防禦：已取消的呼叫端不得拿到 cached 值。
+     */
+    private class CancellationSwallowingVault : KeyVault {
+        private val keys = mutableMapOf<String, CharArray>()
+        var swallow = false
+
+        override suspend fun putKey(providerId: String, apiKey: CharArray) {
+            keys[providerId] = apiKey.copyOf()
+        }
+
+        override suspend fun getKey(providerId: String): CharArray? {
+            if (!swallow) return keys[providerId]?.copyOf()
+            return try {
+                delay(60_000)
+                keys[providerId]?.copyOf()
+            } catch (_: CancellationException) {
+                keys[providerId]?.copyOf() // 吞掉取消仍「正常返回」
+            }
+        }
+
+        override suspend fun deleteKey(providerId: String) {
+            keys.remove(providerId)
+        }
+
+        override suspend fun hasKey(providerId: String): Boolean = keys.containsKey(providerId)
     }
 
     /**

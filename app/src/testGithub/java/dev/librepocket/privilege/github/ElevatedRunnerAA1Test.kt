@@ -39,6 +39,11 @@ class ElevatedRunnerAA1Test {
             "#136-B3 gate must stay closed",
             PrivilegeActivation.ELEVATED_RUNNERS_READY,
         )
+        ElevatedCleanupTracker.clearUnverified()
+        ElevatedCleanupTracker.noteClean()
+        pollOutstandingTo(0)
+        pollActiveTo(0)
+        ElevatedCleanupTracker.noteClean()
     }
 
     @After fun tearDownIsolation() {
@@ -48,12 +53,25 @@ class ElevatedRunnerAA1Test {
         val leakedQuarantine = ElevatedCleanupTracker.quarantinedCount()
         Thread.interrupted()
         ElevatedCleanupTracker.clearUnverified()
+        pollPendingTo(0)
         pollOutstandingTo(0)
         awaitNoElevatedThreads()
         ElevatedCleanupTracker.noteClean()
         assertEquals("test leaked outstanding slots", 0, leakedOutstanding)
         assertEquals("test leaked active calls", 0, leakedActive)
         assertEquals("test leaked quarantined processes", 0, leakedQuarantine)
+    }
+
+    private fun pollPendingTo(expected: Int, boundMs: Long = 15_000L) {
+        val deadline = System.currentTimeMillis() + boundMs
+        while (ElevatedCleanupTracker.sweepPendingCount() != expected) {
+            if (System.currentTimeMillis() >= deadline) {
+                throw AssertionError(
+                    "pending=${ElevatedCleanupTracker.sweepPendingCount()} expected=$expected",
+                )
+            }
+            Thread.sleep(20L)
+        }
     }
 
     /** 不可中斷 destroy stall：吞 interrupt 續等 latch；waitFor 即時回 destroyed（快 hang，不睡）。 */
@@ -164,6 +182,18 @@ class ElevatedRunnerAA1Test {
         }
     }
 
+    private fun pollActiveTo(expected: Int, boundMs: Long = 10_000L) {
+        val deadline = System.currentTimeMillis() + boundMs
+        while (ElevatedCleanupTracker.activeCalls() != expected) {
+            if (System.currentTimeMillis() >= deadline) {
+                throw AssertionError(
+                    "active=${ElevatedCleanupTracker.activeCalls()} expected=$expected",
+                )
+            }
+            Thread.sleep(20L)
+        }
+    }
+
     private fun awaitNoElevatedThreads(boundMs: Long = 10_000L) {
         val names = setOf(
             "elevated-stdout",
@@ -230,6 +260,8 @@ class ElevatedRunnerAA1Test {
             rootSpawns.incrementAndGet()
             StallDestroyProcess(latch)
         }
+        // 預填計數器（tearDown 以實際取得的槽數釋放，避免 acquire 失敗即漏釋或多釋）。
+        var prefilled = 0
         try {
             // 1 次不可中斷 stall timeout：有界 TimedOut＋flag true；Stage 3b：cleanup 槽
             // post-verify 即釋放（victim 改由 quarantine 封存，fail-closed 不變），outstanding 歸 0。
@@ -241,7 +273,10 @@ class ElevatedRunnerAA1Test {
             )
             assertEquals(0, ElevatedCleanupTracker.outstanding())
             assertEquals(1, ElevatedCleanupTracker.quarantinedCount())
-            repeat(7) { ElevatedCleanupTracker.acquireSlot() }
+            repeat(7) {
+                assertTrue("pre-fill acquireSlot #${prefilled + 1} must succeed", ElevatedCleanupTracker.acquireSlot())
+                prefilled++
+            }
             assertEquals(7, ElevatedCleanupTracker.outstanding())
             // 補足熔斷計數（drain 已計 1，再補 3 即連續 4；與飽和同時成立）。
             repeat(3) { ElevatedCleanupTracker.noteUnclean() }
@@ -270,9 +305,9 @@ class ElevatedRunnerAA1Test {
             assertEquals(0, shizukuSpawns.get())
         } finally {
             latch.countDown()
-            // 釋放預填 7 槽（測試自預填；stall victim 槽 post-verify 已由 caller 釋放，
+            // 釋放預填槽（測試自預填；stall victim 槽 post-verify 已由 caller 釋放，
             // 無第三席可釋——poll 收斂）。
-            repeat(7) { ElevatedCleanupTracker.releaseSlot() }
+            repeat(prefilled) { ElevatedCleanupTracker.releaseSlot() }
             pollOutstandingTo(0)
             awaitNoElevatedThreads()
         }

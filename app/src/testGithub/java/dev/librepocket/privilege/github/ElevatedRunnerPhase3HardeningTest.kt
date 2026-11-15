@@ -70,6 +70,7 @@ class ElevatedRunnerPhase3HardeningTest {
         val leakedQuarantine = ElevatedCleanupTracker.quarantinedCount()
         Thread.interrupted()
         ElevatedCleanupTracker.clearUnverified()
+        pollPendingTo(0)
         pollOutstandingTo(0)
         pollActiveTo(0)
         awaitNoElevatedThreads()
@@ -103,6 +104,18 @@ class ElevatedRunnerPhase3HardeningTest {
         }
     }
 
+    private fun pollPendingTo(expected: Int, boundMs: Long = 15_000L) {
+        val deadline = System.currentTimeMillis() + boundMs
+        while (ElevatedCleanupTracker.sweepPendingCount() != expected) {
+            if (System.currentTimeMillis() >= deadline) {
+                throw AssertionError(
+                    "pending=${ElevatedCleanupTracker.sweepPendingCount()} expected=$expected",
+                )
+            }
+            Thread.sleep(20L)
+        }
+    }
+
     private fun awaitNoElevatedThreads(boundMs: Long = 15_000L) {
         val names = setOf(
             "elevated-stdout",
@@ -113,6 +126,8 @@ class ElevatedRunnerPhase3HardeningTest {
             "elevated-wait",
             "elevated-verify",
             "elevated-late-spawn",
+            "elevated-quarantine-sweep",
+            "elevated-quarantine-verify",
         )
         val deadline = System.currentTimeMillis() + boundMs
         while (true) {
@@ -783,9 +798,12 @@ class ElevatedRunnerPhase3HardeningTest {
         pollOutstandingTo(0)
         pollActiveTo(0)
         ElevatedCleanupTracker.resetPeak()
+        // 預填計數器（finally 以實際取得的槽數釋放）。
+        var prefilled = 0
         try {
             repeat(ElevatedCleanupTracker.MAX_OUTSTANDING_CLEANUPS) {
                 assertTrue("slot $it must be granted below MAX", ElevatedCleanupTracker.acquireSlot())
+                prefilled++
             }
             assertEquals(
                 ElevatedCleanupTracker.MAX_OUTSTANDING_CLEANUPS,
@@ -804,7 +822,7 @@ class ElevatedRunnerPhase3HardeningTest {
                 peak <= ElevatedCleanupTracker.MAX_OUTSTANDING_CLEANUPS,
             )
         } finally {
-            repeat(ElevatedCleanupTracker.MAX_OUTSTANDING_CLEANUPS) {
+            repeat(prefilled) {
                 ElevatedCleanupTracker.releaseSlot()
             }
             pollOutstandingTo(0)
@@ -820,8 +838,11 @@ class ElevatedRunnerPhase3HardeningTest {
         ElevatedCleanupTracker.noteClean()
         pollOutstandingTo(0)
         pollActiveTo(0)
+        // 預填計數器（finally 以實際取得的槽數釋放）。
+        var prefilled = 0
         repeat(ElevatedCleanupTracker.MAX_OUTSTANDING_CLEANUPS) {
             assertTrue(ElevatedCleanupTracker.acquireSlot())
+            prefilled++
         }
         assertEquals(
             ElevatedCleanupTracker.MAX_OUTSTANDING_CLEANUPS,
@@ -847,7 +868,7 @@ class ElevatedRunnerPhase3HardeningTest {
             assertFalse(ElevatedCleanupTracker.isBreakerOpen())
             assertEquals("saturated drain must quarantine the unverified handle", 1, ElevatedCleanupTracker.quarantinedCount())
         } finally {
-            repeat(ElevatedCleanupTracker.MAX_OUTSTANDING_CLEANUPS) {
+            repeat(prefilled) {
                 ElevatedCleanupTracker.releaseSlot()
             }
             // Stage 3b：飽和臂在 acquireSlotOrQuarantine 同鎖內原子登記 1 條

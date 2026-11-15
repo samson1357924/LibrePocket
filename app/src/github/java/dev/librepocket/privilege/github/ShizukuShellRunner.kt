@@ -596,10 +596,11 @@ class ShizukuShellRunner(
             ElevatedRunnerCommon.checkPreSpawnCancel(timeoutMs, deadlineNanos, isCancelled)?.let { return it }
             // P1-3 quota 後顯式 deadline 檢查（PR140 Phase 2）：重驗→配額間 budget
             // 耗盡即零 spawn（配額已耗無 refund，fail-closed 窄競態，不建特權進程；
-            // worker 從未啟動故 `hasLinger=false`）。取消語義（中斷不清旗標、不看 deadline）見 checkPreSpawnCancel
+            // 旗標經 preSpawnLinger(false) 判定——本門從未啟動 worker，
+            // `outstanding()>0` 即 true，全域無殘留即 false）。取消語義（中斷不清旗標、不看 deadline）見 checkPreSpawnCancel
             // （不看 deadline），此處為真正的提交前最後一門。
             if (ElevatedCallSupervisor.isExpired(deadlineNanos)) {
-                return ElevatedRunnerCommon.preSpawnExpired(timeoutMs, false)
+                return ElevatedRunnerCommon.preSpawnExpired(timeoutMs, ElevatedRunnerCommon.preSpawnLinger(false))
             }
             // 遠端建子進程（B3 有界，owner P1-5）：`newProcess` 同步 Binder 可無限等；
             // 跑監督 worker，超界／取消即 TimedOut（配額已耗仍零 handoff，

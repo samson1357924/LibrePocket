@@ -30,11 +30,14 @@ import org.junit.Test
  */
 class ElevatedCleanupTrackerRegistrationFailureTest {
 
+    private var floorBefore: Int = 0
+
     @Before fun setUpIsolation() {
         assertFalse(
             "#136-B3 gate must stay closed",
             PrivilegeActivation.ELEVATED_RUNNERS_READY,
         )
+        floorBefore = ElevatedCleanupTracker.releaseFloorHits()
         ElevatedProcessIo.quarantineRegistrar = { ElevatedCleanupTracker.quarantineUnverified(it) }
         ElevatedCleanupTracker.clearUnverified()
         ElevatedCleanupTracker.noteClean()
@@ -62,6 +65,7 @@ class ElevatedCleanupTrackerRegistrationFailureTest {
         assertEquals("test leaked outstanding slots", 0, leakedOutstanding)
         assertEquals("test leaked active calls", 0, leakedActive)
         assertEquals("test leaked quarantined processes", 0, leakedQuarantine)
+        assertEquals("release floor must not be hit during this test", floorBefore, ElevatedCleanupTracker.releaseFloorHits())
     }
 
     private fun pollOutstandingTo(expected: Int, boundMs: Long = 10_000L) {

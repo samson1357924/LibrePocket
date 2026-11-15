@@ -781,10 +781,9 @@ class ElevatedRunnerP1B2Test {
                 1,
                 ElevatedCleanupTracker.quarantinedCount(),
             )
-            assertTrue(
-                "$failName already-started threads must be joined cleanly",
-                started.all { !it.isAlive },
-            )
+            pollTrue("$failName already-started threads must be joined cleanly", 5_000L) {
+                started.none { it.isAlive }
+            }
             pollOutstandingTo(0)
             awaitNoElevatedThreads()
 
@@ -2717,6 +2716,7 @@ class ElevatedRunnerP1B2Test {
             }
         }
         val p = FakeProcess("ok".toByteArray(), ByteArray(0), 0, hang = true)
+        val stalledBefore = ElevatedCleanupTracker.cleanupWorkerStalledAfterVerifyCount()
         val t0 = System.currentTimeMillis()
         try {
             val d = ElevatedProcessIo.drain(
@@ -2733,6 +2733,12 @@ class ElevatedRunnerP1B2Test {
             assertTrue("drain must return bounded under blocking killer, wall=${wallMs}ms", wallMs < 15_000L)
             assertTrue("drain must time out on hanging process", d.timedOut)
             assertTrue("cleanupIncomplete must be true", d.cleanupIncomplete)
+            // Worker stuck behind the uninterruptible latch is definitely still
+            // alive at drain return → the B3 telemetry counter must have moved.
+            assertTrue(
+                "cleanupWorkerStalledAfterVerifyCount must increase by >= 1 for a stuck slot-carrying worker",
+                ElevatedCleanupTracker.cleanupWorkerStalledAfterVerifyCount() - stalledBefore >= 1,
+            )
             // hang=true 的 FakeProcess 從未被 destroy（killer 永久阻塞，destroy 未執行），
             // post-kill verify（waitFor=false）必敗 → handle 轉入 quarantine。
             assertEquals(

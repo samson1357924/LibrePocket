@@ -466,16 +466,23 @@ private fun snapHistoryToPairBoundary(history: List<ChatMessage>, naiveStart: In
  * Inline `role="system"` rows are not exempt from windowing: one leading a
  * non-user run is dropped wholesale with the run (counted in
  * `droppedHistoryCount`/`droppedHistoryChars`/`contextOmission`), never
- * kept to "protect" instructions. Instructions that must survive window
- * trims belong in `systemPromptOverride` (serialized at request-build time
- * into each adapter's system slot — Anthropic top-level `system`,
+ * kept to "protect" instructions. `systemPromptOverride` exists at the
+ * `ChatRequest` adapter layer only: each adapter serializes a non-null
+ * value into its own system slot (Anthropic top-level `system`,
  * Responses top-level `instructions`, ChatCompletions a leading `system`
- * message — which no window leg touches) — not as transcript-prefix rows in
- * `initialHistory`. The
+ * message), none of which is a transcript row and none of which any window
+ * leg touches. It is NOT a chat-session configuration available today:
+ * `buildRequest` constructs `ChatRequest(model, messages, tools)` without
+ * passing an override, and neither `ChatSession` nor the controller
+ * constructor accepts or exposes one — `systemPromptOverride` is an
+ * adapter-level escape hatch, not a durable-instruction feature. The
  * hydration path (`loadModelHistory`) never restores system rows (it only
  * projects non-partial user/assistant rows), so this shape arises only
  * when a caller constructs `initialHistory` directly; an inline system row
  * carrying an instruction is a caller bug the window will not accommodate.
+ * A future "persistent system instructions" feature must be specified and
+ * wired as its own change (ChatSession API, a `buildRequest` parameter,
+ * adapter-semantics consistency); this PR does not commit to it.
  *
  * The window never repairs *pairing*; leading invalid/unpaired slices may
  * be dropped wholesale by boundary alignment (counted in the drop); only

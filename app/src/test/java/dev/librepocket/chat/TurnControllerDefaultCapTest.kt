@@ -1118,9 +1118,10 @@ class TurnControllerDefaultCapTest {
     // (index 1, the system row), the user-boundary snap finds no user row
     // until the live tail, and the whole leading non-user run
     // (u0 + system + a0) is dropped wholesale — the system instruction is
-    // never kept to "protect" it. Instructions that must survive window
-    // trims belong in systemPromptOverride; hydration never restores
-    // system rows, so this shape arises only via direct initialHistory
+    // never kept to "protect" it. Durable instructions can survive window
+    // trims only via the adapter-level ChatRequest.systemPromptOverride
+    // (not a chat-session setting today; hydration never restores system
+    // rows), so this shape arises only via direct initialHistory
     // construction.
     val history = listOf(
       ChatMessage(role = "user", text = "u0"),

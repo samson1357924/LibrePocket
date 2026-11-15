@@ -21,7 +21,7 @@ import java.util.concurrent.atomic.AtomicLong
  *
  * Stage1 (P2 safe slice, #19 前置): guessing never executes. Missing
  * alarm time (never defaulted: [missingQuestionFor] intercepts first, so
- * [alarmArgs]' 7:00 is only a dead template-direct fallback), missing phone
+ * [alarmArgs]' 7:00 is unconditionally dead from decide()), missing phone
  * number (empty string), empty-field templates (`sms.compose` to /
  * `calendar.create` start-end) and negated intents all become DENIED +
  * NEED_CLARIFICATION with a 補參 question (audit-distinct from
@@ -710,7 +710,9 @@ class FastRouter(
         // Shared argument patterns (also hoisted: previously recompiled per
         // call inside hasExplicitAlarmTime/hasPhoneNumber/phoneArgs and
         // music/volume/alarm arg builders).
-        private val ALARM_TIME = Regex("(\\d{1,2})[:點点](\\d{1,2})?")
+        // ALARM_TIME：`(?<!\d)`／`(?!\d)` 守衛讓 `7點123分`／`123點` 整體不匹配
+        // （鄰接數字不會被截出靜默錯誤的時間），一律落缺參澄清。
+        private val ALARM_TIME = Regex("(?<!\\d)(\\d{1,2})[:點点](\\d{1,2})?(?!\\d)")
         private val PHONE_CANDIDATE = Regex("[+\\d][\\d\\-\\.\\s]{5,16}")
         private val MUSIC_NEXT = Regex("下一首|切歌|next", RegexOption.IGNORE_CASE)
         private val MUSIC_PREV = Regex("上一首|previous", RegexOption.IGNORE_CASE)
@@ -1151,8 +1153,16 @@ class FastRouter(
                 containsAny(spaced, NEGATION_MARKERS)
         }
 
-        private fun hasExplicitAlarmTime(text: String): Boolean =
-            ALARM_TIME.containsMatchIn(text)
+        private fun hasExplicitAlarmTime(text: String): Boolean {
+            // 明確但超出範圍的時間值（hour > 23、minute > 59，例如 `25點`／`7點99分`／
+            // `7:99`）一律視為「無明確時間」⇒ missingQuestionFor 轉澄清，
+            // 絕不以 coerceIn 夾值後執行（鬧鐘 25 點 是壞指令，不是 23 點）。
+            val m = ALARM_TIME.find(text) ?: return false
+            val hour = m.groupValues[1].toIntOrNull() ?: return false
+            if (hour > 23) return false
+            val minute = m.groupValues[2].takeIf { it.isNotEmpty() }?.toIntOrNull() ?: 0
+            return minute <= 59
+        }
 
         private fun hasPhoneNumber(text: String): Boolean {
             val raw = findPhoneCandidate(text) ?: return false

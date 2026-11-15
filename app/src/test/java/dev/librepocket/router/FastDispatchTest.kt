@@ -64,6 +64,23 @@ class FastDispatchTest {
         override suspend fun diagnostics(path: String): List<LspTools.Diagnostic> = emptyList()
     }
 
+    private class ThrowingIterationBackend : LspTools.Backend {
+        val invocations = AtomicInteger(0)
+        override suspend fun symbols(query: String, pathPrefix: String?, limit: Int): List<LspTools.Symbol> {
+            invocations.incrementAndGet()
+            // okResult projection 時（take/size/get/iterator）即爆炸的 List：
+            // okResult 內部邊界須將其映射為 typed denial（EXEC_ERROR），不外拋。
+            return object : AbstractList<LspTools.Symbol>() {
+                override val size: Int
+                    get() = throw RuntimeException("backend-iteration-marker")
+
+                override fun get(index: Int): LspTools.Symbol =
+                    throw RuntimeException("backend-get-marker")
+            }
+        }
+        override suspend fun diagnostics(path: String): List<LspTools.Diagnostic> = emptyList()
+    }
+
     private class CountingFake(override val toolName: String) : FastToolExecutor {
         val invocations = AtomicInteger(0)
         override suspend fun execute(call: ToolCall, ctx: ProjectionContext): FastExecResult {
@@ -104,6 +121,8 @@ class FastDispatchTest {
         val executed = out as? FastDispatchOutcome.Executed
         assertNotNull("FAST lsp.symbols must execute against the registered fake backend (got $out)", executed)
         assertEquals(1, backend.invocations.get())
+        // decide() 產生的 benign callId 為 redact-stable，bounded == raw；
+        // Executed outcome 現在攜帶有界形態（見「executedCallIdCarriesBoundedForm」）。
         assertEquals(call.callId, executed!!.result.callId)
         assertFalse(executed.result.denied)
         assertTrue(executed.result.resultJson.contains("Foo"))
@@ -1555,6 +1574,166 @@ class FastDispatchTest {
         val skipped = skippedOf(out, "oversized result")
         assertEquals("EXEC_ERROR", skipped.denyCode)
         assertTrue("oversized result comes from the entered executor", skipped.attempted)
+    }
+
+    @Test fun executedStructurallyInvalidResultIsRejected() = runBlocking {
+        // gate 11 結構檢查：resultJson 非 JSON／root 非 JsonObject 一律映射至
+        // 與超預算相同的 backstop（Skipped EXEC_ERROR，attempted=true）；
+        // backend／executor 話術永不騎 outcome。
+        val marker = "backend-marker-MUST-NOT-RIDE-結構案例"
+        val d = decide("幫我查 Foo 這個符號")
+        val call = d.toolCall!!
+        for ((label, resultJson) in listOf(
+            "unparseable" to "not json $marker",
+            "json array" to """[1,2,"$marker"]""",
+            "json primitive" to "\"backend-marker-MUST-NOT-RIDE-結構案例\"",
+        )) {
+            val bad = executorReturning(FastExecResult(LspTools.SYMBOLS_NAME, call.callId, resultJson))
+            val out = FastDispatcher(mapOf(LspTools.SYMBOLS_NAME to bad)).dispatch(d, lspOn)
+            val skipped = skippedOf(out, "$label result")
+            assertEquals("$label denyCode", "EXEC_ERROR", skipped.denyCode)
+            assertTrue("$label must carry attempted=true", skipped.attempted)
+            assertFalse("$label must not echo backend text", (skipped.fallbackMessage ?: "").contains(marker))
+            assertFalse("$label outcome must not carry backend text", skipped.toString().contains(marker))
+        }
+        // 合法 JsonObject 仍放行（Executed 不受結構檢查誤傷）。
+        val good = executorReturning(FastExecResult(LspTools.SYMBOLS_NAME, call.callId, """{"ok":true}"""))
+        val out = FastDispatcher(mapOf(LspTools.SYMBOLS_NAME to good)).dispatch(d, lspOn)
+        assertTrue("valid JsonObject must execute (got $out)", out is FastDispatchOutcome.Executed)
+    }
+
+    @Test fun executedCallIdCarriesBoundedFormNotRaw() = runBlocking {
+        // Executed outcome 攜帶有界 callId（redact → ≤500 pass → cap+#sha256），
+        // 與 receipt channel 一致；raw（敏感形）callId 永不騎 Executed outcome。
+        // gate 9 的 identity 比對在 outcome 之前以 raw 對 raw 完成，故 executor
+        // 回傳 raw callId 仍能正常 Executed——只是 outcome 的 callId 已有界。
+        val d = decide("幫我查 Foo 這個符號")
+        val call = d.toolCall!!
+        // (a) secret-shaped、≤500：redacted（含 marker）後與原值不同。
+        val secretId = "fast-call-sk-SECRETMARKER1234567890abcd"
+        val secretCall = call.copy(callId = secretId)
+        val secretDecision = d.copy(toolCall = secretCall)
+        val execA = executorReturning(FastExecResult(LspTools.SYMBOLS_NAME, secretId, """{"ok":true}"""))
+        val outA = FastDispatcher(mapOf(LspTools.SYMBOLS_NAME to execA)).dispatch(secretDecision, lspOn)
+        val executedA = outA as? FastDispatchOutcome.Executed
+        assertNotNull("sensitive callId must still execute with the same raw id at gate 9 (got $outA)", executedA)
+        assertEquals(
+            "outcome callId must equal the bounded form the receipt channel would emit",
+            dev.librepocket.redact.Redactor.redact(secretId).text,
+            executedA!!.result.callId,
+        )
+        assertFalse(
+            "raw secret-shaped callId must never ride the outcome",
+            executedA.result.callId.contains("sk-SECRETMARKER1234567890abcd"),
+        )
+        // (b) 超長（redacted 後仍 >500）：cap + # + 32-hex suffix。
+        // 單一 sk- run 會被整段 redact 成短 marker，故用空白切斷 secret run、
+        // 尾綴 600 個無害字元確保 post-redaction 長度 >500 觸發 cap 路徑。
+        val longId = "fast-sk-ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 " + "x".repeat(600)
+        val longCall = call.copy(callId = longId)
+        val longDecision = d.copy(toolCall = longCall)
+        val execB = executorReturning(FastExecResult(LspTools.SYMBOLS_NAME, longId, """{"ok":true}"""))
+        val outB = FastDispatcher(mapOf(LspTools.SYMBOLS_NAME to execB)).dispatch(longDecision, lspOn)
+        val executedB = outB as? FastDispatchOutcome.Executed
+        assertNotNull("over-long callId must still execute (got $outB)", executedB)
+        val boundedB = executedB!!.result.callId
+        assertTrue("bounded callId must be ≤500 chars: ${boundedB.length}", boundedB.length <= 500)
+        assertTrue(
+            "bounded callId must end with # + 32 lowercase hex: $boundedB",
+            Regex("#[0-9a-f]{32}$").containsMatchIn(boundedB),
+        )
+        assertFalse(
+            "raw secret material must never ride the outcome",
+            boundedB.contains("sk-ABCDEFGHIJKLMNOPQRSTUVWXYZ"),
+        )
+    }
+
+    @Test fun executedOutcomeCarriesNoUnboundedDenyCode() = runBlocking {
+        // Executed outcome 永不攜帶 executor 提供的 denyCode：outcome 的
+        // denyCode 一律為 null（有界 callId 有界、denyCode 無界一併禁止出站）。
+        // 偽造的超長/含換行 denyCode 不得騎 outcome 的任何欄位或 toString。
+        val d = decide("幫我查 Foo 這個符號")
+        val call = d.toolCall!!
+        val forged = "fake-forged\n" + "A".repeat(200_000)
+        val exec = executorReturning(
+            FastExecResult(
+                LspTools.SYMBOLS_NAME,
+                call.callId,
+                """{"ok": true}""",
+                denied = false,
+                denyCode = forged,
+            ),
+        )
+        val out = FastDispatcher(mapOf(LspTools.SYMBOLS_NAME to exec)).dispatch(d, lspOn)
+        val executed = out as? FastDispatchOutcome.Executed
+        assertNotNull("forged denyCode must not block a valid Ok execution (got $out)", executed)
+        assertNull("Executed outcome must carry NO executor denyCode", executed!!.result.denyCode)
+        assertEquals("non-denied Ok must report denied=false", false, executed.result.denied)
+        assertFalse(
+            "forged denyCode marker must never ride the outcome",
+            executed.toString().contains("fake-forged"),
+        )
+        assertFalse(
+            "forged denyCode bulk must never ride the outcome",
+            executed.toString().contains("A".repeat(1_000)),
+        )
+        assertTrue(
+            "every string field of the outcome must stay length-bounded: callId=${executed.result.callId.length}, resultJson=${executed.result.resultJson.length}",
+            executed.result.callId.length <= SafeToolSlice.MAX_STRING_CHARS &&
+                executed.result.resultJson.length <= SafeToolSlice.MAX_RESULT_CHARS,
+        )
+    }
+
+    @Test fun okResultInternalBoundaryMapsIteratorThrowToExecError() = runBlocking {
+        // 縱深防禦：後端 symbols List 在 okResult projection（take/size/get）
+        // 時爆炸 → okResult 內部邊界映射為 typed denial（EXEC_ERROR），
+        // 不外拋、不退化、不觸發 call-site catch 才有的路徑；backend 話術永不放行。
+        val backend = ThrowingIterationBackend()
+        val d = decide("幫我查 Foo 這個符號")
+        val out = lspDispatcher(backend).dispatch(d, lspOn)
+        val skipped = skippedOf(out, "iterator-throwing backend")
+        assertEquals("EXEC_ERROR", skipped.denyCode)
+        assertTrue("executor was entered before the backend list blew up", skipped.attempted)
+        assertFalse(
+            "backend text must never ride the outcome",
+            (skipped.fallbackMessage ?: "").contains("backend-iteration-marker"),
+        )
+        assertFalse(skipped.toString().contains("backend-iteration-marker"))
+        assertFalse(skipped.toString().contains("backend-get-marker"))
+        assertEquals(1, backend.invocations.get())
+    }
+
+    @Test fun fastDecisionWithNullToolCallFailsClosedWithFixedMessage() = runBlocking {
+        // 手建 FAST + null toolCall 的 decision：fail-closed 為 Skipped，
+        // fallbackMessage 非 null（固定不回音話術），attempted=false；
+        // decision 自帶的 message 永不騎 outcome。
+        val decision = RouteDecision(
+            route = RouteKind.FAST,
+            toolCall = null,
+            reasonCode = null,
+            fallbackMessage = "handbuilt-marker-should-not-ride",
+            header = TranscriptHeader(
+                sessionId = "s1",
+                turnIndex = 1,
+                route = RouteKind.FAST,
+                toolName = null,
+                reasonCode = null,
+                visibleTools = emptyList(),
+            ),
+        )
+        val out = FastDispatcher().dispatch(decision, lspOn)
+        val skipped = skippedOf(out, "FAST with null toolCall")
+        assertNotNull("must carry a fixed non-echoing message", skipped.fallbackMessage)
+        assertTrue(
+            "message must be the fixed no-match receipt, not anything else",
+            skipped.fallbackMessage!!.contains("NO_MATCH"),
+        )
+        assertFalse(
+            "the hand-built decision's own message must never ride the outcome",
+            skipped.fallbackMessage!!.contains("handbuilt-marker-should-not-ride"),
+        )
+        assertFalse("nothing was executed", skipped.attempted)
+        assertNull(skipped.denyCode)
     }
 
     @Test fun schemaInvalidReceiptCallIdIsBoundedWithHash() = runBlocking {

@@ -307,6 +307,61 @@ class FastRouterDecisionTest {
         assertEquals("NEED_CLARIFICATION", d.header.reasonCode)
     }
 
+    @Test fun outOfRangeAlarmTimeNeedsClarification() {
+        // 明確但超出範圍的時間值（hour>23、minute>59，含 `:` 形式）：
+        // 一律轉補參澄清，絕不 coerceIn 夾值後執行（`25點` 不是 23 點、
+        // `7點99分` 不是 7:59）。
+        for (text in listOf(
+            "鬧鐘 25點叫我",
+            "鬧鐘 7點99分叫我",
+            "鬧鐘 7:99叫我",
+            "鬧鐘 23點60分叫我",
+        )) {
+            val d = decide(text)
+            assertEquals(text, RouteKind.DENIED, d.route)
+            assertEquals(text, DenyReason.NEED_CLARIFICATION, d.reasonCode)
+            assertNull(text, d.toolCall)
+            assertTrue(text, d.fallbackMessage!!.contains("alarm.create"))
+            assertTrue(text, d.fallbackMessage!!.contains("NEED_CLARIFICATION"))
+            assertEquals(text, "NEED_CLARIFICATION", d.header.reasonCode)
+        }
+    }
+
+    @Test fun adjacentDigitAlarmTimeNeedsClarification() {
+        // 時間 token 緊鄰數字（`7點123分`／`123點`）一律視為「無明確時間」⇒
+        // 缺參澄清，絕不以鄰接數字截出靜默錯誤的時間（守衛 `(?<!\d)`／`(?!\d)`：
+        // `7點123分` 不是 7:12、`123點` 不是 23 點，兩者皆不 matching ⇒ 澄清）。
+        for (text in listOf(
+            "鬧鐘 7點123分叫我",
+            "鬧鐘 123點叫我",
+        )) {
+            val d = decide(text)
+            assertEquals(text, RouteKind.DENIED, d.route)
+            assertEquals(text, DenyReason.NEED_CLARIFICATION, d.reasonCode)
+            assertNull(text, d.toolCall)
+            assertTrue(text, d.fallbackMessage!!.contains("alarm.create"))
+            assertTrue(text, d.fallbackMessage!!.contains("NEED_CLARIFICATION"))
+            assertEquals(text, "NEED_CLARIFICATION", d.header.reasonCode)
+        }
+    }
+
+    @Test fun inRangeTwoDigitAlarmTimeStillAdmittedToWiringGate() {
+        // 合法的完整兩位分鐘（7點30分／7點59分）通過缺參門（`(?!\d)` 守衛不誤傷，
+        // 與 alarmIntentDeniedUntilWired 對齊），落接線門：alarm.create 未 ready ⇒
+        // USER_DISABLED（答應而非執行），不轉澄清。
+        for (text in listOf(
+            "鬧鐘 7點30分叫我",
+            "鬧鐘 7點59分叫我",
+        )) {
+            val d = decide(text)
+            assertEquals(text, RouteKind.DENIED, d.route)
+            assertEquals(text, DenyReason.USER_DISABLED, d.reasonCode)
+            assertNull(text, d.toolCall)
+            assertTrue(text, d.fallbackMessage!!.contains("alarm.create"))
+            assertEquals(text, "USER_DISABLED", d.header.reasonCode)
+        }
+    }
+
     @Test fun negationWithMissingGrantStaysNoPrivilege() {
         // 遮罩順序：投影 UNAVAILABLE（無授權）優先於否定澄清；否定句在無授權
         // 下仍回 NO_PRIVILEGE，絕不被誤讀為補參澄清。

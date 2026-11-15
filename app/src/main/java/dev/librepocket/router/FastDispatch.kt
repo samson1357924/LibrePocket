@@ -41,7 +41,11 @@ import kotlin.coroutines.coroutineContext
  * gate 8's timeout branch and gates 9–11 — trip at or after it; see
  * `attempted`):
  * 1. the decision must be FAST with a non-null [ToolCall] (DENIED /
- *    NEED_CLARIFICATION / no-match intents never execute);
+ *    NEED_CLARIFICATION / no-match intents never execute). A hand-built
+ *    FAST decision with a null [ToolCall] is malformed and fails closed
+ *    with the fixed non-echoing no-match message
+ *    ([FallbackMessages.forNoMatch] with an empty intent — never a
+ *    message-less skip, never the hand-built decision's own message);
  * 2. the tool must resolve via [lookup] — a lookup that throws (non-cancel)
  *    maps to [FastDispatchOutcome.Skipped] with denyCode `LOOKUP_ERROR`;
  *    unknown names fail closed with `UNKNOWN_TOOL`;
@@ -53,7 +57,9 @@ import kotlin.coroutines.coroutineContext
  *    returned tool's name is never interpolated (it may be
  *    attacker-controlled content) — the fixed non-echoing message applies,
  *    like the lookup-failure paths;
- * 4. a FRESH projection at dispatch time must be NATIVE (any non-NATIVE
+ * 4. a dispatch-time re-projection (SAME snapshot the decision saw — NOT a
+ *    freshness signal; [decideAndDispatch] re-validates the same
+ *    snapshot) must be NATIVE (any non-NATIVE
  *    projection — UNAVAILABLE or DEGRADED — denies, mirroring the slice's
  *    NATIVE-only rule; DEGRADED tools never execute on the fast lane. The
  *    ready `lsp.symbols` projects NATIVE once its switch is on, so the
@@ -92,12 +98,18 @@ import kotlin.coroutines.coroutineContext
  *    `UNKNOWN_TOOL` / `LOOKUP_IDENTITY_MISMATCH` / `PROJECTION_ERROR` /
  *    `EXECUTOR_IDENTITY_MISMATCH` / `RESULT_IDENTITY_MISMATCH` / `EXEC_ERROR`);
  * 11. defense in depth on the executed path: a result whose serialized
- *    `resultJson` exceeds [SafeToolSlice.MAX_RESULT_CHARS] never rides the
- *    outcome — [FastDispatchOutcome.Executed] is withheld and the call maps
+ *    `resultJson` exceeds [SafeToolSlice.MAX_RESULT_CHARS] OR fails a
+ *    structural check (`Json.parseToJsonElement` must succeed and the root
+ *    must be a `JsonObject`) never rides the outcome —
+ *    [FastDispatchOutcome.Executed] is withheld and the call maps
  *    to [FastDispatchOutcome.Skipped] with denyCode `EXEC_ERROR`
  *    (`attempted=true` — executor was entered;
  *    the built-in executor is already bounded; this is the trust-boundary
- *    backstop for misbehaving or future executors).
+ *    backstop for misbehaving or future executors). The
+ *    [FastDispatchOutcome.Executed] outcome also carries the SAME bounded
+ *    callId form as the receipt channel (redact → ≤[SafeToolSlice.MAX_STRING_CHARS]
+ *    pass-through → cap + `#`-SHA-256 suffix), never the raw [ToolCall.callId];
+ *    Executed carries bounded callId and NO executor denyCode;
  *
  * Explicitly NOT done here (future production wiring PR, per the capability
  * matrix activation prerequisites): fresh `tool.exec` policy evaluation,
@@ -131,8 +143,6 @@ class FastDispatcher(
     private fun fixedFailureMessage(toolName: String?): String =
         "執行${toolName ?: "工具"}失敗，請重試或手動操作"
 
-    private val DENY_CODE_ALLOWLIST = Regex("^[A-Z0-9_]{1,64}$")
-
     /**
      * executor 提供的 denyCode allowlist：只保留 `^[A-Z0-9_]{1,64}$`
      * （涵蓋本切片已知型別碼如 `SCHEMA_INVALID` / `UNAVAILABLE` /
@@ -156,6 +166,13 @@ class FastDispatcher(
     ): FastDispatchOutcome {
         val call = decision.toolCall
         if (decision.route != RouteKind.FAST || call == null) {
+            if (decision.route == RouteKind.FAST && call == null) {
+                // Malformed hand-built FAST decision: fail-closed with the
+                // fixed non-echoing no-match message — never a message-less
+                // skip, and never a hand-built decision's own message text.
+                // attempted=false（executor 不會被進入）；reasonCode 原樣攜帶。
+                return FastDispatchOutcome.Skipped(decision.reasonCode, FallbackMessages.forNoMatch(""))
+            }
             return FastDispatchOutcome.Skipped(decision.reasonCode, decision.fallbackMessage)
         }
         coroutineContext.ensureActive()
@@ -266,7 +283,26 @@ class FastDispatcher(
             // 已自限；此為 trust-boundary backstop）——超預算一律型別化 EXEC_ERROR。
             return FastDispatchOutcome.Skipped(null, fixedFailureMessage(tool.name), denyCode = "EXEC_ERROR", attempted = true)
         }
-        return FastDispatchOutcome.Executed(result)
+        if (!isJsonObjectDocument(result.resultJson)) {
+            // 結構檢查（gate 11）：resultJson 必須可解析且 root 為 JsonObject；
+            // 否則視同超預算，mapping 至同一條 EXEC_ERROR backstop（denied）。
+            // 非法 JSON／array／primitive 一律不放行；backend 話術永不騎 outcome。
+            return FastDispatchOutcome.Skipped(null, fixedFailureMessage(tool.name), denyCode = "EXEC_ERROR", attempted = true)
+        }
+        // Executed outcome 攜帶有界 callId（與 receipt channel 一致）：gate 9 的
+        // identity 比對已於 outcome 之前以 raw call.callId 對 raw 完成，outcome
+        // 不再做任何 identity 比對，故此處以有界形態放行——raw callId 永不騎
+        // Executed outcome；executor 提供的 denyCode 一律不騎（denyCode = null）。
+        // 有界化自身爆掉（非取消、非 fatal Error）→ 型別化 EXEC_ERROR skip，
+        // 維持 contract「never throws except CancellationException / fatal Error」。
+        val boundedId = try {
+            boundedCallId(result.callId)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Exception) {
+            return FastDispatchOutcome.Skipped(null, fixedFailureMessage(tool.name), denyCode = "EXEC_ERROR", attempted = true)
+        }
+        return FastDispatchOutcome.Executed(result.copy(callId = boundedId, denyCode = null))
     }
 
     /**
@@ -275,7 +311,7 @@ class FastDispatcher(
      * beyond [FastRouter.decide] + [dispatch] with the same [ctx].
      *
      * The SAME [ctx] snapshot is passed to both decide and dispatch, so the
-     * gate-4 projection re-check inside [dispatch] re-validates the same
+     * gate-4 (dispatch-time re-projection) re-check inside [dispatch] re-validates the same
      * snapshot the router saw — it is a same-snapshot recheck, NOT a
      * freshness signal. Freshness still requires the caller to re-read
      * [ProjectionContext] per call; a future wiring PR owns the
@@ -291,6 +327,28 @@ class FastDispatcher(
         val decision = FastRouter().decide(intentText, ctx, sessionId, turnIndex)
         return FastLaneResult(decision, dispatch(decision, ctx))
     }
+
+    /**
+     * Structural validity of an executed-result payload (gate 11): the
+     * [resultJson] must parse as JSON and its root must be a [JsonObject].
+     * Anything else — unparseable text, an array, a primitive — maps to the
+     * same over-budget EXEC_ERROR backstop.
+     */
+    private fun isJsonObjectDocument(resultJson: String): Boolean = try {
+        Json.parseToJsonElement(resultJson) is JsonObject
+    } catch (e: kotlinx.coroutines.CancellationException) {
+        throw e
+    } catch (_: Exception) {
+        false
+    }
+
+    companion object {
+        /**
+         * executor-provided denyCode allowlist（原 instance val；無 instance
+         * 依賴，hoist 至 companion）：只保留 `^[A-Z0-9_]{1,64}$`。
+         */
+        private val DENY_CODE_ALLOWLIST = Regex("^[A-Z0-9_]{1,64}$")
+    }
 }
 
 /** One fast-lane attempt: the routing decision plus its dispatch outcome. */
@@ -299,7 +357,17 @@ data class FastLaneResult(
     val outcome: FastDispatchOutcome,
 )
 
-/** Typed execution result from a [FastToolExecutor]. */
+/**
+ * Typed execution result from a [FastToolExecutor].
+ *
+ * Note: [callId] as produced by an executor may be raw; [FastDispatcher]
+ * binds the [FastDispatchOutcome.Executed] outcome to the SAME bounded
+ * callId form used by the receipt channel (redact → ≤[SafeToolSlice.MAX_STRING_CHARS]
+ * pass-through → surrogate-safe cap + `#` + 32-hex SHA-256 of the full
+ * redacted string) before the outcome rides — the raw [ToolCall.callId]
+ * never rides [FastDispatchOutcome.Executed].
+ * Executed carries bounded callId and NO executor denyCode.
+ */
 data class FastExecResult(
     val toolName: String,
     val callId: String,
@@ -313,6 +381,15 @@ data class FastExecResult(
  * necessarily effect-free — see [FastDispatchOutcome.Skipped.attempted].
  */
 sealed interface FastDispatchOutcome {
+    /**
+     * Executed exactly once. The carried [FastExecResult.callId] is the
+     * SAME bounded form used by the receipt channel (redact → ≤cap
+     * pass-through → cap + `#`-SHA-256 suffix), NOT the raw
+     * [ToolCall.callId]; the raw-vs-raw identity comparison happens inside
+     * [FastDispatcher.dispatch] (gate 9) before this outcome is produced,
+     * and the outcome path performs no identity comparison.
+     * Executed carries bounded callId and NO executor denyCode.
+     */
     data class Executed(val result: FastExecResult) : FastDispatchOutcome
 
     /**
@@ -411,6 +488,12 @@ interface FastToolExecutor {
  * maps to a fixed minimal JSON with denyCode `EXEC_ERROR` — the backend's
  * message never rides the receipt either.
  *
+ * [okResult] carries its own internal boundary (defense in depth): a
+ * projection-time `Exception` (snapshot/iterator/reduce/redaction) maps to
+ * the same fixed minimal JSON with denyCode `EXEC_ERROR` instead of
+ * reaching the call-site catch in [execute] — same outcome type, same
+ * fixed message.
+ *
  * Kept in sync with [SafeToolSlice] by hand (same module, same constants):
  * the copied predicates ([jsonNestingDepth], [containsFormatCodePoint],
  * [isSafeInput], [boundedRawBackendField], [cappedTake], [cappedEcho]), the
@@ -485,8 +568,9 @@ class LspSymbolsExecutor(
             } catch (e: CancellationException) {
                 throw e
             } catch (_: Exception) {
-                // 後端物件（例如 lazy List 的 size/iterator/get）在投影時爆掉 →
-                // typed denial，非 turn 失敗。
+                // now redundant belt-and-braces; internal okResult boundary
+                // handles Exception（okResult 內部邊界先轉為 typed EXEC_ERROR）。
+                // 保留此 catch（無害）；backend 話術永不放行；非 turn 失敗。
                 deniedResult(call, "EXEC_ERROR")
             }
             is LspTools.SymbolsOutcome.Unavailable ->
@@ -496,6 +580,25 @@ class LspSymbolsExecutor(
     }
 
     private fun okResult(
+        call: ToolCall,
+        query: String,
+        outcome: LspTools.SymbolsOutcome.Ok,
+        requestedLimit: Int,
+    ): FastExecResult {
+        // 內部邊界（縱深防禦）：snapshot／iterator／reduce 例外 → typed denial
+        // （EXEC_ERROR），與 call-site catch 同 outcome 型別、同固定話術；
+        // backend 話術永不放行；dispatch 端 attempted=true。
+        // CancellationException 不跨邊界——原樣外拋。
+        return try {
+            projectOkResult(call, query, outcome, requestedLimit)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Exception) {
+            deniedResult(call, "EXEC_ERROR")
+        }
+    }
+
+    private fun projectOkResult(
         call: ToolCall,
         query: String,
         outcome: LspTools.SymbolsOutcome.Ok,
@@ -587,27 +690,6 @@ class LspSymbolsExecutor(
         )
 
     /**
-     * Bounded, collision-disambiguated redacted id（對 slice
-     * `boundedRedactedId` 語義的忠實 port）：先 redact（可能膨風），redacted
-     * 長度 ≤ [SafeToolSlice.MAX_STRING_CHARS] 原樣放行；否則 surrogate-safe
-     * `cappedTake` 到 `MAX_STRING_CHARS - PAIRING_SUFFIX_CHARS` 前綴，接上
-     * `#` + 對「完整 redacted 字串」的 SHA-256 前 16 bytes 摘要（小寫 32-hex）。
-     * 結果長度永不超過 [SafeToolSlice.MAX_STRING_CHARS]。
-     *
-     * must stay in sync with SafeToolSlice.boundedRedactedId
-     */
-    private fun boundedCallId(callId: String): String {
-        val redacted = dev.librepocket.redact.Redactor.redact(callId).text
-        if (redacted.length <= SafeToolSlice.MAX_STRING_CHARS) return redacted
-        val digest = MessageDigest.getInstance("SHA-256").digest(redacted.toByteArray(Charsets.UTF_8))
-        val hex = digest.take(16).joinToString("") { byte ->
-            (byte.toInt() and 0xFF).toString(16).padStart(2, '0')
-        }
-        val suffix = "#$hex"
-        return cappedTake(redacted, SafeToolSlice.MAX_STRING_CHARS - PAIRING_SUFFIX_CHARS) + suffix
-    }
-
-    /**
      * Must stay in sync with SafeToolSlice.cappedEcho — identical logic and
      * marker format; only the reference constants differ (this file quotes
      * SafeToolSlice's MAX_STRING_CHARS directly).
@@ -629,20 +711,6 @@ class LspSymbolsExecutor(
     private fun boundedRawBackendField(value: String): String =
         if (value.length <= SafeToolSlice.RAW_BACKEND_FIELD_MAX_CHARS) value
         else "[backend field omitted]"
-
-    /**
-     * Surrogate-safe cap slice.
-     *
-     * must stay in sync with SafeToolSlice.cappedTake
-     */
-    private fun cappedTake(value: String, cap: Int): String {
-        if (value.length <= cap) return value
-        var end = cap
-        while (end > 0 && value[end - 1].code in 0xD800..0xDBFF) {
-            end--
-        }
-        return value.substring(0, end)
-    }
 
     /**
      * Computes max JSON nesting depth while ignoring string contents.
@@ -707,14 +775,50 @@ class LspSymbolsExecutor(
         if (v.any { it.isISOControl() }) return false
         return true
     }
+}
 
-    companion object {
-        /**
-         * Over-cap redacted id 的確定性配對後綴長度：`#` + 32-hex（128 位元
-         * SHA-256 前綴）＝ `1 + 16 * 2` UTF-16 units。
-         *
-         * must stay in sync with SafeToolSlice.PAIRING_SUFFIX_CHARS
-         */
-        internal const val PAIRING_SUFFIX_CHARS = 1 + 16 * 2
+/**
+ * Over-cap redacted id 的確定性配對後綴長度：`#` + 32-hex（128 位元
+ * SHA-256 前綴）＝ `1 + 16 * 2` UTF-16 units。
+ *
+ * must stay in sync with SafeToolSlice.PAIRING_SUFFIX_CHARS
+ */
+private const val PAIRING_SUFFIX_CHARS = 1 + 16 * 2
+
+/**
+ * Surrogate-safe cap slice.
+ *
+ * must stay in sync with SafeToolSlice.cappedTake
+ */
+private fun cappedTake(value: String, cap: Int): String {
+    if (value.length <= cap) return value
+    var end = cap
+    while (end > 0 && value[end - 1].code in 0xD800..0xDBFF) {
+        end--
     }
+    return value.substring(0, end)
+}
+
+/**
+ * Bounded, collision-disambiguated redacted id（對 slice
+ * `boundedRedactedId` 語義的忠實 port）：先 redact（可能膨風），redacted
+ * 長度 ≤ [SafeToolSlice.MAX_STRING_CHARS] 原樣放行；否則 surrogate-safe
+ * [cappedTake] 到 `MAX_STRING_CHARS - PAIRING_SUFFIX_CHARS` 前綴，接上
+ * `#` + 對「完整 redacted 字串」的 SHA-256 前 16 bytes 摘要（小寫 32-hex）。
+ * 結果長度永不超過 [SafeToolSlice.MAX_STRING_CHARS]。
+ *
+ * must stay in sync with SafeToolSlice.boundedRedactedId
+ *
+ * File-private so [FastDispatcher] can bind its [FastDispatchOutcome.Executed]
+ * outcome to the same bounded form used by the receipt channel.
+ */
+private fun boundedCallId(callId: String): String {
+    val redacted = dev.librepocket.redact.Redactor.redact(callId).text
+    if (redacted.length <= SafeToolSlice.MAX_STRING_CHARS) return redacted
+    val digest = MessageDigest.getInstance("SHA-256").digest(redacted.toByteArray(Charsets.UTF_8))
+    val hex = digest.take(16).joinToString("") { byte ->
+        (byte.toInt() and 0xFF).toString(16).padStart(2, '0')
+    }
+    val suffix = "#$hex"
+    return cappedTake(redacted, SafeToolSlice.MAX_STRING_CHARS - PAIRING_SUFFIX_CHARS) + suffix
 }

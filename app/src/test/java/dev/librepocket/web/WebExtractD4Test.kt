@@ -61,8 +61,13 @@ class WebExtractD4Test {
     /**
      * Fake transport：捕捉 urls／pinnedAddresses／maxBytes（test-side only；
      * pin 建連釘住與 raw-read 上限透傳契約用）。
+     *
+     * [pinnedHandler]（選填）：以 (url, pinnedAddresses) 決定回應——用於
+     * 以「當次建連所釘住的答案集合」分派不同 tenant 回應之 fixture；未設則
+     * 一律走 [handler]（既有呼叫端不受影響）。
      */
     private class FakeExtract(
+        val pinnedHandler: (suspend (url: String, pinnedAddresses: List<InetAddress>) -> WebExtractRawResponse)? = null,
         val handler: suspend (url: String) -> WebExtractRawResponse,
     ) : WebExtractHttpGet {
         val urls = java.util.Collections.synchronizedList(mutableListOf<String>())
@@ -79,7 +84,7 @@ class WebExtractD4Test {
             calls.incrementAndGet()
             pinnedAddressesSeen.add(pinnedAddresses)
             maxBytesSeen.add(maxBytes)
-            return handler(url)
+            return pinnedHandler?.invoke(url, pinnedAddresses) ?: handler(url)
         }
     }
 
@@ -187,6 +192,77 @@ class WebExtractD4Test {
         val leaderOut = withTimeout(5_000) { leader.await() }
         assertTrue("leader 應照常完成 Ok，got $leaderOut", leaderOut is WebExtractOutcome.Ok)
         assertEquals(1, http.calls.get())
+    }
+
+    @Test fun allowedDistinctAddressesCacheHitIsolation() = runBlocking {
+        // 兩個皆允許之 DNS 綁定（ALLOW_PRIVATE_DNS 下 10.0.0.11／10.0.0.12，皆 PRIVATE）：
+        // resolver A 必須被單獨使用、resolver B 必須被單獨使用——相同 URL／policy／revision，
+        // 但不同 hop-0 已核准位址集合 → 不同 key → 絕不命中對方之快取或 tenant 回應。
+        val dnsA = fakeDns("service.example" to listOf("10.0.0.11"))
+        val dnsB = fakeDns("service.example" to listOf("10.0.0.12"))
+        val http = FakeExtract(
+            pinnedHandler = { _, pinned ->
+                val body = if (pinned.any { it.hostAddress == "10.0.0.11" }) {
+                    "TENANT_A data marker"
+                } else {
+                    "TENANT_B data marker"
+                }
+                okResp(html(body = body))
+            },
+            handler = { okResp(html(body = "UNREACHABLE_MARKER")) },
+        )
+        val svc = WebExtractService(http)
+        val optIn = EndpointNetworkOptIn(NetworkEgressPolicy.ALLOW_PRIVATE_DNS)
+        val first = svc.extract("https://service.example/data", optIn = optIn, resolver = dnsA) as WebExtractOutcome.Ok
+        assertFalse(first.cached)
+        assertTrue("A 之回應必須為 TENANT_A，got ${first.content.snippet}", first.content.snippet.contains("TENANT_A"))
+        val second = svc.extract("https://service.example/data", optIn = optIn, resolver = dnsB) as WebExtractOutcome.Ok
+        assertFalse("B 之呼叫不得命中 A 之快取（不同 hop-0 綁定）", second.cached)
+        assertTrue(
+            "B 之回應必須為 TENANT_B（不得收到 A 的 tenant 資料），got ${second.content.snippet}",
+            second.content.snippet.contains("TENANT_B"),
+        )
+        assertFalse(second.content.snippet.contains("TENANT_A"))
+        assertEquals(2, http.calls.get())
+    }
+
+    @Test fun allowedDistinctAddressesFollowerIsolation() = runBlocking {
+        // A 的 leader 在飛行中（gated in handler）；B（同 URL／policy／revision、
+        // 不同 hop-0 綁定）必須以自己的綁定獨立完成——不得 join A 的 inFlight、
+        // 不得收到 A 的 tenant 資料；B 不應受 A 的 gate 阻塞。
+        val dnsA = fakeDns("service.example" to listOf("10.0.0.11"))
+        val dnsB = fakeDns("service.example" to listOf("10.0.0.12"))
+        val gate = CompletableDeferred<Unit>()
+        val http = FakeExtract(
+            pinnedHandler = { _, pinned ->
+                if (pinned.any { it.hostAddress == "10.0.0.11" }) {
+                    gate.await()
+                    okResp(html(body = "TENANT_A data marker"))
+                } else {
+                    okResp(html(body = "TENANT_B data marker"))
+                }
+            },
+            handler = { okResp(html(body = "UNREACHABLE_MARKER")) },
+        )
+        val svc = WebExtractService(http)
+        val optIn = EndpointNetworkOptIn(NetworkEgressPolicy.ALLOW_PRIVATE_DNS)
+        val leader = async { svc.extract("https://service.example/follow", optIn = optIn, resolver = dnsA) }
+        withTimeout(5_000) { while (http.calls.get() < 1) delay(1) }
+        val followerOut = withTimeout(5_000) {
+            svc.extract("https://service.example/follow", optIn = optIn, resolver = dnsB)
+        } as WebExtractOutcome.Ok
+        assertTrue(
+            "B 必須收到 TENANT_B（自己的綁定），got ${followerOut.content.snippet}",
+            followerOut.content.snippet.contains("TENANT_B"),
+        )
+        assertFalse(followerOut.content.snippet.contains("TENANT_A"))
+        gate.complete(Unit)
+        val leaderOut = withTimeout(5_000) { leader.await() } as WebExtractOutcome.Ok
+        assertTrue(
+            "leader A 必須收到 TENANT_A（不受 B 影響），got ${leaderOut.content.snippet}",
+            leaderOut.content.snippet.contains("TENANT_A"),
+        )
+        assertEquals(2, http.calls.get())
     }
 
     @Test fun cacheHitDnsThrowsFailsClosed() = runBlocking {

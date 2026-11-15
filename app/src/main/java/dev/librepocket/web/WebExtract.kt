@@ -96,7 +96,9 @@ internal class DeadlineExceededException : RuntimeException()
  *   每跳 policy（含 DNS）必須 allowed、且當次解析之 token 必須與記錄一致；
  *   任一跳不符即視為 miss、重打 upstream（`putByKey` 覆寫），絕不回傳該 Ok——
  *   **成本：每次 cache hit 額外付 L×(DNS+policy) 驗證成本（L＝chain 長度）**；
- *   single-flight follower 之 chain-face 仍為 D3 pinning-identity 殘留（見 D3 追蹤項 #1）；
+ *   single-flight follower 於 Ok 交付前以自己的 opt-in／resolver／deadline 逐跳重驗
+ *   leader 記錄之 chain（規則與 fetch 相同）；不符即視為 miss、follower 自行重選舉
+ *   （自己以自己的 binding fetch），絕不交付該 Ok（見 D3 追蹤項 #1）；
  *   per-call 重驗仍是真正的權威；
  *   重驗失敗（denial／`Failed(TIMEOUT)`）不讀取快取，亦不觸 upstream。
  *   `Failed`／`Unavailable`／取消一律不寫。
@@ -108,8 +110,8 @@ internal class DeadlineExceededException : RuntimeException()
  *   跨 tier 內容永不共用。
  * - `inFlight` single-flight map：無界，但受 per-key timeout 有界（leader 受
  *   [TIMEOUT_MS] 端到端約束，逾時即完成並出 map；與 `WebSearchService` 同姿態）。
- *   key 同樣綁 hop-0 位址集合（與快取相同 identity；redirect 逐跳殘留——
- *   follower 之 chain-face——見 D3 追蹤項 #1）。
+ *   key 同樣綁 hop-0 位址集合（與快取相同 identity；redirect 逐跳由
+ *   follower 之 Ok 交付前 chain-face 驗證把關——見 D3 追蹤項 #1）。
  *   `invalidate()` bump 快取 generation epoch、清空快取，並 drain 所有在途 entry
  *   例外完成（`CancellationException`）→ follower 映射 `Unavailable(CANCELLED)`；
  *   invalidate 之前建立之條目／在途結果永遠無法重新出現在 cache 或 follower 路徑。
@@ -127,7 +129,18 @@ internal class DeadlineExceededException : RuntimeException()
  *   follower 映射 typed `Unavailable(DETAIL_CANCELLED, null)`（never cached；
  *   follower 不得 out-fetch 已取消的 leader，不再進入單飛迴圈 refetch）；
  *   例外：leader 於取消前已完整產出 Ok（okForFollowers 路徑）者，follower
- *   收到該 Ok 而非 CANCELLED。
+ *   收到該 Ok 而非 CANCELLED——但 Ok 仍須先通過下方之 chain-face 驗證及其後之
+ *   post-validation epoch re-check 才交付。
+ *   單飛 follower 之 chain-face（leader 路徑產出 Ok 後交付 follower 前）契約：
+ *   follower await 回 Ok 後，**leader 記錄之 chain 須以 follower 自己的 opt-in／
+ *   resolver／deadline 逐跳重驗**（規則與 fetch 相同：跨 origin opt-in 不可逆降級、
+ *   https→http 連續對拒、per-hop policyGate＋sorted distinct token 相等；
+ *   以 follower 剩餘預算為界，逾時視為驗證失敗；無 chain（pathological，should never
+ *   happen）fail-closed）；
+ *   驗證失敗即 miss 語義：follower 不取得該 Ok、不寫快取、不 purge 快取，
+ *   以有界重選舉（`bindingRestarts` ≤ [MAX_STALE_RESTARTS]）以自己的 binding 重 fetch；
+ *   leader 內容不得跨越不符之驗證邊界；
+ *   驗證成功則 leader 之 Ok verbatim 交付（不修改內容）。
  * - 內容：`title/url/snippet/published/siteName` 正規化（HTML-family 見 [parseHtml]：
  *   tag 剝除＋entity unescape；非 HTML-family 已放行型別走 raw-text 管線，
  *   不刪 tag、不 unescape，raw `&` 原樣保留，見 [pipelineOf]；raw-text 保留原文
@@ -180,11 +193,20 @@ internal class DeadlineExceededException : RuntimeException()
  *    opt-in 降級走與 fetch 相同之 `downgradedOptInForRedirect` walker；
  *    任一跳不符／失敗即視為 miss、重打 upstream（`putByKey` 覆寫 entry），
  *    絕不回傳該 Ok；代價為每次 hit 額外 L×(DNS+policy) 驗證成本（L＝chain 長度）。
- *    **follower 面仍為 D3 pinning-identity 殘留**：single-flight follower 收到
- *    leader 產出之 Ok 時，無法對自己的 resolver 再次逐跳驗證（entry 之 chain
- *    僅供 cache 命中路徑把關）——follower 之隔離依賴 hop-0 key 綁定＋當次
- *    per-call 政策重驗；redirect 逐跳之 A/B 位址差異下 follower 仍可能收到
- *    leader 的 tenant 內容；此為 D3 殘留，不得宣稱完整 redirect 隔離。
+ *    **follower 面已具 redirect 逐跳 re-validation（#138，round 2）**：
+ *    single-flight follower 收到 leader 產出之 Ok 時，會先以**自己的** opt-in／
+ *    resolver／deadline 逐跳重驗 leader 記錄之 chain（規則與 fetch 相同：跨 origin
+ *    opt-in 不可逆降級、https→http 連續對拒、per-hop policyGate＋sorted distinct
+ *    token 相等；以 follower 剩餘預算為界）——驗證失敗即 miss 語義（follower 不收
+ *    到該 Ok；以自己的 binding 有界重選舉，`bindingRestarts` ≤ [MAX_STALE_RESTARTS]，
+ *    超過 fail-closed `Failed(TRANSPORT)`）；leader 內容不得跨越不符之驗證邊界。
+ *    殘餘（誠實聲明，**非**「完整 redirect 隔離」已達成）：(a) awaited Ok 內容仍由
+ *    leader 於其 hop-0 等效信任之 binding 下產出——成功之 follower 信任 hop-0 key
+ *    綁定＋其自身之逐跳 re-validation 結果（同 URL、同解析答案者信任成立）；
+ *    (b) Ok 交付窗口含 follower 之鏈重驗（L×(DNS+policy)）時段；`validateChain` 通過後之 epoch re-check 後完成之撤權仍可能落在 re-check→delivery 之靜默窗口內（與 cache arm 同一脫管交付殘留類），絕不經 cache 寫回；follower 重驗不改變 leader Ok 之內容。
+ *    (c) 解析答案與 chain 相符之 follower 須付 L×(DNS+policy) 驗證成本——與 cache
+ *    hit 同一成本類別；(d) 驗證僅涵蓋 delivery 前之窗口，不承諾對之後撤權之追溯
+ *    失效（同 detached 交付殘留類）。
  * 2. cache **不解析 `Cache-Control`（含 `no-store`）**：TTL-only，屬刻意
  *    設計（read 工具、無寫副作用）；D3 須決定 honor 或明文件化此行為。
  * 3. `cleanField` 已由共享 15s deadline 限界（parse→clean 管線逐層傳入單調
@@ -297,12 +319,15 @@ object WebExtract {
     const val DETAIL_TRANSPORT = "TRANSPORT"
     const val DETAIL_CLEARTEXT_DOWNGRADE = "CLEARTEXT_DOWNGRADE"
 
-    /** `rawUrl` 長度硬上限（UTF-16 code units）：超過即 [DETAIL_URL_TOO_LONG]。 */
+    /** `rawUrl` 與 redirect `Location` 長度硬上限（UTF-16 code units）：超過即 [DETAIL_URL_TOO_LONG]。 */
     const val MAX_URL_CHARS = 8192
 
     /**
-     * `rawUrl` 長度硬上限（[MAX_URL_CHARS] code units）：超過即 `Unavailable(DETAIL_URL_TOO_LONG, null)`，
+     * `rawUrl`（及 redirect 之 `Location` 解析結果）長度硬上限（[MAX_URL_CHARS] code units）：
+     * 超過即 `Unavailable(DETAIL_URL_TOO_LONG, null)`，
      * 於任何 policy 評估或 cache key 建構之前 fail-closed 返回（不送請求、不查 DNS、不建 key）。
+     * redirect hop 同理：`Location` 標頭原文過長、或 `resolveRedirect` 解析後之絕對 URL
+     * 過長，一律於下一跳 DNS/HTTP/chain 處理之前 fail-closed（見 `extractUncachedInner`）。
      * 單位為 UTF-16 code units（`String.length`），與 `rawUrl.isBlank()` 同層次、同時機。
      */
     const val DETAIL_URL_TOO_LONG = "URL_TOO_LONG"
@@ -315,7 +340,8 @@ object WebExtract {
      * `await()` 丟出 CancellationException；若 follower 自身未被取消，
      * 映射為 `Unavailable(CANCELLED, null)` 而非重新進入單飛迴圈；
      * 若 leader 於取消前已完整產出 Ok（`okForFollowers` 路徑，complete(ok)），
-     * follower 收到該 Ok 而非 CANCELLED。
+     * follower 收到該 Ok 而非 CANCELLED（仍須先通過 follower 自己之
+     * chain-face 逐跳重驗；見 D3 追蹤項 #1）。
      */
     const val DETAIL_CANCELLED = "CANCELLED"
 }
@@ -806,8 +832,8 @@ class WebExtractCache(
  *   回傳副本即正規化 `cached=true`；HTTP upstream 不再出發，但當次政策重驗
  *   （含 DNS preflight）仍執行）；快取 key 含 policy identity（`policy`＋`configRevision`）
  *   ＋hop-0 已核准位址集合；redirect 逐跳之信任上下文由 entry 之
- *   [HopBinding] 鏈逐跳重驗（不符即 miss）；follower 之 chain-face 仍為
- *   D3 pinning-identity 殘留；
+ *   [HopBinding] 鏈逐跳重驗（不符即 miss）；follower 於 Ok 交付前亦以自己的
+ *   opt-in／resolver／deadline 逐跳重驗 leader 記錄之 chain（見 D3 追蹤項 #1）；
  *   快取 key 刻意不含 resolver／endpoint 身份；重驗失敗不讀取快取；
  *   命中前仍須 per-call 政策重驗（含 DNS preflight），不同首跳解析答案
  *   （同 policy＋revision 亦然）不得重用結果；重驗本身不 purge 快取；
@@ -857,8 +883,12 @@ class WebExtractService(
      * - 撤權後之 detached 交付殘留（by design；同一殘留類）：
      *   (i) 已 join 之 follower 於 drain 之前收到 leader 已完成之 Ok（pre-drain Ok completion）；
      *   (ii) [verifiedCachedHit] 之 post-validation epoch re-check 已通過、revocation
-     *   於該 re-check 與交付 caller 之間之窗口內完成之 post-revoke Ok（見上條）。
-     *   兩者皆發生於交付呼叫端之前的無懸掛點窗口，不經 cache 寫回、不再導致二次落地。
+     *   於該 re-check 與交付 caller 之間之窗口內完成之 post-revoke Ok（見上條）；
+     *   (iii) single-flight follower 之 chain-face 驗證：[validateChain] 與其後之 post-validation
+     *   epoch re-check 皆已通過、revocation 於該 re-check 與交付 caller 之間之窗口內完成之
+     *   post-revoke Ok（follower 交付路徑之同一窗口類，見上方 `InFlightEntry` KDoc／D3 追蹤項 #1；
+     *   follower Ok 交付窗口自 await 返回起含 L×(DNS+policy) 重驗時段，非 suspension-free）。
+     *   三者皆發生於交付呼叫端之前的無懸掛點窗口，不經 cache 寫回、不再導致二次落地。
      *   in-flight 路徑依 detached 語義處理：已 join 之 follower 於 drain 前
      *   收到 leader 已完成之 Ok（leader 自身 caller 同理）；drain 時仍 pending
      *   者收到 `CancellationException("web.extract invalidated")` → 映射
@@ -866,6 +896,9 @@ class WebExtractService(
      * - leader 於 drain 之後完成者：其 `Ok` 仍正常返回給它自己的 caller，
      *   但 cache 寫入被 epoch guard 抑制；follower 因 `m.complete(outcome)`
      *   對已例外完成的 deferred 無效而只見 CancellationException。
+     * - 附註（round 2 起）：detached Ok 交付給 follower 者，仍須先通過 follower
+     *   自己之 chain-face 逐跳重驗及其後之 post-validation epoch re-check（見 `InFlightEntry` KDoc／D3 追蹤項 #1）；
+     *   驗證失敗或世代漂移即 miss 語義，follower 不取得該 detached Ok。
      * - NonCancellable：整個撤銷流程（clear＋drain）包在 `withContext(NonCancellable)`
      *   內——呼叫端自身被取消不得中斷撤銷（半撤銷狀態是不可接受的）；
      *   drain 對所有 pending entries 例外完成，follower 映射 `Unavailable(CANCELLED)`。
@@ -892,8 +925,31 @@ class WebExtractService(
      * election 臨界區內以 `entry.epoch == epochAtEntry` 判 join；世代不符之
      * 條目不得被 join，而是就地插入新世代條目（舊 leader 仍持有其 deferred
      * 完成給自己的 caller；僅 map 中的入口改掛新世代）。
+     *
+     * 單飛 follower 之 chain-face 契約：follower await 回 **Ok** 後，不得直接交付；
+     * leader 記錄之 chain 須先以 follower 自己的 opt-in／resolver／deadline 逐跳重驗
+     * （規則與 fetch 相同；以 follower 剩餘預算為界）；驗證失敗即 miss 語義——
+     * follower 不取得該 Ok、不寫快取、不 purge 快取，以有界重選舉
+     * （`bindingRestarts` ≤ [MAX_STALE_RESTARTS]）以自己的 binding 重 fetch；
+     * 驗證成功則 leader 之 Ok verbatim 交付（不修改內容）——但交付前另有一道
+     * post-validation epoch re-check（鏡射 [verifiedCachedHit]；撤權於 re-check 之前
+     * 完成者抑制交付，視為 miss）。leader 內容不得跨越不符之驗證邊界。
+     * mismatch 時 election 不得 join 該 deferred 之 `inFlight` 條目（`skipJoinForDeferred`），
+     * 而由 caller 自己當 leader（自己的 binding 自行 fetch）。
+     *
+     * deferred 攜帶之值為 [LeaderOutcome]（結果＋leader 記錄之 chain）——chain 經由
+     * deferred completion edge 跨協程傳遞（happens-before 由 `CompletableDeferred.complete`
+     * 保證）：follower await 回 Ok 後即見 leader 發布之 chain，並以自己的 binding 重驗。
      */
-    private data class InFlightEntry(val epoch: Long, val deferred: CompletableDeferred<WebExtractOutcome>)
+    private data class InFlightEntry(val epoch: Long, val deferred: CompletableDeferred<LeaderOutcome>)
+
+    /**
+     * leader 交付給 follower 之載體：outcome ＋ leader 記錄之逐跳
+     * 信任上下文 chain。經 deferred completion edge 同步給 follower；follower 於 Ok
+     * 交付前執行 [validateChain]（規則與 fetch 相同；以 follower 自己的 opt-in／resolver／
+     * deadline 為準）。僅 Ok 路徑可能非空；非 Ok 為 emptyList()，follower 不讀取（僅 is Ok 分支驗證）。
+     */
+    private data class LeaderOutcome(val outcome: WebExtractOutcome, val chain: List<HopBinding>?)
 
     private val mutex = Mutex()
     private val inFlight: MutableMap<String, InFlightEntry> = mutableMapOf()
@@ -916,7 +972,15 @@ class WebExtractService(
      * （含 key 重算）。入口（epochAtEntry 捕獲點）至 election 之間被
      * invalidate 的請求因此**不會**在 invalidate 之後建立陳舊世代的 inFlight 條目。
      * follower 映射語義不變：leader drain 時 pending 者見
-     * `Unavailable(CANCELLED)`；leader 於 drain 前已完整產出 Ok 者 follower 照收。
+     * `Unavailable(CANCELLED)`；leader 於 drain 前已完整產出 Ok 者 follower 照收
+     * （但 Ok 仍須先通過 follower 自己之 chain-face 逐跳重驗才交付——見上方
+     * `InFlightEntry` KDoc 與 D3 追蹤項 #1）。
+     * election 另有一個 follower 面例外：`skipJoinForDeferred === 該條目之 deferred` 時不 join 該
+     * in-flight 條目（先前之 Ok 未通過本 follower 之 chain-face 驗證），呼叫方就地
+     * 插入新世代條目並自己當 leader；與世代漂移之有界重試正交（後者另計
+     * `staleRestarts`）。
+     * follower Ok 交付前亦有一道 post-validation epoch re-check（鏡射 [verifiedCachedHit]）：
+     * 重驗通過後、交付前若世代已漂移，視為 miss（同驗證失敗之有界重選舉），不交付。
      */
     suspend fun extract(
         rawUrl: String,
@@ -951,6 +1015,11 @@ class WebExtractService(
         // 超過 MAX_STALE_RESTARTS（3）次即 fail-closed Failed(TRANSPORT)。
         var epochAtEntry = cache.currentGeneration
         var staleRestarts = 0
+        var bindingRestarts = 0
+        // A2：follower 驗證失敗／epoch-drift 後 skipJoin 之對象——election 見此 deferred
+        // 即不 join 該 in-flight 條目（僅 identity 相等時），改為就地插入新條目
+        //（自己當 leader）。以 deferred identity 為範圍而非 key，同 key 之後續 leader 不受誤傷。
+        var skipJoinForDeferred: CompletableDeferred<LeaderOutcome>? = null
         val hop0 = stripFragment(rawUrl.trim())
         while (true) {
             // per-call 政策重驗（含 DNS preflight），fail-closed；必須在 cache／
@@ -958,11 +1027,15 @@ class WebExtractService(
             // 返回點皆位於此檢查之後；通過後才觸 cache。鎖內（election 臨界區）
             // 不再評估 policy／DNS（見 verifiedCachedHit 之 KDoc），僅做廉價的
             // epoch-checked getHitByKey 讀取與 stale/restart election。
-            // cache miss 的 hop 0 會再評估一次（revalidate 與 hop-0 評估各一次 DNS；取代：不 memoize，避免讓 gate 變可變狀態）
-            val gate = when (val g = policyGate(hop0, optIn, resolver, deadlineNs)) {
-                is GateResult.Allowed -> g.eval
+            // 本閘之決策會沿 [extractUncached] 傳入（`hop0Eval`）並於
+            // `extractUncachedInner` 首跳直接沿用（不二次 resolve；key 綁定之決策與
+            // 建連所用之決策為同一份——保證 key binding == fetched binding）；
+            // redirect 逐跳仍全量過閘。
+            val hop0Gate = when (val g = policyGate(hop0, optIn, resolver, deadlineNs)) {
+                is GateResult.Allowed -> g
                 is GateResult.Denied -> return g.outcome
             }
+            val gate = hop0Gate.eval
             // hop-0 綁定：key 納入當次重驗所解析並授權之位址集合（與閘共用同一份
             // eval，不二次查 DNS）；sorted set 語義（去重＋排序），round-robin
             // 返回答案順序不影響 key identity。
@@ -970,7 +1043,7 @@ class WebExtractService(
             verifiedCachedHit(k, epochAtEntry, optIn, resolver, deadlineNs)?.let { return it }
 
             var lateHit: WebExtractOutcome.Ok? = null
-            var mine: CompletableDeferred<WebExtractOutcome>? = null
+            var mine: CompletableDeferred<LeaderOutcome>? = null
             var leader = false
             var stale = false
             mutex.withLock {
@@ -995,14 +1068,19 @@ class WebExtractService(
                         ?.takeIf { it.chain.isEmpty() }
                         ?.outcome
                     if (lateHit == null) {
-                        val existing = inFlight[k]
+                        // follower chain-face 驗證失敗後：skipJoinForDeferred === 該條目之 deferred
+                        // 表示該 leader（內容）已被本 caller 判定不可信——不得 join，
+                        // 改為就地插入新世代條目，由本 caller 以自己的 binding 當 leader
+                        //（其 fetch 將自行逐跳過閘，通過即交付自己的結果）。
+                        val entry = inFlight[k]
+                        val existing = if (entry != null && entry.deferred === skipJoinForDeferred) null else entry
                         if (existing != null && existing.epoch == epochAtEntry) {
                             mine = existing.deferred
                         } else {
                             // 無條目，或條目世代不符（例如共享 cache 被其他 service
                             // clear 而本 service 未 drain）→ 插入當前世代的新條目；
                             // 陳舊世代條目不得被 join。
-                            val fresh = CompletableDeferred<WebExtractOutcome>()
+                            val fresh = CompletableDeferred<LeaderOutcome>()
                             mine = fresh
                             inFlight[k] = InFlightEntry(epochAtEntry, fresh)
                             leader = true
@@ -1019,18 +1097,20 @@ class WebExtractService(
                     return WebExtractOutcome.Failed(WebExtract.DETAIL_TRANSPORT)
                 }
                 epochAtEntry = cache.currentGeneration
+                // 世代已漂移＝全新 election 域（invalidate 已 drain inFlight）；
+                // skipJoinForDeferred 之針對性失效，清除以免誤傷新世代 leader 之 join。
+                skipJoinForDeferred = null
                 continue
             }
             lateHit?.let { return it }
             val m = mine ?: error("extract() invariant violated: no in-flight entry elected")
             if (!leader) {
-                try {
-                    // per-follower deadline：以整體預算為界包住 await；
-                    // 逾時映射 Failed(TIMEOUT)（與 CANCELLED 的 audit 語義區分）；
-                    // follower 不得在 leader 卡於 parse／gunzip 時無界等待。
-                    val waitMs = ((deadlineNs - System.nanoTime()) / 1_000_000).coerceAtLeast(1)
-                    return withTimeoutOrNull(waitMs) { m.await() }
-                        ?: WebExtractOutcome.Failed(WebExtract.DETAIL_TIMEOUT)
+                // per-follower deadline：以整體預算為界包住 await；
+                // 逾時映射 Failed(TIMEOUT)（與 CANCELLED 的 audit 語義區分）；
+                // follower 不得在 leader 卡於 parse／gunzip 時無界等待。
+                val waitMs = ((deadlineNs - System.nanoTime()) / 1_000_000).coerceAtLeast(1)
+                val awaited = try {
+                    withTimeoutOrNull(waitMs) { m.await() }
                 } catch (e: CancellationException) {
                     currentCoroutineContext().ensureActive()
                     // 自身被取消：ensureActive 拋出（self-cancellation）。
@@ -1039,7 +1119,8 @@ class WebExtractService(
                     // cancelled leader）。
                     // 例外：若 leader 於取消前已完整產出 Ok（okForFollowers 路徑，
                     // complete(ok) 而非 completeExceptionally），follower 收到該 Ok
-                    // 而非 CANCELLED——`await()` 會直接回傳已落定的結果。
+                    // 而非 CANCELLED——`await()` 會直接回傳已落定的結果（仍須通過下方
+                    // 之 chain 驗證才交付）。
                     return WebExtractOutcome.Unavailable(WebExtract.DETAIL_CANCELLED, null)
                 } catch (e: Error) {
                     // Error（OOM/SOE 等致命錯誤）原樣上拋，不映射為 TRANSPORT、不吞噬；
@@ -1049,7 +1130,58 @@ class WebExtractService(
                     // m.await() 不執行解析階段，DeadlineExceededException 不會由此逸出；
                     // leader 異常貫穿時 fail-closed TRANSPORT。
                     return WebExtractOutcome.Failed(WebExtract.DETAIL_TRANSPORT)
+                } ?: return WebExtractOutcome.Failed(WebExtract.DETAIL_TIMEOUT)
+                // awaited 為 LeaderOutcome（經 deferred completion edge 同步之載體）。
+                if (awaited.outcome !is WebExtractOutcome.Ok) {
+                    return awaited.outcome
                 }
+                // Ok 之 chain-face 驗證：leader 記錄之 chain 須以 **follower 自己的**
+                // opt-in/resolver/deadline 逐跳重驗（規則與 fetch 相同：跨 origin opt-in
+                // 不可逆降級、https→http 連續對拒、per-hop policyGate＋sorted distinct token
+                // 相等）。以 follower 之剩餘預算（waitMs 語義）為界；逾時＝驗證失敗。
+                // 驗證失敗絕不交付 leader 之 Ok；leader 內容不得跨越不符之驗證邊界。
+                val leaderChain = awaited.chain
+                    // Pathological：Ok 卻無 chain（should never happen）→ fail-closed。
+                    ?: return WebExtractOutcome.Failed(WebExtract.DETAIL_TRANSPORT)
+                val validateWaitMs = ((deadlineNs - System.nanoTime()) / 1_000_000).coerceAtLeast(1)
+                val validated = try {
+                    withTimeoutOrNull(validateWaitMs) {
+                        validateChain(leaderChain, optIn, resolver, deadlineNs)
+                    } == true
+                } catch (_: DeadlineExceededException) {
+                    // Defense-in-depth：policyGate 從不產生此例外（此例外僅源自
+                    // gunzip／parse／cleanup 之 deadline 耗盡），此臂為 belt-and-braces——
+                    // 保留不得刪除：一旦未來出現新的 throw site，刪除此臂會使驗證失敗
+                    // 坍縮為 Error 穿透路徑，喪失 miss 語義（fail-closed 於 TRANSPORT）。
+                    false
+                }
+                if (validated) {
+                    // Post-validation epoch re-check（鏡射 verifiedCachedHit 之 post-validation re-check）：
+                    // 撤權（invalidate）若於本 re-check 執行之前完成，則該撤權抑制交付——
+                    // Ok 不得落地（revoke completing before the re-check suppresses delivery）。
+                    // 世代漂移＝miss 語義（同驗證失敗之有界重選舉）。re-check→delivery 之間
+                    // 無懸掛點，期間完成之撤權無法攔截（與 cache arm 同一脫管交付殘留類，
+                    // 見 invalidate() KDoc）。
+                    if (cache.currentGeneration != epochAtEntry) {
+                        bindingRestarts += 1
+                        if (bindingRestarts > WebExtract.MAX_STALE_RESTARTS) {
+                            return WebExtractOutcome.Failed(WebExtract.DETAIL_TRANSPORT)
+                        }
+                        skipJoinForDeferred = m
+                        continue
+                    }
+                    // 交付 leader 之 Ok verbatim（不修改內容、不寫快取）。
+                    return awaited.outcome
+                }
+                // 驗證失敗 → miss 語義（與 cache 路徑一致）：有界重選舉——
+                // `bindingRestarts` 超限即 fail-closed TRANSPORT；否則設 skipJoinForDeferred
+                // 使 caller 不再 join 該 deferred 之（遭竄改／不符之）leader，改為自己 fetch。
+                bindingRestarts += 1
+                if (bindingRestarts > WebExtract.MAX_STALE_RESTARTS) {
+                    return WebExtractOutcome.Failed(WebExtract.DETAIL_TRANSPORT)
+                }
+                skipJoinForDeferred = m
+                continue
             }
 
             var okForFollowers: WebExtractOutcome.Ok? = null
@@ -1057,7 +1189,7 @@ class WebExtractService(
             // Ok 仍為公開契約，chain 經內部 channel 傳回）。
             var chain = emptyList<HopBinding>()
             try {
-                val outcome = extractUncached(rawUrl, optIn, resolver, effBytes, effModel, deadlineNs, checking) { chain = it }
+                val outcome = extractUncached(rawUrl, optIn, resolver, effBytes, effModel, deadlineNs, checking, hop0Eval = hop0Gate) { chain = it }
                 if (outcome is WebExtractOutcome.Ok) okForFollowers = outcome
                 currentCoroutineContext().ensureActive()
                 if (outcome is WebExtractOutcome.Ok && cache.currentGeneration == epochAtEntry) {
@@ -1070,12 +1202,17 @@ class WebExtractService(
                         cache.putByKey(k, outcome, epochAtEntry, chain)
                     }
                 }
-                m.complete(outcome)
+                // follower 之 chain-face 驗證所需：leader 完成前（Ok cache-write 區塊
+                // 之後、無論是否寫入）發布本跳之 chain——以 LeaderOutcome 載體經 deferred
+                // completion edge 跨協程傳遞（happens-before 保證）。
+                m.complete(LeaderOutcome(outcome, chain))
                 return outcome
             } catch (e: CancellationException) {
                 val ok = okForFollowers
                 if (ok != null) {
-                    m.complete(ok)
+                    // Ok 已完整產出（chainSink 已執行）——發布 chain 供 follower 之
+                    // chain-face 驗證（同 m.complete(outcome) 路徑）。
+                    m.complete(LeaderOutcome(ok, chain))
                 } else {
                     m.completeExceptionally(e)
                 }
@@ -1086,7 +1223,7 @@ class WebExtractService(
                 // extract() 側 backstop）：m 必須 settle 為 Failed(TIMEOUT)，
                 // follower 映射同 detail；never Ok、never cached。
                 val failed = WebExtractOutcome.Failed(WebExtract.DETAIL_TIMEOUT)
-                m.complete(failed)
+                m.complete(LeaderOutcome(failed, emptyList()))
                 return failed
             } catch (_: Exception) {
                 // 剩餘例外（非 DeadlineExceededException）一律 fail-closed
@@ -1098,7 +1235,7 @@ class WebExtractService(
                     throw ce
                 }
                 val failed = WebExtractOutcome.Failed(WebExtract.DETAIL_TRANSPORT)
-                m.complete(failed)
+                m.complete(LeaderOutcome(failed, emptyList()))
                 return failed
             } catch (e: Throwable) {
                 // DeadlineExceededException 屬 Exception，已於上方 arm 攔截
@@ -1113,6 +1250,64 @@ class WebExtractService(
                 }
             }
         }
+    }
+
+    /**
+     * chain 逐跳驗證之單跳核心：以 [policyGate]（含有界 DNS preflight，以全程 deadline
+     * 為界）重評估該跳；必須 allowed，且當次解析之 sorted distinct hostAddress token
+     * 必須與 [HopBinding.addresses] 相等。任一不符 → false（fail-closed）。
+     *
+     * 本函式與 [validateChain] 為 cache hit chain arm（[verifiedCachedHit]）與
+     * single-flight follower 之 Ok 交付前 chain-face 驗證**共用之同一份實作**——
+     * 兩處不得各自 fork 第二份邏輯。
+     */
+    private suspend fun validateChainStep(
+        hop: HopBinding,
+        effectiveOptIn: EndpointNetworkOptIn,
+        resolver: HostResolver,
+        deadlineNs: Long,
+    ): Boolean {
+        val eval = when (val g = policyGate(hop.url, effectiveOptIn, resolver, deadlineNs)) {
+            is GateResult.Allowed -> g.eval
+            is GateResult.Denied -> return false
+        }
+        return sortedDistinctAddressTokens(eval.resolvedAddresses) == hop.addresses
+    }
+
+    /**
+     * chain 逐跳重驗之共用行走核心（[verifiedCachedHit] 之 chain arm 與 single-flight
+     * follower 之 Ok 交付前 chain-face 驗證共用；不得 fork 第二份）。依序走每一跳：
+     * 1. 連續 https→http 對拒（defense-in-depth；記錄鏈即便遭竄改／注入此類降級對，
+     *    一律視為不符——fetch 路徑永遠不會發出該明文請求）；
+     * 2. 以與 fetch 相同之不可逆降級規則（[downgradedOptInForRedirect]；跨 origin →
+     *    預設 `HTTPS_ONLY` 姿態）重走 opt-in 降級；scheme 一律以
+     *    `lowercase(Locale.ROOT)` 比對（與 fetch 逐跳判定一致）；
+     * 3. 每跳 [validateChainStep]（policyGate 必須 allowed＋token 相等）。
+     * 任一跳不符／失敗 → false；全數通過 → true。空 chain → true（無從驗證，沿用
+     * 舊命中語義）。重驗本身不寫快取、不 purge 快取。
+     * binding-restart 輪次會重付 L×(DNS+policy) 之重驗成本（round-robin DNS 變更可使重驗合法通過，
+     * 故不消除；以 bindingRestarts 上界兜底）。
+     */
+    private suspend fun validateChain(
+        chain: List<HopBinding>,
+        optIn: EndpointNetworkOptIn,
+        resolver: HostResolver,
+        deadlineNs: Long,
+    ): Boolean {
+        // 空 chain arm 僅為 internal scaffold `put()` 之防禦——來自真實 fetch 之 Ok 之
+        // chain 必為非空（chainSink 於 Ok 路徑必設值）；空鏈條目無從驗證，沿用舊命中語義
+        //（defense note，security review）。
+        var effectiveOptIn = optIn
+        for ((index, hop) in chain.withIndex()) {
+            if (index > 0) {
+                val prevScheme = chain[index - 1].url.toHttpUrlOrNull()?.scheme?.lowercase(Locale.ROOT)
+                val curScheme = hop.url.toHttpUrlOrNull()?.scheme?.lowercase(Locale.ROOT)
+                if (prevScheme == "https" && curScheme == "http") return false
+                effectiveOptIn = downgradedOptInForRedirect(chain[index - 1].url, hop.url, effectiveOptIn)
+            }
+            if (!validateChainStep(hop, effectiveOptIn, resolver, deadlineNs)) return false
+        }
+        return true
     }
 
     /**
@@ -1150,24 +1345,7 @@ class WebExtractService(
         if (chain.isEmpty()) {
             return if (cache.currentGeneration == epochAtEntry) hit.outcome else null
         }
-        var effectiveOptIn = optIn
-        for ((index, hop) in chain.withIndex()) {
-            if (index > 0) {
-                // Defense-in-depth：fetch 路徑永遠拒絕 https→http 降級（chain 理論上
-                // 不會記錄此類鏈——明文請求根本不會發出）；記錄鏈即便遭竄改／注入
-                // 此類降級對，亦視為 miss（fail-closed，不信任該 entry）。
-                val prevScheme = chain[index - 1].url.toHttpUrlOrNull()?.scheme?.lowercase(Locale.ROOT)
-                val curScheme = hop.url.toHttpUrlOrNull()?.scheme?.lowercase(Locale.ROOT)
-                if (prevScheme == "https" && curScheme == "http") return null
-                // 與 fetch 相同之不可逆降級規則（跨 origin → 預設 HTTPS_ONLY 姿態）。
-                effectiveOptIn = downgradedOptInForRedirect(chain[index - 1].url, hop.url, effectiveOptIn)
-            }
-            val eval = when (val g = policyGate(hop.url, effectiveOptIn, resolver, deadlineNs)) {
-                is GateResult.Allowed -> g.eval
-                is GateResult.Denied -> return null
-            }
-            if (sortedDistinctAddressTokens(eval.resolvedAddresses) != hop.addresses) return null
-        }
+        if (!validateChain(chain, optIn, resolver, deadlineNs)) return null
         // Post-validation epoch re-check：重驗（DNS／policy）期間發生、且已於本
         // re-check 執行之前完成之 invalidate()（clear 與 bump 世代同一臨界區）時，
         // 本次 hit 不得交付——視為 miss，由 caller 之 stale/restart election 或
@@ -1186,13 +1364,14 @@ class WebExtractService(
         effModel: Int,
         deadlineNs: Long,
         checking: () -> Unit = {},
+        hop0Eval: GateResult.Allowed? = null,
         chainSink: ((List<HopBinding>) -> Unit)? = null,
     ): WebExtractOutcome =
         // 任何 DeadlineExceededException（gunzip／parse／cleanup 之 deadline 耗盡）
         // → 與預算耗盡同 detail：Failed(TIMEOUT)；never Ok、never cached。
         // CancellationException（協程取消，含 checking 探針拋出）刻意不攔截：原樣上拋。
         try {
-            extractUncachedInner(rawUrl, optIn, resolver, effBytes, effModel, deadlineNs, checking, chainSink)
+            extractUncachedInner(rawUrl, optIn, resolver, effBytes, effModel, deadlineNs, checking, hop0Eval, chainSink)
         } catch (e: DeadlineExceededException) {
             WebExtractOutcome.Failed(WebExtract.DETAIL_TIMEOUT)
         }
@@ -1205,6 +1384,7 @@ class WebExtractService(
         effModel: Int,
         deadlineNs: Long,
         checking: () -> Unit = {},
+        hop0Eval: GateResult.Allowed? = null,
         chainSink: ((List<HopBinding>) -> Unit)? = null,
     ): WebExtractOutcome {
         // 全程單一單調 deadline（由 extract() 入口計算並傳入）：DNS preflight
@@ -1227,7 +1407,12 @@ class WebExtractService(
                 return WebExtractOutcome.Failed(WebExtract.DETAIL_TIMEOUT)
             }
             // 建連前必經政策（含首跳；redirect 逐跳重驗；DNS 需查則經有界 preflight）。
-            val eval = when (val g = policyGate(current, effectiveOptIn, resolver, deadlineNs)) {
+            // 首跳：沿用 extract() 傳入之 hop-0 決策（`hop0Eval`；key 建構與本處 fetch 共用
+            // 同一份已授權之見解——key binding == fetched binding）；不再二次 resolve。
+            // redirect 逐跳永遠全量過閘。`first` 於下方設為 false 後不再沿用 hop0Eval。
+            val eval = if (first && hop0Eval != null) {
+                hop0Eval.eval
+            } else when (val g = policyGate(current, effectiveOptIn, resolver, deadlineNs)) {
                 is GateResult.Allowed -> g.eval
                 is GateResult.Denied -> return g.outcome
             }
@@ -1242,7 +1427,7 @@ class WebExtractService(
             chain.add(HopBinding(normalized, sortedDistinctAddressTokens(eval.resolvedAddresses)))
             // https → http 降級永遠拒（含迴環，fail-closed），絕不發出明文請求。
             val curScheme = try {
-                normalized.toHttpUrlOrNull()?.scheme?.lowercase()
+                normalized.toHttpUrlOrNull()?.scheme?.lowercase(Locale.ROOT)
             } catch (_: Exception) {
                 // 純 URL 解析，不產生 DeadlineExceededException；失敗 → null（fail-closed 後續檢查）。
                 null
@@ -1286,16 +1471,26 @@ class WebExtractService(
                 }
                 val location = headerLookup(response.headers, "location")
                     ?: return WebExtractOutcome.Failed(WebExtract.DETAIL_BAD_REDIRECT)
+                // Location 之 URL 長度硬上限（與入口 `rawUrl` 相同上限）：
+                // `Location` 原文或解析後之絕對 URL 過長，一律於下一跳 DNS／HTTP／chain
+                // 處理之前 fail-closed（不查 DNS、不建 HopBinding、不寫快取），
+                // 與入口 `MAX_URL_CHARS` 檢查同一 fail-closed 姿態。
+                if (location.length > WebExtract.MAX_URL_CHARS) {
+                    return WebExtractOutcome.Unavailable(WebExtract.DETAIL_URL_TOO_LONG, null)
+                }
                 val resolved = resolveRedirect(normalized, location)
                     ?.let { stripFragment(it) }
                     ?: return WebExtractOutcome.Failed(WebExtract.DETAIL_BAD_REDIRECT)
+                if (resolved.length > WebExtract.MAX_URL_CHARS) {
+                    return WebExtractOutcome.Unavailable(WebExtract.DETAIL_URL_TOO_LONG, null)
+                }
                 // 跨 origin 跳轉：opt-in 不可逆降級為預設 `HTTPS_ONLY` 姿態（公網 https 仍允許；
                 // 私有／明文一律拒）；下一跳政策以降級後
                 // opt-in 評估（不得恢復已降級權限；同 origin 維持目前有效 opt-in）。
                 effectiveOptIn = downgradedOptInForRedirect(normalized, resolved, effectiveOptIn)
                 // 預檢 downgrade（未發請求前擋；下一圈政策再驗一次，雙保險）。
-                val fromHttps = normalized.toHttpUrlOrNull()?.scheme?.lowercase() == "https"
-                val toHttp = resolved.toHttpUrlOrNull()?.scheme?.lowercase() == "http"
+                val fromHttps = normalized.toHttpUrlOrNull()?.scheme?.lowercase(Locale.ROOT) == "https"
+                val toHttp = resolved.toHttpUrlOrNull()?.scheme?.lowercase(Locale.ROOT) == "http"
                 if (fromHttps && toHttp) {
                     return WebExtractOutcome.Unavailable(
                         WebExtract.DETAIL_CLEARTEXT_DOWNGRADE,
@@ -2203,9 +2398,24 @@ internal object HtmlExtract {
         return null
     }
 
-    /** 線性去 tag（無 regex）：`<` 至下一個 `>`（含）視為一個 tag，輸出單一空白；若無 `>` 則捨棄其餘字串。
-     *  每輪雙閘（[checking] 先、[deadlineNs] 後）；內部 `indexOf('<'／'>')` 為原生掃描、不可 weave（線性、受 input cap 約束）。 */
+    /**
+     * 線性去 tag（無 regex）：與 [parseHtml] 之 structural scanner（[isTagOpen]／[findTagEnd]／
+     * [foldAsciiLower]）一致之可辨識 tag token 判定——
+     * 1. `<!--` → 整個 comment（至首個 `-->`，或 EOF）**不輸出任何內容**
+     *    （comment 為非可見文本；`HELLO</p><!-- note > SECRET --> WORLD` → comment 內文不進 snippet）；
+     * 2. 可辨識 tag token（[isTagOpen] 之 `<`＋字母／`</`＋字母，以及 `<!`／`<?` 前綴，
+     *    如 `<!DOCTYPE`／`<?xml`）→ 引號感知（single／double quote）消耗至真正閉合之 `>`，
+     *    輸出單一空白（`<div data-test="a > b">` 之 `>` 於引號內，不算閉合）；
+     *    若可辨識卻未閉合（`findTagEnd` == -1，即其後再無 `>`），捨棄其餘字串
+     *    （未閉合 tag 之後全屬 tag 內容，無可見文本）；
+     * 3. 其餘無法辨識之 `<`（如 `Price < 10 > 3`、`<1`、`< s`）→ 原樣輸出 `<` 並前進 1。
+     *
+     * 每輪雙閘（[checking] 先、[deadlineNs] 後）；子掃描（[foldAsciiLower]／[isTagOpen]／
+     * [findTagEnd]）各自雙閘；內部 `indexOf('<'／'-->')` 為原生掃描、不可 weave
+     * （線性、受 input cap 約束）。`lower` 為 ASCII 摺疊（長度不變），索引與 `html` 一一對齊。
+     */
     private fun stripTags(html: String, deadlineNs: Long = Long.MAX_VALUE, checking: () -> Unit = {}): String {
+        val lower = foldAsciiLower(html, deadlineNs, checking)
         val sb = StringBuilder(html.length)
         var i = 0
         while (i < html.length) {
@@ -2217,10 +2427,26 @@ internal object HtmlExtract {
                 break
             }
             sb.append(html, i, lt)
-            val gt = html.indexOf('>', lt)
-            if (gt < 0) break
-            sb.append(' ')
-            i = gt + 1
+            if (lower.startsWith("<!--", lt)) {
+                // comment：吃到首個 `-->`（或 EOF），不輸出任何內容。
+                // indexOf 為原生掃描、不可 weave（線性、受 input cap 約束），接受此剩餘。
+                val close = html.indexOf("-->", lt + 4)
+                i = if (close < 0) html.length else close + 3
+                continue
+            }
+            val recognizable = isTagOpen(lower, lt, deadlineNs, checking) ||
+                (lt + 1 < html.length && (lower[lt + 1] == '!' || lower[lt + 1] == '?'))
+            if (recognizable) {
+                // 可辨識 tag token：引號感知消耗至真正閉合之 `>`，輸出單一空白。
+                val end = findTagEnd(lower, lt, deadlineNs, checking)
+                if (end < 0) break // 未閉合 tag：捨棄其餘字串。
+                sb.append(' ')
+                i = end + 1
+                continue
+            }
+            // 無法辨識之 `<`：原樣輸出並前進 1。
+            sb.append('<')
+            i = lt + 1
         }
         return sb.toString()
     }

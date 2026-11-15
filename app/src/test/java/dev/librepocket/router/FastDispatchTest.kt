@@ -151,7 +151,9 @@ class FastDispatchTest {
         // 後端零呼叫（不得走 FAST 執行）。
         val backend = CountingBackend()
         val dispatcher = lspDispatcher(backend)
-        // Symbol-naming negated intents (the 10 symbol probes).
+        // A2 note: lookup markers are 繁簡對稱（查|找|尋|搜|詢|寻|询…）；
+        // 所有 symbol 否定探針皆帶 marker ⇒ NEED_CLARIFICATION。
+        // （`問`/`設` 等非 lookup 動詞的陰性探針見 mixedScriptNegationNeverExecutes。）
         val symbolTexts = listOf(
             "不查 Foo 這個符號",
             "別找 Foo 符號",
@@ -208,10 +210,12 @@ class FastDispatchTest {
         assertEquals(RouteKind.FAST, t3.route)
         assertTrue(t3.toolCall!!.argumentsJson.contains("\"query\": \"理\""))
 
-        // Meta-question tokens strip to empty ⇒ clarification, never executes.
+        // Meta-question token-only utterances now route no-match (A2: no
+        // lookup marker ⇒ symbol template does not match) — DENIED, no
+        // reasonCode, never executes.
         val t4 = decide("符號是什麼？")
         assertEquals(RouteKind.DENIED, t4.route)
-        assertEquals(DenyReason.NEED_CLARIFICATION, t4.reasonCode)
+        assertNull(t4.reasonCode)
         assertNull(t4.toolCall)
 
         // Punctuation-only remainder ⇒ clarification (meaningful-remainder gate).
@@ -231,21 +235,35 @@ class FastDispatchTest {
     }
 
     @Test fun negatedSymbolVerbsNeverExecuteForDispatch() = runBlocking {
-        // 代表性否定符號意圖（含 別問/别问）走 decide → dispatch，並註冊 executor：
+        // 代表性否定符號意圖（含 別問/别問）走 decide → dispatch，並註冊 executor：
         // 全部 Skipped、後端零呼叫。
+        // A2 note: `別問`/`别问` carry no lookup marker (問 is not one), so the
+        // symbol template no-matches (reasonCode null) instead of clarifying —
+        // still DENIED, never FAST, zero backend invocations. The `查/搜`
+        // probes keep the clarification reason via the negation gate.
         val backend = CountingBackend()
         val dispatcher = lspDispatcher(backend)
-        for (text in listOf(
-            "別問 Foo 符號",
-            "别问 Foo 符號",
+        val markerProbes = listOf(
             "不查 Foo 這個符號",
             "別搜 Foo 符號",
             "沒查 Foo 符號",
             "没查 Foo 符號",
-        )) {
+        )
+        val noMarkerProbes = listOf(
+            "別問 Foo 符號",
+            "别问 Foo 符號",
+        )
+        for (text in markerProbes) {
             val d = decide(text)
             assertEquals(text, RouteKind.DENIED, d.route)
             assertEquals(text, DenyReason.NEED_CLARIFICATION, d.reasonCode)
+            assertNull(text, d.toolCall)
+            skippedOf(dispatcher.dispatch(d, lspOn), text)
+        }
+        for (text in noMarkerProbes) {
+            val d = decide(text)
+            assertEquals(text, RouteKind.DENIED, d.route)
+            assertNull(text, d.reasonCode)
             assertNull(text, d.toolCall)
             skippedOf(dispatcher.dispatch(d, lspOn), text)
         }
@@ -531,14 +549,27 @@ class FastDispatchTest {
             "別_查 Foo 符號",         // U+005F low line (Pc)
             "別\u30FC查 Foo 符號",   // U+30FC prolonged sound mark (Lm)
             "別\u3164查 Foo 符號",   // U+3164 hangul filler (Lo; NFKC→U+1160)
-            "not symbols",
-            "NOT SYMBOLS",
-            "no symbols",
-            "ｎｅｖｅｒ symbols",     // fullwidth English (NFKC→never), ASCII 符號 hint 可命中模板
         )) {
             val d = decide(text)
             assertEquals(text, RouteKind.DENIED, d.route)
             assertEquals(text, DenyReason.NEED_CLARIFICATION, d.reasonCode)
+            assertNull(text, d.toolCall)
+            skippedOf(dispatcher.dispatch(d, lspOn), text)
+        }
+        // A2: English negations carrying no lookup marker (find/search/lookup/
+        // locate) no-match at the template stage (reasonCode null), not
+        // clarification — still DENIED, never FAST. (`never find symbol
+        // Foo` DOES clarify — it carries `find` — covered by
+        // englishNegationNeverExecutes.)
+        for (text in listOf(
+            "not symbols",
+            "NOT SYMBOLS",
+            "no symbols",
+            "ｎｅｖｅｒ symbols",     // fullwidth never + ASCII symbols: hint matches, intent does not (A2)
+        )) {
+            val d = decide(text)
+            assertEquals(text, RouteKind.DENIED, d.route)
+            assertNull(text, d.reasonCode)
             assertNull(text, d.toolCall)
             skippedOf(dispatcher.dispatch(d, lspOn), text)
         }
@@ -596,24 +627,40 @@ class FastDispatchTest {
 
     @Test fun mixedScriptNegationNeverExecutes() = runBlocking {
         // 繁簡交叉混排否定詞（traditional prefix × simplified verb and vice
-        // versa）：一律 DENIED + NEED_CLARIFICATION + dispatch skipped + backend 0。
+        // versa）：一律 DENIED + 絕不執行 + backend 0。A2 後依是否有 lookup
+        // marker 分流——marker 有則 NEED_CLARIFICATION，無則 no-match。
         val backend = CountingBackend()
         val dispatcher = lspDispatcher(backend)
-        for (text in listOf(
+        // 尋/寻/詢/询 皆為 lookup marker（繁簡對稱）⇒ 模板成立 ⇒ 否定閘轉澄清。
+        // 問/設/調/導/發/寫 非 lookup marker ⇒ A2 起模板不成立 ⇒ no-match
+        // DENIED（reasonCode null）。皆為 DENIED、絕不執行。
+        val markerProbes = listOf(
+            "别尋 Foo 符號",
+            "别寻 Foo 符號",
             "別寻 Foo 符號",
+            "别询 Foo 符號",
             "別询 Foo 符號",
+        )
+        val noMarkerProbes = listOf(
             "別问 Foo 符號",
             "別设 Foo 符號",
             "別调 Foo 符號",
-            "别尋 Foo 符號",
             "没導 Foo 符號",
             "沒发 Foo 符號",
             "别寫 Foo 符號",
             "沒写 Foo 符號",
-        )) {
+        )
+        for (text in markerProbes) {
             val d = decide(text)
             assertEquals(text, RouteKind.DENIED, d.route)
             assertEquals(text, DenyReason.NEED_CLARIFICATION, d.reasonCode)
+            assertNull(text, d.toolCall)
+            skippedOf(dispatcher.dispatch(d, lspOn), text)
+        }
+        for (text in noMarkerProbes) {
+            val d = decide(text)
+            assertEquals(text, RouteKind.DENIED, d.route)
+            assertNull(text, d.reasonCode)
             assertNull(text, d.toolCall)
             skippedOf(dispatcher.dispatch(d, lspOn), text)
         }
@@ -634,18 +681,16 @@ class FastDispatchTest {
 
     @Test fun acceptedResidualsArePinned() {
         // Pin accepted residuals so future changes notice drift.
-        // `符號是Foo嗎` → FAST with query=Foo（過度剝離殘餘，已記錄、安全方向）。
+        // `符號是Foo嗎` → no-match DENIED（A2 起：無 lookup marker，不進模板）。
         val residual = decide("符號是Foo嗎")
-        assertEquals(RouteKind.FAST, residual.route)
-        assertTrue(
-            "query must survive as Foo: ${residual.toolCall!!.argumentsJson}",
-            residual.toolCall!!.argumentsJson.contains("\"query\": \"Foo\""),
-        )
-        // `意思是符號` → DENIED + NEED_CLARIFICATION（剝離後無有意義的殘餘）。
+        assertEquals(RouteKind.DENIED, residual.route)
+        assertNull("symbol template must not match without a lookup marker: ${residual.toolCall}", residual.toolCall)
+        assertNull("no-match denial carries no reasonCode: ${residual.reasonCode}", residual.reasonCode)
+        // `意思是符號` → no-match DENIED（A2 起：無 lookup marker，不進模板）。
         val meta = decide("意思是符號")
         assertEquals(RouteKind.DENIED, meta.route)
-        assertEquals(DenyReason.NEED_CLARIFICATION, meta.reasonCode)
         assertNull(meta.toolCall)
+        assertNull("no-match denial carries no reasonCode: ${meta.reasonCode}", meta.reasonCode)
         // `查 LSPClient 符號` → FAST with query=LSPClient（\blsp\b 有錨，LSPClient 完整保留）。
         val anchored = decide("查 LSPClient 符號")
         assertEquals(RouteKind.FAST, anchored.route)
@@ -681,17 +726,29 @@ class FastDispatchTest {
     }
 
     @Test fun metaQuestionVariantsAreDenied() = runBlocking {
-        // Meta-question tokens (now including bare 是/的/要/用) strip to an
-        // empty or meaningful-less remainder ⇒ clarification, never executes.
+        // A2: utterances without a lookup marker no-match at the template
+        // stage (reasonCode null, not clarification); utterances with a
+        // marker but no meaningful remainder clarify (NEED_CLARIFICATION).
+        // Both DENIED, never execute.
         val backend = CountingBackend()
         val dispatcher = lspDispatcher(backend)
         for (text in listOf(
             "符號的意思",
             "什麼是符號",
             "為什麼要用符號",
+        )) {
+            // A2: 無 lookup marker ⇒ 模板不成立 ⇒ no-match DENIED（reasonCode null），
+            // 不是澄清。
+            val d = decide(text)
+            assertEquals(text, RouteKind.DENIED, d.route)
+            assertNull(text, d.reasonCode)
+            assertNull(text, d.toolCall)
+        }
+        for (text in listOf(
             "查 是 符號",
             "查 要 用 符號",
         )) {
+            // marker（查）命中 ⇒ 模板成立；剝離後無有意義殘餘 ⇒ 澄清，絕不執行。
             val d = decide(text)
             assertEquals(text, RouteKind.DENIED, d.route)
             assertEquals(text, DenyReason.NEED_CLARIFICATION, d.reasonCode)
@@ -1318,6 +1375,112 @@ class FastDispatchTest {
         val d2 = decide("symbol Foo")
         assertEquals(RouteKind.FAST, d2.route)
         assertTrue(d2.toolCall!!.argumentsJson.contains("\"query\": \"Foo\""))
+    }
+
+    @Test fun naturalNegationNeverReachesExecutor() = runBlocking {
+        // A1 保守任意否定閘：自然否定句（任意助詞隔開之 不/沒/別/… 或英文否定詞）
+        // 一律 DENIED、toolCall null、dispatch Skipped、後端零呼叫。
+        val backend = CountingBackend()
+        val dispatcher = lspDispatcher(backend)
+        // 群組一：含 lookup marker（查/找）的否定句 ⇒ 模板成立後否定閘轉
+        // NEED_CLARIFICATION（marker 命中模板，否定詞命中否定閘 → 澄清而非 no-match）。
+        // 涵蓋 無/无（無法＝unable）與 免（免查＝refrain/avoid）。
+        val markerProbes = listOf(
+            "我不想查 Foo 符號",
+            "先別再查 Foo 符號",
+            "我沒有要查 Foo 符號",
+            "請別去找 Foo 符號",
+            "不願意查 Foo 符號",
+            "我不要查 Foo 符號",
+            "別再幫我查 Foo 符號",
+            "沒有要找 Foo 符號",
+            "别想查 Foo 符号",
+            "不 想 查 Foo 符號",
+            "先别再找 Foo 符号",
+            "没办法查 Foo 符號",
+            "無法查 Foo 符號",
+            "无法查 Foo 符号",
+            "免查 Foo 符號",
+        )
+        for (text in markerProbes) {
+            val d = decide(text)
+            assertEquals(text, RouteKind.DENIED, d.route)
+            assertEquals(text, DenyReason.NEED_CLARIFICATION, d.reasonCode)
+            assertNull(text, d.toolCall)
+            skippedOf(dispatcher.dispatch(d, lspOn), text)
+        }
+        // 群組二：EN-mix `我不想 symbol Foo` 無 lookup marker ⇒ A2 兩段式模板不成立
+        // ⇒ no-match DENIED（reasonCode null，不進否定閘）。
+        for (text in listOf(
+            "我不想 symbol Foo",
+        )) {
+            val d = decide(text)
+            assertEquals(text, RouteKind.DENIED, d.route)
+            assertNull(text, d.reasonCode)
+            assertNull(text, d.toolCall)
+            skippedOf(dispatcher.dispatch(d, lspOn), text)
+        }
+        assertEquals(0, backend.invocations.get())
+    }
+
+    @Test fun commandFormWithNegationClarifies() = runBlocking {
+        // 命令式模板命中（command form `^symbols?\s+\S` 或 lookup marker `查`）＋否定詞
+        // ⇒ 模板成立後否定閘轉 NEED_CLARIFICATION，絕不 FAST、絕不進 executor。
+        // 釘住否定閘不是「只有自然語句」的濾網：命令式模板命中同樣不得繞過否定閘。
+        val backend = CountingBackend()
+        val dispatcher = lspDispatcher(backend)
+        for (text in listOf(
+            "symbols Foo 不要",
+            "查 Foo 符號 不要",
+        )) {
+            val d = decide(text)
+            assertEquals(text, RouteKind.DENIED, d.route)
+            assertEquals(text, DenyReason.NEED_CLARIFICATION, d.reasonCode)
+            assertNull(text, d.toolCall)
+            skippedOf(dispatcher.dispatch(d, lspOn), text)
+        }
+        assertEquals(0, backend.invocations.get())
+    }
+
+    @Test fun nonLookupSymbolUtterancesAreDenied() = runBlocking {
+        // A2: 質問/知識性語句與 bare `symbols` 無 lookup intent ⇒ 模板不成立
+        // ⇒ no-match DENIED（reasonCode null），絕不 clarify、絕不執行。
+        val backend = CountingBackend()
+        val dispatcher = lspDispatcher(backend)
+        for (text in listOf(
+            "What is a symbol?",
+            "Explain symbols",
+            "請解釋符號",
+            "符號有哪些種類",
+            "symbols",
+            "符號是Foo嗎",
+            "how do symbols work",
+        )) {
+            val d = decide(text)
+            assertEquals(text, RouteKind.DENIED, d.route)
+            assertNull(text, d.reasonCode)
+            assertNull(text, d.toolCall)
+            skippedOf(dispatcher.dispatch(d, lspOn), text)
+        }
+        assertEquals(0, backend.invocations.get())
+    }
+
+    @Test fun cjkMixedMarkerSymbolLookupRoutesFast() {
+        // A2 正向 pin：CJK marker（查）+ symbols 字 ⇒ 模板成立 ⇒ FAST；
+        // query 為提示詞剝離後的殘餘（一下/symbols 皆被剝離）。
+        val d = decide("查一下 symbols Foo")
+        assertEquals(RouteKind.FAST, d.route)
+        assertTrue(
+            "query must be Foo: ${d.toolCall!!.argumentsJson}",
+            d.toolCall!!.argumentsJson.contains("\"query\": \"Foo\""),
+        )
+        // Plain canonical form pins the same path end to end: `查 Foo 符號`.
+        val plain = decide("查 Foo 符號")
+        assertEquals(RouteKind.FAST, plain.route)
+        assertTrue(
+            "query must be Foo: ${plain.toolCall!!.argumentsJson}",
+            plain.toolCall!!.argumentsJson.contains("\"query\": \"Foo\""),
+        )
     }
 
     private fun fastDecision(toolName: String, argumentsJson: String, callId: String): RouteDecision =

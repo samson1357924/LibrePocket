@@ -52,6 +52,20 @@ import java.util.concurrent.atomic.AtomicLong
  * sampled negated intents to deny the ready tool before FAST, not just
  * RULES membership.
  *
+ * A1/A2 routing hardening (fail-opens closed, conservatively): the
+ * `lsp.symbols` template no longer fires on mere hint presence — it now
+ * requires an explicit lookup intent (single-word command form
+ * `^symbol(s)?\s+\S`, or a lookup marker: CJK 查/找/尋/搜/詢 family or
+ * `\b(find|search|lookup|locate)\b`; `where` deliberately excluded).
+ * Question/knowledge utterances (`What is a symbol?`, `Explain symbols`,
+ * `請解釋符號`, `符號有哪些種類`, bare `symbols`, `符號是Foo嗎`) fall through
+ * to no-match DENIED (reasonCode null) — not clarification. The negation
+ * gate is now a conservative ANY-presence gate ([NEGATION_MARKERS]): any
+ * occurrence of 不/沒/別/勿/莫… or English negation words clarifies over
+ * the same three normalized texts — phrases are open-ended, so a closed
+ * verb table cannot be complete; over-clarification is the fail-safe
+ * direction (the single ready tool is READ-only).
+ *
  * Pure logic, no Android dependencies.
  *
  * Note: the [TranscriptHeader.visibleTools] snapshot carried by every outcome
@@ -198,7 +212,13 @@ class FastRouter(
             return TemplateMatch(ToolRegistry.SLOW_TOOL_NAME, jsonText(text))
         }
         for ((toolName, hints, args) in RULES) {
-            if (containsAny(text, hints)) return TemplateMatch(toolName, args(text))
+            if (containsAny(text, hints)) {
+                // A2: the symbol template needs an explicit lookup intent in
+                // addition to hint presence; otherwise it falls through to
+                // no-match DENIED (reasonCode null), not clarification.
+                if (toolName == LspTools.SYMBOLS_NAME && !hasSymbolLookupIntent(text)) continue
+                return TemplateMatch(toolName, args(text))
+            }
         }
         return null
     }
@@ -232,16 +252,42 @@ class FastRouter(
         // narrow (symbol words only — a bare 「查」 without a symbol word is
         // NOT a symbol query and stays no-match, fail-safe). Latin hint is
         // word-anchored: `symbolize` does NOT route; `symbol`/`symbols` do.
+        // A2: hint membership is only the prefilter — the authoritative
+        // test is [hasSymbolLookupIntent] (command form or lookup marker;
+        // fullwidth ｓｅａｒｃｈ/ｆｉｎｄ do NOT match the EN marker — they
+        // route no-match, same fail-safe direction, pinned by the
+        // fullwidth-English tests).
         private val SYMBOL_HINTS = listOf(r("符號"), r("符号"), r("\\bsymbols?\\b"))
+        // A2 explicit-lookup gate for the symbol template: either the
+        // single-word command form (`symbol(s) <name>`, anchored at start)
+        // or a lookup marker (CJK 查/找/尋/搜/詢 — 「查詢/查找/搜尋」 are
+        // subsumed by their CJK syllables — or EN find/search/lookup/locate,
+        // word-anchored). `where` is deliberately excluded: a bare
+        // 「where is symbol Foo」 carries no lookup verb and over-clarifies
+        // into no-match (accepted, conservative direction).
+        private val SYMBOL_LOOKUP_MARKER =
+            Regex("查|找|尋|搜|詢|寻|询|查询|查找|搜尋|搜寻|\\b(find|search|lookup|locate)\\b", RegexOption.IGNORE_CASE)
+        private val SYMBOL_COMMAND_FORM = Regex("^symbols?\\s+\\S", RegexOption.IGNORE_CASE)
         private val SLOW_HINTS = listOf(
             r("自動點擊"), r("自动点击"), r("點擊螢幕"), r("点击屏幕"), r("幫我點"), r("帮我点"),
             r("自動填表"), r("自动填表"), r("代操"), r("自動操作"), r("自动操作"),
         )
 
         /**
-         * Stage1 否定句門：裸「別/别」不用（避「特別/别人/特別/別人」誤判），只收
-         * 「別/别+動詞」（繁簡對稱）與明確否定詞；命中且同時命中工具模板即轉澄清，
-         * 絕不執行。
+         * Stage1 否定句門：NEGATION_HINTS 收「別/别+動詞」（繁簡對稱）與明確否定詞；
+         * 命中且同時命中工具模板即轉澄清，絕不執行。A1 起再叠加 [NEGATION_MARKERS]
+         * ANY-presence 閘（見下）——只要有否定詞/不確定詞存在即澄清。
+         *
+         * 兩表互補（COMPLEMENTARY），不得刪除單顆粒集或通用禁止詞：本表（[NEGATION_HINTS]）
+         * 收多動詞複合否定與通用禁止詞（取消/停止/禁止/算了＋不/別/没&貼動詞 等 176 條；
+         * 本表相對 [NEGATION_MARKERS] 的獨有載荷 = `取消`/`停止`/`禁止`/`算了` 四個通用禁止詞
+         * ——中文複合詞的每條子串皆含不/未/別等單顆粒，實為 MARKERS 的子集合；與 MARKERS
+         * 英文集重複的 11 個 \b 詞）；
+         * [NEGATION_MARKERS] 收單一顆粒集（不 沒 没 別 别 勿 莫 嫑 否 無 无 免）＋英文 \b 集。
+         * [isNegated] 將兩表 OR 同命三個文本：否定詞片語是開放集合，
+         * 封閉表不可能完整，故不猜——命中即澄清（過度澄清為 fail-safe 方向）。
+         * 「特別找」必澄清（先前即如此釘住）；「特別」/「别人」後接任意模板動詞
+         * 同樣轉澄清（A1 閘的必然結果，取代只收「別+動詞」的舊精度）。
          *
          * 擴表規則（B3 fail-safe ordering）：封閉動詞表——新工具上線為執行 ready
          * 前必須先擴充此表（並在 RULES 增模板，見 [templateToolNames]），否則該
@@ -285,13 +331,18 @@ class FastRouter(
          *       （`never`/`don'?t`/`do not`/`stop`/`cancel`/`refus\w*`/`avoid\w*`/`skip\w*`/`without`/`no`/`not`）；
          *       `cannot` 類及未列舉動詞不涵蓋；
          *   (d) 全形-only 符號 hint 不會路由（SYMBOL_HINTS 比對原始文本，安全方向）；
-         *   (e) `符號是Foo嗎` → FAST query=Foo（pinned）；`特別找` 過度澄清（pinned）；
-         *       `查理`→`理` 過度剝離（pinned）；`意思是符號` → DENIED +
-         *       NEED_CLARIFICATION（pinned）；
+         *   (e) `符號是Foo嗎` → no-match（A2 起：無 lookup marker，不進模板，reasonCode null）；
+         *       `特別找` 過度澄清（pinned）；`查理`→`理` 過度剝離（pinned）；
+         *       `意思是符號` → no-match（A2：無 lookup marker，reasonCode null）；
          *   (f) CJK 異體字碼點（查 vs 査）未涵蓋。
-         * - `什麼是符號` → clarify；`為什麼要用符號` → clarify；`符號是什麼` → clarify；
-         *   `查 是 符號` → clarify；`符號的意思` → clarify（皆因 是/的/要/用/什麼/意思
-         *   被剝離後無有意義的殘餘）。
+         * - 含 lookup marker 之否定句仍轉澄清（marker 命中模板後閘才會跑）；
+         *   無 marker 之否定句（如 `別問 Foo 符號`、`not symbols`）直接
+         *   no-match DENIED——皆為 DENIED、絕不執行。
+         * - `查 是 符號` → clarify；`查 要 用 符號` → clarify（marker 命中，
+         *   剝離後無有意義殘餘）。無 marker 者一律 no-match：
+         *   `什麼是符號`、`為什麼要用符號`、`符號是什麼`、`符號的意思`、
+         *   `符號有哪些種類`、bare `symbols`、`What is a symbol?`、`Explain symbols`
+         *   （A2：不問模板語意，只問 lookup intent 的兩段式）。
          */
         private val NEGATION_HINTS = listOf(
             r("不要"), r("不用"), r("不需要"), r("不必"), r("不需"), r("勿"),
@@ -334,6 +385,31 @@ class FastRouter(
             r("\\bnever\\b"), r("\\bnot\\b"), r("\\bno\\b"),
             r("\\brefus\\w*\\b"), r("\\bavoid\\w*\\b"), r("\\bskip\\w*\\b"), r("\\bwithout\\b"),
             r("\\bdon'?t\\b"), r("\\bdo not\\b"), r("\\bstop\\b"), r("\\bcancel\\b"),
+        )
+
+        // Conservative negation/uncertainty gate: ANY presence of a negation word
+        // clarifies — phrases are open-ended, so a closed verb table cannot be complete.
+        // The two tables are COMPLEMENTARY: [NEGATION_MARKERS]
+        // holds the single-particle set （不 沒 没 別 别 勿 莫 嫑 否 無 无 免） plus the
+        // English \b set; [NEGATION_HINTS]
+        // holds the multi-verb compound negations plus general forbiddens, whose unique
+        // load-bearing contribution is {取消,停止,禁止,算了} (its Chinese compounds and EN
+        // entries are subsets of this gate). The single-particle set and those four words
+        // are load-bearing and must not be deleted; [isNegated] ORs both
+        // over the same three texts
+        // (raw, NFKC-removed, NFKC-spaced). Over-clarification is the
+        // fail-safe direction here (the single ready tool is READ-only and this lane
+        // dispatches at most one of everything): when in doubt, ask, never execute.
+        // Known deliberate over-clarifies (pinned by tests): 「特別」含「別」、
+        // 「别人」含「别」——接受，不另設例外（例外清單本身會變成另一個表）。
+        private val NEGATION_MARKERS = listOf(
+            r("不"), r("沒"), r("没"), r("別"), r("别"), r("勿"), r("莫"), r("嫑"), r("否"),
+            // 無/无（無法＝unable）與 免（免查＝refrain/avoid）亦為否定語氣顆粒，
+            // 保守閘必須收錄（否則「無法查 Foo 符號」「免查 Foo 符號」會落 FAST）。
+            r("無"), r("无"), r("免"),
+            r("\\bno\\b"), r("\\bnot\\b"), r("\\bnever\\b"), r("\\bdon'?t\\b"), r("\\bdo not\\b"),
+            r("\\bstop\\b"), r("\\bcancel\\b"), r("\\brefus\\w*\\b"), r("\\bavoid\\w*\\b"),
+            r("\\bskip\\w*\\b"), r("\\bwithout\\b"),
         )
 
         // Shared argument patterns (also hoisted: previously recompiled per
@@ -416,6 +492,8 @@ class FastRouter(
             // symbol-naming intents route FAST only when projected AND ready;
             // the query is the hint-stripped remainder (blank ⇒ clarification
             // in [missingQuestionFor], never an empty-query execution).
+            // A2: hint alone is not enough — the match site requires
+            // [hasSymbolLookupIntent] (see matchTemplate).
             Triple(
                 LspTools.SYMBOLS_NAME,
                 SYMBOL_HINTS,
@@ -519,16 +597,24 @@ class FastRouter(
          * `SymbolTable` / `getSymbol` / `LSPClient` survive intact (an
          * unanchored `symbol` would shred the `Symbol` inside `getSymbol`).
          * Meta-question tokens (什麼/什么/為什麼/为什么/是什麼/是什么/怎麼/怎么/如何/意思/嗎/吗/呢)
-         * strip as well, so 「符號是什麼？」 strips to empty and clarifies rather
-         * than executing. The bare meta-question verbs 是/的/要/用 are stripped
+         * strip as well, so a marker-bearing utterance that reduces to empty
+         * (e.g. `查 是 符號`) clarifies rather than executing. Bare
+         * `符號是什麼？` itself carries no lookup marker, so under A2 it does not
+         * reach this path at all (no-match DENIED — pinned by test). The bare
+         * meta-question verbs 是/的/要/用 are stripped
          * too since the B3 re-review:
-         * 「什麼是符號」 / 「為什麼要用符號」 / 「查 是 符號」 / 「查 要 用 符號」
-         * all strip to empty and clarify, and 「符號的意思」 clarifies too.
+         * 「查 是 符號」 / 「查 要 用 符號」 strip to empty and clarify — but note
+         * A2: utterances WITHOUT a lookup marker never reach this path at all
+         * （`什麼是符號`、`為什麼要用符號`、`符號的意思` 等一律 no-match DENIED）；
+         * clarify 只保留帶 marker 者。
          * Accepted over-strip residual class (recorded, safe direction):
-         * 「符號是Foo嗎」 → query=Foo (arguably a legitimate query), and symbol
-         * names containing 是/的/要/用 are shredded — both fail safe (a mis-query
-         * or a clarification, never a wrong execution); this over-strip is
-         * accepted and documented here rather than fixed with token boundaries.
+         * 「符號是Foo嗎」 → query=Foo if it reached extraction (arguably a
+         * legitimate query), and symbol names containing 是/的/要/用 are shredded
+         * — both fail safe (a mis-query or a clarification, never a wrong
+         * execution); this over-strip is accepted and documented here rather
+         * than fixed with token boundaries. A2: 「符號是Foo嗎」 no longer reaches
+         * this path — without a lookup marker the symbol template does not
+         * match at all (no-match DENIED).
          * The meaningful-remainder predicate lives in
          * [hasSymbolQuery]: at least one Unicode letter/digit must survive,
          * so punctuation-only remainders (e.g. 「查 - 符號」 → 「-」) clarify too.
@@ -552,6 +638,13 @@ class FastRouter(
          * query — fail-safe direction. The esc test uses 𠮷 together with a
          * BMP anchor (`Foo`) for the same reason.
          */
+        // A2 explicit-intent predicate: single-word command form anchored at
+        // start (`symbol(s) <name>`), or any lookup marker anywhere. `where`
+        // intentionally NOT a marker — English question phrasings without a
+        // lookup verb route no-match (documented over-clarify → no-match).
+        private fun hasSymbolLookupIntent(text: String): Boolean =
+            SYMBOL_COMMAND_FORM.containsMatchIn(text) || SYMBOL_LOOKUP_MARKER.containsMatchIn(text)
+
         private fun hasSymbolQuery(text: String): Boolean =
             extractSymbolQuery(text).any { it.isLetterOrDigit() }
 
@@ -612,13 +705,23 @@ class FastRouter(
          * `別找` stays mis-routed to clarification — accepted as the safe tail
          * (never executes).
          */
+        // [isNegated] 同命三個文本（raw / NFKCremoved / NFKCspaced）；A1 保守否定閘。
+        // 兩表互補（COMPLEMENTARY），不得刪除單顆粒集或四個通用禁止詞：[NEGATION_MARKERS]
+        // 收單一顆粒集（不 沒 没 別 别 勿 莫 嫑 否 無 无 免）＋英文 \b 集；[NEGATION_HINTS]
+        // 收多動詞複合否定與通用禁止詞，其獨有載荷 = {取消,停止,禁止,算了}（中文複合詞與英文集
+        // 實為 MARKERS 的子集合/重複，可清理但非必須）。
+        // 兩表皆 OR 同命同文本——任何否定詞/不確定詞存在即澄清，絕不執行（封閉表不
+        // 完整是既定限制，不再宣稱；任一表皆不得以涵蓋另一表為由刪除）。
         private fun isNegated(text: String): Boolean {
             val nfkc = Normalizer.normalize(text, Normalizer.Form.NFKC)
             val removed = nfkc.replace(NEGATION_REMOVED, "")
             val spaced = nfkc.replace(NEGATION_SPACED, " ").trim()
             return containsAny(text, NEGATION_HINTS) ||
+                containsAny(text, NEGATION_MARKERS) ||
                 containsAny(removed, NEGATION_HINTS) ||
-                containsAny(spaced, NEGATION_HINTS)
+                containsAny(removed, NEGATION_MARKERS) ||
+                containsAny(spaced, NEGATION_HINTS) ||
+                containsAny(spaced, NEGATION_MARKERS)
         }
 
         private fun hasExplicitAlarmTime(text: String): Boolean =

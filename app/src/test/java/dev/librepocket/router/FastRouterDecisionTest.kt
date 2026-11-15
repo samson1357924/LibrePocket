@@ -206,19 +206,22 @@ class FastRouterDecisionTest {
         }
     }
 
-    @Test fun negationDoesNotMisFireOnPartialMatch() {
-        // 「特別」含「別」但非否定：不得誤判為澄清，仍走接線門 USER_DISABLED。
+    @Test fun specialZheIsOverClarifiedByNegationGate() {
+        // A1 之後（any-presence 閘）：「特別」含「別」⇒ 轉澄清，不再走接線門。
+        // 過度澄清為 fail-safe 方向（與「特別找」殘餘同類），取代舊的
+        // 「裸 別 不誤判」精度——封閉動詞表不完整，不猜。
         val d = decide("特別想聽音樂，播放周杰倫的歌")
         assertEquals(RouteKind.DENIED, d.route)
-        assertEquals(DenyReason.USER_DISABLED, d.reasonCode)
+        assertEquals(DenyReason.NEED_CLARIFICATION, d.reasonCode)
         assertTrue(d.fallbackMessage!!.contains("music.control"))
     }
 
-    @Test fun negationDoesNotMisFireOnSimplifiedPartialMatch() {
-        // 簡體「别人」含「别」但非否定：不得誤判為澄清，仍走接線門 USER_DISABLED。
+    @Test fun bieRenIsOverClarifiedByNegationGate() {
+        // A1 之後（any-presence 閘）：簡體「别人」含「别」⇒ 轉澄清；
+        // 與「特別」同類已知過度澄清（安全方向），不另設例外。
         val d = decide("别人想聽音樂，播放周杰倫的歌")
         assertEquals(RouteKind.DENIED, d.route)
-        assertEquals(DenyReason.USER_DISABLED, d.reasonCode)
+        assertEquals(DenyReason.NEED_CLARIFICATION, d.reasonCode)
         assertTrue(d.fallbackMessage!!.contains("music.control"))
     }
 

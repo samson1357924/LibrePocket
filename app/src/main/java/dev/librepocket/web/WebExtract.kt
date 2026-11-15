@@ -1891,14 +1891,13 @@ private object HtmlExtract {
      * 否則續掃。無匹配時再掃 `<time datetime>` 候選同法解析。
      *
      * 未閉合候選 tag 之處理（stop vs skip，依候選型別區分）——
-     * meta／time：候選**作廢**，自候選之後（`candidateIdx + 1`）續掃；
-     * 不中止整趟解析（其後理論上無引號感知 `>` 可用，至多耗盡全文）。
+     * meta／time：候選**作廢並中止本趟掃描**（前向證明：findTagEnd==-1
+     * 代表此候選之後已無任何 `>`（引號感知），之後不可能出現可閉合的
+     * meta／time 候選 → 兩迴圈一律 break，整趟 O(n)）；
      * script／style（見 [stripScriptAndStyle]）：自開始標籤剝至輸入結尾。
      *
-     * 對抗性 `<meta a` 鏈（無 `>`）：首個候選作廢（-1）後續掃，之後每個
-     * 候選同法被作廢；每個未閉合候選各觸發一次 O(n) 的 findTagEnd 掃描，
-     * 最壞 O(n²)（常數由輸入上限與 512-codeunit deadline 檢查兜底；
-     * findTagEnd 逾時拋 [DeadlineExceededException] → `Failed(TIMEOUT)`，永不部分回傳）。
+     * 對抗性 `<meta a` 鏈（無 `>`）：首個候選作廢（-1）後 break；
+     * metaPublishedLinearFixture 對 44,800 字元 < 10 秒上限穩定通過。
      */
     fun publishedOf(html: String, deadlineNs: Long = Long.MAX_VALUE): String? {
         if (System.nanoTime() >= deadlineNs) throw DeadlineExceededException()
@@ -1913,9 +1912,8 @@ private object HtmlExtract {
             if (p < 0) break
             val tagEnd = findTagEnd(lower, p, deadlineNs)
             if (tagEnd < 0) {
-                // 未閉合 meta tag：候選作廢，自候選之後續掃（不中止整趟解析）。
-                cursor = p + 1
-                continue
+                // 未閉合 meta tag：前向證明此後不存在 `>`，之後所有候選皆不可閉合 → break。
+                break
             }
             val attrs = parseTagAttrs(html.substring(p, tagEnd + 1), deadlineNs)
             val name = attrs.propertyName?.lowercase()
@@ -1931,9 +1929,8 @@ private object HtmlExtract {
             if (p < 0) break
             val tagEnd = findTagEnd(lower, p, deadlineNs)
             if (tagEnd < 0) {
-                // 未閉合 time tag：候選作廢，自候選之後續掃（不中止整趟解析）。
-                cursor = p + 1
-                continue
+                // 未閉合 time tag：前向證明此後不存在 `>`，之後所有候選皆不可閉合 → break。
+                break
             }
             val attrs = parseTagAttrs(html.substring(p, tagEnd + 1), deadlineNs)
             if (!attrs.datetime.isNullOrBlank()) {

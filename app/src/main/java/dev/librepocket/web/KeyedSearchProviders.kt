@@ -84,8 +84,10 @@ private fun primitiveOf(obj: JsonObject, vararg keys: String): String? {
 
 /**
  * http(s) URL 白名單檢查：scheme 限 http/https（大小寫不拘）、host 非空白、無 userinfo
- * （拒絕 `https://user:pass@evil.example/`）；否則回傳 null。
+ * （拒絕 `https://user:pass@evil.example/`）、port 僅允許 1–65535（port 0 與 >65535 一律拒絕）；否則回傳 null。
  *
+ * 僅驗證 scheme/host/userinfo/port 範圍；不做 IP 分類——WHATWG 解析器會把全數字 host（如 2130706433）視為 IPv4 整數、IPv6 literal 亦穿過本白名單；
+ * D4 `NetworkPolicy` 必須自行做地址分類（numeric/octal/hex IPv4、IPv4-mapped/compatible IPv6、NAT64 well-known），不得依賴本函數的放行。
  * 未 punycode 化的 Unicode IDN 與含 `_` 的 host 會因 `URI.getHost()==null` 被拒
  * （URI 式白名單為 Phase 1 一併引入——相對 HEAD 為新行為；不改變 D4 之後的 NetworkPolicy 義務）。
  * 本層不 fetch，D4 必須過 NetworkPolicy（http:// 仍放行至 D4 為止）。
@@ -101,6 +103,7 @@ private fun httpUrlOrNull(raw: String): String? {
     val scheme = uri.scheme?.lowercase(Locale.ROOT)
     if (scheme != "http" && scheme != "https") return null
     if (uri.host.isNullOrBlank()) return null
+    if (uri.port != -1 && (uri.port < 1 || uri.port > 65535)) return null
     if (uri.userInfo != null) return null
     return u
 }
@@ -245,7 +248,8 @@ abstract class BaseKeyedSearchProvider(
             return CredentialState.Unavailable
         }
         // 所有權移交呼叫方（呼叫方負責 wipe）；此處不得 wipe trimmed。
-        return CredentialState.Ready(CredentialSnapshot(trimmed, fingerprint))
+        // ownerKeyId 綁定本 provider keyId：供 searchWithSnapshot 防跨 provider 誤送（見該方法 KDoc）。
+        return CredentialState.Ready(CredentialSnapshot(trimmed, fingerprint, keyId))
     }
 
     /**
@@ -284,8 +288,16 @@ abstract class BaseKeyedSearchProvider(
     /**
      * 以 [snapshot] 執行搜尋（**不再讀 vault**；HTTP 使用 snapshot 的 key）。
      * snapshot 由最外層持有者負責 wipe，本層不得清零。
+     *
+     * 跨 provider 防護：snapshot 帶有 `ownerKeyId`（本層 `credentialState()` 建構時綁定本
+     * provider 的 keyId）且與本 provider keyId 不符時，fail-closed 回
+     * `Unavailable(MISSING_KEY)`——零 HTTP、不讀 vault。例：Brave 的 snapshot 被傳給 Tavily
+     * 即於此拒絕（防 D3 接線傳錯 snapshot 造成跨 provider 送 key）。
      */
     final override suspend fun searchWithSnapshot(snapshot: CredentialSnapshot, query: String, count: Int): WebSearchOutcome {
+        if (snapshot.ownerKeyId != null && snapshot.ownerKeyId != keyId) {
+            return WebSearchOutcome.Unavailable(WebUnavailableReason.MISSING_KEY)
+        }
         if (query.isBlank()) return WebSearchOutcome.Unavailable(WebUnavailableReason.EMPTY_QUERY)
         val key = snapshot.keyAsTrimmedString()
         if (key.isEmpty()) return WebSearchOutcome.Unavailable(WebUnavailableReason.MISSING_KEY)
@@ -323,7 +335,11 @@ abstract class BaseKeyedSearchProvider(
 }
 
 /**
- * Brave Search API（GET `{ENDPOINT}?q=...&count=...`；`X-Subscription-Token` 傳 key）。
+ * Brave Search API（GET `{ENDPOINT}?q=...&count=...&text_decorations=false`；`X-Subscription-Token` 傳 key）。
+ *
+ * `q` 上限 600 字元（Brave Web API 契約；query 的前 600 個 UTF-16 code units 於本層靜默截斷，
+ * 超過不打 upstream；截斷不切斷 surrogate pair，與 Firecrawl 500 同一 [takeUtf16Prefix] 規則）。
+ * `text_decorations=false` 關閉 `<strong>` 高亮標記，讓回應 snippet 為模型可直接消費的純文字。
  *
  * 回應 `{"web":{"results":[{title,url,description,page_age}]}}`；缺 url／非 http(s)
  * 條目跳過（沿 D2 SearXNG 姿態）。發布日期欄位為 `page_age`（解析另容忍
@@ -350,7 +366,9 @@ class BraveSearchProvider(
     }
 
     override suspend fun searchWithKey(query: String, count: Int, key: String): WebSearchOutcome {
-        val url = "$ENDPOINT?q=${URLEncoder.encode(query, Charsets.UTF_8)}&count=$count"
+        // Brave Web API 契約：q 前 600 個 UTF-16 code units（超過靜默截斷，見類別 KDoc）；
+        // 截斷不切斷 surrogate pair（與 capResultsForModel 同一 takeUtf16Prefix 規則）。
+        val url = "$ENDPOINT?q=${URLEncoder.encode(query.takeUtf16Prefix(600), Charsets.UTF_8)}&count=$count&text_decorations=false"
         val response = when (
             val fetched = fetchWithTimeout(
                 httpGet,
@@ -659,17 +677,6 @@ class FirecrawlSearchProvider(
         }
         return finishOk(parseFirecrawlData(root, count), count)
     }
-
-    internal fun parseFirecrawlDataForTest(body: String): List<WebSearchResult>? {
-        val root = try {
-            json.parseToJsonElement(body) as? JsonObject ?: return null
-        } catch (e: CancellationException) {
-            throw e
-        } catch (_: Exception) {
-            return null
-        }
-        return parseFirecrawlData(root)
-    }
 }
 
 internal fun parseFirecrawlData(root: JsonObject, limitHint: Int = 16): List<WebSearchResult>? {
@@ -703,6 +710,7 @@ internal fun parseFirecrawlData(root: JsonObject, limitHint: Int = 16): List<Web
  *（cache＋single-flight 在 Service 層）；排序僅為 registry 順序，
  * 實際路由優先序由 [WebSearchSelector]／D3 adapter 決定。
  * 本函數不做任何 key 讀寫、不打網路；D3 UI wiring 落地前無 production 呼叫點。
+ * 回傳型別為 List<WebSearchProvider> 僅為建構便利；呼叫方 MUST 以 WebSearchService 包裝後再註冊進 WebSearchRegistry／WebSearchDispatch（否則無 cache＋single-flight）。
  */
 fun defaultKeyedProviders(
     vault: KeyVault,

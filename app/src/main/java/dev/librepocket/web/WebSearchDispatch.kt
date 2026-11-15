@@ -23,12 +23,13 @@ package dev.librepocket.web
  * [runLocal] 收到 `(provider, query, count)`，query／count 由本層原樣下傳，
  * 無隱藏 closure 漂移；[runHosted] 不帶參數（hosted 內容由 endpoint 決定）。
  *
- * [hostedMarker] 為真正的 enum allowlist：僅含六個已知狀態字，其他字串
+ * [hostedMarker] 為 allowlist（Set<String>，非 enum class）：僅含六個已知狀態字，其他字串
  * 直接拋 [IllegalArgumentException]，異常原樣向上傳播給呼叫方
  * （D3 必須自行捕捉／處理；本層不捕捉）。
  *
  * Throw 契約：本層不捕捉異常（runner 的 [kotlinx.coroutines.CancellationException]
  * 原樣透傳；provider 的值契約由 [WebSearchService] 中央保證）。
+ * `isReady` 拋出的例外原樣傳播（fail-loud）；這與 D3 `WebSearchAdapter.safeReady` 將例外吞為 false（靜默跳過候選）刻意不同——routing 層 fail-loud 是本層契約，兩者不得互相複製貼上。
  * D3 UI wiring 留待：本檔不註冊 ToolDef、不翻 `executionReady`。
  */
 sealed interface WebDispatchOutcome {
@@ -46,7 +47,7 @@ sealed interface WebDispatchOutcome {
 
 object WebSearchDispatch {
     /**
-     * ENUM allowlist for hosted 轉錄狀態字：僅六個已知狀態字——
+     * allowlist for hosted 轉錄狀態字：僅六個已知狀態字——
      * production 程式碼於別處實際發出的狀態字（`started`／`searching`／`completed`／`update`，
      * 見 `ResponsesProvider.webSearchStateOf` 對廠商事件後綴的收斂），
      * 加上 `failed`／`cancelled`（錯誤路徑）。
@@ -60,7 +61,7 @@ object WebSearchDispatch {
      * `state` 為呼叫方傳入的狀態字（如 `completed`），不攜帶使用者原文。
      *
      * 構造保證：[state] 必須屬於 [HOSTED_STATES]——僅此六個已知狀態字的
-     * ENUM allowlist（`started`／`searching`／`completed`／`update` 為 production
+     * 字串 allowlist（`started`／`searching`／`completed`／`update` 為 production
      * 程式碼於別處實際發出的狀態字，加上 `failed`／`cancelled` 供錯誤路徑）；
      * 任何其他字串（例如 server 送來的 garbage）皆拋 [IllegalArgumentException]——
      * 異常原樣傳播給呼叫方（D3 須自行捕捉／處理，本層不捕捉）。
@@ -68,7 +69,7 @@ object WebSearchDispatch {
      *
      * 注意 `ServerToolTranscript.webSearchMarker` 本身不做驗證——web 側刻意更嚴格；
      * 兩者的 mirror 一致性由 `hostedMarkerMirrorsServerTools` 測試釘住
-     * （mirror 校驗的狀態字是 enum 的子集）。
+     * （mirror 校驗的狀態字是 allowlist 的子集）。
      */
     fun hostedMarker(state: String): String {
         require(state in HOSTED_STATES) { "hostedMarker state must be one of $HOSTED_STATES" }

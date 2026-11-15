@@ -120,8 +120,9 @@ object ShellExecutables {
         // 該檔與 /usr/bin/coreutils 共用同一 inode —— 115+ applet 共用一個以
         // argv[0] basename 派發的 multicall 分派器。MULTICALL_BINARIES
         //（toybox/toolbox/busybox）為 argv[1] 形，不含此形；插入 applet 反而會讓
-        // [real, "id"] 解析失敗（uutils 會把 "id" 當 username）。applet=null 為必要
-        //（僅文件，不改邏輯）；落在此表內且受 writability 閘保護，不放寬其他約束。
+        // [real, "id"] 解析失敗（uutils 會把 "id" 當 username）。applet=null 為必要；
+        // 本項為新增一個受信任 real-prefix（ubuntu-26.04 uutils multicall dispatcher），
+        // 受 writability 閘保護，非僅文件、非放寬；表內全為系統分區 real 落點，不在表內一律 fail-closed。
         "/usr/lib/cargo/bin/coreutils",
     )
 

@@ -28,10 +28,13 @@ sealed interface CredentialState {
  * 不可變憑證快照：同一份（trim 後）CharArray 既產生 cache 指紋（[fingerprint]）、亦供 HTTP 請求使用，
  * 消除 read#1(指紋)／read#2(key) 之間的憑證漂移。in-memory only；絕不落盤。
  * 指紋 = SHA-256(trim 後 CharArray 經 LE byte-pack)，取前 8 bytes 之十六進位（16 hex chars）。key material 不進指紋、不印出。
+ * [ownerKeyId] 記錄產生本 snapshot 的 keyId（keyed provider 建構時綁定）；接收端
+ * MUST 以此核對自身 keyId，防 D3 接線傳錯 snapshot 造成跨 provider 送 key。
  */
 class CredentialSnapshot internal constructor(
     internal val key: CharArray,
     internal val fingerprint: String,
+    internal val ownerKeyId: String? = null,
 ) {
     /** 與原 `search()` 相同的正規化：concat → trim。僅供 provider 內部單次請求使用。 */
     internal fun keyAsTrimmedString(): String = key.concatToString().trim()
@@ -86,8 +89,7 @@ interface WebSearchProvider {
     /**
      * 以 [snapshot] 執行搜尋（不再讀 vault；HTTP 使用 snapshot 的 key）。
      * 巢狀 [WebSearchService]：Service 收到此呼叫時，沿用外層已解析的同一份 snapshot 繼續處理（見 Service KDoc）。
-     * 預設實作 fail-closed（`Unavailable(MISSING_KEY)`）：keyed provider MUST 覆寫本方法
-     * （否則 HTTP 會重讀 vault，重新引入憑證漂移）。keyless provider 不會走到這裡。
+     * 預設實作回 `Unavailable(MISSING_KEY)`、零 HTTP。keyed provider MUST 覆寫，否則功能性靜默失效（非安全漏洞，不影響憑證邊界）；unwired provider 仍 fail-closed。
      * 不得清零傳入的 snapshot（由最外層持有者負責）。
      * 所有權契約（MUST）：持有最外層 search() 呼叫的一方 MUST 以 try/finally 於 finally 內 `wipe()`
      * 傳入的 snapshot，即使本方法拋出；snapshot 為單次使用；被呼叫端不得保留／複製／清零傳入的 snapshot。

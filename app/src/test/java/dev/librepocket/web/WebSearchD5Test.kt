@@ -14,6 +14,8 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
@@ -428,32 +430,28 @@ class WebSearchD5Test {
         assertEquals(WebFailureReason.BAD_RESPONSE, (out as WebSearchOutcome.Failed).reason)
     }
 
-    // ---- Firecrawl parser 級（parseFirecrawlDataForTest internal 測試 hook） ----
+    // ---- Firecrawl parser 級（parseFirecrawlData） ----
 
     @Test fun parseFirecrawlDataFlatV1ReturnsNull() {
-        val p = FirecrawlSearchProvider(FakeVault(), FakePost { _, _ -> ok(body = "{}") })
-        assertNull(p.parseFirecrawlDataForTest("""{"success":true,"data":[{"url":"https://example.com/x"}]}"""))
+        assertNull(parseFirecrawlData(Json { ignoreUnknownKeys = true }.parseToJsonElement("""{"success":true,"data":[{"url":"https://example.com/x"}]}""") as JsonObject))
     }
 
     @Test fun parseFirecrawlDataMissingWebReturnsNull() {
-        val p = FirecrawlSearchProvider(FakeVault(), FakePost { _, _ -> ok(body = "{}") })
-        assertNull(p.parseFirecrawlDataForTest("""{"success":true,"data":{"other":[]}}"""))
+        assertNull(parseFirecrawlData(Json { ignoreUnknownKeys = true }.parseToJsonElement("""{"success":true,"data":{"other":[]}}""") as JsonObject))
     }
 
     @Test fun parseFirecrawlDataDescriptionBeatsMarkdown() {
-        val p = FirecrawlSearchProvider(FakeVault(), FakePost { _, _ -> ok(body = "{}") })
-        val hits = p.parseFirecrawlDataForTest(
+        val hits = parseFirecrawlData(Json { ignoreUnknownKeys = true }.parseToJsonElement(
             """{"success":true,"data":{"web":[{"title":"D","url":"https://example.com/d","description":"desc wins","markdown":"md loses"}]}}""",
-        )
+        ) as JsonObject)
         assertEquals(1, hits!!.size)
         assertEquals("desc wins", hits[0].snippet)
     }
 
     @Test fun parseFirecrawlDataMarkdownBeatsSnippet() {
-        val p = FirecrawlSearchProvider(FakeVault(), FakePost { _, _ -> ok(body = "{}") })
-        val hits = p.parseFirecrawlDataForTest(
+        val hits = parseFirecrawlData(Json { ignoreUnknownKeys = true }.parseToJsonElement(
             """{"success":true,"data":{"web":[{"title":"M","url":"https://example.com/m","markdown":"md wins","snippet":"snippet loses"}]}}""",
-        )
+        ) as JsonObject)
         assertEquals(1, hits!!.size)
         assertEquals("md wins", hits[0].snippet)
     }
@@ -2226,6 +2224,63 @@ class WebSearchD5Test {
         assertTrue("query 必須 URL-encoded（& → %26、空格 → +）", http.lastUrl!!.contains("q=a%26b+c"))
     }
 
+    @Test fun braveQueryIsCappedAt600() = runBlocking {
+        val vault = FakeVault()
+        vault.putKey(BraveSearchProvider.DEFAULT_KEY_ID, "k".toCharArray())
+        val http = FakeGet { ok(body = braveJson) }
+        BraveSearchProvider(vault, http).search("a".repeat(700), 5)
+        // q= 項恰 600 個 a（不含第 601 個）；'a' 為 unreserved，不被 URL-encode。
+        assertTrue(http.lastUrl!!.contains("q=" + "a".repeat(600) + "&"))
+        assertTrue(!http.lastUrl!!.contains("a".repeat(601)))
+        val q = http.lastUrl!!.substringAfter("q=").substringBefore("&")
+        assertEquals(600, java.net.URLDecoder.decode(q, Charsets.UTF_8).length)
+    }
+
+    @Test fun braveRequestDisablesTextDecorations() = runBlocking {
+        val vault = FakeVault()
+        vault.putKey(BraveSearchProvider.DEFAULT_KEY_ID, "k".toCharArray())
+        val http = FakeGet { ok(body = braveJson) }
+        BraveSearchProvider(vault, http).search("kotlin", 5)
+        assertTrue(http.lastUrl!!.contains("text_decorations=false"))
+    }
+
+    @Test fun crossProviderSnapshotIsFailClosed() = runBlocking {
+        val vault = FakeVault()
+        vault.putKey(BraveSearchProvider.DEFAULT_KEY_ID, "k-brave".toCharArray())
+        val braveState = BraveSearchProvider(vault, FakeGet { ok(body = braveJson) }).credentialState()
+        assertTrue(braveState is CredentialState.Ready)
+        val snapshot = (braveState as CredentialState.Ready).snapshot
+        try {
+            val fakePost = FakePost { _, _ -> ok(body = tavilyJson) }
+            // Brave 的 snapshot 傳給 Tavily：ownerKeyId != keyId → fail-closed，零 HTTP。
+            val out = TavilySearchProvider(vault, fakePost).searchWithSnapshot(snapshot, "q", 5)
+            assertTrue(out is WebSearchOutcome.Unavailable)
+            assertEquals(WebUnavailableReason.MISSING_KEY, (out as WebSearchOutcome.Unavailable).reason)
+            assertEquals(0, fakePost.calls.get())
+        } finally {
+            snapshot.wipe()
+        }
+    }
+
+    @Test fun defaultSearchWithSnapshotIsFailClosedUnavailable() = runBlocking {
+        // 僅覆寫 interface 的抽象成員（id／capabilities／probe／search）；searchWithSnapshot 沿用預設實作。
+        val stub = object : WebSearchProvider {
+            override val id: String = "stub"
+            override val capabilities: Set<WebCapability> = emptySet()
+            override suspend fun probe(): WebProbe = WebProbe.Ready
+            override suspend fun search(query: String, count: Int): WebSearchOutcome =
+                WebSearchOutcome.Unavailable(WebUnavailableReason.NO_PROVIDER)
+        }
+        val snapshot = CredentialSnapshot("x".toCharArray(), "deadbeef", "id")
+        try {
+            val out = stub.searchWithSnapshot(snapshot, "q", 5)
+            assertTrue(out is WebSearchOutcome.Unavailable)
+            assertEquals(WebUnavailableReason.MISSING_KEY, (out as WebSearchOutcome.Unavailable).reason)
+        } finally {
+            snapshot.wipe()
+        }
+    }
+
     // ---- count 裁切＋truncated 標記 ----
 
     @Test fun keyedClipsToCountAndMarksTruncated() = runBlocking {
@@ -2336,6 +2391,19 @@ class WebSearchD5Test {
             assertEquals("${p.id} 恰保留 1 筆 valid hit", 1, results.size)
             assertEquals("https://example.com/ok", results[0].url)
         }
+    }
+
+    @Test fun resultUrlWithOutOfRangePortIsSkipped() {
+        val body = """{"web":{"results":[
+              {"title":"p0","url":"https://example.com:0/","description":"port zero rejected"},
+              {"title":"p65536","url":"https://example.com:65536/","description":"port too big"},
+              {"title":"p99999","url":"https://example.com:99999/","description":"port too big"},
+              {"title":"ok","url":"https://example.com:8080/","description":"valid port"}
+        ]}}"""
+        val hits = parseBraveResults(Json { ignoreUnknownKeys = true }, body)
+        assertTrue(hits != null)
+        assertEquals(1, hits!!.size)
+        assertEquals("https://example.com:8080/", hits[0].url)
     }
 
     @Test fun keyedNonStringOrMissingUrlSkipsItem() = runBlocking {

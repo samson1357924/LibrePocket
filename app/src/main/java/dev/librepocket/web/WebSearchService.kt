@@ -132,7 +132,7 @@ class WebSearchService(
      * 所有權不在本函數；絕不 wipe 傳入的 snapshot（由最外層持有者於 `finally` 負責）。
      * 首輪沿用外層 snapshot 即本層的 cache identity 與 HTTP 依據（不重讀 vault）；
      * 唯 follower 重選（inner leader 取消）後，本層退回當前 vault 重解析——已刪除的憑證不會被重送，見 [searchInternal] 與 N1 修復。
-     * 非符合契約之 keyed 子類務必覆寫 searchWithSnapshot（否則 HTTP 會重讀 vault，重新引入憑證漂移）。
+     * 非符合契約之 keyed 子類務必覆寫 searchWithSnapshot（預設實作回 `Unavailable(MISSING_KEY)`、零 HTTP——功能性靜默失效，非安全漏洞）。
      */
     override suspend fun searchWithSnapshot(
         snapshot: CredentialSnapshot,

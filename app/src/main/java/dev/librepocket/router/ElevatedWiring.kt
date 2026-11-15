@@ -61,6 +61,7 @@ import kotlin.coroutines.coroutineContext
  * （github 側 `GrantCheck.Valid／Invalid` 對映，rebase 後以 B1 持久版為準）。
  *
  * Rebase 註記（#166，寫進 PR 描述用）：
+ * TODO(#166): rebase 時依本「Rebase 註記」區塊處置（刪 InMemoryPrivilegeRevokeStore、withdrawScope 注入 ShizukuGrantStore.clear()、持久寫入失敗重試 UI）；翻旗硬門檻待裝置 E2E。
  * - B1 的 `PrivilegeBridgeStore`（DataStore）實現
  *   [dev.librepocket.shell.PrivilegeRevokeStore]（rebase 時加
  *   `: PrivilegeRevokeStore`），並刪除本分支的重複 overload／佔位

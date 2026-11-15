@@ -1311,6 +1311,76 @@ class ElevatedWiringTest {
         assertDeniedZeroSpawn(r, runner, audit)
     }
 
+    /**
+     * userSwitches entries 迭代拋 ClassCastException 的 hostile Map（raw-cast 失敗針）。
+     *
+     * 註：字面非 Map 物件無法經 Kotlin/Java 位元組碼塞入 `Map` 型別欄位——任何進入
+     * Map 型別位置的轉型都會發出 checkcast（已實測：`smuggle<T>` 擦除走私在指派點
+     * 即 CCE）。故以迭代拋 ClassCastException 的 hostile Map 釘住同一失敗出口：
+     * doFreeze 內 `catch (_: Throwable) → null` → fail-closed。
+     */
+    private fun cceThrowingSwitches(): Map<String, Boolean> =
+        object : AbstractMap<String, Boolean>() {
+            override val entries: MutableSet<MutableMap.MutableEntry<String, Boolean>>
+                get() = object : AbstractSet<MutableMap.MutableEntry<String, Boolean>>() {
+                    override val size: Int get() = 1
+                    override fun iterator(): MutableIterator<MutableMap.MutableEntry<String, Boolean>> =
+                        throw ClassCastException("switch entry cast failed")
+                }
+        }
+
+    /** grantedPermissions iterator 拋 ClassCastException 的 hostile Set（raw-cast 失敗針）。 */
+    private fun cceThrowingPermissions(): Set<String> =
+        object : AbstractSet<String>() {
+            override val size: Int get() = 1
+            override fun iterator(): MutableIterator<String> =
+                throw ClassCastException("permission element cast failed")
+        }
+
+    @Test fun cceThrowingUserSwitchesFailClosedZeroSpawn() = runBlocking {
+        // userSwitches 迭代拋 ClassCastException → doFreeze catch(Throwable) → null
+        // → Denied("projection context not freezable")＋DENY、零 spawn。
+        val runner = SpawnCounter()
+        val audit = PrivilegeAuditLog()
+        val ctx = elevatedCtx().copy(userSwitches = cceThrowingSwitches())
+        val w = wiringArgs(runner = runner, audit = audit, ctx = ctx)
+        val r = ElevatedWiring.execute(
+            argv = listOf("id"),
+            reasonCode = "B3-T",
+            confirmed = true,
+            ctxSupplier = w.ctxSupplier,
+            policyStore = w.policyStore,
+            runner = w.r,
+            audit = w.a,
+            grantCheck = w.grantCheck,
+            bridgeGranted = w.bridgeGranted,
+        )
+        assertDeniedZeroSpawn(r, runner, audit)
+        assertTrue("$r", (r as ShellResult.Denied).message.contains("projection context not freezable"))
+    }
+
+    @Test fun cceThrowingGrantedPermissionsFailClosedZeroSpawn() = runBlocking {
+        // grantedPermissions 迭代拋 ClassCastException → doFreeze catch(Throwable) → null
+        // → Denied("projection context not freezable")＋DENY、零 spawn。
+        val runner = SpawnCounter()
+        val audit = PrivilegeAuditLog()
+        val ctx = elevatedCtx().copy(grantedPermissions = cceThrowingPermissions())
+        val w = wiringArgs(runner = runner, audit = audit, ctx = ctx)
+        val r = ElevatedWiring.execute(
+            argv = listOf("id"),
+            reasonCode = "B3-T",
+            confirmed = true,
+            ctxSupplier = w.ctxSupplier,
+            policyStore = w.policyStore,
+            runner = w.r,
+            audit = w.a,
+            grantCheck = w.grantCheck,
+            bridgeGranted = w.bridgeGranted,
+        )
+        assertDeniedZeroSpawn(r, runner, audit)
+        assertTrue("$r", (r as ShellResult.Denied).message.contains("projection context not freezable"))
+    }
+
     @Test fun grantedPermissionsOverLimitDenied() = runBlocking {
         // grantedPermissions 65 筆 > MAX_FROZEN_PERMISSIONS(64) → Denied＋DENY、零 spawn。
         val runner = SpawnCounter()

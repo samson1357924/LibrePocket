@@ -1724,8 +1724,8 @@ class SignerPinRegistryTest(unittest.TestCase):
         path = self._write(
             "pins.json",
             {
-                "foss": {"package": "dev.librepocket.agent", "cert_sha256": "CD34" * 16},
-                "github": {"package": "dev.librepocket.agent", "cert_sha256": "EF56" * 16},
+                "foss": {"package": "dev.librepocket.agent.foss", "cert_sha256": "CD34" * 16},
+                "github": {"package": "dev.librepocket.agent.github", "cert_sha256": "EF56" * 16},
             },
         )
 
@@ -1734,8 +1734,8 @@ class SignerPinRegistryTest(unittest.TestCase):
         self.assertEqual(
             pins,
             {
-                "foss": {"package": "dev.librepocket.agent", "cert_sha256": "cd34" * 16},
-                "github": {"package": "dev.librepocket.agent", "cert_sha256": "ef56" * 16},
+                "foss": {"package": "dev.librepocket.agent.foss", "cert_sha256": "cd34" * 16},
+                "github": {"package": "dev.librepocket.agent.github", "cert_sha256": "ef56" * 16},
             },
         )
 
@@ -1744,8 +1744,8 @@ class SignerPinRegistryTest(unittest.TestCase):
             "pins.json",
             {
                 "play": {"package": "dev.librepocket.agent", "cert_sha256": "ab12" * 16},
-                "foss": {"package": "dev.librepocket.agent", "cert_sha256": "cd34" * 16},
-                "github": {"package": "dev.librepocket.agent", "cert_sha256": "ef56" * 16},
+                "foss": {"package": "dev.librepocket.agent.foss", "cert_sha256": "cd34" * 16},
+                "github": {"package": "dev.librepocket.agent.github", "cert_sha256": "ef56" * 16},
             },
         )
 

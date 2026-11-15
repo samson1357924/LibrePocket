@@ -28,11 +28,18 @@ import kotlin.coroutines.coroutineContext
  * Pure logic, no Android dependencies. This layer decides NOTHING about
  * intent: [FastRouter] owns routing (FAST vs DENIED + clarification), and
  * this dispatcher only executes a FAST decision when every gate below holds.
- * Anything else is [FastDispatchOutcome.Skipped] with zero executor effects
- * (pinned by `FastDispatchTest`, including the clarification path which
- * must never execute even when an executor IS registered for that tool).
+ * Anything else is [FastDispatchOutcome.Skipped]. A skip with
+ * [FastDispatchOutcome.Skipped.attempted] == false means genuinely zero
+ * executor effects (all resolving happened before `executor.execute(...)`
+ * was entered); a skip with `attempted` == true means the executor was
+ * entered and may have effects (e.g. the backend was called) — pinned by
+ * `FastDispatchTest`, including the clarification path which must never
+ * execute even when an executor IS registered for that tool.
  *
- * Dispatch gates, in order (all fail-closed, zero execution on trip):
+ * Dispatch gates, in order (fail-closed; gates 1–6 and gate 7's non-positive
+ * `timeoutMs` branch trip before any executor entry; the rest — including
+ * gate 7's timeout branch and gates 8–10 — trip at or after it; see
+ * `attempted`):
  * 1. the decision must be FAST with a non-null [ToolCall] (DENIED /
  *    NEED_CLARIFICATION / no-match intents never execute);
  * 2. the tool must resolve via [lookup] — a lookup that throws (non-cancel)
@@ -54,15 +61,19 @@ import kotlin.coroutines.coroutineContext
  *    executor self-descriptions are never trusted);
  * 7. the executor call runs under `tool.annotations.timeoutMs`
  *    (`withTimeout`); a non-positive budget is a fail-closed typed
- *    `TIMEOUT` denial with zero backend invocations, and a `withTimeout`
+ *    `TIMEOUT` denial with zero backend invocations (`attempted=false` —
+ *    executor never entered), and a `withTimeout`
  *    expiry maps to [FastDispatchOutcome.Skipped] with denyCode `TIMEOUT`
- *    — a typed failure, never a propagated cancel;
+ *    — a typed failure, never a propagated cancel (`attempted=true` —
+ *    executor was entered);
  * 8. AFTER the executor returns, its [FastExecResult.toolName] and
  *    [FastExecResult.callId] must equal the call's, else
  *    [FastDispatchOutcome.Skipped] with denyCode `RESULT_IDENTITY_MISMATCH`
- *    — zero propagation: a forged result never rides the outcome;
- * 9. executor denials (typed [FastExecResult.denied]) never reach the
- *    caller as executions: `SCHEMA_INVALID` → [DenyReason.NEED_CLARIFICATION],
+ *    — executor was entered (`attempted=true`); zero propagation: a forged
+ *    result never rides the outcome;
+ * 9. executor denials (typed [FastExecResult.denied]) — executor was
+ *    entered (`attempted=true`) — never reach the caller as executions:
+ *    `SCHEMA_INVALID` → [DenyReason.NEED_CLARIFICATION],
  *    anything else (including `UNAVAILABLE`) → [DenyReason.USER_DISABLED].
  *    The executor's `denyCode` rides through on
  *    [FastDispatchOutcome.Skipped.denyCode] only when it matches the strict
@@ -75,8 +86,9 @@ import kotlin.coroutines.coroutineContext
  * 10. defense in depth on the executed path: a result whose serialized
  *    `resultJson` exceeds [SafeToolSlice.MAX_RESULT_CHARS] never rides the
  *    outcome — [FastDispatchOutcome.Executed] is withheld and the call maps
- *    to [FastDispatchOutcome.Skipped] with denyCode `EXEC_ERROR` (the
- *    built-in executor is already bounded; this is the trust-boundary
+ *    to [FastDispatchOutcome.Skipped] with denyCode `EXEC_ERROR`
+ *    (`attempted=true` — executor was entered;
+ *    the built-in executor is already bounded; this is the trust-boundary
  *    backstop for misbehaving or future executors).
  *
  * Explicitly NOT done here (future production wiring PR, per the capability
@@ -207,19 +219,20 @@ class FastDispatcher(
             // 若呼叫端恰在此刻並發取消，外部取消優先：ensureActive() 重拋
             // CancellationException；否則維持 typed TIMEOUT skip。
             coroutineContext.ensureActive()
-            return FastDispatchOutcome.Skipped(null, fixedFailureMessage(tool.name), denyCode = "TIMEOUT")
+            return FastDispatchOutcome.Skipped(null, fixedFailureMessage(tool.name), denyCode = "TIMEOUT", attempted = true)
         } catch (e: CancellationException) {
             throw e
         } catch (_: Exception) {
             // Fixed receipt: never interpolate executor/backend messages (they
             // may carry paths or secrets, and this string is user-visible).
-            return FastDispatchOutcome.Skipped(null, fixedFailureMessage(tool.name), denyCode = "EXEC_ERROR")
+            // executor 已被進入：attempted=true。
+            return FastDispatchOutcome.Skipped(null, fixedFailureMessage(tool.name), denyCode = "EXEC_ERROR", attempted = true)
         }
         coroutineContext.ensureActive()
         if (result.toolName != call.toolName || result.callId != call.callId) {
             // 零傳播：偽造的 result（錯誤 toolName 或 callId）永遠不放行。
             // 工具名來自 registry 解析結果（tool.name），可安全插值。
-            return FastDispatchOutcome.Skipped(null, fixedFailureMessage(tool.name), denyCode = "RESULT_IDENTITY_MISMATCH")
+            return FastDispatchOutcome.Skipped(null, fixedFailureMessage(tool.name), denyCode = "RESULT_IDENTITY_MISMATCH", attempted = true)
         }
         if (result.denied) {
             // 型別化映射：SCHEMA_INVALID → NEED_CLARIFICATION（補參）；
@@ -232,12 +245,12 @@ class FastDispatcher(
             } else {
                 DenyReason.USER_DISABLED
             }
-            return FastDispatchOutcome.Skipped(reason, fixedFailureMessage(tool.name), denyCode = code)
+            return FastDispatchOutcome.Skipped(reason, fixedFailureMessage(tool.name), denyCode = code, attempted = true)
         }
         if (result.resultJson.length > SafeToolSlice.MAX_RESULT_CHARS) {
             // 縱深防禦：misbehaving／未來 executor 不得騎超預算輸出（內建 executor
             // 已自限；此為 trust-boundary backstop）——超預算一律型別化 EXEC_ERROR。
-            return FastDispatchOutcome.Skipped(null, fixedFailureMessage(tool.name), denyCode = "EXEC_ERROR")
+            return FastDispatchOutcome.Skipped(null, fixedFailureMessage(tool.name), denyCode = "EXEC_ERROR", attempted = true)
         }
         return FastDispatchOutcome.Executed(result)
     }
@@ -281,12 +294,25 @@ data class FastExecResult(
     val denyCode: String? = null,
 )
 
-/** Dispatch outcome: executed exactly once, or skipped with zero effects. */
+/**
+ * Dispatch outcome: executed exactly once, or skipped. A skip is NOT
+ * necessarily effect-free — see [FastDispatchOutcome.Skipped.attempted].
+ */
 sealed interface FastDispatchOutcome {
     data class Executed(val result: FastExecResult) : FastDispatchOutcome
 
     /**
-     * Skipped with zero executor effects.
+     * Skipped.
+     *
+     * [attempted] is false ⇔ the dispatcher resolved everything BEFORE
+     * entering `executor.execute(...)` (all gates 1–6, plus the non-positive
+     * timeout budget check) — genuinely zero executor effects.
+     * [attempted] is true ⇔ `executor.execute(...)` was entered (timeout
+     * mid-flight, executor exception, denied result, post-execute identity /
+     * size checks) — every construction site sets it only on a post-entry
+     * path; the flag reflects the executor/backend having been entered and
+     * able to have partially executed (e.g. the backend was called once
+     * before an exception).
      *
      * [denyCode] carries a typed code for audit: either an executor-provided
      * upstream code passed through after the `^[A-Z0-9_]{1,64}$` shape
@@ -300,7 +326,7 @@ sealed interface FastDispatchOutcome {
      * [fallbackMessage] remains a fixed, curated, non-interpolated string —
      * never executor/backend text.
      */
-    data class Skipped(val reasonCode: DenyReason?, val fallbackMessage: String?, val denyCode: String? = null) : FastDispatchOutcome
+    data class Skipped(val reasonCode: DenyReason?, val fallbackMessage: String?, val denyCode: String? = null, val attempted: Boolean = false) : FastDispatchOutcome
 }
 
 /**
@@ -340,8 +366,12 @@ interface FastToolExecutor {
  *   after trimming, no backslash, no NUL, no ISO control chars, no
  *   percent-escapes, no `:`, no FORMAT code points).
  *
- * Output caps (Ok branch): at most [LspTools.MAX_LIMIT] symbols itemized
- * (`outcome.symbols` beyond the cap is reported as `omittedCount`); every
+ * Output caps (Ok branch): at most the requested limit is itemized —
+ * `args.limit` (defaulted to [LspTools.DEFAULT_LIMIT] when absent), a strict
+ * integer clamped into `1..MAX_LIMIT`; [LspTools.MAX_LIMIT] is the absolute
+ * cap — the requested limit is stricter. A backend returning more
+ * symbols than the effective limit violates the backend contract; the
+ * excess is reported as `omittedCount` and flags `truncated`. Every
  * symbol field (`name` / `kind` / `path`) is pre-bounded to
  * [SafeToolSlice.RAW_BACKEND_FIELD_MAX_CHARS] (over-bound values replaced
  * whole by a fixed receipt — a truncated prefix could defeat suffix-anchored
@@ -369,9 +399,11 @@ interface FastToolExecutor {
  * Kept in sync with [SafeToolSlice] by hand (same module, same constants):
  * the copied predicates ([jsonNestingDepth], [containsFormatCodePoint],
  * [isSafeInput], [boundedRawBackendField], [cappedTake], [cappedEcho]), the
- * copied [PAIRING_SUFFIX_CHARS] constant, and the [boundedCallId] port each
- * carry a sync comment and must be edited together with their slice
- * counterparts.
+ * copied [PAIRING_SUFFIX_CHARS] constant, the [boundedCallId] port, and the
+ * [okResult]/[LspSymbolsExecutor.parseArgs] pair (this file's Ok-receipt
+ * pipeline mirrors the slice's `ok()`/`parseArgs()` item-cap clamp, effective
+ * limit, `omittedCount`/`truncated` computation — edit together with their
+ * slice counterparts).
  */
 class LspSymbolsExecutor(
     private val backend: LspTools.Backend = LspTools.StubBackend,
@@ -434,7 +466,7 @@ class LspSymbolsExecutor(
         }
         return when (outcome) {
             is LspTools.SymbolsOutcome.Ok -> try {
-                okResult(call, args.query, outcome)
+                okResult(call, args.query, outcome, args.limit)
             } catch (e: CancellationException) {
                 throw e
             } catch (_: Exception) {
@@ -452,10 +484,13 @@ class LspSymbolsExecutor(
         call: ToolCall,
         query: String,
         outcome: LspTools.SymbolsOutcome.Ok,
+        requestedLimit: Int,
     ): FastExecResult {
-        // 一次快照：上限擷取 + limitOmitted（後端超給是 contract violation，
-        // 只數一次）。
-        val available = outcome.symbols.take(LspTools.MAX_LIMIT)
+        // 一次快照：以「請求的 limit」（預設 DEFAULT_LIMIT、coerceIn 保險）做上限
+        // 擷取；MAX_LIMIT 是絕對上限，請求上限更嚴格。後端超給屬 backend
+        // contract violation，只數一次 → limitOmitted。
+        val effectiveLimit = requestedLimit.coerceIn(1, LspTools.MAX_LIMIT)
+        val available = outcome.symbols.take(effectiveLimit)
         val limitOmitted = (outcome.symbols.size - available.size).coerceAtLeast(0)
         val redactedQuery = dev.librepocket.redact.Redactor.redact(query).text
         // 截斷判定一律以 POST-redaction 長度為準（redaction 可能膨風）。
@@ -499,7 +534,7 @@ class LspSymbolsExecutor(
             }
         val chosen = ArrayList(symbolJsons)
         // 逐步縮減到總預算：最壞情況為 O(n²) re-serialize，但輸入已被
-        // MAX_LIMIT item cap 與 per-field cap 限界，屬可接受成本。
+        // effective item cap（≤ MAX_LIMIT）與 per-field cap 限界，屬可接受成本。
         while (chosen.size > 1) {
             val omittedCount = limitOmitted + (symbolJsons.size - chosen.size)
             val truncated = anyFieldTruncated || omittedCount > 0

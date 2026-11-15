@@ -793,6 +793,22 @@ class SafeToolSliceTest {
         assertEquals(2, backend.invocations.get())
     }
 
+    @Test fun backendOverDeliveryClampedToRequestedLimit() = runBlocking {
+        val total = 300
+        val all = List(total) { i -> LspTools.Symbol("S$i:example", "function", "s/$i.kt", i) }
+        val over = object : LspTools.Backend {
+            override suspend fun symbols(query: String, pathPrefix: String?, limit: Int): List<LspTools.Symbol> = all
+            override suspend fun diagnostics(path: String): List<LspTools.Diagnostic> = emptyList()
+        }
+        val r = slice(backend = over).execute(listOf(call(args = """{"query":"Foo","limit":1}"""))).single()
+        assertFalse(r.denied)
+        val body = Json.parseToJsonElement(r.resultJson).jsonObject
+        assertEquals("1", body["returnedCount"]!!.jsonPrimitive.content)
+        assertEquals((total - 1).toString(), body["omittedCount"]!!.jsonPrimitive.content)
+        assertEquals("true", body["truncated"]!!.jsonPrimitive.content)
+        assertEquals(1, body["symbols"]!!.jsonArray.size)
+    }
+
     @Test fun limitDefaultsToFiftyWhenOmitted() = runBlocking {
         val backend = CountingBackend()
         val r = slice(backend = backend).execute(listOf(call())).single()

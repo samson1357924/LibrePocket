@@ -908,7 +908,7 @@ class SafeToolSlice(
         coroutineContext.ensureActive()
         return when (outcome) {
             is LspTools.SymbolsOutcome.Ok -> try {
-                ok(call, args.query, outcome)
+                ok(call, args.query, outcome, args.limit)
             } catch (e: CancellationException) {
                 throw e
             } catch (_: Exception) {
@@ -1096,16 +1096,23 @@ class SafeToolSlice(
         if (value.length <= RAW_BACKEND_FIELD_MAX_CHARS) value
         else "[backend field omitted]"
 
+    /**
+     * Mirrored by hand in [FastDispatch] (`okResult` copy) — edit the two
+     * implementations together (item-cap clamp, effective limit, omittedCount /
+     * truncated computation).
+     */
     private fun ok(
         call: ToolCall,
         query: String,
         outcome: LspTools.SymbolsOutcome.Ok,
+        requestedLimit: Int,
     ): ToolResult {
         // Snapshot the bounded projection ONCE inside the typed-error
         // boundary: a backend List with a throwing size/iterator/get is a
         // backend failure (EXEC_ERROR), never an escaped turn crash. Both the
         // redaction pass and the raw-field pass share this snapshot, and a
-        // backend returning more than MAX_LIMIT (contract violation) is not
+        // backend returning more than the REQUESTED limit (contract violation;
+        // the absolute cap is MAX_LIMIT) is not
         // iterated twice.
         val available: List<LspTools.Symbol>
         val limitOmitted: Int
@@ -1113,7 +1120,8 @@ class SafeToolSlice(
         val redactedSymbols: List<Triple<String, String, String>>
         val anyFieldTruncated: Boolean
         try {
-            available = outcome.symbols.take(LspTools.MAX_LIMIT)
+            val effectiveLimit = requestedLimit.coerceIn(1, LspTools.MAX_LIMIT)
+            available = outcome.symbols.take(effectiveLimit)
             limitOmitted = (outcome.symbols.size - available.size).coerceAtLeast(0)
             redactedQuery = dev.librepocket.redact.Redactor.redact(query).text
             // Truncation is decided on the POST-redaction lengths: redaction
@@ -1164,9 +1172,9 @@ class SafeToolSlice(
         val chosen = ArrayList(symbolJsons)
         // Worst case accepted deliberately: the scan-down shrink re-serializes
         // per dropped symbol (O(n²) in symbol count), but the input is
-        // pre-bounded by the LspTools.MAX_LIMIT item cap and the per-field
-        // MAX_STRING_CHARS cap, so the quadratic component is constant-bounded
-        // — perf, not correctness.
+        // pre-bounded by the effective item cap (≤ MAX_LIMIT) and the
+        // per-field MAX_STRING_CHARS cap, so the quadratic component is
+        // constant-bounded — perf, not correctness.
         while (chosen.size > 1) {
             val omittedCount = limitOmitted + (symbolJsons.size - chosen.size)
             val truncated = anyFieldTruncated || omittedCount > 0
@@ -1174,7 +1182,8 @@ class SafeToolSlice(
             if (candidate.length <= MAX_RESULT_CHARS) break
             chosen.removeAt(chosen.lastIndex)
         }
-        // A backend returning more than MAX_LIMIT is over the item cap even
+        // A backend returning more than the effective item cap (min of the
+        // requested limit and MAX_LIMIT) is over-cap even
         // when the serialized result fits: report both cap drops and
         // shrink-loop drops in omittedCount, and mark truncated.
         val omittedCount = limitOmitted + (symbolJsons.size - chosen.size)

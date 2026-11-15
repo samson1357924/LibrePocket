@@ -1483,6 +1483,158 @@ class FastDispatchTest {
         )
     }
 
+    // A3 回歸：okResult 必須以「請求的 limit」截斷（MAX_LIMIT 僅絕對上限）。
+    private class ListBackend(private val count: Int) : LspTools.Backend {
+        val invocations = AtomicInteger(0)
+        var lastLimit: Int = -1
+            private set
+        override suspend fun symbols(query: String, pathPrefix: String?, limit: Int): List<LspTools.Symbol> {
+            invocations.incrementAndGet()
+            lastLimit = limit
+            return (1..count).map { i ->
+                LspTools.Symbol("sym$i", "function", "app/src/main/F$i.kt", i)
+            }
+        }
+        override suspend fun diagnostics(path: String): List<LspTools.Diagnostic> = emptyList()
+    }
+
+    @Test fun requestedLimitIsEnforced() = runBlocking {
+        // 以 Json 解析 receipt 取 counts（與檔案內 Json.parseToJsonElement 風格一致）。
+        fun counts(json: String): Triple<Int, Int, Boolean> {
+            val o = Json.parseToJsonElement(json).jsonObject
+            return Triple(
+                o["returnedCount"]!!.jsonPrimitive.content.toInt(),
+                o["omittedCount"]!!.jsonPrimitive.content.toInt(),
+                o["truncated"]!!.jsonPrimitive.content == "true",
+            )
+        }
+
+        // limit=1、後端回 3 個 → returnedCount=1、omittedCount=2、truncated=true；後端收到 limit==1。
+        val b1 = ListBackend(3)
+        val r1 = LspSymbolsExecutor(b1)
+            .execute(ToolCall(LspTools.SYMBOLS_NAME, """{"query":"Foo","limit":1}""", "c-lim1"), lspOn)
+        assertFalse(r1.denied)
+        assertEquals(Triple(1, 2, true), counts(r1.resultJson))
+        assertEquals(1, b1.lastLimit)
+        assertEquals(1, b1.invocations.get())
+
+        // limit=2、後端回 5 個 → returnedCount=2、omittedCount=3、truncated=true。
+        val b2 = ListBackend(5)
+        val r2 = LspSymbolsExecutor(b2)
+            .execute(ToolCall(LspTools.SYMBOLS_NAME, """{"query":"Foo","limit":2}""", "c-lim2"), lspOn)
+        assertFalse(r2.denied)
+        assertEquals(Triple(2, 3, true), counts(r2.resultJson))
+        assertEquals(2, b2.lastLimit)
+
+        // 無 limit（預設 DEFAULT_LIMIT=50）、後端回 60 個 → returnedCount=50、omittedCount=10、truncated=true。
+        val b3 = ListBackend(60)
+        val r3 = LspSymbolsExecutor(b3)
+            .execute(ToolCall(LspTools.SYMBOLS_NAME, """{"query":"Foo"}""", "c-lim3"), lspOn)
+        assertFalse(r3.denied)
+        assertEquals(Triple(50, 10, true), counts(r3.resultJson))
+        assertEquals(LspTools.DEFAULT_LIMIT, b3.lastLimit)
+
+        // 無 limit、後端回 10 個 → returnedCount=10、omittedCount=0、truncated=false；後端收到 DEFAULT_LIMIT(50)。
+        val b4 = ListBackend(10)
+        val r4 = LspSymbolsExecutor(b4)
+            .execute(ToolCall(LspTools.SYMBOLS_NAME, """{"query":"Foo"}""", "c-lim4"), lspOn)
+        assertFalse(r4.denied)
+        assertEquals(Triple(10, 0, false), counts(r4.resultJson))
+        assertEquals(LspTools.DEFAULT_LIMIT, b4.lastLimit)
+    }
+
+    @Test fun skippedAttemptedReflectsExecutionBoundary() = runBlocking {
+        // A4 回歸：attempted=false ⇔ dispatcher 於進入 executor.execute 前即 fail-closed；
+        // attempted=true ⇔ executor 已被進入（逾時中途／例外／denied／post-execute 檢查）。
+        val d = decide("幫我查 Foo 這個符號")
+        assertEquals(RouteKind.FAST, d.route)
+
+        // (1) blank-query schema-invalid：executor 進入但後端零呼叫 → attempted=true。
+        val schemaBackend = CountingBackend()
+        val schemaDecision = fastDecision(LspTools.SYMBOLS_NAME, """{"query":"   "}""", "call-att-schema")
+        val outSchema = lspDispatcher(schemaBackend).dispatch(schemaDecision, lspOn)
+        val skippedSchema = skippedOf(outSchema, "schema-invalid blank query")
+        assertTrue(skippedSchema.attempted)
+        assertEquals("SCHEMA_INVALID", skippedSchema.denyCode)
+        assertEquals(0, schemaBackend.invocations.get())
+
+        // (2) backend 拋 RuntimeException：executor 進入、backend 一次 → attempted=true、EXEC_ERROR。
+        val boom = object : LspTools.Backend {
+            val invocations = AtomicInteger(0)
+            override suspend fun symbols(query: String, pathPrefix: String?, limit: Int): List<LspTools.Symbol> {
+                invocations.incrementAndGet()
+                throw RuntimeException("boom-secret-marker")
+            }
+            override suspend fun diagnostics(path: String): List<LspTools.Diagnostic> = emptyList()
+        }
+        val outBoom = FastDispatcher(mapOf(LspTools.SYMBOLS_NAME to LspSymbolsExecutor(boom))).dispatch(d, lspOn)
+        val skippedBoom = skippedOf(outBoom, "backend throws")
+        assertTrue(skippedBoom.attempted)
+        assertEquals("EXEC_ERROR", skippedBoom.denyCode)
+        assertEquals(1, boom.invocations.get())
+        assertFalse(skippedBoom.fallbackMessage!!.contains("boom-secret-marker"))
+
+        // (3) fake executor 跑 10s、ready-copy timeoutMs=50 → TIMEOUT、attempted=true。
+        val readyCopy: (String) -> ToolDef? = { name ->
+            ToolRegistry.find(name)?.let {
+                if (name == LspTools.SYMBOLS_NAME) it.copy(annotations = it.annotations.copy(timeoutMs = 50)) else it
+            }
+        }
+        val slow = object : FastToolExecutor {
+            override val toolName: String = LspTools.SYMBOLS_NAME
+            override suspend fun execute(call: ToolCall, ctx: ProjectionContext): FastExecResult {
+                delay(10_000)
+                return FastExecResult(toolName, call.callId, """{"ok":true}""")
+            }
+        }
+        val outSlow = FastDispatcher(mapOf(LspTools.SYMBOLS_NAME to slow), lookup = readyCopy).dispatch(d, lspOn)
+        val skippedSlow = skippedOf(outSlow, "timeout")
+        assertTrue(skippedSlow.attempted)
+        assertEquals("TIMEOUT", skippedSlow.denyCode)
+
+        // (4) executorToolNameMismatch → attempted=false（executor 零呼叫）。
+        val mismatch = CountingFake("phone.dial")
+        val outMismatch = FastDispatcher(mapOf(LspTools.SYMBOLS_NAME to mismatch)).dispatch(d, lspOn)
+        val skippedMismatch = skippedOf(outMismatch, "executor identity mismatch")
+        assertFalse(skippedMismatch.attempted)
+        assertEquals("EXECUTOR_IDENTITY_MISMATCH", skippedMismatch.denyCode)
+        assertEquals(0, mismatch.invocations.get())
+
+        // (5) lookup 拋出 → attempted=false。
+        val outLookup = FastDispatcher(lookup = { throw IllegalStateException("lookup-boom") }).dispatch(d, lspOn)
+        val skippedLookup = skippedOf(outLookup, "lookup throwing")
+        assertFalse(skippedLookup.attempted)
+        assertEquals("LOOKUP_ERROR", skippedLookup.denyCode)
+
+        // (6) decide 後、dispatch 前切換 switch off → attempted=false（executor 從未被觸碰）。
+        val flipBackend = CountingBackend()
+        val dFlip = decide("幫我查 Foo 這個符號")
+        val outFlip = lspDispatcher(flipBackend).dispatch(dFlip, lspOn.copy(userSwitches = mapOf("lsp" to false)))
+        val skippedFlip = skippedOf(outFlip, "switch flipped off")
+        assertFalse(skippedFlip.attempted)
+        assertEquals(0, flipBackend.invocations.get())
+
+        // (7) executor 回 denied → attempted=true。
+        val denied = executorReturning(
+            FastExecResult(LspTools.SYMBOLS_NAME, d.toolCall!!.callId, """{"denied":true}""", denied = true, denyCode = "SCHEMA_INVALID"),
+        )
+        val outDenied = FastDispatcher(mapOf(LspTools.SYMBOLS_NAME to denied)).dispatch(d, lspOn)
+        val skippedDenied = skippedOf(outDenied, "executor denied")
+        assertTrue(skippedDenied.attempted)
+        assertEquals("SCHEMA_INVALID", skippedDenied.denyCode)
+
+        // (8) result toolName mismatch → attempted=true。
+        val wrongTool = object : FastToolExecutor {
+            override val toolName: String = LspTools.SYMBOLS_NAME
+            override suspend fun execute(call: ToolCall, ctx: ProjectionContext): FastExecResult =
+                FastExecResult("other.tool", call.callId, "{}")
+        }
+        val outWrong = FastDispatcher(mapOf(LspTools.SYMBOLS_NAME to wrongTool)).dispatch(d, lspOn)
+        val skippedWrong = skippedOf(outWrong, "result toolName mismatch")
+        assertTrue(skippedWrong.attempted)
+        assertEquals("RESULT_IDENTITY_MISMATCH", skippedWrong.denyCode)
+    }
+
     private fun fastDecision(toolName: String, argumentsJson: String, callId: String): RouteDecision =
         RouteDecision(
             route = RouteKind.FAST,

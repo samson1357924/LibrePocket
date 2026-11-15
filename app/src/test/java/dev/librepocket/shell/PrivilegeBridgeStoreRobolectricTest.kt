@@ -1,6 +1,7 @@
 package dev.librepocket.shell
 
 import android.content.Context
+import android.content.ContextWrapper
 import androidx.datastore.core.DataStore
 import androidx.datastore.preferences.core.PreferenceDataStoreFactory
 import androidx.datastore.preferences.core.Preferences
@@ -62,6 +63,25 @@ class PrivilegeBridgeStoreRobolectricTest {
         val expectedMarkerFile = File(context.noBackupFilesDir, PRIVILEGE_PENDING_REVOKE_FILE_NAME)
         assertEquals(expectedMarkerFile.absolutePath, store.revokeMarker.file?.absolutePath)
         assertFalse(store.revokeMarker.isPending())
+    }
+
+    @Test fun contextConstructorNoBackupFilesDirUnavailable_markerInMemoryOnly() {
+        // direct-boot／儲存不可用情境：noBackupFilesDir 回 null。
+        // marker 不得退回 filesDir（備份域內），須為 in-memory-only（file == null）。
+        val noBackupUnavailable = object : ContextWrapper(context) {
+            override fun getApplicationContext(): Context = this
+            override fun getNoBackupFilesDir(): File? = null
+        }
+        val store = PrivilegeBridgeStore(noBackupUnavailable)
+        assertNull("noBackupFilesDir 不可用時 marker 不得落盤（含 filesDir）", store.revokeMarker.file)
+        // in-memory-only：記憶體旗標 fail-closed 語義不變
+        assertFalse(store.revokeMarker.isPending())
+        assertTrue("in-memory-only markPending 必須回 true（記憶體已置位）", store.revokeMarker.markPending())
+        assertTrue(store.revokeMarker.isPending())
+        store.revokeMarker.clearPending()
+        assertFalse(store.revokeMarker.isPending())
+        assertFalse(File(context.filesDir, PRIVILEGE_PENDING_REVOKE_FILE_NAME).exists())
+        assertFalse(File(context.noBackupFilesDir, PRIVILEGE_PENDING_REVOKE_FILE_NAME).exists())
     }
 
     @Test fun realContextRoundTripAndClear() = runBlocking {

@@ -183,15 +183,23 @@ class ShizukuGrantStore(
     private val ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
     val revokeMarker: PendingRevokeMarker = PendingRevokeMarker(null),
 ) {
+    /**
+     * Context 便利構造子。
+     *
+     * marker 放置：`noBackupFilesDir` 可用時落該目錄（天然不備份）；
+     * 不可用時（direct-boot 未解鎖／儲存不可用等）[PendingRevokeMarker]
+     * 以 `null` 檔案參數構造＝in-memory-only，不落盤——不落備份域，
+     * 跨重啟語義由撤權 journal 承接（見類別 KDoc「已知限制」(ii)）。
+     */
     constructor(context: Context) : this(
         dataStore = (context.applicationContext ?: context).shizukuGrantDataStore,
         ioDispatcher = Dispatchers.IO,
         revokeMarker = PendingRevokeMarker(
-            File(
-                (context.applicationContext ?: context).noBackupFilesDir
-                    ?: (context.applicationContext ?: context).filesDir,
-                SHIZUKU_PENDING_REVOKE_FILE_NAME,
-            ),
+            // noBackupFilesDir 不可用時不得退回 filesDir（備份域內）：
+            // 傳 null 走 in-memory-only 模式，重啟語義由 journal 承接。
+            (context.applicationContext ?: context).noBackupFilesDir?.let { dir ->
+                File(dir, SHIZUKU_PENDING_REVOKE_FILE_NAME)
+            },
         ),
     )
 

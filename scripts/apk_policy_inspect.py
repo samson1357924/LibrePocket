@@ -75,7 +75,12 @@ merged networkSecurityConfig binding + compiled NSC) plus the COMMON flavor
 permission policy below: the Github debug artifact is neither a Play nor a
 Foss package, so the flavor DEX class-table policies do not apply, while the
 same manifest/resource merger paths this scanner exists to police are shared
-by all three flavors. In github mode ``--expect-provider required`` upgrades
+by all three flavors. The github mode DOES parse the root DEX shards with
+the same bounded parser as play/foss (DEX tables are no longer skipped):
+every DEX-evidenced ``ShizukuProvider`` subclass must be declared in the
+merged manifest and carry the full attribute contract, so a renamed
+``Bridge extends ShizukuProvider`` with an arbitrary authority cannot pass as
+invisible. In github mode ``--expect-provider required`` upgrades
 the ShizukuProvider check to a fail-closed existence contract (the merged
 manifest must declare exactly one compliant provider); the default
 ``optional`` only verifies provider attributes when a provider is present.
@@ -256,18 +261,44 @@ class DescriptorBudget:
         self.remaining_bytes -= encoded_bytes
 
 
+# ShizukuProvider DEX detection (github artifact gate): a class DEFINED in a
+# root DEX shard whose superclass descriptor is one of these names - or
+# which descends from one transitively through any number of re-layered
+# superclasses (``Bridge extends Middle extends ShizukuProvider``) - is a
+# ShizukuProvider subclass however it is renamed in the merged manifest.
+# ``Lmoe/shizuku/ShizukuProvider;`` has no official-AAR counterpart and is
+# treated as suspicious like any other renamed subclass.
+_SHIZUKU_PROVIDER_SUPERCLASSES = frozenset(
+    (
+        "Lrikka/shizuku/ShizukuProvider;",
+        "Lmoe/shizuku/ShizukuProvider;",
+    )
+)
+# The single legitimate upstream definition. A DEX-evidenced subclass whose
+# own descriptor is this exact name is not processed (the official class
+# itself; see _check_github_dex_shizuku_providers).
+_OFFICIAL_SHIZUKU_PROVIDER_DESCRIPTOR = "Lrikka/shizuku/ShizukuProvider;"
+
+
 class ParsedDex:
-    __slots__ = ("type_descriptors", "defined_classes", "superclasses")
+    __slots__ = (
+        "type_descriptors",
+        "defined_classes",
+        "superclasses",
+        "class_superclasses",
+    )
 
     def __init__(
         self,
         type_descriptors: tuple[str, ...],
         defined_classes: frozenset[str],
         superclasses: frozenset[str],
+        class_superclasses: frozenset[tuple[str, str]],
     ) -> None:
         self.type_descriptors = type_descriptors
         self.defined_classes = defined_classes
         self.superclasses = superclasses
+        self.class_superclasses = class_superclasses
 
 
 def _u32(data: bytes, offset: int, what: str) -> int:
@@ -560,6 +591,7 @@ def parse_dex_type_tables(data: bytes, *, descriptor_budget: DescriptorBudget | 
 
     defined_classes: set[str] = set()
     superclasses: set[str] = set()
+    class_superclasses: set[tuple[str, str]] = set()
     seen_class_indices: set[int] = set()
     for index in range(class_count):
         cursor = class_offset + 32 * index
@@ -580,8 +612,14 @@ def parse_dex_type_tables(data: bytes, *, descriptor_budget: DescriptorBudget | 
             if not (superclass.startswith("L") and superclass.endswith(";")):
                 raise PolicyError("DEX superclass_idx does not name an object type")
             superclasses.add(superclass)
+            class_superclasses.add((class_descriptor, superclass))
 
-    return ParsedDex(tuple(type_descriptors), frozenset(defined_classes), frozenset(superclasses))
+    return ParsedDex(
+        tuple(type_descriptors),
+        frozenset(defined_classes),
+        frozenset(superclasses),
+        frozenset(class_superclasses),
+    )
 
 
 def _canonical_member_name(name: str) -> str:
@@ -1780,6 +1818,32 @@ def _validate_dexdump(dexdump: str, dex_name: str, dex_bytes: bytes) -> None:
         raise PolicyError(f"native dexdump rejected {dex_name} (exit {return_code})")
 
 
+def _parse_root_dexes(
+    apk: Path, dex_infos: list[zipfile.ZipInfo], dexdump: str
+) -> list[ParsedDex]:
+    """Parse every root DEX shard with the shared bounded parser.
+
+    Shared by the play/foss modes and the github mode: same
+    ``MAX_SINGLE_DEX_BYTES`` read bound, the same ``_validate_dexdump``
+    parseability check, the same cumulative ``DescriptorBudget``. Behavior is
+    identical whichever caller drives it; the flavor class-table policies only
+    run for play/foss, but the github mode now parses the tables too so the
+    ShizukuProvider existence contract can see renamed subclasses.
+    """
+    parsed_dexes: list[ParsedDex] = []
+    descriptor_budget = DescriptorBudget()
+    with zipfile.ZipFile(apk, "r") as archive:
+        for info in dex_infos:
+            with archive.open(info, "r") as member:
+                dex_bytes = member.read(MAX_SINGLE_DEX_BYTES + 1)
+            if len(dex_bytes) != info.file_size or len(dex_bytes) > MAX_SINGLE_DEX_BYTES:
+                raise PolicyError(f"APK DEX expanded size mismatch: {info.filename}")
+            parsed = parse_dex_type_tables(dex_bytes, descriptor_budget=descriptor_budget)
+            _validate_dexdump(dexdump, info.filename, dex_bytes)
+            parsed_dexes.append(parsed)
+    return parsed_dexes
+
+
 def _check_common_permissions(permissions: str, xmltree: str) -> None:
     """Assert the COMMON flavor permission policy on the merged manifest.
 
@@ -1900,6 +1964,10 @@ def _active_xmltree_namespaces(
     return active
 
 
+# #166 blast-radius note (changelog-style): all providers now decode the
+# six Shizuku security attributes in EVERY mode; decode failures fail closed
+# for runs whose providers are unrelated to Shizuku. Real compiled boolean
+# (type 0x12) attribute values are unaffected.
 def _iter_application_providers(
     xmltree: str,
 ) -> list[tuple[dict[str, str], set[str]]]:
@@ -1911,10 +1979,14 @@ def _iter_application_providers(
     ``versionCode=(type 0x10)0x1`` elsewhere). Own attributes sit at exact
     two-space indent past the ``E: provider`` line and precede any child
     element so child attributes (e.g. nested ``<meta-data android:name=...>``)
-    never overwrite them. ``N: <prefix>=<uri>`` namespace declarations are
-    resolved across the xmltree so aliased Android attributes cannot evade
-    inspection, and unexpected prefixes on provider security attributes fail
-    closed instead of being silently dropped.
+    never overwrite them. The six Shizuku-relevant security attributes are
+    decoded for EVERY provider (not only the name/authority-matched ones): a
+    DEX-evidenced renamed ShizukuProvider subclass can declare an arbitrary
+    authority, so the github artifact gate must be able to see its attribute
+    contract without the manifest-side name heuristic. ``N: <prefix>=<uri>``
+    namespace declarations are resolved across the xmltree so aliased Android
+    attributes cannot evade inspection, and unexpected prefixes on provider
+    security attributes fail closed instead of being silently dropped.
 
     Fail-closed precondition: ``xmltree`` must carry a unique top-level
     ``<application>`` element; otherwise ``_locate_application_manifest_span``
@@ -2107,32 +2179,41 @@ def _iter_application_providers(
             else ""
         )
         decoded: dict[str, str] = {"name": name, "authorities": authorities}
-        if _is_shizuku_provider(name, authorities):
-            for attr_name in (
-                "permission",
-                "readPermission",
-                "writePermission",
-                "grantUriPermissions",
-                "exported",
-                "multiprocess",
-            ):
-                if attr_name in raw_attrs:
-                    decoded[attr_name] = _xmltree_attr_value(
-                        raw_attrs[attr_name],
-                        f"merged manifest <provider> android:{attr_name}",
-                    )
+        # Decode the six security attributes for EVERY provider: a renamed
+        # DEX-evidenced ShizukuProvider subclass can carry an arbitrary
+        # authority, so the attribute gate cannot rely on the name/authority
+        # heuristic to decide whose attrs to decode. Same decoding and error
+        # paths for all providers; the output shape only gains keys.
+        for attr_name in (
+            "permission",
+            "readPermission",
+            "writePermission",
+            "grantUriPermissions",
+            "exported",
+            "multiprocess",
+        ):
+            if attr_name in raw_attrs:
+                decoded[attr_name] = _xmltree_attr_value(
+                    raw_attrs[attr_name],
+                    f"merged manifest <provider> android:{attr_name}",
+                )
         providers.append((decoded, child_tags))
         index = end
     return providers
 
 
-def _check_github_shizuku_provider(xmltree: str) -> None:
-    """Enforce ShizukuProvider permission & URI-grant boundaries when present.
+def _check_provider_attrs(
+    decoded: dict[str, str], child_tags: set[str], label: str
+) -> None:
+    """Enforce the ShizukuProvider permission & URI-grant attribute contract.
 
-    In ``--mode github`` the real APK declares ``rikka.shizuku.ShizukuProvider``
-    (compact synthetic unit fixtures may omit ``<provider>`` elements).
-    Whenever a Shizuku provider appears in the merged manifest xmltree, the
-    base ``android:permission`` must resolve to
+    Shared per-provider validator used by both the manifest-detected path
+    (``_check_github_shizuku_provider``) and the DEX-evidenced path
+    (``_check_github_dex_shizuku_providers``). ``label`` names the provider
+    in error messages (``ShizukuProvider`` for the manifest-detected path,
+    ``DEX-evidenced ShizukuProvider subclass <java-name>`` otherwise).
+
+    The base ``android:permission`` must resolve to
     ``android.permission.INTERACT_ACROSS_USERS_FULL`` (the base permission is
     the framework's only gate on ``ContentProvider.call()``; a missing or
     weakened base permission fails closed, even when explicit read/write
@@ -2151,54 +2232,246 @@ def _check_github_shizuku_provider(xmltree: str) -> None:
     unproven ``exported`` fails closed: a merged manifest that cannot prove
     the provider exported is treated as non-compliant.
     """
+    perm = decoded.get("permission")
+    if perm != _SHIZUKU_PROVIDER_PERMISSION:
+        raise PolicyError(
+            f"github APK {label} must declare "
+            f"android:permission={_SHIZUKU_PROVIDER_PERMISSION} "
+            f"(got {perm!r})"
+        )
+    read_perm = decoded["readPermission"] if "readPermission" in decoded else perm
+    write_perm = decoded["writePermission"] if "writePermission" in decoded else perm
+    if (
+        read_perm != _SHIZUKU_PROVIDER_PERMISSION
+        or write_perm != _SHIZUKU_PROVIDER_PERMISSION
+    ):
+        raise PolicyError(
+            f"github APK {label} must enforce "
+            f"{_SHIZUKU_PROVIDER_PERMISSION} for both read and write "
+            f"(got readPermission={read_perm!r}, writePermission={write_perm!r})"
+        )
+    grant_uri = decoded.get("grantUriPermissions")
+    if grant_uri is not None and grant_uri != "false":
+        raise PolicyError(
+            f"github APK {label} must not enable "
+            f"android:grantUriPermissions (got {grant_uri!r})"
+        )
+    exported = decoded.get("exported")
+    if exported != "true":
+        raise PolicyError(
+            f"github APK {label} must declare android:exported "
+            f"as the exact boolean true (Shizuku attachInfo contract; "
+            f"got {exported!r})"
+        )
+    multiprocess = decoded.get("multiprocess")
+    if multiprocess is not None and multiprocess != "false":
+        raise PolicyError(
+            f"github APK {label} must not set android:multiprocess "
+            f"to true (Shizuku attachInfo contract; got {multiprocess!r})"
+        )
+    for forbidden_child in ("path-permission", "grant-uri-permission"):
+        if forbidden_child in child_tags:
+            raise PolicyError(
+                f"github APK {label} must not declare "
+                f"<{forbidden_child}> children"
+            )
+
+
+def _check_github_shizuku_provider(xmltree: str) -> None:
+    """Enforce the manifest-detected ShizukuProvider path.
+
+    In ``--mode github`` the real APK declares ``rikka.shizuku.ShizukuProvider``
+    (compact synthetic unit fixtures may omit ``<provider>`` elements).
+    Whenever a Shizuku provider appears in the merged manifest xmltree (by
+    name/authority heuristic), the full attribute contract enforced by
+    ``_check_provider_attrs`` is pinned on it. DEX-evidenced renamed
+    subclasses are enforced separately by ``_check_github_dex_shizuku_providers``.
+    """
     for attrs, child_tags in _iter_application_providers(xmltree):
         if not _is_shizuku_provider(
             attrs.get("name", ""), attrs.get("authorities", "")
         ):
             continue
-        perm = attrs.get("permission")
-        if perm != _SHIZUKU_PROVIDER_PERMISSION:
+        _check_provider_attrs(attrs, child_tags, "ShizukuProvider")
+
+
+def _shizuku_provider_evidenced_descriptors(parsed_dexes: list[ParsedDex]) -> set[str]:
+    """Descriptors of DEX-defined ShizukuProvider subclasses, any depth.
+
+    A class DEFINED in any root DEX shard whose ancestry bottoms out at
+    ``Lrikka/shizuku/ShizukuProvider;`` or ``Lmoe/shizuku/ShizukuProvider;``
+    is a ShizukuProvider subclass however many re-layered superclasses stand
+    in between (``Bridge extends Middle extends ShizukuProvider``). The
+    parent map is the UNION across parsed shards: a class descriptor that
+    shards disagree about contributes BOTH superclass edges - fail toward
+    more evidence, never less. Bounded by the shard/class-def budgets already
+    enforced at parse time; each class enters the worklist at most once.
+    """
+    children: dict[str, set[str]] = {}
+    for dex in parsed_dexes:
+        for class_descriptor, superclass_descriptor in dex.class_superclasses:
+            children.setdefault(superclass_descriptor, set()).add(class_descriptor)
+    evidenced = set(_SHIZUKU_PROVIDER_SUPERCLASSES)
+    worklist = list(evidenced)
+    while worklist:
+        for child in children.get(worklist.pop(), ()):
+            if child not in evidenced:
+                evidenced.add(child)
+                worklist.append(child)
+    return evidenced - _SHIZUKU_PROVIDER_SUPERCLASSES
+
+
+def _dex_shizuku_provider_java_names(parsed_dexes: list[ParsedDex]) -> set[str]:
+    """Java names of DEX-defined ShizukuProvider subclasses, official class aside.
+
+    Every DEX class whose ancestry bottoms out at
+    ``Lrikka/shizuku/ShizukuProvider;`` or ``Lmoe/shizuku/ShizukuProvider;``
+    (transitively, however many re-layered superclasses stand in between)
+    is a ShizukuProvider subclass however it is renamed in the manifest.
+    The official class itself (``Lrikka/shizuku/ShizukuProvider;``) is
+    excluded: it carries its own pinned contract. The closure never adds it
+    (its ancestry bottoms out at ContentProvider); the explicit exclusion is
+    kept as defense in depth. ``Lmoe/shizuku/ShizukuProvider;`` has no
+    official counterpart and is treated as suspicious like any renamed
+    subclass. Java names drop the leading ``L`` and trailing ``;`` and map
+    ``/`` to ``.``.
+    """
+    names: set[str] = set()
+    for descriptor in _shizuku_provider_evidenced_descriptors(parsed_dexes):
+        if descriptor == _OFFICIAL_SHIZUKU_PROVIDER_DESCRIPTOR:
+            continue
+        if not (descriptor.startswith("L") and descriptor.endswith(";")):
+            continue
+        names.add(descriptor[1:-1].replace("/", "."))
+    return names
+
+
+def _provider_name_matches_dex_class(name: str, java_name: str) -> bool:
+    """Manifest ``android:name`` match against a DEX-evidenced java name.
+
+    Exact fully-qualified match, or the Android component-name relative
+    spellings: ``.Bridge`` (leading dot) resolves inside the package and
+    matches when ``java_name`` ends with ``.Bridge``; a name with no leading
+    dot likewise matches when ``java_name`` ends with ``.`` + name (covers
+    the ``internal.Bridge`` partial spelling). An empty name never matches.
+    """
+    if not name:
+        return False
+    if name == java_name:
+        return True
+    if name.startswith("."):
+        return java_name.endswith("." + name[1:])
+    return java_name.endswith("." + name)
+
+
+def _check_github_dex_shizuku_providers(
+    xmltree: str, parsed_dexes: list[ParsedDex]
+) -> set[str]:
+    """Enforce the attribute contract on DEX-evidenced renamed subclasses.
+
+    Every DEX class extending ``ShizukuProvider`` (transitively, however
+    many re-layered superclasses in between) must be declared in the merged
+    manifest as a ``<provider>``; otherwise PolicyError (a renamed subclass
+    injection ships an unpermissioned Shizuku binder IPC surface).
+    A matched provider must carry the FULL attribute contract of
+    ``_check_provider_attrs`` - the contract is the permission, not the name.
+
+    Returns the java names of the DEX-evidenced subclasses that matched a
+    merged-manifest provider, for the caller's ``--expect-provider
+    required`` accounting. A provider that is both manifest-detected and
+    DEX-evidenced is ONE surface: in the counting redesign only an exact
+    fully-qualified ``android:name`` match against an evidenced java name
+    consumes a detected block (suffix-spelled matches never consume).
+
+    Semantic note (exact): a single compliant provider that happens to be a
+    renamed DEX-evidenced ShizukuProvider subclass is allowed through ONLY if
+    it carries the full attribute contract (INTERACT_ACROSS_USERS_FULL base
+    permission, exported exactly true, multiprocess absent|false, no
+    grantUriPermissions, no <path-permission>/<grant-uri-permission>). The
+    contract is the permission, not the name: the gate proves the surface is
+    permission-gated, NOT where the code came from (provenance is not
+    claimed - a renamed subclass that carries the full contract is
+    indistinguishable, by design, from a compliant official provider).
+    """
+    matched_java_names: set[str] = set()
+    java_names = _dex_shizuku_provider_java_names(parsed_dexes)
+    if not java_names:
+        return matched_java_names
+    providers = _iter_application_providers(xmltree)
+    for java_name in sorted(java_names):
+        matches = [
+            (decoded, child_tags)
+            for decoded, child_tags in providers
+            if _provider_name_matches_dex_class(decoded.get("name", ""), java_name)
+        ]
+        if not matches:
             raise PolicyError(
-                "github APK ShizukuProvider must declare "
-                f"android:permission={_SHIZUKU_PROVIDER_PERMISSION} "
-                f"(got {perm!r})"
+                f"github DEX-evidenced ShizukuProvider subclass {java_name} "
+                "is not declared in the merged manifest"
             )
-        read_perm = attrs["readPermission"] if "readPermission" in attrs else perm
-        write_perm = attrs["writePermission"] if "writePermission" in attrs else perm
-        if (
-            read_perm != _SHIZUKU_PROVIDER_PERMISSION
-            or write_perm != _SHIZUKU_PROVIDER_PERMISSION
-        ):
+        matched_java_names.add(java_name)
+        for decoded, child_tags in matches:
+            _check_provider_attrs(
+                decoded,
+                child_tags,
+                f"DEX-evidenced ShizukuProvider subclass {java_name}",
+            )
+    return matched_java_names
+
+
+def _github_required_provider_total(
+    xmltree: str,
+    dex_java_names: set[str],
+) -> int:
+    """Distinct ShizukuProvider surfaces for ``--expect-provider required``.
+
+    Block-identity (multiset) accounting. ``detected_blocks`` are the
+    manifest ``<provider>`` blocks - identity is the positional index in the
+    parsed provider list - matched by ``_is_shizuku_provider``. The
+    merged-manifest provider identity is expected to be unique: BEFORE
+    counting anything, two detected blocks sharing the same
+    ``android:name`` fail closed as a PolicyError, so merger accidents and
+    name-padding attacks go red instead of silently deduping to one.
+
+    An exact fully-qualified ``android:name`` match against an evidenced
+    java name consumes (one) detected block; a provider that is both
+    manifest-detected and DEX-evidenced is therefore ONE surface. Non-exact
+    (suffix-spelled) matches never consume: a detected block whose name
+    merely suffix-matches an evidenced class still counts (the suffix match
+    is an attribution convenience, not an identity proof).
+
+    ``total = |{detected blocks NOT consumed by an exact evidenced match}|
+    + |evidenced java names|``.
+
+    Semantic note (exact): a single compliant provider that happens to be a
+    renamed DEX-evidenced ShizukuProvider subclass is allowed through ONLY if
+    it carries the full attribute contract (see
+    ``_check_github_dex_shizuku_providers``). The contract is the permission,
+    not the name - provenance is not claimed.
+    """
+    detected_blocks = [
+        (index, attrs.get("name", ""))
+        for index, (attrs, _child_tags) in enumerate(
+            _iter_application_providers(xmltree)
+        )
+        if _is_shizuku_provider(attrs.get("name", ""), attrs.get("authorities", ""))
+    ]
+    counts_by_name: dict[str, int] = {}
+    for _index, name in detected_blocks:
+        counts_by_name[name] = counts_by_name.get(name, 0) + 1
+    for name in sorted(counts_by_name):
+        count = counts_by_name[name]
+        if count > 1:
             raise PolicyError(
-                "github APK ShizukuProvider must enforce "
-                f"{_SHIZUKU_PROVIDER_PERMISSION} for both read and write "
-                f"(got readPermission={read_perm!r}, writePermission={write_perm!r})"
+                f"github merged manifest declares {count} ShizukuProvider "
+                f"blocks with identical android:name: {name}"
             )
-        grant_uri = attrs.get("grantUriPermissions")
-        if grant_uri is not None and grant_uri != "false":
-            raise PolicyError(
-                "github APK ShizukuProvider must not enable "
-                f"android:grantUriPermissions (got {grant_uri!r})"
-            )
-        exported = attrs.get("exported")
-        if exported != "true":
-            raise PolicyError(
-                "github APK ShizukuProvider must declare android:exported "
-                f"as the exact boolean true (Shizuku attachInfo contract; "
-                f"got {exported!r})"
-            )
-        multiprocess = attrs.get("multiprocess")
-        if multiprocess is not None and multiprocess != "false":
-            raise PolicyError(
-                "github APK ShizukuProvider must not set android:multiprocess "
-                f"to true (Shizuku attachInfo contract; got {multiprocess!r})"
-            )
-        for forbidden_child in ("path-permission", "grant-uri-permission"):
-            if forbidden_child in child_tags:
-                raise PolicyError(
-                    "github APK ShizukuProvider must not declare "
-                    f"<{forbidden_child}> children"
-                )
+    consumed: set[int] = set()
+    for java_name in dex_java_names:
+        for index, name in detected_blocks:
+            if name == java_name:
+                consumed.add(index)
+    return (len(detected_blocks) - len(consumed)) + len(dex_java_names)
 
 
 def _check_play(permissions: str, xmltree: str, infos: Iterable[zipfile.ZipInfo], dexes: list[ParsedDex]) -> None:
@@ -2303,46 +2576,38 @@ def inspect_apk(apk: Path, mode: str, aapt: str, dexdump: str, expect_provider: 
         # class-table policy applies. It already proved the mode-independent
         # artifact authorities (merged backup binding + compiled rules bytes
         # + NSC binding compiled check) plus the COMMON flavor permission
-        # policy above - and when ShizukuProvider is present in the merged
-        # manifest, verifies its INTERACT_ACROSS_USERS_FULL & URI-grant bounds.
-        # The aapt/dexdump tool contract is still enforced above, so a wrong
-        # tool invocation cannot silently degrade the mode.
+        # policy above - and it parses the root DEX shards with the same
+        # bounded parser as play/foss so a renamed ShizukuProvider subclass
+        # (an arbitrary manifest authority) cannot pass as invisible: every
+        # DEX-evidenced subclass must be declared in the merged manifest AND
+        # carry the full attribute contract. The aapt/dexdump tool contract
+        # is still enforced above, so a wrong tool invocation cannot silently
+        # degrade the mode.
+        parsed_dexes = _parse_root_dexes(apk, dex_infos, dexdump)
+        dex_java_names = _check_github_dex_shizuku_providers(
+            xmltree, parsed_dexes
+        )
         if expect_provider == "required":
-            providers = [
-                provider
-                for provider in _iter_application_providers(xmltree)
-                if _is_shizuku_provider(
-                    provider[0].get("name", ""), provider[0].get("authorities", "")
-                )
-            ]
-            if len(providers) != 1:
+            total = _github_required_provider_total(xmltree, dex_java_names)
+            if total != 1:
                 raise PolicyError(
                     "github APK must declare exactly one ShizukuProvider "
-                    f"(found {len(providers)})"
+                    f"(found {total})"
                 )
         _check_github_shizuku_provider(xmltree)
         print(
             f"  structure: APK ZIP/manifest OK ({len(dex_infos)} root DEX "
-            "shard(s), DEX tables not parsed)"
+            f"shard(s), DEX tables parsed: {len(parsed_dexes)} shard(s))"
         )
         print(
             "  policy: github OK (mode-independent artifact authorities "
-            "only: merged-manifest backup/NSC bindings + compiled backup "
-            "rules bytes + compiled NSC)"
+            "+ DEX ShizukuProvider subclass tables: merged-manifest "
+            "backup/NSC bindings + compiled backup rules bytes + compiled "
+            "NSC)"
         )
         return
 
-    parsed_dexes: list[ParsedDex] = []
-    descriptor_budget = DescriptorBudget()
-    with zipfile.ZipFile(apk, "r") as archive:
-        for info in dex_infos:
-            with archive.open(info, "r") as member:
-                dex_bytes = member.read(MAX_SINGLE_DEX_BYTES + 1)
-            if len(dex_bytes) != info.file_size or len(dex_bytes) > MAX_SINGLE_DEX_BYTES:
-                raise PolicyError(f"APK DEX expanded size mismatch: {info.filename}")
-            parsed = parse_dex_type_tables(dex_bytes, descriptor_budget=descriptor_budget)
-            _validate_dexdump(dexdump, info.filename, dex_bytes)
-            parsed_dexes.append(parsed)
+    parsed_dexes = _parse_root_dexes(apk, dex_infos, dexdump)
 
     if mode == "play":
         _check_play(permissions, xmltree, infos, parsed_dexes)
@@ -2365,10 +2630,11 @@ def main(argv: list[str] | None = None) -> int:
         choices=("required", "optional"),
         default="optional",
         help=(
-            "github mode: 'required' demands the merged manifest declare "
-            "exactly one ShizukuProvider (release/debug gate fail-closed); "
-            "'optional' (default) checks provider attributes only when a "
-            "ShizukuProvider is present"
+            "github mode: 'required' demands exactly one ShizukuProvider "
+            "surface (manifest-detected or DEX-evidenced, deduplicated by "
+            "name; release/debug gate fail-closed); 'optional' (default) "
+            "checks provider attributes only when a ShizukuProvider is "
+            "present (including DEX-evidenced renamed subclasses)"
         ),
     )
     args = parser.parse_args(argv)

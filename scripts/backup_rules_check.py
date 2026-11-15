@@ -279,6 +279,49 @@ def _missing_exclude_errors(
     ]
 
 
+def _unexpected_include_errors(
+    path: str,
+    branch_label: str,
+    node: ET.Element,
+    depth: int = 0,
+    skip_tags: frozenset[str] = frozenset(),
+) -> list[str]:
+    """Report any ``<include>`` element at any depth (exact-set mode only).
+
+    The compiled backup rules must be include-free: an ``<include>`` in the
+    compiled artifact re-adds paths the exact-set contract exists to keep
+    out (the compiled bytes must be exactly ``REQUIRED_EXCLUDES`` +
+    ``REQUIRED_DEVICE_BOUND_EXCLUDES`` and nothing else), so any appearance
+    fails as the set violation it is, naming the branch and the offending
+    ``domain``/``path``. The walk recurses into include/exclude sub-trees
+    too, bounded by ``_MAX_RULE_NEST_DEPTH`` (deeper shapes surface as a
+    clean depth FAIL, not a RecursionError).
+    """
+    errors: list[str] = []
+    for child in node:
+        if child.tag in skip_tags:
+            # 該子樹由呼叫端以 per-section 走訪各自回報（避免雙重計數）。
+            continue
+        if child.tag == "include":
+            domain = child.get("domain")
+            rule_path = child.get("path")
+            errors.append(
+                f"{path}: {_where(branch_label)}unexpected <include> "
+                f"domain={domain!r} path={rule_path!r} - the compiled "
+                "backup rules must be include-free (exact-set contract)"
+            )
+        if depth >= _MAX_RULE_NEST_DEPTH:
+            errors.append(
+                f"{path}: {_where(branch_label)}<include>-scan exceeds the "
+                f"maximum rule nesting depth {_MAX_RULE_NEST_DEPTH}"
+            )
+            continue
+        errors.extend(
+            _unexpected_include_errors(path, branch_label, child, depth + 1, skip_tags)
+        )
+    return errors
+
+
 def _unexpected_exclude_errors(
     path: str, branch_label: str, present: set[tuple[str, str]]
 ) -> list[str]:
@@ -364,7 +407,12 @@ def validate_tree(
     excludes beyond ``REQUIRED_EXCLUDES`` + ``REQUIRED_DEVICE_BOUND_EXCLUDES``
     (single-sourced as ``ALLOWED_EXTRA_EXCLUDES``)
     - see ``_unexpected_exclude_errors`` - while a missing entry from EITHER
-    set still fails via ``_missing_exclude_errors``.
+    set still fails via ``_missing_exclude_errors``; and additionally refuses
+    ANY ``<include>`` element at any depth - including one sitting directly
+    under the ``<data-extraction-rules>`` root, outside both gated sections;
+    see ``_unexpected_include_errors``: the compiled backup rules must be
+    include-free. Source-level semantics
+    (``exact_excludes=False``) are unchanged.
     """
     if root.tag != expected_root:
         return [f"{path}: expected root <{expected_root}>, found <{root.tag}>"]
@@ -378,6 +426,7 @@ def validate_tree(
         errors.extend(_missing_exclude_errors(path, "", present))
         if exact_excludes:
             errors.extend(_unexpected_exclude_errors(path, "", present))
+            errors.extend(_unexpected_include_errors(path, "", root))
     elif root.tag == "data-extraction-rules":
         # Android's runtime parser visits EVERY matching section occurrence
         # (duplicates included), so the gate validates all of them too;
@@ -390,6 +439,14 @@ def validate_tree(
         # in _UNDECIDED_SECTIONS); hardcoding the walk against
         # supported names keeps a future platform section from sneaking past
         # as a "skip".
+        if exact_excludes:
+            # A root-level <include> sits OUTSIDE both gated sections, so the
+            # per-section walk below would never see it - mirror the
+            # full-backup-content branch and refuse it at the root. Gated
+            # sections are skipped here; the per-section walk reports them.
+            errors.extend(
+                _unexpected_include_errors(path, "", root, skip_tags=_GATE_SECTIONS)
+            )
         seen: set[str] = set()
         for child in root:
             if child.tag in _UNDECIDED_SECTIONS:
@@ -414,6 +471,7 @@ def validate_tree(
                 errors.extend(
                     _unexpected_exclude_errors(path, f"<{child.tag}>", present)
                 )
+                errors.extend(_unexpected_include_errors(path, f"<{child.tag}>", child))
         for branch in _GATE_SECTIONS:
             if branch not in seen:
                 errors.append(f"{path}: missing <{branch}>")

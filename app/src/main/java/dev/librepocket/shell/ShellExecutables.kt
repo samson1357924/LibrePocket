@@ -119,6 +119,12 @@ object ShellExecutables {
         // coreutils 改為 symlink 至此 real 落點（如 /usr/bin/id ->
         // ../lib/cargo/bin/coreutils/id）；root-owned 755，落在此表內且
         // 受 writability 閘保護，不放寬其他約束。
+        // ubuntu-26.04：GNU→rust coreutils（uutils）。/usr/bin/id 為 symlink →
+        // ../lib/cargo/bin/coreutils/id，而該檔與 /usr/bin/coreutils 共用同一
+        // inode —— 115+ applet 共用一個以 argv[0] basename 派發的 multicall
+        // 分派器；MULTICALL_BINARIES（toybox/toolbox/busybox）為 argv[1] 形，
+        // 不含此形，插入 applet 反而會讓 [real, "id"] 解析失敗
+        // （uutils 會把 "id" 當 username）。applet=null 為必要，僅文件不改邏輯。
         "/usr/lib/cargo/bin/coreutils",
     )
 

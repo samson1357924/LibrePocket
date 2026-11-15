@@ -25,6 +25,7 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.withTimeoutOrNull
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 
 /**
@@ -135,8 +136,10 @@ internal class DeadlineExceededException : RuntimeException()
  *    或記錄 accept。
  * 4. envelope 僅為標記籬笆，**非授權**；D3 須另行接 `#165` consent/授權
  *    流程，envelope 不擔任 authorization 角色。
- * 5. Follower `await()` 未獨立掛 per-follower deadline（由 leader 預算＋cap-bounded
- *    parse 間接有界）；D3 wiring 時可另加 `withTimeoutOrNull`。
+ * 5. Follower `await()` 以共享整體預算為界
+ *    （`withTimeoutOrNull(deadlineNs - now)`），逾時映射 `Failed(TIMEOUT)`；
+ *    follower 不再於 leader 卡於 parse／gunzip 時無界等待（與取消語義區分：
+ *    leader 取消仍映射 `Unavailable(CANCELLED)`）。
  * 6. `timeoutMs <= 0` 會被 `coerceAtLeast(1)` 收斂為 1ms 預算 — 幾乎立即
  *    fail-closed `TIMEOUT`；屬保守方向，安全可接受。
  *
@@ -176,9 +179,11 @@ object WebExtract {
      *
      * `extract()` 於入口即以單調時鐘（`System.nanoTime()`）計算全程 deadline：
      * per-call 政策重驗（含 DNS preflight）＋`extractUncached`（DNS preflight＋
-     * 各 hop 之 HTTP 請求＋解壓）共用此單一單調預算；
-     * parse／清理迴圈受該 deadline 約束（逾時拋 [DeadlineExceededException]，
-     * 映射 `Failed(TIMEOUT)`）；decode 不計入 deadline，但受位元組／字元上限
+     * 各 hop 之 HTTP 請求＋解壓＋parse／cleanup）共用此單一單調預算；
+     * `extractUncached` 於解析／解壓各迴圈內、以及返回 `Ok` 前檢查該 deadline
+     *（逾時拋 [DeadlineExceededException]，映射 `Failed(TIMEOUT)`）；
+     * follower `await()` 亦以同一預算為界（`withTimeoutOrNull`，逾時映射
+     * `Failed(TIMEOUT)`）；decode 不計入 deadline，但受位元組／字元上限
      * 約束（cap-bounded）；逐跳以剩餘預算執行（見 `extractUncached`）。
      */
     const val TIMEOUT_MS = 15_000L
@@ -596,7 +601,12 @@ class WebExtractService(
             val m = mine ?: continue
             if (!leader) {
                 try {
-                    return m.await()
+                    // per-follower deadline：以整體預算為界包住 await；
+                    // 逾時映射 Failed(TIMEOUT)（與 CANCELLED 的 audit 語義區分）；
+                    // follower 不得在 leader 卡於 parse／gunzip 時無界等待。
+                    val waitMs = ((deadlineNs - System.nanoTime()) / 1_000_000).coerceAtLeast(1)
+                    return withTimeoutOrNull(waitMs) { m.await() }
+                        ?: WebExtractOutcome.Failed(WebExtract.DETAIL_TIMEOUT)
                 } catch (e: CancellationException) {
                     currentCoroutineContext().ensureActive()
                     // 自身被取消：ensureActive 拋出（self-cancellation）。
@@ -627,7 +637,11 @@ class WebExtractService(
                     // epoch guard：extract() 入口後發生過 invalidate()/clear()，
                     // 陳舊結果不得寫回快取（m.isCompleted 情形亦由本檢查涵蓋——
                     // drain 會 bump generation；leader 仍正常返回 outcome 予其 caller）。
-                    cache.putByKey(k, outcome, epochAtEntry)
+                    // pre-cache-write gate：預算已耗盡則跳過寫入
+                    //（caller 仍正常拿到 outcome；僅 cache 寫入被抑制）。
+                    if (System.nanoTime() < deadlineNs) {
+                        cache.putByKey(k, outcome, epochAtEntry)
+                    }
                 }
                 m.complete(outcome)
                 return outcome
@@ -639,11 +653,17 @@ class WebExtractService(
                     m.completeExceptionally(e)
                 }
                 throw e
+            } catch (e: DeadlineExceededException) {
+                // parse／gunzip 內部 deadline 耗盡逸出（本 commit 起由
+                // extractUncached 的 wrapper 先接為 Failed(TIMEOUT)，此 arm 為
+                // extract() 側 backstop）：m 必須 settle 為 Failed(TIMEOUT)，
+                // follower 映射同 detail；never Ok、never cached。
+                val failed = WebExtractOutcome.Failed(WebExtract.DETAIL_TIMEOUT)
+                m.complete(failed)
+                return failed
             } catch (_: Exception) {
-                // parse 階段的 DeadlineExceededException 會流入此處：
-                // 先以 fail-closed TRANSPORT 收場（m 必須 settle；follower 不得 hang）。
-                // 下一 commit 以獨立 arm 映射為 Failed(TIMEOUT)（audit 語義區分）。
-                // 不得在此直接 rethrow——會讓 m 懸空、follower 永久等待。
+                // 剩餘例外（非 DeadlineExceededException）一律 fail-closed
+                // TRANSPORT（m 必須 settle；follower 不得 hang）。
                 try {
                     currentCoroutineContext().ensureActive()
                 } catch (ce: CancellationException) {
@@ -654,8 +674,8 @@ class WebExtractService(
                 m.complete(failed)
                 return failed
             } catch (e: Throwable) {
-                // DeadlineExceededException 屬 Exception，不會到達此 arm
-                //（c4 之 DeadlineExceededException arm 亦位於 Exception arm 之前）。
+                // DeadlineExceededException 屬 Exception，已於上方 arm 攔截
+                //（不會到達此 arm）。
                 m.completeExceptionally(e)
                 throw e
             } finally {
@@ -669,6 +689,22 @@ class WebExtractService(
     }
 
     private suspend fun extractUncached(
+        rawUrl: String,
+        optIn: EndpointNetworkOptIn,
+        resolver: HostResolver,
+        effBytes: Int,
+        effModel: Int,
+        deadlineNs: Long,
+    ): WebExtractOutcome =
+        // 任何 DeadlineExceededException（gunzip／parse／cleanup 之 deadline 耗盡）
+        // → 與預算耗盡同 detail：Failed(TIMEOUT)；never Ok、never cached。
+        try {
+            extractUncachedInner(rawUrl, optIn, resolver, effBytes, effModel, deadlineNs)
+        } catch (e: DeadlineExceededException) {
+            WebExtractOutcome.Failed(WebExtract.DETAIL_TIMEOUT)
+        }
+
+    private suspend fun extractUncachedInner(
         rawUrl: String,
         optIn: EndpointNetworkOptIn,
         resolver: HostResolver,
@@ -826,7 +862,7 @@ class WebExtractService(
                 return WebExtractOutcome.Failed(WebExtract.DETAIL_TOO_LARGE)
             }
             val bytes: ByteArray = if (encoding == "gzip" || encoding == "x-gzip") {
-                when (val dec = gunzipCapped(rawBytes, effBytes)) {
+                when (val dec = gunzipCapped(rawBytes, effBytes, deadlineNs)) {
                     is GunzipOut.Ok -> dec.data
                     is GunzipOut.TooLarge -> return WebExtractOutcome.Failed(WebExtract.DETAIL_TOO_LARGE)
                     is GunzipOut.Corrupt -> return WebExtractOutcome.Failed(WebExtract.DETAIL_BAD_RESPONSE)
@@ -873,6 +909,9 @@ class WebExtractService(
             } else {
                 WebContentEnvelope.wrap(capped)
             }
+            // pre-Ok gate：預算已耗盡則絕不建構／返回逾越預算之 Ok
+            //（parse／gunzip 內部 deadline 檢查之外的最後一道守門）。
+            if (System.nanoTime() >= deadlineNs) throw DeadlineExceededException()
             return WebExtractOutcome.Ok(
                 content = content,
                 envelope = envelope,
@@ -963,27 +1002,36 @@ internal sealed interface GunzipOut {
 }
 
 /**
- * 受上限的 gzip 解壓（bomb fail-closed）。
+ * 受上限的 gzip 解壓（bomb fail-closed；deadline 有界）。
  *
  * - 解壓超過 [cap] 即回 [GunzipOut.TooLarge]（不回部分資料）；
- * - 非 gzip／損壞即回 [GunzipOut.Corrupt]（→ `BAD_RESPONSE`，與超限區分）。
+ * - 非 gzip／損壞即回 [GunzipOut.Corrupt]（→ `BAD_RESPONSE`，與超限區分）；
+ * - 每次 `gz.read` 前、以及回傳前各檢查一次 [deadlineNs]：逾時拋
+ *   [DeadlineExceededException]（→ `Failed(TIMEOUT)`；絕不回部分資料）。
+ *   預設 `Long.MAX_VALUE`（直接呼叫語義不變）。
  */
-internal fun gunzipCapped(data: ByteArray, cap: Int): GunzipOut {
+internal fun gunzipCapped(data: ByteArray, cap: Int, deadlineNs: Long = Long.MAX_VALUE): GunzipOut {
     return try {
         GZIPInputStream(ByteArrayInputStream(data)).use { gz ->
             val out = ByteArrayOutputStream(minOf(cap.coerceAtLeast(1), 8192))
             val buf = ByteArray(8192)
             var total = 0
             while (true) {
+                if (System.nanoTime() >= deadlineNs) throw DeadlineExceededException()
                 val n = gz.read(buf)
                 if (n == -1) break
                 if (total + n > cap) return GunzipOut.TooLarge
                 out.write(buf, 0, n)
                 total += n
             }
+            // 回傳前再確認一次預算：膨脹工作不得逾越預算後才交出位元組。
+            if (System.nanoTime() >= deadlineNs) throw DeadlineExceededException()
             GunzipOut.Ok(out.toByteArray())
         }
     } catch (e: CancellationException) {
+        throw e
+    } catch (e: DeadlineExceededException) {
+        // deadline 耗盡不得被吞沒：never partial output。
         throw e
     } catch (_: Exception) {
         GunzipOut.Corrupt

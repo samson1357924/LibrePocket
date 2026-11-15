@@ -1473,6 +1473,39 @@ class WebExtractD4Test {
         assertEquals(1, http.calls.get())
     }
 
+    @Test fun gunzipDeadlineThrows() {
+        // 小型合法 gzip payload；deadline 已過 → DeadlineExceededException（never partial）
+        val payload = "hello gzip world ".repeat(64).toByteArray(Charsets.UTF_8)
+        val bos = ByteArrayOutputStream()
+        GZIPOutputStream(bos).use { it.write(payload) }
+        val compressed = bos.toByteArray()
+        org.junit.Assert.assertThrows(DeadlineExceededException::class.java) {
+            gunzipCapped(compressed, WebExtract.DEFAULT_MAX_BYTES, System.nanoTime() - 1)
+        }
+    }
+
+    @Test fun followerAwaitDeadlineMapsToFailedTimeout() = runBlocking {
+        // leader handler delay(500)、timeoutMs=100：follower 以其自身整體預算
+        // 包住 await()，到期映射 Failed(TIMEOUT)（NOT CANCELLED、never cached）。
+        // 兩種交錯皆收斂至同一結果：follower 先逾時 → withTimeoutOrNull 回 null；
+        // 或 leader 先完成（leader 自身亦於 100ms 逾時）→ follower 取到該 Failed。
+        val dns = publicDns("example.com")
+        val http = FakeExtract {
+            delay(500)
+            okResp(html())
+        }
+        val svc = WebExtractService(http, timeoutMs = 100)
+        val leader = async { svc.extract("https://example.com/followerTimeout", resolver = dns) }
+        withTimeout(5_000) { while (http.calls.get() < 1) delay(1) }
+        val follower = async { svc.extract("https://example.com/followerTimeout", resolver = dns) }
+        val followerOut = withTimeout(5_000) { follower.await() }
+        assertTrue("follower 應以 Failed(TIMEOUT) 收場，got $followerOut", followerOut is WebExtractOutcome.Failed)
+        assertEquals(WebExtract.DETAIL_TIMEOUT, (followerOut as WebExtractOutcome.Failed).detail)
+        val leaderOut = withTimeout(5_000) { leader.await() }
+        assertTrue("leader 應以 Failed(TIMEOUT) 收場，got $leaderOut", leaderOut is WebExtractOutcome.Failed)
+        assertEquals(WebExtract.DETAIL_TIMEOUT, (leaderOut as WebExtractOutcome.Failed).detail)
+    }
+
     // ---- registry 形狀：executionReady=false、投影存在但模型不可見 ----
 
     @Test fun webExtractRegistryShapeStaysNotExecutable() {

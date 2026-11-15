@@ -4,7 +4,10 @@ import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
 import java.io.InputStream
 import java.io.OutputStream
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicReference
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -25,7 +28,11 @@ import org.junit.Test
  *   verify 臂 helper 各計 1 次失敗、槽保留、`cleanupIncomplete=true`；另補三臂
  *   registrar-throw pin：kill 臂／preflight 臂（timeoutMs=0L 確定性入口過期）／
  *   `elevated-stdout` 起線程失敗（`cleanupOnThreadStartFailureInner`）臂；
- * - 純 JVM、零真機、零 su、零 binder；排序一律同步呼叫（helper 直調）。
+ * - P1 迴歸釘（catch-all 臂有界返回）：[BinderBlockedDestroyProcess] 的 `destroy()` 永久阻塞
+ *   （Binder 不可中斷 stall 模型，吞中斷）下，caller 於 latch 關閉期間有界返回——
+ *   kill 路徑臂（`forceDrainPostAcquireFailure` seam）與零槽臂（`elevated-stdout` 起線程失敗＋
+ *   `forceCleanupOnThreadStartFailureFailure` seam）各一例；
+ * - 純 JVM、零真機、零 su、零 binder；helper 級 pin 同步直調，drain 級 pin 於背景執行緒跑 drain＋latch 斷言。
  *
  * 隔離：@Before/@After 強制還原預設 registrar（`{ ElevatedCleanupTracker.quarantineUnverified(it) }`），
  * 清 quarantine／槽／active／breaker，並斷言本類零洩漏。
@@ -53,6 +60,7 @@ class ElevatedCleanupTrackerRegistrationFailureTest {
         ElevatedProcessIo.quarantineRegistrar = { ElevatedCleanupTracker.quarantineUnverified(it) }
         ElevatedCleanupTracker.forceAcquireSlotOrQuarantineThrow = false
         ElevatedProcessIo.forceDrainPostAcquireFailure = false
+        ElevatedProcessIo.forceCleanupOnThreadStartFailureFailure = false
         ElevatedCleanupTracker.clearRegistrationFailedStickyForTest()
         val leakedOutstanding = ElevatedCleanupTracker.outstanding()
         val leakedActive = ElevatedCleanupTracker.activeCalls()
@@ -114,6 +122,22 @@ class ElevatedCleanupTrackerRegistrationFailureTest {
         }
     }
 
+    private fun pollUninterruptibleDestroyEnteredTo(
+        expected: Int,
+        victim: BinderBlockedDestroyProcess,
+        boundMs: Long = 5_000L,
+    ) {
+        val deadline = System.currentTimeMillis() + boundMs
+        while (victim.uninterruptibleDestroyEntered.get() != expected) {
+            if (System.currentTimeMillis() >= deadline) {
+                throw AssertionError(
+                    "uninterruptibleDestroyEntered=${victim.uninterruptibleDestroyEntered.get()} expected=$expected",
+                )
+            }
+            Thread.sleep(20L)
+        }
+    }
+
     /** destroy no-op＋waitFor 恒 false：killer 調了等於沒調，驗證必失敗（drain 整合 pin 用）。 */
     private class NoOpHangProcess : Process() {
         override fun getOutputStream(): OutputStream = ByteArrayOutputStream()
@@ -155,6 +179,53 @@ class ElevatedCleanupTrackerRegistrationFailureTest {
         override fun exitValue(): Int = 0
         override fun destroy() = Unit
         override fun destroyForcibly(): Process = this
+    }
+
+    /**
+     * Binder stall 模型（P1 迴歸釘）：`destroy()`／`destroyForcibly()` 互斥進入＋
+     * 永不返回——進入即 [uninterruptibleDestroyEntered] +1，隨後 `destroyLatch.await()`
+     * 並**吞中斷**（模擬 Shizuku 同步 Binder `Method.invoke` 不可中斷阻塞：
+     * interrupt 不生效，caller 線程永久卡住而非抛出）。latch 僅由測試 finally 釋放。
+     * waitFor(任一 timeout) 恒 false、exitValue 恒 0（本臂在到達 verify 之前拋出，
+     * 驗證階段不被觸達）。
+     * 迴歸釘依賴本假件保持 unattested：Base `Process.toHandle()` 預設拋
+     * UnsupportedOperationException ⇒（若日後改接 killTree）臂即退化為無條件 `destroy()`；
+     * 不得 override `toHandle()` 回報已死 handle（否則 unattested 臂不觸發、
+     * 測試即失去釘性）。（本釘以 `killer = { it.destroy() }` 接線，killTree 本身
+     * 不在路徑上；此註為前向相容守衛。）
+     */
+    private class BinderBlockedDestroyProcess(
+        private val destroyLatch: CountDownLatch,
+    ) : Process() {
+        /** destroy／destroyForcibly 被調用的累積次數（每信號 +1）。 */
+        val uninterruptibleDestroyEntered = AtomicInteger(0)
+
+        override fun getOutputStream(): OutputStream = ByteArrayOutputStream()
+        override fun getInputStream(): InputStream = ByteArrayInputStream(ByteArray(0))
+        override fun getErrorStream(): InputStream = ByteArrayInputStream(ByteArray(0))
+        override fun waitFor(): Int = 0
+        override fun waitFor(timeout: Long, unit: TimeUnit): Boolean = false
+        override fun exitValue(): Int = 0
+        override fun destroy() {
+            uninterruptibleDestroyEntered.incrementAndGet()
+            awaitLatchUninterruptibly()
+        }
+        override fun destroyForcibly(): Process {
+            uninterruptibleDestroyEntered.incrementAndGet()
+            awaitLatchUninterruptibly()
+            return this
+        }
+
+        private fun awaitLatchUninterruptibly() {
+            while (true) {
+                try {
+                    destroyLatch.await()
+                    return
+                } catch (_: InterruptedException) {
+                    // 吞中斷：Binder 不可中斷 stall——caller 永遠卡在 latch 上
+                }
+            }
+        }
     }
 
     // ---- (a) verified=false＋registrar 拋 → 槽保留、計數 +1、准入 BACKLOG_FULL ----
@@ -605,6 +676,211 @@ class ElevatedCleanupTrackerRegistrationFailureTest {
             pollOutstandingTo(0)
             ElevatedCleanupTracker.clearUnverified()
             ElevatedProcessIo.forceDrainPostAcquireFailure = false
+        }
+    }
+
+    /**
+     * P1 迴歸釘（kill 路徑臂；[ElevatedProcessIo.forceDrainPostAcquireFailure] seam）：
+     * runCleanupBounded 佔槽之後、verify 之前拋出 ⇒ 頂層 catch-all 收斂。
+     * [BinderBlockedDestroyProcess] 的 `destroy()` 永久阻塞（Binder 不可中斷 stall 模型，
+     * 吞中斷）——catch-all 臂若執行任何外部 process IPC（destroy／getter／waitFor／invoke），
+     * caller 線程將卡在 latch 上永不返回。本測試在 latch **仍然關閉**時斷言 caller 有界返回
+     * （drainDone.await(15s)），證明有界返回由構造保證（臂內零阻塞操作）。
+     * latch 僅在 finally 釋放；main assertion 全程在 latch 關閉期間執行。
+     */
+    @Test fun drainCatchAllArmReturnsBoundedWhileDestroyBlocksForeverOnKillPath() {
+        val destroyLatch = CountDownLatch(1)
+        val victim = BinderBlockedDestroyProcess(destroyLatch)
+        val killNeverBefore = ElevatedCleanupTracker.killNeverAttemptedCount()
+        val quarantineBefore = ElevatedCleanupTracker.quarantinedCount()
+        val residualBefore = ElevatedCleanupTracker.untrackedResidualCount()
+        val floorBeforeLocal = ElevatedCleanupTracker.releaseFloorHits()
+        val drainDone = CountDownLatch(1)
+        val drained = AtomicReference<ElevatedProcessIo.Drained?>()
+        ElevatedProcessIo.forceDrainPostAcquireFailure = true
+        val bg = Thread {
+            drained.set(
+                ElevatedProcessIo.drainWithThreadStarter(
+                    process = victim,
+                    timeoutMs = 300L,
+                    killer = { it.destroy() },
+                    isCancelled = { false },
+                ),
+            )
+            drainDone.countDown()
+        }.also { it.isDaemon = true; it.start() }
+        try {
+            // latch 仍關閉：caller 必須有界返回（bounded-or-nothing——catch-all 零外部 IPC）。
+            assertTrue(
+                "caller must return bounded while the destroy latch stays shut",
+                drainDone.await(15, TimeUnit.SECONDS),
+            )
+            val d = drained.get()
+            assertTrue("drain result must be present", d != null)
+            assertEquals(-1, d!!.exitCode)
+            assertFalse("catch-all arm is local failure, not budget ⇒ timedOut=false", d.timedOut)
+            assertTrue("catch-all arm must flag readFailed", d.readFailed)
+            assertTrue("catch-all arm must flag truncated", d.truncated)
+            assertTrue("catch-all arm must flag tailIncomplete", d.tailIncomplete)
+            assertTrue("catch-all arm must flag cleanupIncomplete", d.cleanupIncomplete)
+            assertTrue("catch-all arm must flag untrackedResidual", d.untrackedResidual)
+            // elevated-cleanup worker 的 destroy 進入並非 drain 返回的必要前提
+            // （worker 可能尚未獲排程即返回）——本有界 poll 僅吸收排程可見性，
+            // 不影響上方 bounded-return 斷言的時序語義。
+            pollUninterruptibleDestroyEnteredTo(1, victim)
+            assertEquals(
+                "destroy must be entered exactly once (elevated-cleanup worker only; catch-all performs no IPC)",
+                1,
+                victim.uninterruptibleDestroyEntered.get(),
+            )
+            assertEquals(
+                "catch-all arm has no start-failure counter path ⇒ killNeverAttempted unchanged",
+                killNeverBefore,
+                ElevatedCleanupTracker.killNeverAttemptedCount(),
+            )
+            assertEquals(
+                "catch-all arm registers the victim best-effort",
+                quarantineBefore + 1,
+                ElevatedCleanupTracker.quarantinedCount(),
+            )
+            assertEquals(
+                "stalled elevated-cleanup worker keeps custody of the cleanup slot post-grace (fail-closed, no double release)",
+                1,
+                ElevatedCleanupTracker.outstanding(),
+            )
+            assertEquals(
+                "exactly-once release: floor must not be hit",
+                floorBeforeLocal,
+                ElevatedCleanupTracker.releaseFloorHits(),
+            )
+            assertEquals(
+                "catch-all arm must increment untrackedResidual telemetry exactly once",
+                residualBefore + 1,
+                ElevatedCleanupTracker.untrackedResidualCount(),
+            )
+            val admission = ElevatedCleanupTracker.tryEnterReserved()
+            if (admission == ElevatedCleanupTracker.Admission.OK) {
+                ElevatedCleanupTracker.leaveCall()
+            }
+            assertEquals(
+                "admission must stay fail-closed while the slot is held",
+                ElevatedCleanupTracker.Admission.BACKLOG_FULL,
+                admission,
+            )
+        } finally {
+            // latch 僅在此釋放：elevated-cleanup worker 從 destroy 返回 → finally 恰好釋放槽一次。
+            destroyLatch.countDown()
+            bg.join(10_000L)
+            pollOutstandingTo(0, 5_000L)
+            ElevatedCleanupTracker.clearUnverified()
+            ElevatedCleanupTracker.noteClean()
+            ElevatedProcessIo.forceDrainPostAcquireFailure = false
+        }
+    }
+
+    /**
+     * P1 迴歸釘（零槽臂；[ElevatedProcessIo.forceCleanupOnThreadStartFailureFailure] seam）：
+     * elevated-stdout 起線程失敗 ⇒ `cleanupOnThreadStartFailure()` ⇒ Inner 入口拋出 ⇒
+     * 外層 wrapper catch ⇒ catch-all 收斂；Inner 於入口拋出先於 runCleanupBounded，零槽位分配。
+     * [BinderBlockedDestroyProcess] 的 `destroy()` 永久阻塞——catch-all 臂若執行任何外部
+     * IPC caller 將卡死。本測試在 latch **仍然關閉**時斷言 caller 有界返回。
+     */
+    @Test fun drainCatchAllArmReturnsBoundedWhileDestroyBlocksForeverOnZeroSlotArm() {
+        val destroyLatch = CountDownLatch(1)
+        val victim = BinderBlockedDestroyProcess(destroyLatch)
+        val quarantineBefore = ElevatedCleanupTracker.quarantinedCount()
+        val residualBefore = ElevatedCleanupTracker.untrackedResidualCount()
+        val outstandingBefore = ElevatedCleanupTracker.outstanding()
+        val floorBeforeLocal = ElevatedCleanupTracker.releaseFloorHits()
+        val killNeverBefore = ElevatedCleanupTracker.killNeverAttemptedCount()
+        val drainDone = CountDownLatch(1)
+        val drained = AtomicReference<ElevatedProcessIo.Drained?>()
+        ElevatedProcessIo.forceCleanupOnThreadStartFailureFailure = true
+        val bg = Thread {
+            drained.set(
+                ElevatedProcessIo.drainWithThreadStarter(
+                    process = victim,
+                    timeoutMs = 300L,
+                    killer = { it.destroy() },
+                    isCancelled = { false },
+                    startThread = { t ->
+                        if (t.name == "elevated-stdout") {
+                            throw RuntimeException("simulated gobbler start failure")
+                        }
+                        t.start()
+                    },
+                ),
+            )
+            drainDone.countDown()
+        }.also { it.isDaemon = true; it.start() }
+        try {
+            // latch 仍關閉：caller 必須有界返回（bounded-or-nothing——catch-all 零外部 IPC）。
+            assertTrue(
+                "caller must return bounded while the destroy latch stays shut",
+                drainDone.await(15, TimeUnit.SECONDS),
+            )
+            val d = drained.get()
+            assertTrue("drain result must be present", d != null)
+            assertEquals(-1, d!!.exitCode)
+            assertFalse("catch-all arm is local failure, not budget ⇒ timedOut=false", d.timedOut)
+            assertTrue("catch-all arm must flag readFailed", d.readFailed)
+            assertTrue("catch-all arm must flag truncated", d.truncated)
+            assertTrue("catch-all arm must flag tailIncomplete", d.tailIncomplete)
+            assertTrue("catch-all arm must flag cleanupIncomplete", d.cleanupIncomplete)
+            assertTrue("catch-all arm must flag untrackedResidual", d.untrackedResidual)
+            assertEquals(
+                "zero-slot arm: destroy must never be entered (no kill path reached)",
+                0,
+                victim.uninterruptibleDestroyEntered.get(),
+            )
+            assertEquals(
+                "zero-slot arm: killNeverAttempted must be unchanged",
+                killNeverBefore,
+                ElevatedCleanupTracker.killNeverAttemptedCount(),
+            )
+            assertEquals(
+                "zero-slot arm: outstanding must be unchanged",
+                outstandingBefore,
+                ElevatedCleanupTracker.outstanding(),
+            )
+            assertEquals(
+                "exactly-once release: floor must not be hit",
+                floorBeforeLocal,
+                ElevatedCleanupTracker.releaseFloorHits(),
+            )
+            assertEquals(
+                "catch-all arm registers the victim best-effort",
+                quarantineBefore + 1,
+                ElevatedCleanupTracker.quarantinedCount(),
+            )
+            assertEquals(
+                "catch-all arm must increment untrackedResidual telemetry exactly once",
+                residualBefore + 1,
+                ElevatedCleanupTracker.untrackedResidualCount(),
+            )
+            val admission = ElevatedCleanupTracker.tryEnterReserved()
+            if (admission == ElevatedCleanupTracker.Admission.OK) {
+                ElevatedCleanupTracker.leaveCall()
+            }
+            // 零槽臂：outstanding==0／debt==0／consecutive==1（< MAX）⇒ 前門皆不觸發，
+            // quarantine 非空 ⇒ 末門 QUARANTINE（BACKLOG_FULL 在 outstanding==0 且 debt==0 時不可達；
+            // 門序見 classifyAdmissionLocked KDoc）。
+            assertEquals(
+                "admission must stay fail-closed (quarantine door) after catch-all registration",
+                ElevatedCleanupTracker.Admission.QUARANTINE,
+                admission,
+            )
+            assertFalse(
+                "catch-all arm with succeeding registrar must not brick",
+                ElevatedCleanupTracker.isRegistrationFailedSticky(),
+            )
+        } finally {
+            // latch 僅在此釋放（本路徑無阻塞 caller；釋放僅為結束語義對稱）。
+            destroyLatch.countDown()
+            bg.join(10_000L)
+            ElevatedCleanupTracker.clearUnverified()
+            ElevatedCleanupTracker.noteClean()
+            ElevatedProcessIo.forceCleanupOnThreadStartFailureFailure = false
         }
     }
 

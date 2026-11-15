@@ -22,7 +22,7 @@
 | `Round-6 IR-P2` | 登記雙失敗（無槽＋雙登記皆拋）⇒ admission 無訊號 | `registrationFailedSticky`、`Admission.REGISTRATION_FAILED` |
 | `Round-6 D-A1..D-E7` | 子代碼複審發現編號（A=併發、B=提權執行安全、C=測試、D=架構/KDoc、E=scope/CI） | 本檔末 P1 段＋`pr167-review-aggregation.md`（repo 外彙整表） |
 | `Round-6 PG-#` | PocketGuard bot 發現（BLOCK/WARN/SUGGESTION） | 同上 |
-| `drainFailClosedDrained` | drain 內部逃逸時的 catch-all 收斂臂：killTree best-effort＋中斷 thread＋登記 quarantine＋計數；outstanding 不釋放（B3＝重啟恢復） | `ElevatedProcessIo.drainWithThreadStarter`／`drainFailClosedDrained` |
+| `drainFailClosedDrained` | drain 內部逃逸時的 catch-all 收斂臂：caller 零外部 process IPC（無 destroy／getter／waitFor）＋中斷 thread＋登記 quarantine＋計數；有界返回由構造保證；outstanding 不釋放（B3＝重啟恢復） | `ElevatedProcessIo.drainWithThreadStarter`／`drainFailClosedDrained` |
 | `Stage 1/2/3/4（本 PR 的 Round-6 提交階梯）` | 20af2877 linger-debt seal → ed1f8d81 sticky brick＋catch-all backstop → ff509999 遙測/文件 → 9d5ad1e7 有界 tearDown/本檔 | git log |
 | `quarantine（閘）／QUARANTINE` | 未驗證死亡 handle 的持久登記，admission 末門 QUARANTINE（fail-closed） | `ElevatedCleanupTracker.quarantineUnverified` |
 | `sweep／verify-only sweep` | 以 `waitFor(0ms)` 有界驗證後才移除 quarantine 條目 | `verifyQuarantinedOneBounded` |

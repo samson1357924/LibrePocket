@@ -3018,12 +3018,14 @@ internal object ElevatedProcessIo {
         /** 全路徑有界返回裁決（drain 契約）：內部任一層漏網 ⇒ fail-closed Drained
          *  （runner 映 Failed，永非 Ok/TimedOut；untrackedResidual 遙測置 true）。
          *
-         * （CR-1）catch-all 臂新契約：先 threads 後 process——
-         * - D-A1（Stage 1）：入口先盡力 `runCatching { ElevatedProcessKiller.killTree(process) }`
-         *   （best-effort、冪等；attested JVM：isAlive==false 即零信號；Android/Shizuku
-         *   unattested：已死 handle 仍發無條件 destroy（PID 回收風險已接受，見
-         *   ElevatedProcessKiller body attestation 段；#136-B3 device-acceptance 必查
-         *   bodyDestroyUnattestedCount））；本臂為 drain 內部失敗時避免 privileged child 完全無信號的最後一道防線；
+         * （CR-1）catch-all 臂新契約：caller thread ZERO 外部 process IPC，先 threads 後 process——
+         * - caller thread 在本臂執行 ZERO 外部 process IPC——無 destroy／getter／waitFor／invoke
+         *   之任何一種；封鎖 destroy 的 Binder stall 下，best-effort kill 刻意不嘗試
+         *   （任何外部呼叫皆可能於 Binder 上無界阻塞）；有界返回由構造保證（本臂不存在任何
+         *   無外部 IPC 的阻塞呼叫；VME 極角下接受文件化殘餘——見頂層 backstop 註解「前置宣告」段）；
+         *   密封由 quarantine 登記（sticky brick）承擔，執行順序仍是先 threads 後 process
+         *   （先中斷＋記槽，不阻塞；後做 registrar 之本地 tracker 狀態變更）：sweep 僅驗證
+         *   死亡並離封，child 存活期間唯 app 重啟可復原（fail-closed 恆態設置）；
          * - 中斷已起執行緒（`elevated-stdout`／`elevated-stderr`／`elevated-stdin-close`）；
          *   仍存活者以其 normal path 同一 state 四態經
          *   [ElevatedCleanupTracker.markLingering] 登記（outCounted／errCounted／stdinCounted
@@ -3031,21 +3033,18 @@ internal object ElevatedProcessIo {
          *   （已終止／state 非 0 no-op，零雙計、零槽洩漏）；
          * - process 最佳努力登記 [ElevatedProcessIo.quarantineRegistrar]（拋出即
          *   [ElevatedCleanupTracker.noteQuarantineRegistrationFailed] 遙測並
-         *   [ElevatedCleanupTracker.noteRegistrationFailedSticky] 置位（catch-all 臂登記失敗
-         *   即 brick，作為最後防線直接密封）；本臂不經
-         *   verify／runCleanupBounded，無槽可留，登記失敗僅 note＋breaker 兜底）；
+         *   [ElevatedCleanupTracker.noteRegistrationFailedSticky] 置位——sticky brick，永久拒絕
+         *   新 spawn（admission 首門 REGISTRATION_FAILED），直至 app 重啟）；本臂不經
+         *   verify／runCleanupBounded，無槽可留，登記失敗即以 brick 密封（不以 breaker 兜底）；
          * - D-D10（Round-6）：caller 側已佔槽（acquired==true）於本臂不被釋放 —outstanding
          *   永久≥1、admission 永久 BACKLOG_FULL（或 registrar 拋→REGISTRATION_FAILED）；
          *   恢復唯一途徑 app 重啟；B3 必接 alert＋runbook。
          * - [ElevatedCleanupTracker.noteUntrackedResidual] 遙測 +1（registered ⇒
-         *   admission 以 QUARANTINE 拒新 spawn，恢復走 sweep 路徑；本臂不自行清 quarantine）。
+         *   admission 以 QUARANTINE 拒新 spawn；sweep 僅驗死亡離封，child 存活期間唯 app 重啟可復原；
+         *   本臂不自行清 quarantine）。
          * `noteUnclean()` 與回傳 `Drained` 旗標（readFailed／tailIncomplete／cleanupIncomplete／
          * untrackedResidual／timedOut）保持原契約不變。 */
         fun drainFailClosedDrained(): Drained {
-            // Stage 1（D-A1）：先盡力 kill 已知的 qualifying child（kill 冪等；attested
-            // JVM：isAlive==false 即零信號；Android/Shizuku unattested：已死 handle 仍發無條件
-            // destroy）；本臂為 drain 內部失敗時避免 privileged child 完全無信號的最後一道防線。
-            runCatching { ElevatedProcessKiller.killTree(process) }
             runCatching { ElevatedCleanupTracker.noteUnclean() }
             // 先 threads（中斷＋殘留記槽）再 process（quarantine 登記）：已起執行緒
             // 仍存活即有上界殘留，先收斂；process 登記冪等（`===` 去重）且最佳努力。
@@ -3214,7 +3213,9 @@ internal object ElevatedProcessIo {
         }
 
         /** `cleanupOnThreadStartFailure` 的總包裝：任何內部異常 ⇒ [drainFailClosedDrained]
-         *  （drain 全路徑有界返回契約由此成為無條件保證）。 */
+         *  （drain 全路徑有界返回契約由此成立——catch-all 臂只含本地非 IPC 操作，
+         *  無外部 IPC 的阻塞呼叫（VME 極角下接受文件化殘餘——見頂層 backstop 註解「前置宣告」段），
+         *  有界返回由構造保證）。 */
         fun cleanupOnThreadStartFailure(): Drained =
             try {
                 cleanupOnThreadStartFailureInner()
@@ -3926,9 +3927,12 @@ internal object ElevatedProcessIo {
             )
         } catch (_: Throwable) {
             // D-D3（#136-B2 round-6）：頂層 backstop — 任何內部逃逸異常皆收斂為 fail-closed Drained。
-            // drainFailClosedDrained() 已含：killTree best-effort（D-A1）、已起執行緒 interrupt＋
-            // 殘留記槽、quarantine 登記（失敗即 noteQuarantineRegistrationFailed＋sticky brick）、
-            // noteUntrackedResidual＋旗標；與 cleanupOnThreadStartFailure() 的 catch-all 臂同構。
+            // drainFailClosedDrained() 已含：已起執行緒 interrupt＋殘留記槽、quarantine 登記
+            // （失敗即 noteQuarantineRegistrationFailed＋sticky brick）、noteUntrackedResidual＋旗標
+            // （caller thread ZERO 外部 process IPC——無 destroy／getter／waitFor／invoke；
+            // 無外部 IPC 的阻塞呼叫（VME 極角下接受文件化殘餘——見下「前置宣告」段），
+            // 有界返回由構造保證，best-effort kill 刻意不嘗試於本臂）；
+            // 與 cleanupOnThreadStartFailure() 的 catch-all 臂同構。
             // 前置宣告（callerInterrupted／pipes／counters／local funs）不在 try 內——除
             // computeDeadlineNanos／isExpired 已內部收斂外，其餘為原子計數器／參考建構，理論上
             // 可能於 VME 下抛，但逃逸機率可忽略且此時無資源可追蹤（零執行緒起動），接受並文件化。
@@ -3944,6 +3948,8 @@ internal object ElevatedProcessIo {
 
     /**
      * Stage 3b-final（seam）：quarantine 登記的單一測試注入點。
+     * 預設實作必須維持 local-only（僅本地 tracker 狀態、無外部 IPC）；production 不得
+     * 重新綁定為會 IPC 的實作者——否則 catch-all 臂的有界返回保證即失效。
      * 預設值＝[ElevatedCleanupTracker.quarantineUnverified]（登記不拋出時，生產行為
      * 與舊碼 byte-for-byte 一致；若登記本身拋出，現收斂為 fail-closed——槽保留＋計數，
      * 而非外抛，較舊碼更保守，此差異為刻意設計）。所有登記呼叫點（[releaseCleanupSlotAfterVerify]、drain 起線程失敗臂、

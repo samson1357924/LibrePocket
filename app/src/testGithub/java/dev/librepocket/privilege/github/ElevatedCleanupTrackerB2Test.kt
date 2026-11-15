@@ -45,6 +45,7 @@ class ElevatedCleanupTrackerB2Test {
         floorBefore = ElevatedCleanupTracker.releaseFloorHits()
         lingerFloorBefore = ElevatedCleanupTracker.lingerDebtFloorHits()
         ElevatedCleanupTracker.clearUnverified()
+        ElevatedCleanupTracker.clearRegistrationFailedStickyForTest()
         ElevatedCleanupTracker.noteClean()
         pollOutstandingTo(0)
         pollActiveTo(0)

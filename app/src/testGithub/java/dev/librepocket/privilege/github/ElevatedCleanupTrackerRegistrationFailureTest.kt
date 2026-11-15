@@ -43,6 +43,7 @@ class ElevatedCleanupTrackerRegistrationFailureTest {
         ElevatedProcessIo.quarantineRegistrar = { ElevatedCleanupTracker.quarantineUnverified(it) }
         ElevatedCleanupTracker.clearUnverified()
         ElevatedCleanupTracker.noteClean()
+        ElevatedCleanupTracker.clearRegistrationFailedStickyForTest()
         pollOutstandingTo(0)
         pollActiveTo(0)
         pollPendingTo(0)
@@ -50,6 +51,9 @@ class ElevatedCleanupTrackerRegistrationFailureTest {
 
     @After fun tearDownIsolation() {
         ElevatedProcessIo.quarantineRegistrar = { ElevatedCleanupTracker.quarantineUnverified(it) }
+        ElevatedCleanupTracker.forceAcquireSlotOrQuarantineThrow = false
+        ElevatedProcessIo.forceDrainPostAcquireFailure = false
+        ElevatedCleanupTracker.clearRegistrationFailedStickyForTest()
         val leakedOutstanding = ElevatedCleanupTracker.outstanding()
         val leakedActive = ElevatedCleanupTracker.activeCalls()
         val leakedQuarantine = ElevatedCleanupTracker.quarantinedCount()
@@ -446,6 +450,158 @@ class ElevatedCleanupTrackerRegistrationFailureTest {
         assertEquals(floorBefore, ElevatedCleanupTracker.releaseFloorHits())
         pollOutstandingTo(0)
         ElevatedCleanupTracker.clearUnverified()
+    }
+
+    // ---- (d2) Round-6（#136-B2 IR-P2／D-B3／D-A10）：登記雙失敗 brick — admission 永久密封 ----
+
+    /**
+     * D-C1：releaseCleanupSlotAfterVerify 零追蹤 arm（verified=false、slotHeld=false、登記拋）
+     * ⇒ quarantineRegistrationFailed +1、sticky 置位、admission 以 REGISTRATION_FAILED 永久拒
+     * （gate 1，app 重啟恢復）、activeCalls 零、outstanding 零（無槽可留）。
+     */
+    @Test fun releaseCleanupSlotAfterVerifyDoubleFailureBricksAdmission() {
+        val p = FakeProcess("ok".toByteArray())
+        try {
+            ElevatedCleanupTracker.clearRegistrationFailedStickyForTest()
+            val before = ElevatedCleanupTracker.quarantineRegistrationFailedCount()
+            ElevatedProcessIo.quarantineRegistrar = { throw RuntimeException("registrar boom") }
+            ElevatedProcessIo.releaseCleanupSlotAfterVerify(p, verified = false, slotHeld = false)
+            assertEquals(before + 1, ElevatedCleanupTracker.quarantineRegistrationFailedCount())
+            assertTrue("double registration failure must brick admission", ElevatedCleanupTracker.isRegistrationFailedSticky())
+            assertEquals(
+                ElevatedCleanupTracker.Admission.REGISTRATION_FAILED,
+                ElevatedCleanupTracker.tryEnterReserved(),
+            )
+            assertEquals(0, ElevatedCleanupTracker.activeCalls())
+            assertEquals(0, ElevatedCleanupTracker.outstanding())
+        } finally {
+            ElevatedProcessIo.quarantineRegistrar = { ElevatedCleanupTracker.quarantineUnverified(it) }
+            ElevatedCleanupTracker.clearRegistrationFailedStickyForTest()
+            ElevatedCleanupTracker.clearUnverified()
+        }
+    }
+
+    /** D-C1 對照臂：同一 call 但 registrar 成功（dedup 登記）⇒ 不置 brick、sticky 保持 false、
+     *  admission 以 QUARANTINE 拒（gate 7），非 REGISTRATION_FAILED。 */
+    @Test fun releaseCleanupSlotAfterVerifySucceedingRegistrarDoesNotBrick() {
+        val p = FakeProcess("ok".toByteArray())
+        try {
+            ElevatedCleanupTracker.clearRegistrationFailedStickyForTest()
+            val before = ElevatedCleanupTracker.quarantineRegistrationFailedCount()
+            ElevatedProcessIo.releaseCleanupSlotAfterVerify(p, verified = false, slotHeld = false)
+            assertEquals(before, ElevatedCleanupTracker.quarantineRegistrationFailedCount())
+            assertFalse("succeeding registrar must not brick", ElevatedCleanupTracker.isRegistrationFailedSticky())
+            assertEquals(1, ElevatedCleanupTracker.quarantinedCount())
+            assertEquals(
+                ElevatedCleanupTracker.Admission.QUARANTINE,
+                ElevatedCleanupTracker.tryEnterReserved(),
+            )
+        } finally {
+            ElevatedCleanupTracker.clearUnverified()
+            ElevatedCleanupTracker.clearRegistrationFailedStickyForTest()
+        }
+    }
+
+    /**
+     * acquire-throw seam 測試：[ElevatedCleanupTracker.forceAcquireSlotOrQuarantineThrow] 置位
+     * ⇒ runCleanupBounded 進 acquire-throw 臂；second-chance 登記再拋 ⇒ sticky brick；
+     * caller verify 臂（NoOpHangProcess 恒 verify=false）helper 重試再拋 ⇒ 再計 1 次。
+     * 期望：cleanupIncomplete／untrackedResidual／timedOut=true、admission REGISTRATION_FAILED、
+     * 槽與 active 零殘留（acquire 從未遞增）。
+     */
+    @Test fun drainAcquireThrowWithSecondChanceFailureBricksAdmission() {
+        val hanger = NoOpHangProcess()
+        val before = ElevatedCleanupTracker.quarantineRegistrationFailedCount()
+        try {
+            ElevatedCleanupTracker.forceAcquireSlotOrQuarantineThrow = true
+            ElevatedProcessIo.quarantineRegistrar = { throw RuntimeException("registrar boom") }
+            val d = ElevatedProcessIo.drainWithThreadStarter(
+                process = hanger,
+                timeoutMs = 300L,
+                killer = { it.destroy() },
+                isCancelled = { false },
+            )
+            assertTrue("drain must flag cleanupIncomplete", d.cleanupIncomplete)
+            assertTrue("drain must flag untrackedResidual", d.untrackedResidual)
+            assertTrue("NoOpHangProcess never exits ⇒ timedOut", d.timedOut)
+            assertTrue(
+                "admission must be bricked after double registration failure",
+                ElevatedCleanupTracker.isRegistrationFailedSticky(),
+            )
+            assertEquals(
+                "admission must be REGISTRATION_FAILED (gate 1)",
+                ElevatedCleanupTracker.Admission.REGISTRATION_FAILED,
+                ElevatedCleanupTracker.tryEnterReserved(),
+            )
+            assertEquals(0, ElevatedCleanupTracker.activeCalls())
+            // 三個計數站點：acquire-throw 臂首嘗＋second-chance＋caller verify 臂 helper 重試。
+            assertEquals(before + 3, ElevatedCleanupTracker.quarantineRegistrationFailedCount())
+            assertEquals(0, ElevatedCleanupTracker.outstanding())
+            assertEquals(0, ElevatedCleanupTracker.quarantinedCount())
+        } finally {
+            ElevatedProcessIo.quarantineRegistrar = { ElevatedCleanupTracker.quarantineUnverified(it) }
+            ElevatedCleanupTracker.forceAcquireSlotOrQuarantineThrow = false
+            ElevatedCleanupTracker.clearRegistrationFailedStickyForTest()
+            ElevatedCleanupTracker.clearUnverified()
+        }
+    }
+
+    /**
+     * D-C4／D-D2：forceDrainPostAcquireFailure seam 釘頂層 catch-all fail-closed 契約。
+     * kill 路徑在 runCleanupBounded 佔槽（outstanding=1）之後、verify 之前拋出 ⇒
+     * drain 不外抛，回 drainFailClosedDrained 形狀 Drained（readFailed／cleanupIncomplete／
+     * untrackedResidual／truncated／tailIncomplete=true，exitCode=-1）；slot 不釋放
+     * （catch-all 臂不重釋，admission 續拒）；quarantine 盡力登記（default registrar 成功）。
+     */
+    @Test fun drainTopLevelCatchAllFailsClosedAndPinsSlotHeldNotReleased() {
+        val hanger = NoOpHangProcess()
+        try {
+            ElevatedProcessIo.forceDrainPostAcquireFailure = true
+            val d = ElevatedProcessIo.drainWithThreadStarter(
+                process = hanger,
+                timeoutMs = 300L,
+                killer = { it.destroy() },
+                isCancelled = { false },
+            )
+            assertEquals(-1, d.exitCode)
+            assertFalse("catch-all arm is local failure, not budget ⇒ timedOut=false", d.timedOut)
+            assertTrue("catch-all arm must flag readFailed", d.readFailed)
+            assertTrue("catch-all arm must flag truncated", d.truncated)
+            assertTrue("catch-all arm must flag tailIncomplete", d.tailIncomplete)
+            assertTrue("catch-all arm must flag cleanupIncomplete", d.cleanupIncomplete)
+            assertTrue("catch-all arm must flag untrackedResidual", d.untrackedResidual)
+            assertEquals(
+                "cleanup slot must stay held (fail-closed, no double release)",
+                1,
+                ElevatedCleanupTracker.outstanding(),
+            )
+            assertFalse(
+                "registrar succeeds in catch-all arm ⇒ sticky must NOT be set",
+                ElevatedCleanupTracker.isRegistrationFailedSticky(),
+            )
+            assertEquals(
+                "catch-all arm registers the victim best-effort",
+                1,
+                ElevatedCleanupTracker.quarantinedCount(),
+            )
+            val admission = ElevatedCleanupTracker.tryEnterReserved()
+            if (admission == ElevatedCleanupTracker.Admission.OK) {
+                ElevatedCleanupTracker.leaveCall()
+            }
+            assertEquals(
+                "admission must stay fail-closed while the slot is held",
+                ElevatedCleanupTracker.Admission.BACKLOG_FULL,
+                admission,
+            )
+        } finally {
+            // 清理：catch-all 臂不重釋槽——測試手動歸零，保持 tearDown 零洩漏斷言有效。
+            if (ElevatedCleanupTracker.outstanding() > 0) {
+                runCatching { ElevatedCleanupTracker.releaseSlot() }
+            }
+            pollOutstandingTo(0)
+            ElevatedCleanupTracker.clearUnverified()
+            ElevatedProcessIo.forceDrainPostAcquireFailure = false
+        }
     }
 
     // ---- (d) counter wiring：@VisibleForTesting reader 直接讀數＋note 單調 +1 ----

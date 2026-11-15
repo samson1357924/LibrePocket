@@ -59,6 +59,7 @@ class ElevatedRunnerP1B2Test {
         floorBefore = ElevatedCleanupTracker.releaseFloorHits()
         lingerFloorBefore = ElevatedCleanupTracker.lingerDebtFloorHits()
         ElevatedCleanupTracker.clearUnverified()
+        ElevatedCleanupTracker.clearRegistrationFailedStickyForTest()
         ElevatedCleanupTracker.noteClean()
     }
 

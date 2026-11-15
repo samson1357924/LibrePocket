@@ -285,6 +285,11 @@ internal object ElevatedCleanupTracker {
      * Round-3 Phase E（P1-1）：新增 [QUARANTINE]——未驗證停止的特權 process
      * 持久 quarantine 非空即拒（獨立維度，見 [quarantineUnverified]；
      * slot 常數 7 語義保持，quarantine 不佔槽、不計 consecutive）。
+     *
+     * Round-6（#136-B2 IR-P2 / D-B3 / D-A10）：新增 [REGISTRATION_FAILED]——
+     * 登記雙失敗（acquire 拋臂第二次登記／helper 登記重試／catch-all 臂登記）皆
+     * 失敗（VME 極角），handle 無槽且無登記，任何後續信號皆不安全：admission
+     * 永久密封（app 重啟恢復；#136-B3 必接 alert＋runbook）。
      */
     enum class Admission {
         OK,
@@ -292,6 +297,7 @@ internal object ElevatedCleanupTracker {
         BREAKER_OPEN,
         CONCURRENCY_FULL,
         QUARANTINE,
+        REGISTRATION_FAILED,
     }
 
     private val lock = Any()
@@ -328,7 +334,7 @@ internal object ElevatedCleanupTracker {
      *
      * Round-6（#136-B2 IR-P1）：sweep 不再是最後密封——sweep 驗證死亡只解除
      * quarantine 的 `waitFor(0)==true` 條目；無槽 lingering worker 債務
-     * `lingerDebt>0` 時 admission 仍拒（見 [classifyAdmissionLocked] gate 5，
+     * `lingerDebt>0` 時 admission 仍拒（見 [classifyAdmissionLocked] gate 6，
      * end 入口三處：(i) markLingering 飽和臂 → 四態 finally 的 3 臂；(ii) cleanup worker cell-finally 之 acquired==false 臂（0→2）;(iii) 起線程失敗臂的 catch 經 cell 互斥收斂（前提：startThread「拋即未起」契約）。exactly-once 由同一 cell/state 鎖保證）。
      * 本 seal 與 Stage 3c verify-stall seal 同政策：#136-B3 落地前無 operator 可見性（不接 verdict、不接 prod telemetry）;B3 必接 alert＋runbook（重啟）。
      */
@@ -454,6 +460,8 @@ internal object ElevatedCleanupTracker {
      * 告警接線一律以 `>0` 判定，禁止當作唯一失敗計數。
      * 登記失敗＝槽保留（admission 續拒）之 fail-closed 記數；app 重啟前不可自清、應告警。
      * 零消費方（僅診斷可見）：非零即 fail-closed brick 需 app 重啟恢復；告警/上報接線歸 #136-B3
+     * （double-failure brick：admission 以 [Admission.REGISTRATION_FAILED] 永久密封；
+     * #136-B3 必同步接 alert，參考本計數同款）。
      */
     private val quarantineRegistrationFailed = AtomicInteger(0)
 
@@ -532,6 +540,33 @@ internal object ElevatedCleanupTracker {
     internal fun noteQuarantineRegistrationFailed() {
         quarantineRegistrationFailed.incrementAndGet()
     }
+
+    /** Round-6（#136-B2 IR-P2／D-B3／D-A10）登記雙失敗 brick：handle 無槽且 quarantine 雙登記皆抛（VME 極角）。
+     *  設立後 admission 永久拒絕（app 重啟方能解除；#136-B3 必接 alert＋runbook）。
+     *  單向（true→true），無產品清除路徑；僅測試隔離可經 [clearRegistrationFailedStickyForTest] 歸零。
+     *  brick 條件＝「無槽（acquire 拋／已失 slot custody）且登記失敗」；飽和無槽／起線程失敗等
+     *  「有追蹤」臂（slot 保留或登記成功）一律不置位。 */
+    private val registrationFailedSticky = AtomicBoolean(false)
+
+    /** 置位 sticky（登記雙失敗臂專用；冪等）。 */
+    internal fun noteRegistrationFailedSticky() {
+        registrationFailedSticky.set(true)
+    }
+
+    @VisibleForTesting
+    internal fun isRegistrationFailedSticky(): Boolean = registrationFailedSticky.get()
+
+    @VisibleForTesting
+    internal fun clearRegistrationFailedStickyForTest() {
+        registrationFailedSticky.set(false)
+    }
+
+    /**
+     * 僅供測試：[acquireSlotOrQuarantine] 一律拋（OutOfMemoryError 模擬 VME），釘雙失敗 brick 臂。
+     * 不接產品路徑；測試須於 finally 還原為 false。
+     */
+    @VisibleForTesting
+    internal var forceAcquireSlotOrQuarantineThrow: Boolean = false
 
     /** 目前未完成清理數（跨呼叫全域，雙 runner 共用；僅計未完成，正常完成即釋放）。 */
     fun outstanding(): Int = synchronized(lock) { outstandingCount.get() }
@@ -1042,16 +1077,21 @@ internal object ElevatedCleanupTracker {
      * 純判定（B3 Phase 5 拆分，行為不變）：僅計算准入 verdict，不佔席、無副作用。
      *
      * 須在 [lock] 內調用（調用方 [tryEnterReserved] 同一鎖內先判後佔，仍單一原子點，
-     * 不做三段 CAS）。判定順序同 [tryEnterReserved]（backlog／breaker／併發／預留／debt／quarantine）。
+     * 不做三段 CAS）。判定順序同 [tryEnterReserved]（brick／backlog／breaker／併發／預留／debt／quarantine）。
      *
-     * Round-6（#136-B2 IR-P1）新增 gate 5：無槽 lingering worker 債務 >0 即
+     * Round-6（#136-B2 IR-P2）首門 brick：[registrationFailedSticky] >0 即
+     * [Admission.REGISTRATION_FAILED]。優先級：多門同成立時 brick 原因碼優先
+     * （登記雙失敗＝零追蹤，訊息最嚴重）；復原＝app 重啟（無產品清除路徑）。
+     * Round-6（#136-B2 IR-P1）gate 6：無槽 lingering worker 債務 >0 即
      * [Admission.BACKLOG_FULL]。原因優先級：多門同成立時 BACKLOG_FULL 訊息不變；
      * 復原＝debt 歸零（end 入口三處，見 beginLingerDebt KDoc）或 app 重啟。
      */
     private fun classifyAdmissionLocked(): Admission {
+        // Round-6（#136-B2）：登記雙失敗 brick — admission 永久密封（app 重啟恢復）。
+        if (registrationFailedSticky.get()) return Admission.REGISTRATION_FAILED
         // Round-3 Phase E（P1-1）：quarantine 末門（既有門相對順序不動，Phase F 範圍；
         // quarantine 只補 P1-1 缺口——outstanding==0、consecutive==1、預留通過時，
-        // 前四門皆不觸發，此門獨立兜底；多門同成立時既有 reason 優先，quarantine
+        // 前門皆不觸發，此門獨立兜底；多門同成立時既有 reason 優先，quarantine
         // 仍經 isQuarantined／quarantinedCount 可觀測，backlog 清後即 surface）。
         if (outstandingCount.get() >= MAX_OUTSTANDING_CLEANUPS) return Admission.BACKLOG_FULL
         if (consecutiveUnclean.get() >= MAX_CONSECUTIVE_UNCLEAN) return Admission.BREAKER_OPEN
@@ -1075,18 +1115,22 @@ internal object ElevatedCleanupTracker {
      *
      * 檢查順序（拒絕原因優先級，僅供訊息區分，准入決定單一原子點；
      * Round-3 Phase E（P1-1）：既有 1-4 相對順序不動，quarantine 只為末門；
-     * Round-6 IR-P1：gate 5 新增 lingering worker 債務門，quarantine 順延為末門 gate 6）：
-     * 1. `outstanding >= MAX` → [Admission.BACKLOG_FULL]；
-     * 2. `consecutive >= MAX_CONSECUTIVE_UNCLEAN` → [Admission.BREAKER_OPEN]；
-     * 3. `active >= MAX_CONCURRENT_CALLS` → [Admission.CONCURRENCY_FULL]；
-     * 4. `outstanding + (active+1) * SLOTS_PER_CALL > MAX` → [Admission.BACKLOG_FULL]
+     * Round-6 IR-P1：lingering worker 債務門順延 quarantine；
+     * Round-6 IR-P2：登記雙失敗 brick 為首門，其餘門順延一號）：
+     * 1. `registrationFailedSticky` 置位 → [Admission.REGISTRATION_FAILED]
+     *    （Round-6 IR-P2，登記雙失敗永久密封，app 重啟恢復；無產品清除路徑，
+     *    僅 [clearRegistrationFailedStickyForTest] 供測試隔離）；
+     * 2. `outstanding >= MAX` → [Admission.BACKLOG_FULL]；
+     * 3. `consecutive >= MAX_CONSECUTIVE_UNCLEAN` → [Admission.BREAKER_OPEN]；
+     * 4. `active >= MAX_CONCURRENT_CALLS` → [Admission.CONCURRENCY_FULL]；
+     * 5. `outstanding + (active+1) * SLOTS_PER_CALL > MAX` → [Admission.BACKLOG_FULL]
      *   （預留超額，視為 backlog 壓力）；
-     * 5. `lingerDebt > 0` → [Admission.BACKLOG_FULL]（Round-6 IR-P1，無槽 lingering
+     * 6. `lingerDebt > 0` → [Admission.BACKLOG_FULL]（Round-6 IR-P1，無槽 lingering
      *   worker 債務門；多門同成立時 BACKLOG_FULL 訊息不變；end 入口三處：(i) markLingering 飽和臂 → 四態 finally 的 3 臂；(ii) cleanup worker cell-finally 之 acquired==false 臂（0→2）;(iii) 起線程失敗臂的 catch 經 cell 互斥收斂（前提：startThread「拋即未起」契約）。exactly-once 由同一 cell/state 鎖保證，
      *   見 [classifyAdmissionLocked]／`ElevatedCleanupTracker.beginLingerDebt`）；
-     * 6. `quarantine 非空` → [Admission.QUARANTINE]（Round-3 Phase E 末門，
+     * 7. `quarantine 非空` → [Admission.QUARANTINE]（Round-3 Phase E 末門，
      *   見 [quarantine]；不與 backlog／breaker 混碼）；
-     * 7. 否則 `active++` 並回 [Admission.OK]。
+     * 8. 否則 `active++` 並回 [Admission.OK]。
      *
      * 特權宜序列：MAX=7、SLOTS=7 時乾淨態僅允單一進行中呼叫
      *（0+1*7<=7 通過，0+2*7>7 拒絕），實效串行；且任一殘留（`outstanding>=1`）
@@ -1160,6 +1204,9 @@ internal object ElevatedCleanupTracker {
      *   有界）。`noteUntrackedResidual` 保留為 telemetry，與本登記並列。
      */
     internal fun acquireSlotOrQuarantine(p: Process): Boolean = synchronized(lock) {
+        if (forceAcquireSlotOrQuarantineThrow) {
+            throw OutOfMemoryError("simulated OOM in acquireSlotOrQuarantine (test seam)")
+        }
         if (acquireSlotLocked()) return true
         quarantineUnverifiedLocked(p)
         false
@@ -1214,7 +1261,7 @@ internal object ElevatedCleanupTracker {
      *
      * P1-4 飽和即拒（見 [acquireSlot]）：已飽和即 `state=3`＋[beginLingerDebt]
      * （Round-6 IR-P1：無槽但仍有存活 worker——debt 持有至本體 finally 見 3 即歸零；
-     * admission 於 debt>0 時密封，見 [classifyAdmissionLocked] gate 5）；殘留由呼叫方
+     * admission 於 debt>0 時密封，見 [classifyAdmissionLocked] gate 6）；殘留由呼叫方
      * 既有 `cleanupIncomplete` 旗標經 drain 終審進 `noteUnclean`／breaker，不靜默
      * （`outstanding` 封頂不增）。
      */
@@ -1983,13 +2030,13 @@ internal object ElevatedCallSupervisor {
     /**
      * [awaitSpawn] 的 internal seam（測試注入用）：`startThread` 注入線程起動方式。
      * 注入的 starter 契約：要麼完整啟動線程，要麼在啟動之前拋出。
-     * starts-then-throws 非 supported 形狀：晚補償 daemon 體內以
-     * `releaseCleanupSlotAfterVerify`（clean→release）恰好釋放一次、無 finally
-     * release；若 starter 於啟動後才拋，本函數 catch 臂會再以
-     * slotHeld=acquired 呼叫 helper。登記重試經 `===` 去重冪等，但 release 無去重——
-     * daemon 體內 helper 與 catch 臂可能各自 releaseSlot，outstanding 被扣多次；
-     * `releaseSlot` floor 僅防負計數，帳目仍可能失真；故「抛即未起」不可放寬，
-     * 不得依賴此路徑（releaseFloorHits 為該違例注入的唯一 tripwire）。
+     * Round-6（#136-B2 D-A5）起 starts-then-throws 亦為 supported 形狀：晚補償
+     * daemon 體與 catch 臂之間以 boundary ownership CAS（[ElevatedCallSupervisor.startLateDaemon]
+     * 之 `daemonClaimed`）恰好一次收斂登記／釋槽——daemon 先 CAS 者由 daemon 體收斂
+     * （catch 臂 observe 即 benignly no-op），catch 臂先 CAS 者 daemon 醒後直接退出
+     * （不重複登記／釋放／計數，exactly-once）。登記重試經 `===` 去重冪等，release 由
+     * slotHeld 單次釋放；不再依賴「抛即未起」之極角假設。
+     * `releaseFloorHits` 仍為「兩臂雙釋」違例的 tripwire（D-A5 CAS 收斂後預期恆 0）。
      */
     internal fun awaitSpawnWithThreadStarter(
         deadlineNanos: Long,
@@ -2057,7 +2104,11 @@ internal object ElevatedCallSupervisor {
             } catch (_: Throwable) {
                 ElevatedCleanupTracker.noteQuarantineRegistrationFailed()
                 // 此臂無 verify 階段：second-chance 登記失敗即無後續重試，僅 breaker（countUncleanOnce）＋診斷計數＋#136-B3 接管。
-                try { ElevatedProcessIo.quarantineRegistrar(v) } catch (_: Throwable) { ElevatedCleanupTracker.noteQuarantineRegistrationFailed() }
+                try { ElevatedProcessIo.quarantineRegistrar(v) } catch (_: Throwable) {
+                    ElevatedCleanupTracker.noteQuarantineRegistrationFailed()
+                    // Round-6（#136-B2 IR-P2）：second-chance 亦失 ⇒ 無槽且零追蹤 ⇒ brick admission。
+                    ElevatedCleanupTracker.noteRegistrationFailedSticky()
+                }
                 lateIncomplete.set(true)
                 countUncleanOnce()
                 return
@@ -2071,8 +2122,23 @@ internal object ElevatedCallSupervisor {
                 countUncleanOnce()
                 return
             }
+            // Round-6（#136-B2 D-A5）：daemon 體入口 CAS 取得釋槽權——boundary ownership：
+            // 要麼 daemon 先 CAS（catch 臂 observe 即 benignly no-op，daemon 續行收斂），要麼
+            // catch 臂先 CAS（daemon 醒後 observe 即直接退出，不做任何登記／釋放／計數）。
+            // 兩臂皆經 releaseCleanupSlotAfterVerify 收斂登記／釋槽（slotHeld=true，dedup registrar
+            // 或既有 catch 臂 verified=false, slotHeld=acquired）——登記 `===` 冪等 + 槽 release 由
+            // slotHeld 單次釋放，exactly-once。契約「startThread 拋即未起」之外的極角（已起 OS 線程
+            // 後再拋）亦由本 CAS 收斂：catch 臂 CAS 敗 ⇒ daemon 已接管，no-op 直接 return；
+            // catch 臂 CAS 勝 ⇒ daemon 尚未被排程，catch 臂收斂，daemon 醒後 observe false 退出。
+            // 子進程 handle 兩臂任一皆完整接管，不雙殺不漏殺。
+            val daemonClaimed = AtomicBoolean(false)
             try {
                 val t = Thread({
+                    if (!daemonClaimed.compareAndSet(false, true)) {
+                        // catch 臂已取得所有權：daemon 不做任何事、直接退出
+                        //（不重複登記／釋放／計數，exactly-once 由 CAS 保證）。
+                        return@Thread
+                    }
                     val clean = try {
                         lateCompensateSpawn(v, killer)
                     } catch (_: Throwable) {
@@ -2088,6 +2154,11 @@ internal object ElevatedCallSupervisor {
                 t.isDaemon = true
                 startThread(t)
             } catch (_: Throwable) {
+                if (!daemonClaimed.compareAndSet(false, true)) {
+                    // daemon 已接管（catch 臂 CAS 敗，含「startThread 拋即未起」與「已起 OS 線程後再拋」極角）：本臂 benignly no-op——
+                    // daemon 會自行在 releaseCleanupSlotAfterVerify 收斂登記／釋槽（exact-once）。
+                    return
+                }
                 // 起線程失敗（例如 OOM）：不嘗試 kill——無法保證有界 supervision，
                 // 亦不再起任何 detached 線程；handle 轉入 quarantine 登記（准入阻擋＋
                 // verifier 復核），置 incomplete/unclean，同步有界收斂，不重試起線程。
@@ -2121,7 +2192,11 @@ internal object ElevatedCallSupervisor {
                             } catch (_: Throwable) {
                                 ElevatedCleanupTracker.noteQuarantineRegistrationFailed()
                                 // 此臂無 verify 階段：second-chance 登記失敗即無後續重試，僅 breaker（countUncleanOnce）＋診斷計數＋#136-B3 接管。
-                                try { ElevatedProcessIo.quarantineRegistrar(v) } catch (_: Throwable) { ElevatedCleanupTracker.noteQuarantineRegistrationFailed() }
+                                try { ElevatedProcessIo.quarantineRegistrar(v) } catch (_: Throwable) {
+                                    ElevatedCleanupTracker.noteQuarantineRegistrationFailed()
+                                    // Round-6（#136-B2 IR-P2）：second-chance 亦失 ⇒ 無槽且零追蹤 ⇒ brick admission。
+                                    ElevatedCleanupTracker.noteRegistrationFailedSticky()
+                                }
                                 lateIncomplete.set(true)
                                 countUncleanOnce()
                                 return
@@ -2831,75 +2906,6 @@ internal object ElevatedProcessIo {
             entryClockFailed = true
             0L
         }
-        // P1-3 drain 入口 preflight（PR140 Phase 2，最小改動）：budget 已盡即不起
-        // gobbler／stdin-closer（零新執行緒），直接監督殺＋有界驗證後回
-        // `Drained(timedOut=true)`。殺驗語義同 kill 路徑（killer 永不跳過，下界
-        // [CLEANUP_MIN_MS]；驗證走有界 [verifyParentStoppedBounded]），終審計入
-        // breaker 同正常路徑；caller 預置中斷照常出口恢復。流未起即無已取引用可關
-        // （killer 契約本就不碰流；此 Process 的流隨 kill＋物件回收收斂）。
-        val preflightExpired = entryClockFailed || try {
-            ElevatedCallSupervisor.isExpired(deadlineNanos, nowNanos)
-        } catch (_: Throwable) {
-            true
-        }
-        if (preflightExpired) {
-            var preIncomplete = false
-            // Stage 3b／3c（雙持有者規則）：清理槽所有權移交——正常路徑：
-            // runCleanupBounded 正常返回且已佔槽即 slotHeldOut=true，custody 由
-            // caller 持有跨 post-kill verify 有界窗口（live victim 始終被追蹤），
-            // verify 結果已知後恰好釋放一次（quarantine 先行、release 殿後，
-            // 順序不變）；stall 路徑：post-grace 已把 custody 轉移給 worker 本體、
-            // slotHeldOut=false——本處 releaseCleanupSlotAfterVerify 為 no-op，
-            // release 於 worker 退出時發生（admission 於彼時前維持 fail-closed）。
-            val cleanupSlotHeld = AtomicBoolean(false)
-            val preOk = try {
-                runCleanupBounded(CLEANUP_MIN_MS, process, untrackedResidual, startThread, cleanupSlotHeld) {
-                    try {
-                        killer(process)
-                    } catch (_: Throwable) {
-                        swallowedKillerThrows.incrementAndGet()
-                    }
-                }
-            } catch (_: Throwable) {
-                false
-            }
-            if (!preOk) preIncomplete = true
-            val preVerified = try {
-                ElevatedCallSupervisor.verifyParentStoppedBounded(process)
-            } catch (_: Throwable) {
-                false
-            }
-            if (!preVerified) {
-                preIncomplete = true
-                // Round-3 Phase E（P1-1）：preflight 監督殺後仍未驗證即登記 quarantine
-                // （worker 完成≠verified dead；僅 verify 失敗才登記，worker stall 但已驗證
-                // 死亡不登記——process 已死，無未驗證 handle；後續 spawn 以 QUARANTINE 拒，
-                // 不靠 breaker 計數）。登記改由 [releaseCleanupSlotAfterVerify] 執行
-                // （quarantine 先行、release 殿後，順序不變；登記拋出則槽保留 fail-closed）。
-            }
-            // Stage 3c 雙持有者規則：正常路徑——custody 由 caller 持有跨 verify，verify
-            // 結果已知後於下方恰好釋放一次（quarantine 先行、release 殿後，順序不變）；
-            // stall 路徑——post-grace 已把 custody 轉移給 worker，本次呼叫對
-            // releaseCleanupSlotAfterVerify 為 no-op（slotHeldOut==false），release
-            // 於 worker 退出時發生（admission 於彼時前維持 fail-closed）。
-            releaseCleanupSlotAfterVerify(process, preVerified, cleanupSlotHeld.get())
-            if (preIncomplete) {
-                ElevatedCleanupTracker.noteUnclean()
-            } else if (ElevatedCleanupTracker.outstanding() == 0) {
-                ElevatedCleanupTracker.noteClean()
-            }
-            if (callerInterrupted) Thread.currentThread().interrupt()
-            return Drained(
-                stdout = ByteArray(0),
-                stderr = ByteArray(0),
-                exitCode = -1,
-                timedOut = true,
-                truncated = false,
-                readFailed = false,
-                cleanupIncomplete = preIncomplete,
-                untrackedResidual = untrackedResidual.get(),
-            )
-        }
         val out = ElevatedCappedPipe(hardCapBytes)
         // U2-B：stderr 獨立小 cap（null＝同 stdout cap；截圖傳 512K）。
         val err = ElevatedCappedPipe(hardCapErrBytes ?: hardCapBytes)
@@ -3000,7 +3006,14 @@ internal object ElevatedProcessIo {
                 runCatching { ElevatedCleanupTracker.markLingering(t, counted) }
             }
             runCatching { ElevatedProcessIo.quarantineRegistrar(process) }
-                .onFailure { runCatching { ElevatedCleanupTracker.noteQuarantineRegistrationFailed() } }
+                .onFailure {
+                    runCatching { ElevatedCleanupTracker.noteQuarantineRegistrationFailed() }
+                    // Round-6（#136-B2 IR-P2）：catch-all 臂登記失敗 ⇒ 登記雙失敗 brick。
+                    // 註：kill 臂路徑此臂之前 runCleanupBounded 已 acquired==true 者，本臂 note
+                    // 後 outstanding 仍 ≥1（槽具 fail-closed 密封，見 D-D10）——brick 為冪等冗餘密封、
+                    // 不雙釋、不互斥；零追蹤（drain preflight／零槽路徑）者則為唯一接管 arm。
+                    runCatching { ElevatedCleanupTracker.noteRegistrationFailedSticky() }
+                }
             runCatching { ElevatedCleanupTracker.noteUntrackedResidual() }
             if (callerInterrupted) runCatching { Thread.currentThread().interrupt() }
             return Drained(
@@ -3148,630 +3161,723 @@ internal object ElevatedProcessIo {
             } catch (_: Throwable) {
                 drainFailClosedDrained()
             }
-        // P1-B：spawn 成功後立即關子進程 stdin（子進程 stdin EOF）：等 stdin EOF 的
-        // 子進程（如 cat）不再假性 TimedOut。killer 內不關流，此處是唯一關 stdin 處
-        //（drain kill 路徑另關已取的 stdout/stderr，不碰 stdin）。
-        // 約束：本 drain 為無 stdin 模式（起手即關），未來需寫 stdin 必須另開
-        // API，不得復用本函數（復用會與起手關流競態，並改變 EOF 語義）。
-        // Y1 stdin 有界化（owner 新 P1 兩入口）：`outputStream` getter/close 可阻塞
-        //（Shizuku 單次 Binder 亦可 stall；binder 死亡由狀態門 fail-closed，但
-        // stall 本身無界）。改 daemon thread 執行＋主執行緒 join（上界
-        // `min(剩餘 budget, STDIN_CLOSE_MAX_MS)`，計入同一 deadline）；超界即放行
-        // 繼續（best-effort，後續 killer destroy 兜底），drain 總耗時仍有上界。
-        // AB1 P1-A＋P0-1 四態：stdin-closer 啟動不預佔；尾收 grace 後仍存活才 [markLingering]
-        // （每執行緒（四）態 [AtomicInteger] 0=init／1=held／2=done-no-debt／3=done-debt＋僅未計數時佔槽；
-        // 飽和拒佔記債見 markLingering；本體 finally 釋放／歸債，見 [ElevatedCleanupTracker.markLingering]）。
-        val stdinCloser = try {
-            Thread({
-                try {
-                    runCatching { process.outputStream.close() }
-                } finally {
-                    synchronized(stdinCounted) {
-                        if (stdinCounted.get() == 1) {
-                            stdinCounted.set(2)
-                            ElevatedCleanupTracker.releaseSlot()
-                        } else if (stdinCounted.get() == 0) {
-                            stdinCounted.set(2)
-                        } else if (stdinCounted.get() == 3) {
-                            stdinCounted.set(2)
-                            ElevatedCleanupTracker.endLingerDebt()
-                        }
-                    }
-                }
-            }, "elevated-stdin-close").also {
-                it.isDaemon = true
-                stdinCloserRef = it
-                startThread(it)
-                stdinStarted = true
-            }
-        } catch (_: Throwable) {
-            return cleanupOnThreadStartFailure()
-        }
-        try {
-            val stdinRemainMs = try {
-                TimeUnit.NANOSECONDS.toMillis(deadlineNanos - nowNanos()).coerceAtLeast(0L)
+
+        return try {
+            // P1-3 drain 入口 preflight（PR140 Phase 2，最小改動）：budget 已盡即不起
+            // gobbler／stdin-closer（零新執行緒），直接監督殺＋有界驗證後回
+            // `Drained(timedOut=true)`。殺驗語義同 kill 路徑（killer 永不跳過，下界
+            // [CLEANUP_MIN_MS]；驗證走有界 [verifyParentStoppedBounded]），終審計入
+            // breaker 同正常路徑；caller 預置中斷照常出口恢復。流未起即無已取引用可關
+            // （killer 契約本就不碰流；此 Process 的流隨 kill＋物件回收收斂）。
+            val preflightExpired = entryClockFailed || try {
+                ElevatedCallSupervisor.isExpired(deadlineNanos, nowNanos)
             } catch (_: Throwable) {
-                0L
+                true
             }
-            val stdinBudgetMs = minOf(stdinRemainMs, STDIN_CLOSE_MAX_MS)
-            if (stdinBudgetMs > 0L) stdinCloser.join(stdinBudgetMs)
-        } catch (_: InterruptedException) {
-            Thread.currentThread().interrupt()
-        }
-        // X1 getter 回 gobbler 內、整段 try/catch：throw 即 markFailed（W1 語義保留，
-        // runner 側同一 "elevated IO read failed" 固定文案，不帶 remote 原文或輸出；
-        // 無未捕捉例外）；block 則 caller 不受影響照常進 deadline/poll/kill。
-        // @Volatile 語義由 AtomicReference 承載（函數內局部 var 不可 @Volatile，
-        // 此處以原子引用持有已取流，供 kill 路徑關流）。
-        // AB1 P1-A＋P0-1 四態：gobbler 啟動不預佔；join 超界 grace 後仍存活才
-        // [markLingering]（（四）態＋僅未計數時佔槽；本體 finally 釋放／歸債，見上）。
-        val tOut = try {
-            Thread({
-                var s: InputStream? = null
-                try {
-                    val stream = process.inputStream
-                    s = stream
-                    inAcquired.set(stream)
-                    if (aborted.get() || Thread.currentThread().isInterrupted) {
-                        out.markFailed()
-                        runCatching { stream.close() }
-                    } else {
-                        copyCapped(stream, out)
-                    }
-                } catch (t: Throwable) {
-                    out.markFailed()
-                    runCatching { s?.close() }
-                    if (t is VirtualMachineError && t !is OutOfMemoryError) throw t
-                } finally {
-                    inAcquired.set(null)
-                    synchronized(outCounted) {
-                        if (outCounted.get() == 1) {
-                            outCounted.set(2)
-                            ElevatedCleanupTracker.releaseSlot()
-                        } else if (outCounted.get() == 0) {
-                            outCounted.set(2)
-                        } else if (outCounted.get() == 3) {
-                            outCounted.set(2)
-                            ElevatedCleanupTracker.endLingerDebt()
+            if (preflightExpired) {
+                var preIncomplete = false
+                // Stage 3b／3c（雙持有者規則）：清理槽所有權移交——正常路徑：
+                // runCleanupBounded 正常返回且已佔槽即 slotHeldOut=true，custody 由
+                // caller 持有跨 post-kill verify 有界窗口（live victim 始終被追蹤），
+                // verify 結果已知後恰好釋放一次（quarantine 先行、release 殿後，
+                // 順序不變）；stall 路徑：post-grace 已把 custody 轉移給 worker 本體、
+                // slotHeldOut=false——本處 releaseCleanupSlotAfterVerify 為 no-op，
+                // release 於 worker 退出時發生（admission 於彼時前維持 fail-closed）。
+                val cleanupSlotHeld = AtomicBoolean(false)
+                val preOk = try {
+                    runCleanupBounded(CLEANUP_MIN_MS, process, untrackedResidual, startThread, cleanupSlotHeld) {
+                        try {
+                            killer(process)
+                        } catch (_: Throwable) {
+                            swallowedKillerThrows.incrementAndGet()
                         }
                     }
-                }
-            }, "elevated-stdout").also {
-                it.isDaemon = true
-                tOutRef = it
-                startThread(it)
-                outStarted = true
-            }
-        } catch (_: Throwable) {
-            return cleanupOnThreadStartFailure()
-        }
-        val tErr = try {
-            Thread({
-                var s: InputStream? = null
-                try {
-                    val stream = process.errorStream
-                    s = stream
-                    errAcquired.set(stream)
-                    if (aborted.get() || Thread.currentThread().isInterrupted) {
-                        err.markFailed()
-                        runCatching { stream.close() }
-                    } else {
-                        copyCapped(stream, err)
-                    }
-                } catch (t: Throwable) {
-                    err.markFailed()
-                    runCatching { s?.close() }
-                    if (t is VirtualMachineError && t !is OutOfMemoryError) throw t
-                } finally {
-                    errAcquired.set(null)
-                    synchronized(errCounted) {
-                        if (errCounted.get() == 1) {
-                            errCounted.set(2)
-                            ElevatedCleanupTracker.releaseSlot()
-                        } else if (errCounted.get() == 0) {
-                            errCounted.set(2)
-                        } else if (errCounted.get() == 3) {
-                            errCounted.set(2)
-                            ElevatedCleanupTracker.endLingerDebt()
-                        }
-                    }
-                }
-            }, "elevated-stderr").also {
-                it.isDaemon = true
-                tErrRef = it
-                startThread(it)
-                errStarted = true
-            }
-        } catch (_: Throwable) {
-            return cleanupOnThreadStartFailure()
-        }
-        var finished = false
-        // B3 有界 wait（owner P1-5）：直調 `process.waitFor(slice)` 在 Shizuku 同步
-        // Binder stall 下無界卡住（slice／deadline／cancel 皆不生效）。現每片跑
-        // `elevated-wait` worker（見 [ElevatedCallSupervisor.awaitWaitSlice]），主執行緒
-        // 輪詢 cancel／deadline；超界即 kill 路徑（`finished=false`），殘留 worker
-        // 由監督記槽（`markLingering`），`cleanupIncomplete` 由下方 kill 終審帶出。
-        // 快路徑（`waitFor` 首片內即回）不額外調鉤（B2 計數語義不變）。
-        // B3 wait 殘留旗標：`awaitWaitSlice` lingering 只記槽不直接 `noteUnclean`
-        //（drain 終審統一計入，此處經本旗標傳遞，避免一次 drain 雙計）。
-        var waitLingering = false
-        // R3-PhaseF P2-1 drain 級取消觀察者：hook 只跑 watcher worker（拋折為
-        // 未取消繼續觀察＋計數，不誤殺）；caller 只讀 [cancelBit] 受信位＋中斷＋
-        // deadline，永不直調 hook（blocked hook 只卡 watcher，caller 經 deadline
-        // 有界進 kill／tail 中止）。gobbler 起後、wait 輪詢前啟動（首求值時機≈舊
-        // 主循環首輪 hook 位，B2 計數語義不變）。
-        val cancelWatch = try {
-            ElevatedCallSupervisor.startCancelWatch(deadlineNanos, isCancelled, false, nowNanos)
-        } catch (_: Throwable) {
-            // 鄰接臂（stdin／兩 gobbler 起線程失敗）同式收斂：改走受監督 kill 路徑
-            //（KillPath semantics：killer 嘗試不跳過＋有界驗證→failed verdict）。
-            // `cleanupOnThreadStartFailure` 為總函數（見外層包裝）：絕不外抛，
-            // drain 全路徑有界返回契約在此臂同樣成立。
-            return cleanupOnThreadStartFailure()
-        }
-        // 受信取消讀閉包：傳入 [awaitWaitSlice]（其慢路徑 watcher 再包一層求此位，
-        // 永不觸不可信代碼，見其 KDoc 契約）與 tail 循環。
-        val cancelBit: () -> Boolean = { cancelWatch.bit() }
-        try {
-            while (true) {
-                // R3-PhaseF＋PhaseG P2-3：只讀緩存 bit（hook 在 watcher worker 求值，
-                // 此處永不直調）＋入口一次性 [cancelledAtEntry]。預置中斷的 caller
-                // 在此即 break 走 kill 路徑，不當健康進程跑。
-                if (cancelledAtEntry || cancelBit()) break
-                val remaining = try {
-                    TimeUnit.NANOSECONDS.toMillis((deadlineNanos - nowNanos()).coerceAtLeast(0L))
                 } catch (_: Throwable) {
-                    -1L
+                    false
                 }
-                if (remaining <= 0) break
-                val slice = minOf(remaining, POLL_SLICE_MS)
-                when (val w = ElevatedCallSupervisor.awaitWaitSlice(process, slice, deadlineNanos, cancelBit, nowNanos)) {
-                    is ElevatedCallSupervisor.Res.Ok -> if (w.v) {
-                        // R3-PhaseG P2-2 postcheck：該片 `waitFor==true` 只代表命令
-                        // 已 exit，不代表整個 request 未逾期。整體逾期完成
-                        // （deadline 已過／caller 已取消／入口已取消）不得置
-                        // finished——break 走 kill 路徑（`timedOut=true`），與 tail
-                        // 中止（`tailIncomplete`，`timedOut` 仍 false）區分。
-                        // 逾期完成不攜 linger（slice worker 已死），只 break。
-                        val overdueOrCancelled = cancelledAtEntry ||
-                            Thread.currentThread().isInterrupted ||
-                            cancelBit() ||
-                            try {
-                                ElevatedCallSupervisor.isExpired(deadlineNanos, nowNanos)
-                            } catch (_: Throwable) {
-                                true
+                if (!preOk) preIncomplete = true
+                val preVerified = try {
+                    ElevatedCallSupervisor.verifyParentStoppedBounded(process)
+                } catch (_: Throwable) {
+                    false
+                }
+                if (!preVerified) {
+                    preIncomplete = true
+                    // Round-3 Phase E（P1-1）：preflight 監督殺後仍未驗證即登記 quarantine
+                    // （worker 完成≠verified dead；僅 verify 失敗才登記，worker stall 但已驗證
+                    // 死亡不登記——process 已死，無未驗證 handle；後續 spawn 以 QUARANTINE 拒，
+                    // 不靠 breaker 計數）。登記改由 [releaseCleanupSlotAfterVerify] 執行
+                    // （quarantine 先行、release 殿後，順序不變；登記拋出則槽保留 fail-closed）。
+                }
+                // Stage 3c 雙持有者規則：正常路徑——custody 由 caller 持有跨 verify，verify
+                // 結果已知後於下方恰好釋放一次（quarantine 先行、release 殿後，順序不變）；
+                // stall 路徑——post-grace 已把 custody 轉移給 worker，本次呼叫對
+                // releaseCleanupSlotAfterVerify 為 no-op（slotHeldOut==false），release
+                // 於 worker 退出時發生（admission 於彼時前維持 fail-closed）。
+                releaseCleanupSlotAfterVerify(process, preVerified, cleanupSlotHeld.get())
+                if (preIncomplete) {
+                    ElevatedCleanupTracker.noteUnclean()
+                } else if (ElevatedCleanupTracker.outstanding() == 0) {
+                    ElevatedCleanupTracker.noteClean()
+                }
+                if (callerInterrupted) Thread.currentThread().interrupt()
+                return Drained(
+                    stdout = ByteArray(0),
+                    stderr = ByteArray(0),
+                    exitCode = -1,
+                    timedOut = true,
+                    truncated = false,
+                    readFailed = false,
+                    cleanupIncomplete = preIncomplete,
+                    untrackedResidual = untrackedResidual.get(),
+                )
+            }
+            // P1-B：spawn 成功後立即關子進程 stdin（子進程 stdin EOF）：等 stdin EOF 的
+            // 子進程（如 cat）不再假性 TimedOut。killer 內不關流，此處是唯一關 stdin 處
+            //（drain kill 路徑另關已取的 stdout/stderr，不碰 stdin）。
+            // 約束：本 drain 為無 stdin 模式（起手即關），未來需寫 stdin 必須另開
+            // API，不得復用本函數（復用會與起手關流競態，並改變 EOF 語義）。
+            // Y1 stdin 有界化（owner 新 P1 兩入口）：`outputStream` getter/close 可阻塞
+            //（Shizuku 單次 Binder 亦可 stall；binder 死亡由狀態門 fail-closed，但
+            // stall 本身無界）。改 daemon thread 執行＋主執行緒 join（上界
+            // `min(剩餘 budget, STDIN_CLOSE_MAX_MS)`，計入同一 deadline）；超界即放行
+            // 繼續（best-effort，後續 killer destroy 兜底），drain 總耗時仍有上界。
+            // AB1 P1-A＋P0-1 四態：stdin-closer 啟動不預佔；尾收 grace 後仍存活才 [markLingering]
+            // （每執行緒（四）態 [AtomicInteger] 0=init／1=held／2=done-no-debt／3=done-debt＋僅未計數時佔槽；
+            // 飽和拒佔記債見 markLingering；本體 finally 釋放／歸債，見 [ElevatedCleanupTracker.markLingering]）。
+            val stdinCloser = try {
+                Thread({
+                    try {
+                        runCatching { process.outputStream.close() }
+                    } finally {
+                        synchronized(stdinCounted) {
+                            if (stdinCounted.get() == 1) {
+                                stdinCounted.set(2)
+                                ElevatedCleanupTracker.releaseSlot()
+                            } else if (stdinCounted.get() == 0) {
+                                stdinCounted.set(2)
+                            } else if (stdinCounted.get() == 3) {
+                                stdinCounted.set(2)
+                                ElevatedCleanupTracker.endLingerDebt()
                             }
-                        if (overdueOrCancelled) break
-                        finished = true
-                        break
-                    }
-                    is ElevatedCallSupervisor.Res.Err -> {
-                        if (w.hasLinger) {
-                            waitLingering = true
                         }
-                        break
                     }
-                    is ElevatedCallSupervisor.Res.Expired -> {
-                        // P1-4 per-worker 歸因：`hasLinger` 即本 slice worker 自身
-                        // grace 後仍存活（[awaitInternal] 內 `worker.isAlive` 如實
-                        // 回報），不經全域 `outstanding` 推斷。舊碼以
-                        // `outstanding>0` 判定：他 call 殘留（outstanding 來自別的
-                        // drain）會使本次乾淨超時亦置旗，經終審誤計 `noteUnclean`
-                        // 誤觸 breaker；本 worker 真殘留時監督已記槽，
-                        // `hasLinger==true` 與之一致，不漏計。終審仍由
-                        // `cleanupIncomplete` 統一進 `noteUnclean`（良性超時無殘留
-                        // 時 `outstanding==0` 仍走 `noteClean`，見尾收終審；此處只置旗，
-                        // 不直接計數，避免雙計）。
-                        if (w.hasLinger) {
-                            waitLingering = true
-                        }
-                        break
-                    }
-                }
-            }
-        } catch (_: Throwable) {
-            // 輪詢異常收斂為未完成，走下方清理（fail-closed：timedOut，不偽造成功）。
-        }
-        // gobbler 有界 join 未完成標記：任一 join 超界/中斷後執行緒仍存活即部分讀，
-        // 經 Drained.truncated 帶出（絕不靜默短讀不標）。
-        var joinIncomplete = false
-        // R2-PhaseC P2-2：finished 路徑 tail 中止（取消／超時致 gobbler 中斷＋殘留）
-        // 即 true（與 joinIncomplete 同置三處，見下；kill 路徑永 false）。
-        // 命令 exit（finished）vs 整個 request finished 分開：本旗標真即 request 未完，
-        // runner 側 would-be Ok 升級 TimedOut（見兩 runner P2-2 分支）。
-        var tailIncomplete = false
-        // Z1 清理不完整旗標：kill 監督未完成或 stdin-closer 尾收殘留即 true
-        //（runner verdict 映射不變，僅供 #136-B3 監測）。
-        // P1-3：kill 終審推遲到尾收後（gobbler／stdin linger 亦計入，避免少計）。
-        var cleanupIncomplete = false
-        // B3：wait 殘留（`elevated-wait` worker stall）即清理缺口，不靜默。
-        if (waitLingering) cleanupIncomplete = true
-        if (!finished) {
-            aborted.set(true)
-            // X1：kill 前先 best-effort 中斷兩 gobbler（助可中斷 stalls 脫離，無害；
-            // 若 getter 正阻塞於可中斷等待即抛，經 gobbler 整段 catch 收斂為 markFailed）。
-            runCatching { tOut.interrupt() }
-            runCatching { tErr.interrupt() }
-            // Z1 順序：interrupt stdinCloser → 監督清理 → joins。stdin 先中斷
-            // 助可中斷 stalls 脫離；尾收（見下方共通段）再確認殘留並記旗標。
-            runCatching { stdinCloser.interrupt() }
-            // Z1 kill 路徑清理監督化：killer＋已取流 close 包入單一 daemon worker，
-            // 有界 join；超界 interrupt＋grace。永不跳過 killer 嘗試（下界保底）。
-            // X1 語義保留：只關已取流，不再重調 getter（根除 kill 路徑 getter 阻塞）。
-            val cleanupRemainMs = try {
-                TimeUnit.NANOSECONDS.toMillis(deadlineNanos - nowNanos()).coerceAtLeast(0L)
-            } catch (_: Throwable) {
-                0L
-            }
-            val cleanupBudgetMs = minOf(maxOf(cleanupRemainMs, CLEANUP_MIN_MS), CLEANUP_JOIN_MS)
-            // Stage 3c 雙持有者規則：清理槽所有權移交——正常路徑：slot 持有跨
-            // post-kill verify 有界窗口（live victim 始終被追蹤），custody 由 caller
-            // 持有，verify 結果已知後恰好釋放一次（quarantine 先行、release 殿後，
-            // 順序不變）；stall 路徑：post-grace 已把 custody 轉移給 worker 本體、
-            // slotHeldOut=false——下方 releaseCleanupSlotAfterVerify 為 no-op，
-            // release 於 worker 退出時發生（admission 於彼時前維持 fail-closed）。
-            val cleanupSlotHeld = AtomicBoolean(false)
-            val cleanupOk = try {
-                runCleanupBounded(cleanupBudgetMs, process, untrackedResidual, startThread, cleanupSlotHeld) {
-                    // P2 吞例外計數：killer 抛即吞（best-effort，已盡力殺；刻意靜默，
-                    // 不升級為崩潰，計數見 swallowedKillerThrows；流 close 另逐段吞，
-                    // 預期 close 收斂，不計數）。
-                    try {
-                        killer(process)
-                    } catch (_: Throwable) {
-                        swallowedKillerThrows.incrementAndGet()
-                    }
-                    runCatching { inAcquired.get()?.close() }
-                    runCatching { errAcquired.get()?.close() }
+                }, "elevated-stdin-close").also {
+                    it.isDaemon = true
+                    stdinCloserRef = it
+                    startThread(it)
+                    stdinStarted = true
                 }
             } catch (_: Throwable) {
-                false
-            }
-            if (!cleanupOk) cleanupIncomplete = true
-            // P1-3：終審推遲到尾收後（此處不再 noteClean/noteUnclean，避免
-            // 後續 gobbler／stdin linger 少計；統一終審見尾收段）。
-            // P1-3 post-kill 驗證（B2，killer true ≠ 進程真死）：killer 全
-            // runCatching＋遠端 destroy 吞失敗，cleanupOk 只代表本機 thread
-            // 離開，不代表父進程已停。此處以 waitFor／liveness 驗證父進程，
-            // 失敗或不可驗證（binder 不可達視 unknown）即 cleanupIncomplete=true
-            //（經尾收終審進 noteUnclean／breaker，不宣稱 cleaned）。子孫全滅
-            // 仍為真機 blocker（JVM 真樹已驗，裝置 SELinux／Root 語義差異 E2E
-            // 歸 #136-B3，見 ElevatedProcessKiller）。
-            // Round-3 Phase E（P1-1）：驗證失敗即登記 quarantine（worker 完成≠
-            // verified dead）。注意：registered ⇒ 驗證失敗 僅對此 arm 成立——
-            // 起線程失敗 arm（runCleanupBounded catch）在失敗當下無條件登記
-            // quarantine（即使進程稍後驗證為亡），解除密封專屬 verify-only sweep；
-            // 讀者不得從「已登記」反推「驗證失敗」（起線程失敗與驗證無關）。
-            // 此 arm 的語義：驗證失敗才登記；cleanupOk==false 但已驗證死亡不登記。
-            // verdict cleanupIncomplete 保持 true（經尾收終審），
-            // quarantine 以 QUARANTINE 把 fail-closed 擴展到後續 spawn。
-            // 登記改由 [releaseCleanupSlotAfterVerify] 執行（quarantine 先行、
-            // release 殿後，順序不變；登記拋出則槽保留 fail-closed）。
-            val verified = try {
-                ElevatedCallSupervisor.verifyParentStoppedBounded(process)
-            } catch (_: Throwable) {
-                false
-            }
-            if (!verified) {
-                cleanupIncomplete = true
-            }
-            // Stage 3c 雙持有者規則：正常路徑——custody 由 caller 持有跨 verify，verify
-            // 結果已知後於下方恰好釋放一次（quarantine 先行、release 殿後，順序不變）；
-            // stall 路徑——post-grace 已把 custody 轉移給 worker，本次呼叫對
-            // releaseCleanupSlotAfterVerify 為 no-op（slotHeldOut==false），release
-            // 於 worker 退出時發生（admission 於彼時前維持 fail-closed）。
-            releaseCleanupSlotAfterVerify(process, verified, cleanupSlotHeld.get())
-            // 超時/cancel 路徑保留有界 join：gobbler 仍可能卡住，避免無限等。
-            // join 中斷必須 restore 中斷旗標（不吞 InterruptedException）。
-            // AB1 P1-A：join 超界仍存活即殘留 gobbler（入口已中斷兩 gobbler，
-            // 此處不再重斷；kill 監督＋kill 等待已是上界，不另給 grace）
-            // → [markLingering] 計數＋旗標帶出。
-            try {
-                tOut.join(GOBBLER_JOIN_MS)
-            } catch (_: InterruptedException) {
-                Thread.currentThread().interrupt()
-            } finally {
-                if (tOut.isAlive) {
-                    joinIncomplete = true
-                    cleanupIncomplete = true
-                    ElevatedCleanupTracker.markLingering(tOut, outCounted)
-                }
+                return cleanupOnThreadStartFailure()
             }
             try {
-                tErr.join(GOBBLER_JOIN_MS)
-            } catch (_: InterruptedException) {
-                Thread.currentThread().interrupt()
-            } finally {
-                if (tErr.isAlive) {
-                    joinIncomplete = true
-                    cleanupIncomplete = true
-                    ElevatedCleanupTracker.markLingering(tErr, errCounted)
-                }
-            }
-        } else {
-            // AB1 P1-A：本分支不再起手 noteClean；改由尾收後統一判定
-            // `if (cleanupIncomplete) noteUnclean() else if (outstanding()==0) noteClean()`
-            //（cleanupIncomplete 含殘留 gobbler／stdin；正常完成且全域無殘留仍
-            // noteClean，不誤判良性；讀失敗不計，見尾收終審）。早拒路徑（門拒／
-            // 配額拒，spawn 前）無 drain 執行，不碰計數器。
-            // P1-4 finished tail budget：雙 gobbler joins 共享
-            // `finishedTailBudget = min(剩餘 deadline, FINISHED_TAIL_BUDGET_MS=2s)`。
-            // 舊碼兩段 10s 成功路徑 join（舊 SUCCESS_JOIN_MS 常數，已隨 Y1 tail
-            // 收斂刪除）＋grace 無 remaining／isCancelled 輪詢：
-            // 300ms timeout＋已 exit 但流不 EOF 可釘 20s＋。現每片（POLL_SLICE_MS）
-            // 後查 isCancelled／中斷／deadline，命中即 interrupt＋CLEANUP_GRACE_MS
-            // grace＋isAlive 重判＋三旗＋break（第二流亦走同一 interrupt→grace→重判
-            // 路徑，Stage 2A P1-A6；可 settle 者不記殘留，grace 後仍存活才記槽）；
-            // 自然耗盡（budget 用罄
-            // 仍存活）即 interrupt＋capped grace（grace 至少給 [CLEANUP_GRACE_MS]，封頂
-            // [SUCCESS_JOIN_GRACE_MS]，讓可中斷 gobbler 捕捉 `InterruptedException`
-            // 並完成 `markFailed()` 退出，避免 `tailRemainMs()==0` 時跳過 join 的 0ms 競態）
-            // ＋重判 `isAlive`（P0-2），仍存活即三旗＋記槽。
-            // 單流上界即由 `finishedTailBudget = min(剩餘 deadline,
-            // FINISHED_TAIL_BUDGET_MS=2s)` 承擔（無獨立 10s 絕對上界，tail 2s 下
-            // 單流必有界）；grace 亦 capped，不清除已記標記
-            //（超 tail 的讀數不視為完整，Y1 語義保留）。正常慢讀 tail 內完成即無
-            // interrupt，不受影響；只有卡死執行緒才走到記槽分支。
-            // 無界 join 在遠端流永不 EOF 時可卡死超 timeoutMs，故不用。
-            try {
-                var tailClockFailed = false
-                val tailBudgetMs = try {
-                    minOf(
-                        TimeUnit.NANOSECONDS.toMillis(deadlineNanos - nowNanos()).coerceAtLeast(0L),
-                        FINISHED_TAIL_BUDGET_MS,
-                    )
+                val stdinRemainMs = try {
+                    TimeUnit.NANOSECONDS.toMillis(deadlineNanos - nowNanos()).coerceAtLeast(0L)
                 } catch (_: Throwable) {
-                    tailClockFailed = true
                     0L
                 }
-                val tailBaseNanos = if (tailClockFailed) {
-                    0L
-                } else {
+                val stdinBudgetMs = minOf(stdinRemainMs, STDIN_CLOSE_MAX_MS)
+                if (stdinBudgetMs > 0L) stdinCloser.join(stdinBudgetMs)
+            } catch (_: InterruptedException) {
+                Thread.currentThread().interrupt()
+            }
+            // X1 getter 回 gobbler 內、整段 try/catch：throw 即 markFailed（W1 語義保留，
+            // runner 側同一 "elevated IO read failed" 固定文案，不帶 remote 原文或輸出；
+            // 無未捕捉例外）；block 則 caller 不受影響照常進 deadline/poll/kill。
+            // @Volatile 語義由 AtomicReference 承載（函數內局部 var 不可 @Volatile，
+            // 此處以原子引用持有已取流，供 kill 路徑關流）。
+            // AB1 P1-A＋P0-1 四態：gobbler 啟動不預佔；join 超界 grace 後仍存活才
+            // [markLingering]（（四）態＋僅未計數時佔槽；本體 finally 釋放／歸債，見上）。
+            val tOut = try {
+                Thread({
+                    var s: InputStream? = null
                     try {
-                        nowNanos()
+                        val stream = process.inputStream
+                        s = stream
+                        inAcquired.set(stream)
+                        if (aborted.get() || Thread.currentThread().isInterrupted) {
+                            out.markFailed()
+                            runCatching { stream.close() }
+                        } else {
+                            copyCapped(stream, out)
+                        }
+                    } catch (t: Throwable) {
+                        out.markFailed()
+                        runCatching { s?.close() }
+                        if (t is VirtualMachineError && t !is OutOfMemoryError) throw t
+                    } finally {
+                        inAcquired.set(null)
+                        synchronized(outCounted) {
+                            if (outCounted.get() == 1) {
+                                outCounted.set(2)
+                                ElevatedCleanupTracker.releaseSlot()
+                            } else if (outCounted.get() == 0) {
+                                outCounted.set(2)
+                            } else if (outCounted.get() == 3) {
+                                outCounted.set(2)
+                                ElevatedCleanupTracker.endLingerDebt()
+                            }
+                        }
+                    }
+                }, "elevated-stdout").also {
+                    it.isDaemon = true
+                    tOutRef = it
+                    startThread(it)
+                    outStarted = true
+                }
+            } catch (_: Throwable) {
+                return cleanupOnThreadStartFailure()
+            }
+            val tErr = try {
+                Thread({
+                    var s: InputStream? = null
+                    try {
+                        val stream = process.errorStream
+                        s = stream
+                        errAcquired.set(stream)
+                        if (aborted.get() || Thread.currentThread().isInterrupted) {
+                            err.markFailed()
+                            runCatching { stream.close() }
+                        } else {
+                            copyCapped(stream, err)
+                        }
+                    } catch (t: Throwable) {
+                        err.markFailed()
+                        runCatching { s?.close() }
+                        if (t is VirtualMachineError && t !is OutOfMemoryError) throw t
+                    } finally {
+                        errAcquired.set(null)
+                        synchronized(errCounted) {
+                            if (errCounted.get() == 1) {
+                                errCounted.set(2)
+                                ElevatedCleanupTracker.releaseSlot()
+                            } else if (errCounted.get() == 0) {
+                                errCounted.set(2)
+                            } else if (errCounted.get() == 3) {
+                                errCounted.set(2)
+                                ElevatedCleanupTracker.endLingerDebt()
+                            }
+                        }
+                    }
+                }, "elevated-stderr").also {
+                    it.isDaemon = true
+                    tErrRef = it
+                    startThread(it)
+                    errStarted = true
+                }
+            } catch (_: Throwable) {
+                return cleanupOnThreadStartFailure()
+            }
+            var finished = false
+            // B3 有界 wait（owner P1-5）：直調 `process.waitFor(slice)` 在 Shizuku 同步
+            // Binder stall 下無界卡住（slice／deadline／cancel 皆不生效）。現每片跑
+            // `elevated-wait` worker（見 [ElevatedCallSupervisor.awaitWaitSlice]），主執行緒
+            // 輪詢 cancel／deadline；超界即 kill 路徑（`finished=false`），殘留 worker
+            // 由監督記槽（`markLingering`），`cleanupIncomplete` 由下方 kill 終審帶出。
+            // 快路徑（`waitFor` 首片內即回）不額外調鉤（B2 計數語義不變）。
+            // B3 wait 殘留旗標：`awaitWaitSlice` lingering 只記槽不直接 `noteUnclean`
+            //（drain 終審統一計入，此處經本旗標傳遞，避免一次 drain 雙計）。
+            var waitLingering = false
+            // R3-PhaseF P2-1 drain 級取消觀察者：hook 只跑 watcher worker（拋折為
+            // 未取消繼續觀察＋計數，不誤殺）；caller 只讀 [cancelBit] 受信位＋中斷＋
+            // deadline，永不直調 hook（blocked hook 只卡 watcher，caller 經 deadline
+            // 有界進 kill／tail 中止）。gobbler 起後、wait 輪詢前啟動（首求值時機≈舊
+            // 主循環首輪 hook 位，B2 計數語義不變）。
+            val cancelWatch = try {
+                ElevatedCallSupervisor.startCancelWatch(deadlineNanos, isCancelled, false, nowNanos)
+            } catch (_: Throwable) {
+                // 鄰接臂（stdin／兩 gobbler 起線程失敗）同式收斂：改走受監督 kill 路徑
+                //（KillPath semantics：killer 嘗試不跳過＋有界驗證→failed verdict）。
+                // `cleanupOnThreadStartFailure` 為總函數（見外層包裝）：絕不外抛，
+                // drain 全路徑有界返回契約在此臂同樣成立。
+                return cleanupOnThreadStartFailure()
+            }
+            // 受信取消讀閉包：傳入 [awaitWaitSlice]（其慢路徑 watcher 再包一層求此位，
+            // 永不觸不可信代碼，見其 KDoc 契約）與 tail 循環。
+            val cancelBit: () -> Boolean = { cancelWatch.bit() }
+            try {
+                while (true) {
+                    // R3-PhaseF＋PhaseG P2-3：只讀緩存 bit（hook 在 watcher worker 求值，
+                    // 此處永不直調）＋入口一次性 [cancelledAtEntry]。預置中斷的 caller
+                    // 在此即 break 走 kill 路徑，不當健康進程跑。
+                    if (cancelledAtEntry || cancelBit()) break
+                    val remaining = try {
+                        TimeUnit.NANOSECONDS.toMillis((deadlineNanos - nowNanos()).coerceAtLeast(0L))
                     } catch (_: Throwable) {
-                        tailClockFailed = true
-                        0L
+                        -1L
+                    }
+                    if (remaining <= 0) break
+                    val slice = minOf(remaining, POLL_SLICE_MS)
+                    when (val w = ElevatedCallSupervisor.awaitWaitSlice(process, slice, deadlineNanos, cancelBit, nowNanos)) {
+                        is ElevatedCallSupervisor.Res.Ok -> if (w.v) {
+                            // R3-PhaseG P2-2 postcheck：該片 `waitFor==true` 只代表命令
+                            // 已 exit，不代表整個 request 未逾期。整體逾期完成
+                            // （deadline 已過／caller 已取消／入口已取消）不得置
+                            // finished——break 走 kill 路徑（`timedOut=true`），與 tail
+                            // 中止（`tailIncomplete`，`timedOut` 仍 false）區分。
+                            // 逾期完成不攜 linger（slice worker 已死），只 break。
+                            val overdueOrCancelled = cancelledAtEntry ||
+                                Thread.currentThread().isInterrupted ||
+                                cancelBit() ||
+                                try {
+                                    ElevatedCallSupervisor.isExpired(deadlineNanos, nowNanos)
+                                } catch (_: Throwable) {
+                                    true
+                                }
+                            if (overdueOrCancelled) break
+                            finished = true
+                            break
+                        }
+                        is ElevatedCallSupervisor.Res.Err -> {
+                            if (w.hasLinger) {
+                                waitLingering = true
+                            }
+                            break
+                        }
+                        is ElevatedCallSupervisor.Res.Expired -> {
+                            // P1-4 per-worker 歸因：`hasLinger` 即本 slice worker 自身
+                            // grace 後仍存活（[awaitInternal] 內 `worker.isAlive` 如實
+                            // 回報），不經全域 `outstanding` 推斷。舊碼以
+                            // `outstanding>0` 判定：他 call 殘留（outstanding 來自別的
+                            // drain）會使本次乾淨超時亦置旗，經終審誤計 `noteUnclean`
+                            // 誤觸 breaker；本 worker 真殘留時監督已記槽，
+                            // `hasLinger==true` 與之一致，不漏計。終審仍由
+                            // `cleanupIncomplete` 統一進 `noteUnclean`（良性超時無殘留
+                            // 時 `outstanding==0` 仍走 `noteClean`，見尾收終審；此處只置旗，
+                            // 不直接計數，避免雙計）。
+                            if (w.hasLinger) {
+                                waitLingering = true
+                            }
+                            break
+                        }
                     }
                 }
-                val tailDeadlineNanos = tailBaseNanos + TimeUnit.MILLISECONDS.toNanos(tailBudgetMs)
-                fun tailRemainMs(): Long = if (tailClockFailed) {
+            } catch (_: Throwable) {
+                // 輪詢異常收斂為未完成，走下方清理（fail-closed：timedOut，不偽造成功）。
+            }
+            // gobbler 有界 join 未完成標記：任一 join 超界/中斷後執行緒仍存活即部分讀，
+            // 經 Drained.truncated 帶出（絕不靜默短讀不標）。
+            var joinIncomplete = false
+            // R2-PhaseC P2-2：finished 路徑 tail 中止（取消／超時致 gobbler 中斷＋殘留）
+            // 即 true（與 joinIncomplete 同置三處，見下；kill 路徑永 false）。
+            // 命令 exit（finished）vs 整個 request finished 分開：本旗標真即 request 未完，
+            // runner 側 would-be Ok 升級 TimedOut（見兩 runner P2-2 分支）。
+            var tailIncomplete = false
+            // Z1 清理不完整旗標：kill 監督未完成或 stdin-closer 尾收殘留即 true
+            //（runner verdict 映射不變，僅供 #136-B3 監測）。
+            // P1-3：kill 終審推遲到尾收後（gobbler／stdin linger 亦計入，避免少計）。
+            var cleanupIncomplete = false
+            // B3：wait 殘留（`elevated-wait` worker stall）即清理缺口，不靜默。
+            if (waitLingering) cleanupIncomplete = true
+            if (!finished) {
+                aborted.set(true)
+                // X1：kill 前先 best-effort 中斷兩 gobbler（助可中斷 stalls 脫離，無害；
+                // 若 getter 正阻塞於可中斷等待即抛，經 gobbler 整段 catch 收斂為 markFailed）。
+                runCatching { tOut.interrupt() }
+                runCatching { tErr.interrupt() }
+                // Z1 順序：interrupt stdinCloser → 監督清理 → joins。stdin 先中斷
+                // 助可中斷 stalls 脫離；尾收（見下方共通段）再確認殘留並記旗標。
+                runCatching { stdinCloser.interrupt() }
+                // Z1 kill 路徑清理監督化：killer＋已取流 close 包入單一 daemon worker，
+                // 有界 join；超界 interrupt＋grace。永不跳過 killer 嘗試（下界保底）。
+                // X1 語義保留：只關已取流，不再重調 getter（根除 kill 路徑 getter 阻塞）。
+                val cleanupRemainMs = try {
+                    TimeUnit.NANOSECONDS.toMillis(deadlineNanos - nowNanos()).coerceAtLeast(0L)
+                } catch (_: Throwable) {
                     0L
-                } else {
-                    try {
+                }
+                val cleanupBudgetMs = minOf(maxOf(cleanupRemainMs, CLEANUP_MIN_MS), CLEANUP_JOIN_MS)
+                // Stage 3c 雙持有者規則：清理槽所有權移交——正常路徑：slot 持有跨
+                // post-kill verify 有界窗口（live victim 始終被追蹤），custody 由 caller
+                // 持有，verify 結果已知後恰好釋放一次（quarantine 先行、release 殿後，
+                // 順序不變）；stall 路徑：post-grace 已把 custody 轉移給 worker 本體、
+                // slotHeldOut=false——下方 releaseCleanupSlotAfterVerify 為 no-op，
+                // release 於 worker 退出時發生（admission 於彼時前維持 fail-closed）。
+                val cleanupSlotHeld = AtomicBoolean(false)
+                val cleanupOk = try {
+                    runCleanupBounded(cleanupBudgetMs, process, untrackedResidual, startThread, cleanupSlotHeld) {
+                        // P2 吞例外計數：killer 抛即吞（best-effort，已盡力殺；刻意靜默，
+                        // 不升級為崩潰，計數見 swallowedKillerThrows；流 close 另逐段吞，
+                        // 預期 close 收斂，不計數）。
+                        try {
+                            killer(process)
+                        } catch (_: Throwable) {
+                            swallowedKillerThrows.incrementAndGet()
+                        }
+                        runCatching { inAcquired.get()?.close() }
+                        runCatching { errAcquired.get()?.close() }
+                    }
+                } catch (_: Throwable) {
+                    false
+                }
+                if (forceDrainPostAcquireFailure) {
+                    // Round-6（#136-B2 D-D3 測試 seam；一shot）：取得槽之後（runCleanupBounded
+                    // 已佔槽／或飽和）、verify 之前拋出，釘頂層 catch-all fail-closed 契約。
+                    forceDrainPostAcquireFailure = false
+                    throw IllegalStateException("forced drain post-acquire failure (test seam)")
+                }
+                if (!cleanupOk) cleanupIncomplete = true
+                // P1-3：終審推遲到尾收後（此處不再 noteClean/noteUnclean，避免
+                // 後續 gobbler／stdin linger 少計；統一終審見尾收段）。
+                // P1-3 post-kill 驗證（B2，killer true ≠ 進程真死）：killer 全
+                // runCatching＋遠端 destroy 吞失敗，cleanupOk 只代表本機 thread
+                // 離開，不代表父進程已停。此處以 waitFor／liveness 驗證父進程，
+                // 失敗或不可驗證（binder 不可達視 unknown）即 cleanupIncomplete=true
+                //（經尾收終審進 noteUnclean／breaker，不宣稱 cleaned）。子孫全滅
+                // 仍為真機 blocker（JVM 真樹已驗，裝置 SELinux／Root 語義差異 E2E
+                // 歸 #136-B3，見 ElevatedProcessKiller）。
+                // Round-3 Phase E（P1-1）：驗證失敗即登記 quarantine（worker 完成≠
+                // verified dead）。注意：registered ⇒ 驗證失敗 僅對此 arm 成立——
+                // 起線程失敗 arm（runCleanupBounded catch）在失敗當下無條件登記
+                // quarantine（即使進程稍後驗證為亡），解除密封專屬 verify-only sweep；
+                // 讀者不得從「已登記」反推「驗證失敗」（起線程失敗與驗證無關）。
+                // 此 arm 的語義：驗證失敗才登記；cleanupOk==false 但已驗證死亡不登記。
+                // verdict cleanupIncomplete 保持 true（經尾收終審），
+                // quarantine 以 QUARANTINE 把 fail-closed 擴展到後續 spawn。
+                // 登記改由 [releaseCleanupSlotAfterVerify] 執行（quarantine 先行、
+                // release 殿後，順序不變；登記拋出則槽保留 fail-closed）。
+                val verified = try {
+                    ElevatedCallSupervisor.verifyParentStoppedBounded(process)
+                } catch (_: Throwable) {
+                    false
+                }
+                if (!verified) {
+                    cleanupIncomplete = true
+                }
+                // Stage 3c 雙持有者規則：正常路徑——custody 由 caller 持有跨 verify，verify
+                // 結果已知後於下方恰好釋放一次（quarantine 先行、release 殿後，順序不變）；
+                // stall 路徑——post-grace 已把 custody 轉移給 worker，本次呼叫對
+                // releaseCleanupSlotAfterVerify 為 no-op（slotHeldOut==false），release
+                // 於 worker 退出時發生（admission 於彼時前維持 fail-closed）。
+                releaseCleanupSlotAfterVerify(process, verified, cleanupSlotHeld.get())
+                // 超時/cancel 路徑保留有界 join：gobbler 仍可能卡住，避免無限等。
+                // join 中斷必須 restore 中斷旗標（不吞 InterruptedException）。
+                // AB1 P1-A：join 超界仍存活即殘留 gobbler（入口已中斷兩 gobbler，
+                // 此處不再重斷；kill 監督＋kill 等待已是上界，不另給 grace）
+                // → [markLingering] 計數＋旗標帶出。
+                try {
+                    tOut.join(GOBBLER_JOIN_MS)
+                } catch (_: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                } finally {
+                    if (tOut.isAlive) {
+                        joinIncomplete = true
+                        cleanupIncomplete = true
+                        ElevatedCleanupTracker.markLingering(tOut, outCounted)
+                    }
+                }
+                try {
+                    tErr.join(GOBBLER_JOIN_MS)
+                } catch (_: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                } finally {
+                    if (tErr.isAlive) {
+                        joinIncomplete = true
+                        cleanupIncomplete = true
+                        ElevatedCleanupTracker.markLingering(tErr, errCounted)
+                    }
+                }
+            } else {
+                // AB1 P1-A：本分支不再起手 noteClean；改由尾收後統一判定
+                // `if (cleanupIncomplete) noteUnclean() else if (outstanding()==0) noteClean()`
+                //（cleanupIncomplete 含殘留 gobbler／stdin；正常完成且全域無殘留仍
+                // noteClean，不誤判良性；讀失敗不計，見尾收終審）。早拒路徑（門拒／
+                // 配額拒，spawn 前）無 drain 執行，不碰計數器。
+                // P1-4 finished tail budget：雙 gobbler joins 共享
+                // `finishedTailBudget = min(剩餘 deadline, FINISHED_TAIL_BUDGET_MS=2s)`。
+                // 舊碼兩段 10s 成功路徑 join（舊 SUCCESS_JOIN_MS 常數，已隨 Y1 tail
+                // 收斂刪除）＋grace 無 remaining／isCancelled 輪詢：
+                // 300ms timeout＋已 exit 但流不 EOF 可釘 20s＋。現每片（POLL_SLICE_MS）
+                // 後查 isCancelled／中斷／deadline，命中即 interrupt＋CLEANUP_GRACE_MS
+                // grace＋isAlive 重判＋三旗＋break（第二流亦走同一 interrupt→grace→重判
+                // 路徑，Stage 2A P1-A6；可 settle 者不記殘留，grace 後仍存活才記槽）；
+                // 自然耗盡（budget 用罄
+                // 仍存活）即 interrupt＋capped grace（grace 至少給 [CLEANUP_GRACE_MS]，封頂
+                // [SUCCESS_JOIN_GRACE_MS]，讓可中斷 gobbler 捕捉 `InterruptedException`
+                // 並完成 `markFailed()` 退出，避免 `tailRemainMs()==0` 時跳過 join 的 0ms 競態）
+                // ＋重判 `isAlive`（P0-2），仍存活即三旗＋記槽。
+                // 單流上界即由 `finishedTailBudget = min(剩餘 deadline,
+                // FINISHED_TAIL_BUDGET_MS=2s)` 承擔（無獨立 10s 絕對上界，tail 2s 下
+                // 單流必有界）；grace 亦 capped，不清除已記標記
+                //（超 tail 的讀數不視為完整，Y1 語義保留）。正常慢讀 tail 內完成即無
+                // interrupt，不受影響；只有卡死執行緒才走到記槽分支。
+                // 無界 join 在遠端流永不 EOF 時可卡死超 timeoutMs，故不用。
+                try {
+                    var tailClockFailed = false
+                    val tailBudgetMs = try {
                         minOf(
-                            TimeUnit.NANOSECONDS.toMillis(tailDeadlineNanos - nowNanos()).coerceAtLeast(0L),
                             TimeUnit.NANOSECONDS.toMillis(deadlineNanos - nowNanos()).coerceAtLeast(0L),
+                            FINISHED_TAIL_BUDGET_MS,
                         )
                     } catch (_: Throwable) {
                         tailClockFailed = true
                         0L
                     }
-                }
-                var tailAborted = false
-                fun joinFinishedTail(t: Thread, counted: AtomicInteger) {
-                    if (tailAborted) {
-                        // 前一流已因取消／逾期 abort：本流不再等完整讀，
-                        // 但仍 interrupt→CLEANUP_GRACE_MS grace→isAlive 重判（Stage 2A
-                        // P1-A6，同 budget-exhaustion 分支語義）——可於 grace 內 settle
-                        // 的可中斷 gobbler 不再被立即記殘留（避免高估 cleanupIncomplete）。
-                        // 三旗照置：tail 確未排空，truncated-tail 語義不因 settle 消失；
-                        // 僅 LINGER（markLingering 佔槽）以 grace 後存活為準。
-                        if (t.isAlive) {
-                            runCatching { t.interrupt() }
-                            try {
-                                t.join(CLEANUP_GRACE_MS)
-                            } catch (_: InterruptedException) {
-                                // 預置中斷在場時 join 即抛（join 實質被 elide，不耗 grace）。
-                                Thread.currentThread().interrupt()
-                            }
-                            joinIncomplete = true
-                            cleanupIncomplete = true
-                            tailIncomplete = true
-                            if (t.isAlive) {
-                                ElevatedCleanupTracker.markLingering(t, counted)
-                            }
-                        }
-                        return
-                    }
-                    while (t.isAlive) {
-                        // R3-PhaseF＋PhaseG P2-3：只讀緩存 bit（hook 在 watcher worker
-                        // 求值，此處永不直調；拋折為未取消的語義由 watcher 側同策略
-                        // 承擔，不誤殺）＋入口一次性 [cancelledAtEntry]。
-                        val expiredNow = tailClockFailed || try {
-                            ElevatedCallSupervisor.isExpired(deadlineNanos, nowNanos)
+                    val tailBaseNanos = if (tailClockFailed) {
+                        0L
+                    } else {
+                        try {
+                            nowNanos()
                         } catch (_: Throwable) {
                             tailClockFailed = true
-                            true
+                            0L
                         }
-                        if (cancelledAtEntry || cancelBit() || Thread.currentThread().isInterrupted || expiredNow) {
-                            // 取消／呼叫執行緒中斷／deadline 耗盡：不再等流。
-                            // Stage 2A（P1-A6）：interrupt 後仍給 CLEANUP_GRACE_MS
-                            // grace＋isAlive 重判（與 budget-exhaustion／tailAborted
-                            // 分支一致）——可 settle 的可中斷 gobbler 不記殘留；
-                            // fail-closed：grace 後仍存活即照舊記槽。三旗照置。
+                    }
+                    val tailDeadlineNanos = tailBaseNanos + TimeUnit.MILLISECONDS.toNanos(tailBudgetMs)
+                    fun tailRemainMs(): Long = if (tailClockFailed) {
+                        0L
+                    } else {
+                        try {
+                            minOf(
+                                TimeUnit.NANOSECONDS.toMillis(tailDeadlineNanos - nowNanos()).coerceAtLeast(0L),
+                                TimeUnit.NANOSECONDS.toMillis(deadlineNanos - nowNanos()).coerceAtLeast(0L),
+                            )
+                        } catch (_: Throwable) {
+                            tailClockFailed = true
+                            0L
+                        }
+                    }
+                    var tailAborted = false
+                    fun joinFinishedTail(t: Thread, counted: AtomicInteger) {
+                        if (tailAborted) {
+                            // 前一流已因取消／逾期 abort：本流不再等完整讀，
+                            // 但仍 interrupt→CLEANUP_GRACE_MS grace→isAlive 重判（Stage 2A
+                            // P1-A6，同 budget-exhaustion 分支語義）——可於 grace 內 settle
+                            // 的可中斷 gobbler 不再被立即記殘留（避免高估 cleanupIncomplete）。
+                            // 三旗照置：tail 確未排空，truncated-tail 語義不因 settle 消失；
+                            // 僅 LINGER（markLingering 佔槽）以 grace 後存活為準。
+                            if (t.isAlive) {
+                                runCatching { t.interrupt() }
+                                try {
+                                    t.join(CLEANUP_GRACE_MS)
+                                } catch (_: InterruptedException) {
+                                    // 預置中斷在場時 join 即抛（join 實質被 elide，不耗 grace）。
+                                    Thread.currentThread().interrupt()
+                                }
+                                joinIncomplete = true
+                                cleanupIncomplete = true
+                                tailIncomplete = true
+                                if (t.isAlive) {
+                                    ElevatedCleanupTracker.markLingering(t, counted)
+                                }
+                            }
+                            return
+                        }
+                        while (t.isAlive) {
+                            // R3-PhaseF＋PhaseG P2-3：只讀緩存 bit（hook 在 watcher worker
+                            // 求值，此處永不直調；拋折為未取消的語義由 watcher 側同策略
+                            // 承擔，不誤殺）＋入口一次性 [cancelledAtEntry]。
+                            val expiredNow = tailClockFailed || try {
+                                ElevatedCallSupervisor.isExpired(deadlineNanos, nowNanos)
+                            } catch (_: Throwable) {
+                                tailClockFailed = true
+                                true
+                            }
+                            if (cancelledAtEntry || cancelBit() || Thread.currentThread().isInterrupted || expiredNow) {
+                                // 取消／呼叫執行緒中斷／deadline 耗盡：不再等流。
+                                // Stage 2A（P1-A6）：interrupt 後仍給 CLEANUP_GRACE_MS
+                                // grace＋isAlive 重判（與 budget-exhaustion／tailAborted
+                                // 分支一致）——可 settle 的可中斷 gobbler 不記殘留；
+                                // fail-closed：grace 後仍存活即照舊記槽。三旗照置。
+                                runCatching { t.interrupt() }
+                                try {
+                                    t.join(CLEANUP_GRACE_MS)
+                                } catch (_: InterruptedException) {
+                                    // 預置中斷在場時 join 即抛（join 實質被 elide，不耗 grace）。
+                                    Thread.currentThread().interrupt()
+                                }
+                                joinIncomplete = true
+                                cleanupIncomplete = true
+                                tailIncomplete = true
+                                if (t.isAlive) {
+                                    ElevatedCleanupTracker.markLingering(t, counted)
+                                }
+                                tailAborted = true
+                                return
+                            }
+                            // P1-4 `join(0)` 防呆：`join(0)` 即無限等待。`tailRemainMs()` 取兩次
+                            // （檢查與等待量）之間可被調度切走使第二次回 0，故單次取值、
+                            // 非正即 break，傳入 join 的等待量恒正。
+                            val waitMs = minOf(tailRemainMs(), POLL_SLICE_MS)
+                            if (waitMs <= 0L) break
+                            try {
+                                t.join(waitMs)
+                            } catch (_: InterruptedException) {
+                                Thread.currentThread().interrupt()
+                            }
+                        }
+                        if (t.isAlive && !tailAborted) {
+                            // tail budget 耗盡（非取消／主 deadline 中止）：中斷後至少給
+                            // CLEANUP_GRACE_MS（封頂 SUCCESS_JOIN_GRACE_MS），讓可中斷 gobbler
+                            // 捕捉 InterruptedException 完成 markFailed() 並退出，避免 0ms 競態。
                             runCatching { t.interrupt() }
+                            val graceMs = minOf(maxOf(tailRemainMs(), CLEANUP_GRACE_MS), SUCCESS_JOIN_GRACE_MS)
+                            if (graceMs > 0L) {
+                                try {
+                                    t.join(graceMs)
+                                } catch (_: InterruptedException) {
+                                    Thread.currentThread().interrupt()
+                                }
+                            }
+                            // P0-2：grace 後必須重讀 `isAlive` 再判定（舊碼以 grace 前快照置旗，
+                            // 而四態 mark 對已退出執行緒不佔槽，造成無槽 noteUnclean）。
+                            if (t.isAlive) {
+                                joinIncomplete = true
+                                cleanupIncomplete = true
+                                tailIncomplete = true
+                                ElevatedCleanupTracker.markLingering(t, counted)
+                            }
+                        }
+                    }
+                    joinFinishedTail(tOut, outCounted)
+                    joinFinishedTail(tErr, errCounted)
+                } catch (_: Throwable) {
+                    runCatching { tOut.interrupt() }
+                    runCatching { tErr.interrupt() }
+                    joinIncomplete = true
+                    cleanupIncomplete = true
+                    tailIncomplete = true
+                    for ((t, counted) in listOf(tOut to outCounted, tErr to errCounted)) {
+                        if (t.isAlive) {
                             try {
                                 t.join(CLEANUP_GRACE_MS)
                             } catch (_: InterruptedException) {
-                                // 預置中斷在場時 join 即抛（join 實質被 elide，不耗 grace）。
                                 Thread.currentThread().interrupt()
                             }
-                            joinIncomplete = true
-                            cleanupIncomplete = true
-                            tailIncomplete = true
                             if (t.isAlive) {
                                 ElevatedCleanupTracker.markLingering(t, counted)
                             }
-                            tailAborted = true
-                            return
-                        }
-                        // P1-4 `join(0)` 防呆：`join(0)` 即無限等待。`tailRemainMs()` 取兩次
-                        // （檢查與等待量）之間可被調度切走使第二次回 0，故單次取值、
-                        // 非正即 break，傳入 join 的等待量恒正。
-                        val waitMs = minOf(tailRemainMs(), POLL_SLICE_MS)
-                        if (waitMs <= 0L) break
-                        try {
-                            t.join(waitMs)
-                        } catch (_: InterruptedException) {
-                            Thread.currentThread().interrupt()
-                        }
-                    }
-                    if (t.isAlive && !tailAborted) {
-                        // tail budget 耗盡（非取消／主 deadline 中止）：中斷後至少給
-                        // CLEANUP_GRACE_MS（封頂 SUCCESS_JOIN_GRACE_MS），讓可中斷 gobbler
-                        // 捕捉 InterruptedException 完成 markFailed() 並退出，避免 0ms 競態。
-                        runCatching { t.interrupt() }
-                        val graceMs = minOf(maxOf(tailRemainMs(), CLEANUP_GRACE_MS), SUCCESS_JOIN_GRACE_MS)
-                        if (graceMs > 0L) {
-                            try {
-                                t.join(graceMs)
-                            } catch (_: InterruptedException) {
-                                Thread.currentThread().interrupt()
-                            }
-                        }
-                        // P0-2：grace 後必須重讀 `isAlive` 再判定（舊碼以 grace 前快照置旗，
-                        // 而四態 mark 對已退出執行緒不佔槽，造成無槽 noteUnclean）。
-                        if (t.isAlive) {
-                            joinIncomplete = true
-                            cleanupIncomplete = true
-                            tailIncomplete = true
-                            ElevatedCleanupTracker.markLingering(t, counted)
-                        }
-                    }
-                }
-                joinFinishedTail(tOut, outCounted)
-                joinFinishedTail(tErr, errCounted)
-            } catch (_: Throwable) {
-                runCatching { tOut.interrupt() }
-                runCatching { tErr.interrupt() }
-                joinIncomplete = true
-                cleanupIncomplete = true
-                tailIncomplete = true
-                for ((t, counted) in listOf(tOut to outCounted, tErr to errCounted)) {
-                    if (t.isAlive) {
-                        try {
-                            t.join(CLEANUP_GRACE_MS)
-                        } catch (_: InterruptedException) {
-                            Thread.currentThread().interrupt()
-                        }
-                        if (t.isAlive) {
-                            ElevatedCleanupTracker.markLingering(t, counted)
                         }
                     }
                 }
             }
-        }
-        // Z1 stdin-closer 生命週期收斂（兩路徑共通尾收）：gobbler joins 後仍存活即
-        // interrupt＋grace 重 join，仍存活即 cleanupIncomplete=true（daemon 殘留
-        // 8s 類不可中斷 stall 由旗標帶出，不靜默；正常完成即無 interrupt 影響）。
-        // AB1：仍存活即殘留 stdin-closer → [markLingering] 計數（啟動不預佔，
-        // 僅此處佔槽；本體 finally 釋放，見 [ElevatedCleanupTracker.markLingering]）。
-        if (stdinCloser.isAlive) {
-            runCatching { stdinCloser.interrupt() }
-            try {
-                stdinCloser.join(CLEANUP_GRACE_MS)
-            } catch (_: InterruptedException) {
-                Thread.currentThread().interrupt()
-            }
+            // Z1 stdin-closer 生命週期收斂（兩路徑共通尾收）：gobbler joins 後仍存活即
+            // interrupt＋grace 重 join，仍存活即 cleanupIncomplete=true（daemon 殘留
+            // 8s 類不可中斷 stall 由旗標帶出，不靜默；正常完成即無 interrupt 影響）。
+            // AB1：仍存活即殘留 stdin-closer → [markLingering] 計數（啟動不預佔，
+            // 僅此處佔槽；本體 finally 釋放，見 [ElevatedCleanupTracker.markLingering]）。
             if (stdinCloser.isAlive) {
-                cleanupIncomplete = true
-                ElevatedCleanupTracker.markLingering(stdinCloser, stdinCounted)
-            }
-        }
-        // R3-PhaseF：watcher 收斂（殘留即記槽＋置旗，由下方終審統一進 breaker；
-        // 正常完成即無 interrupt 影響，watcher 自行退出，零殘留）。
-        val watchLingering = try {
-            cancelWatch.close()
-        } catch (_: Throwable) {
-            true
-        }
-        if (watchLingering) cleanupIncomplete = true
-        // P1-3＋P0-1 統一終審（兩路徑共通，kill 終審推遲到此，避免少計）：
-        // - cleanupIncomplete（含 kill 監督未完成、殘留 gobbler／stdin）即
-        //   noteUnclean 累計（kill 路徑 cleanupOk==false 已併入本旗標；kill 後
-        //   gobbler linger 亦併入，不再少計；finished 殘留同理）；
-        // - 無殘留（cleanupIncomplete==false）僅全域無殘留（outstanding==0）才
-        //   noteClean；殘留期間（outstanding>0）的乾淨 drain 保持計數
-        //  （不歸零亦不遞增），避免乾淨呼叫沖掉熔斷（P0-1）。
-        // 讀失敗（out／err.failed）不計入連續計數：finished 下讀異常必為真實 I／O
-        // 錯誤但不持有任何資源（執行緒已退出、流已關），verdict 已回 Failed；
-        // 連續計數只計資源清理未完成（殘留執行緒／worker 持槽），避免數據錯誤
-        // 誤觸熔斷。
-        // B3 有界 exitValue 先行（P2 中斷恢復之前）：`exitValueBounded` 以
-        // `isInterrupted` 判超界，須在 caller 預置中斷恢復前求值。
-        // R3-PhaseG P2-3 注記：預置中斷的 drain 已由 [cancelledAtEntry] 進 kill
-        // 路徑（`finished=false`），不到此 finished 分支；此處只處理 tail 期間
-        // 新到的中斷（join 內抛後 restore 的旗標），語義不變。
-        // P1-4 tail 中斷快照清除：finished joins 在 `InterruptedException` 後一律
-        // restore 旗標（見上兩分支 catch），若呼叫執行緒在 tail 期間被中斷（或預置
-        // 中斷在某 join 內再次抛），此處旗標已置；不清即 `exitValueBounded` 的
-        // cancelCheck（`isInterrupted || isExpired`）必命中，健康進程亦 Expired→
-        // exit -1 誤報（kill -1 同值但 `timedOut` 區分，見下註記；此處 finished 下
-        // -1 會使 runner 誤判 Failed）。故先 `Thread.interrupted()` 快照清除，
-        // exitValue 用獨立 deadline（[ElevatedCallSupervisor.EXIT_JOIN_MS]，不耗
-        // 主 deadline 剩餘），求值後立即恢復（出口 `callerInterrupted` 恢復仍執行，
-        // caller 中斷不丟失）。
-        // Expired（stall 殘留）即置 `cleanupIncomplete`，由下方終審統一進 breaker。
-        val joinInterrupted = Thread.interrupted()
-        val exitCode: Int = if (finished) {
-            try {
-                when (val ev = ElevatedCallSupervisor.exitValueBounded(process, nowNanos)) {
-                    is ElevatedCallSupervisor.Res.Ok -> ev.v
-                    is ElevatedCallSupervisor.Res.Err -> -1
-                    is ElevatedCallSupervisor.Res.Expired -> {
-                        cleanupIncomplete = true
-                        -1
-                    }
+                runCatching { stdinCloser.interrupt() }
+                try {
+                    stdinCloser.join(CLEANUP_GRACE_MS)
+                } catch (_: InterruptedException) {
+                    Thread.currentThread().interrupt()
                 }
-            } catch (_: Throwable) {
-                cleanupIncomplete = true
-                -1
+                if (stdinCloser.isAlive) {
+                    cleanupIncomplete = true
+                    ElevatedCleanupTracker.markLingering(stdinCloser, stdinCounted)
+                }
             }
-        } else -1
-        if (joinInterrupted) Thread.currentThread().interrupt()
-        if (cleanupIncomplete) {
-            ElevatedCleanupTracker.noteUnclean()
-        } else if (ElevatedCleanupTracker.outstanding() == 0) {
-            ElevatedCleanupTracker.noteClean()
-        }
-        // P2 caller 中斷恢復：入口預置中斷出口恢復一次（不吞 caller 中斷）。
-        if (callerInterrupted) Thread.currentThread().interrupt()
-        val outBytes = try {
-            out.bytes()
+            // R3-PhaseF：watcher 收斂（殘留即記槽＋置旗，由下方終審統一進 breaker；
+            // 正常完成即無 interrupt 影響，watcher 自行退出，零殘留）。
+            val watchLingering = try {
+                cancelWatch.close()
+            } catch (_: Throwable) {
+                true
+            }
+            if (watchLingering) cleanupIncomplete = true
+            // P1-3＋P0-1 統一終審（兩路徑共通，kill 終審推遲到此，避免少計）：
+            // - cleanupIncomplete（含 kill 監督未完成、殘留 gobbler／stdin）即
+            //   noteUnclean 累計（kill 路徑 cleanupOk==false 已併入本旗標；kill 後
+            //   gobbler linger 亦併入，不再少計；finished 殘留同理）；
+            // - 無殘留（cleanupIncomplete==false）僅全域無殘留（outstanding==0）才
+            //   noteClean；殘留期間（outstanding>0）的乾淨 drain 保持計數
+            //  （不歸零亦不遞增），避免乾淨呼叫沖掉熔斷（P0-1）。
+            // 讀失敗（out／err.failed）不計入連續計數：finished 下讀異常必為真實 I／O
+            // 錯誤但不持有任何資源（執行緒已退出、流已關），verdict 已回 Failed；
+            // 連續計數只計資源清理未完成（殘留執行緒／worker 持槽），避免數據錯誤
+            // 誤觸熔斷。
+            // B3 有界 exitValue 先行（P2 中斷恢復之前）：`exitValueBounded` 以
+            // `isInterrupted` 判超界，須在 caller 預置中斷恢復前求值。
+            // R3-PhaseG P2-3 注記：預置中斷的 drain 已由 [cancelledAtEntry] 進 kill
+            // 路徑（`finished=false`），不到此 finished 分支；此處只處理 tail 期間
+            // 新到的中斷（join 內抛後 restore 的旗標），語義不變。
+            // P1-4 tail 中斷快照清除：finished joins 在 `InterruptedException` 後一律
+            // restore 旗標（見上兩分支 catch），若呼叫執行緒在 tail 期間被中斷（或預置
+            // 中斷在某 join 內再次抛），此處旗標已置；不清即 `exitValueBounded` 的
+            // cancelCheck（`isInterrupted || isExpired`）必命中，健康進程亦 Expired→
+            // exit -1 誤報（kill -1 同值但 `timedOut` 區分，見下註記；此處 finished 下
+            // -1 會使 runner 誤判 Failed）。故先 `Thread.interrupted()` 快照清除，
+            // exitValue 用獨立 deadline（[ElevatedCallSupervisor.EXIT_JOIN_MS]，不耗
+            // 主 deadline 剩餘），求值後立即恢復（出口 `callerInterrupted` 恢復仍執行，
+            // caller 中斷不丟失）。
+            // Expired（stall 殘留）即置 `cleanupIncomplete`，由下方終審統一進 breaker。
+            val joinInterrupted = Thread.interrupted()
+            val exitCode: Int = if (finished) {
+                try {
+                    when (val ev = ElevatedCallSupervisor.exitValueBounded(process, nowNanos)) {
+                        is ElevatedCallSupervisor.Res.Ok -> ev.v
+                        is ElevatedCallSupervisor.Res.Err -> -1
+                        is ElevatedCallSupervisor.Res.Expired -> {
+                            cleanupIncomplete = true
+                            -1
+                        }
+                    }
+                } catch (_: Throwable) {
+                    cleanupIncomplete = true
+                    -1
+                }
+            } else -1
+            if (joinInterrupted) Thread.currentThread().interrupt()
+            if (cleanupIncomplete) {
+                ElevatedCleanupTracker.noteUnclean()
+            } else if (ElevatedCleanupTracker.outstanding() == 0) {
+                ElevatedCleanupTracker.noteClean()
+            }
+            // P2 caller 中斷恢復：入口預置中斷出口恢復一次（不吞 caller 中斷）。
+            if (callerInterrupted) Thread.currentThread().interrupt()
+            val outBytes = try {
+                out.bytes()
+            } catch (_: Throwable) {
+                out.markFailed()
+                ByteArray(0)
+            }
+            val errBytes = try {
+                err.bytes()
+            } catch (_: Throwable) {
+                err.markFailed()
+                ByteArray(0)
+            }
+            return Drained(
+                stdout = outBytes,
+                stderr = errBytes,
+                // P2 exit -1 難分註記：finished 下 exitValue() 抛（遠端漂移）即 -1，
+                // 與 kill 路徑（!finished）-1 同值但以 timedOut 區分（false vs true），
+                // 不可僅看 exitCode；runner 側 finished -1 即 Failed（非零分支），
+                // kill -1 即 TimedOut，verdict 不混。
+                exitCode = exitCode,
+                timedOut = !finished,
+                // R1-A：join 未完成或任一流硬上限溢出（>hardCapBytes 丟棄）即 truncated；
+                // 通用 512K 溢出本就經 64K truncate 標記，此處 OR 不改其 verdict；
+                // 截圖 8M==8M 時需此位區分「恰 8M 通過」與「>8M 丟棄」（後者 truncate(8M,8M)
+                // 無法檢出，故必須由溢出位帶出，否則 >8M 會誤判為完整幀）。
+                truncated = joinIncomplete || out.didOverflow() || err.didOverflow(),
+                // V2：任一流 gobbler 讀取異常即 true（無條件記錄；超時/取消路徑
+                // 已先回 TimedOut，runner 側按 finished 區分語義，見 Drained.readFailed）。
+                readFailed = out.failed || err.failed,
+                cleanupIncomplete = cleanupIncomplete,
+                // R2-PhaseC P2-2：finished tail 中止原樣帶出（runner 側 would-be Ok
+                // 升級 TimedOut；`timedOut` 本體仍為 `!finished`，命令 exit 語義不動）。
+                tailIncomplete = tailIncomplete,
+                untrackedResidual = untrackedResidual.get(),
+            )
         } catch (_: Throwable) {
-            out.markFailed()
-            ByteArray(0)
+            // D-D3（#136-B2 round-6）：頂層 backstop — 任何內部逃逸異常皆收斂為 fail-closed Drained。
+            // drainFailClosedDrained() 已含：killTree best-effort（D-A1）、已起執行緒 interrupt＋
+            // 殘留記槽、quarantine 登記（失敗即 noteQuarantineRegistrationFailed＋sticky brick）、
+            // noteUntrackedResidual＋旗標；與 cleanupOnThreadStartFailure() 的 catch-all 臂同構。
+            // 前置宣告（callerInterrupted／pipes／counters／local funs）不在 try 內——除
+            // computeDeadlineNanos／isExpired 已內部收斂外，其餘為原子計數器／參考建構，理論上
+            // 可能於 VME 下抛，但逃逸機率可忽略且此時無資源可追蹤（零執行緒起動），接受並文件化。
+            // noteUnclean／markLingering／releaseCleanupSlotAfterVerify 等無保護點逃逸即落此臂：
+            // slot 保留（不雙釋）；admission fail-closed；登記盡力而為。
+            // D-D10（Round-6）：caller 側已佔槽（acquired==true）於本臂不被釋放（custody 不移交給
+            // verify／終審臂不觸及釋槽）—outstanding 永久 ≥1、admission 永久密封
+            // （BACKLOG_FULL；registrar 亦失敗時第一門 REGISTRATION_FAILED 優先僅縮門），
+            // 恢復唯一途徑 app 重啟，此洩漏以 fail-closed 為刻意設計，#136-B3 必須接 alert＋runbook（重啟）。
+            return drainFailClosedDrained()
         }
-        val errBytes = try {
-            err.bytes()
-        } catch (_: Throwable) {
-            err.markFailed()
-            ByteArray(0)
-        }
-        return Drained(
-            stdout = outBytes,
-            stderr = errBytes,
-            // P2 exit -1 難分註記：finished 下 exitValue() 抛（遠端漂移）即 -1，
-            // 與 kill 路徑（!finished）-1 同值但以 timedOut 區分（false vs true），
-            // 不可僅看 exitCode；runner 側 finished -1 即 Failed（非零分支），
-            // kill -1 即 TimedOut，verdict 不混。
-            exitCode = exitCode,
-            timedOut = !finished,
-            // R1-A：join 未完成或任一流硬上限溢出（>hardCapBytes 丟棄）即 truncated；
-            // 通用 512K 溢出本就經 64K truncate 標記，此處 OR 不改其 verdict；
-            // 截圖 8M==8M 時需此位區分「恰 8M 通過」與「>8M 丟棄」（後者 truncate(8M,8M)
-            // 無法檢出，故必須由溢出位帶出，否則 >8M 會誤判為完整幀）。
-            truncated = joinIncomplete || out.didOverflow() || err.didOverflow(),
-            // V2：任一流 gobbler 讀取異常即 true（無條件記錄；超時/取消路徑
-            // 已先回 TimedOut，runner 側按 finished 區分語義，見 Drained.readFailed）。
-            readFailed = out.failed || err.failed,
-            cleanupIncomplete = cleanupIncomplete,
-            // R2-PhaseC P2-2：finished tail 中止原樣帶出（runner 側 would-be Ok
-            // 升級 TimedOut；`timedOut` 本體仍為 `!finished`，命令 exit 語義不動）。
-            tailIncomplete = tailIncomplete,
-            untrackedResidual = untrackedResidual.get(),
-        )
     }
 
     /**
@@ -3797,6 +3903,18 @@ internal object ElevatedProcessIo {
     @VisibleForTesting
     internal var forceCleanupOnThreadStartFailureFailure: Boolean = false
 
+    /** 僅供測試：強制 drain kill 路徑在 runCleanupBounded 取得槽之後、verify 之前
+     *  拋 IllegalStateException（釘頂層 catch-all fail-closed 契約；一shot 自動還原，
+     *  測試須於 finally 覆核 false）。永不在生產路徑置位。
+     *  為何不掛 [ElevatedCallSupervisor.verifyParentStoppedBounded] 入口：本檔三處直接
+     *  調用點（preflight／Inner／kill 臂）與 [lateCompensateSpawn] 皆有局部 try/catch
+     *  收斂 verified=false，verify 內抛永不外傳、無法釘 D-D3；kill 路徑此 seam 為
+     *  唯一未受保護的 post-acquire 點之一。釘：drain 回 drainFailClosedDrained 形狀
+     *  Drained（readFailed／untrackedResidual／cleanupIncomplete／truncated=true，
+     *  exitCode=-1）、slot 不釋放（admission 續拒）、登記盡力而為。 */
+    @VisibleForTesting
+    internal var forceDrainPostAcquireFailure: Boolean = false
+
     /** verified-dead → release; unverifiable+registered → release; registration failed → keep slot.
      *  internal：晚補償臂（[ElevatedCallSupervisor]）與 drain 共用同一 fail-closed 語義。
      *  每 (process, 槽) 至多呼叫一次：六處調用點，皆恰好一條直線呼叫（無分支/無迴圈）——
@@ -3809,8 +3927,13 @@ internal object ElevatedProcessIo {
     internal fun releaseCleanupSlotAfterVerify(process: Process, verified: Boolean, slotHeld: Boolean) {
         if (verified) { if (slotHeld) ElevatedCleanupTracker.releaseSlot(); return }
         val registered = try { quarantineRegistrar(process); true } catch (_: Throwable) { false }
-        if (registered) { if (slotHeld) ElevatedCleanupTracker.releaseSlot() } else { ElevatedCleanupTracker.noteQuarantineRegistrationFailed() }
+        if (registered) { if (slotHeld) ElevatedCleanupTracker.releaseSlot() } else {
+            ElevatedCleanupTracker.noteQuarantineRegistrationFailed()
+            if (!slotHeld) ElevatedCleanupTracker.noteRegistrationFailedSticky()
+        }
         // !slotHeld && !registered：acquire 期 OOM 且登記再失敗，仍無任何追蹤；breaker＋診斷可見；#136-B3 恢復待辦
+        // Round-6（#136-B2 IR-P2）：零追蹤 ⇒ brick admission（REGISTRATION_FAILED，app 重啟恢復）。
+        // slotHeld==true 者槽保留、admission 以 BACKLOG_FULL 續拒（仍有追蹤），不置 brick。
     }
 
     /**
@@ -3873,7 +3996,7 @@ internal object ElevatedProcessIo {
      * P1-4 `start()` 抛收斂：`Thread.start()` 抛（`IllegalThreadState`／
      * `SecurityException` 等）即先無條件登記 quarantine（恰好一次計數以「startThread
      * 拋即未起」契約為前提——自訂 starter 已起執行緒後再拋之極角下，debt 可於仍阻塞的
-     * worker 退出前提前收斂，該極角之 fail-closed backstop 為 gate 6（本臂 quarantine
+     * worker 退出前提前收斂，該極角之 fail-closed backstop 為 gate 7（本臂 quarantine
      * 登記）而非 linger debt；見 catch 臂註解。即使進程稍後驗證為亡；
      * 解除密封專屬 verify-only sweep，讀者不得從「已登記」反推「驗證失敗」），
      * 登記僅由 verify-only sweep 解封（進程自然死亡後）; QUARANTINE 密封直至 sweep 成功。
@@ -4009,7 +4132,12 @@ internal object ElevatedProcessIo {
             ElevatedCleanupTracker.noteQuarantineRegistrationFailed()
             // 此臂無 verify 階段：second-chance 登記失敗即無後續重試，僅診斷計數＋#136-B3 接管
             // （與兩晚補償臂 startLateDaemon／compensateInline 的二次登記同構；===-dedup 冪等）。
-            try { ElevatedProcessIo.quarantineRegistrar(process) } catch (_: Throwable) { ElevatedCleanupTracker.noteQuarantineRegistrationFailed() }
+            try { ElevatedProcessIo.quarantineRegistrar(process) } catch (_: Throwable) {
+                ElevatedCleanupTracker.noteQuarantineRegistrationFailed()
+                // Round-6（#136-B2 IR-P2）：second-chance 亦失 ⇒ 無槽且零追蹤（handle 不入 quarantine）
+                // ⇒ brick admission（app 重啟恢復）。
+                ElevatedCleanupTracker.noteRegistrationFailedSticky()
+            }
             slotHeldOut.set(false)
             untrackedOut?.set(true)
             return false
@@ -4053,7 +4181,7 @@ internal object ElevatedProcessIo {
             // 恰好一次計數以「startThread 拋即未起」契約為前提（production 預設
             // `{ it.start() }`）：自訂 starter 若已起動 OS 執行緒後再拋（或 JVM
             // OOME-inside-start 競態），本臂可能在仍阻塞的 worker 退出前先收斂債務
-            // （debt 生命週期被縮短）——該極角下 fail-closed backstop 是 gate 6
+            // （debt 生命週期被縮短）——該極角下 fail-closed backstop 是 gate 7
             // （本 arm 內 quarantine 登記），而非 linger debt 本身。
             // 刻意不加 waitFor(0) 守衛（Binder 0ms waitFor 可能 stall 有界臂）。
             if (!acquired) {
@@ -4246,6 +4374,11 @@ internal object ElevatedProcessIo {
  * Round-3 Phase E（P1-1）：未驗證 quarantine 持有（[quarantineHeld]）拒絕亦收斂至此，
  * 與 quota 同級（零 spawn、不耗配額），但原因碼獨立（`QUARANTINE`，不與上兩因混碼）。
  *
+ * Round-6（#136-B2 IR-P2）：登記雙失敗 brick（[registrationFailed]，admission 以
+ * [ElevatedCleanupTracker.Admission.REGISTRATION_FAILED] 永久密封）拒絕亦收斂至此，
+ * 與 quota 同級（零 spawn、不耗配額）；原因碼文案獨立（reason code 復用 `QUOTA_EXCEEDED`，
+ * operator 依 message 辨識）；`cleanupIncomplete=true`；app 重啟恢復；#136-B3 必接 alert＋runbook。
+ *
  * AB1 呼叫級准入（owner 新 P1-A＋P1-B）：併發上限（[concurrencyFull]，訊息含
  * "concurrency full" 以區分飽和／熔斷兩因）拒絕收斂至此，與 quota 同級，同為
  * `QUOTA_EXCEEDED` 且零 spawn、不耗配額（准入在飽和／熔斷門之後、配額之前；
@@ -4325,6 +4458,23 @@ internal object ElevatedRunnerCommon {
      */
     fun quarantineHeld(): ElevatedBinaryResult.Denied =
         ElevatedBinaryResult.Denied(ShellDeny.QUARANTINE, QUARANTINE_HELD_MESSAGE, true)
+
+    /**
+     * Round-6（#136-B2）登記雙失敗 fail-closed brick 訊息（獨立原因碼文案；reason code 復用
+     * `QUOTA_EXCEEDED` —— 與資源門同級，與 permit 語義有別，operator 可依 message 辨識；
+     * B3 可改專用 ShellDeny code）。
+     */
+    const val REGISTRATION_FAILED_MESSAGE =
+        "elevated unverified-process registration failed (fail-closed, app restart required)"
+
+    /**
+     * Round-6（#136-B2）登記雙失敗 brick 時的 typed 拒絕：`QUOTA_EXCEEDED`，不建子進程。
+     * `cleanupIncomplete=true`（登記雙失敗＝handle 無槽且無登記，殘留未追蹤中——
+     * fail-closed 信號經 verdict 帶出；app 重啟恢復；admission 以
+     * [ElevatedCleanupTracker.Admission.REGISTRATION_FAILED] 永久密封）。
+     */
+    fun registrationFailed(): ElevatedBinaryResult.Denied =
+        ElevatedBinaryResult.Denied(ShellDeny.QUOTA_EXCEEDED, REGISTRATION_FAILED_MESSAGE, true)
 
     /** 呼叫級併發上限拒絕訊息（AB1 P1-B 准入門，與 quota 同級，零 spawn、不耗配額）。 */
     const val CONCURRENCY_FULL_MESSAGE =

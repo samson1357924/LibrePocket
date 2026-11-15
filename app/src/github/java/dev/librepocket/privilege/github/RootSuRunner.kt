@@ -172,6 +172,13 @@ import java.util.concurrent.TimeUnit
  * 不耗配額；成功後整個剩餘 runBinary 包 `try { ... } finally { leaveCall() }`
  * （配額拒、spawn 抛、drain 全路徑釋放）。
  *
+ * Round-6（#136-B2）登記雙失敗 brick：admission 於「無槽且 quarantine 雙登記皆拋」
+ * 臂（`ElevatedCleanupTracker.registrationFailedSticky` 置位——drain 三臂／`drainFailClosedDrained`／
+ * `releaseCleanupSlotAfterVerify` 零追蹤臂）後永久拒絕
+ * `Denied(QUOTA_EXCEEDED, "elevated unverified-process registration failed (fail-closed, app restart required)")`；
+ * 與上述五因同碼，訊息獨立可辨識；app 重啟方能恢復；
+ * 審計 `DENY` 下須看拒絕訊息而非 verdict；#136-B3 必接 alert＋runbook（重啟）。
+ *
  * B2 P1-4 spawn 前取消（owner 新 P1-4）：入口＋最後授權重驗後（配額前）＋
  * 配額→spawn 窗口三點經 [ElevatedRunnerCommon.checkPreSpawnCancel] 有界檢查
  * （R2-PhaseC P2-1：hook 只跑監督 worker，呼叫側只看中斷＋deadline；
@@ -320,6 +327,9 @@ class RootSuRunner(
             }
             ElevatedCleanupTracker.Admission.QUARANTINE -> {
                 return ElevatedRunnerCommon.quarantineHeld()
+            }
+            ElevatedCleanupTracker.Admission.REGISTRATION_FAILED -> {
+                return ElevatedRunnerCommon.registrationFailed()
             }
             ElevatedCleanupTracker.Admission.CONCURRENCY_FULL -> {
                 // Phase 5 B3：分支保留不刪。現參數下實效不可達（預留檢查先拒，

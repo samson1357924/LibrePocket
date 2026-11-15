@@ -178,15 +178,17 @@ interface BinaryElevatedRunner : ElevatedShellRunner {
  * Phase 5 verdict 坍縮表（B5，僅 KDoc，#136-B3 排障用；不新增 verdict 常數，
  * `OK_TRUNCATED` 不引入，維持 Phase 4 決定 —— truncated-Ok 仍記 `OK`，
  * 只是不回位元組、不摘要部分幀，見 `RootFramebufferCapture`）：
- * - `QUOTA_EXCEEDED` 四因同碼（僅訊息區分，皆零 spawn、不耗配額）：
+ * - `QUOTA_EXCEEDED` 五因同碼（僅訊息區分，皆零 spawn、不耗配額）：
  *   配額耗盡（`ElevatedRunnerCommon.quotaExceeded`）／清理 backlog 飽和
  *   （`cleanupBacklogFull`）／連續不清創熔斷（`cleanupBreakerOpen`）／
- *   併發上限（`concurrencyFull`）。審計 `DENY` 下四因不可區分，
- *   排障須看拒絕訊息（`quota exceeded`／`backlog full`／`breaker open`／
- *   `concurrency full`），不得僅看 verdict；
+ *   併發上限（`concurrencyFull`）／登記雙失敗 brick（`registrationFailed`，
+ *   無槽且 quarantine 雙登記皆抛之極角，app 重啟方能恢復，#136-B3 必接 alert）。
+ *   審計 `DENY` 下五因不可區分，排障須看拒絕訊息
+ *   （`quota exceeded`／`backlog full`／`breaker open`／`concurrency full`／
+ *   `registration failed`），不得僅看 verdict；
  * - 未驗證 quarantine（Round-3 Phase E，P1-1）：獨立原因碼 `QUARANTINE`
  *   （`ElevatedRunnerCommon.quarantineHeld`，訊息含 `quarantine held`），
- *   不與上四因混碼；同為零 spawn、不耗配額，審計同記 `DENY`，
+ *   不與上五因混碼；同為零 spawn、不耗配額，審計同記 `DENY`，
  *   另攜 `cleanupIncomplete=true`（quarantine 接管前 cleanup 仍未完成，
  *   fail-closed 信號經 verdict 持久帶出；binary 層攜旗，`toShellResult` 僅
  *   `TimedOut` 穿透、`Denied` 無對應欄仍丟棄）；

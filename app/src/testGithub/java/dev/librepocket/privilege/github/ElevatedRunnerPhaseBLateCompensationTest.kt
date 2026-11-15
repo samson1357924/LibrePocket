@@ -51,6 +51,7 @@ class ElevatedRunnerPhaseBLateCompensationTest {
         floorBefore = ElevatedCleanupTracker.releaseFloorHits()
         ElevatedProcessIo.quarantineRegistrar = { ElevatedCleanupTracker.quarantineUnverified(it) }
         ElevatedCleanupTracker.clearUnverified()
+        ElevatedCleanupTracker.clearRegistrationFailedStickyForTest()
         ElevatedCleanupTracker.noteClean()
         pollOutstandingTo(0)
         pollActiveTo(0)
@@ -766,6 +767,124 @@ class ElevatedRunnerPhaseBLateCompensationTest {
                 ElevatedCleanupTracker.noteClean()
                 awaitNoElevatedThreads()
             }
+        }
+    }
+
+    /**
+     * (b3.5) `elevated-late-spawn` 起線程「已起 OS 線程後再拋」極角（Round-6 D-A5 pin）：
+     * startThread ＝`{ t -> t.start(); throw OutOfMemoryError(...) }`——OS 線程已起、daemon
+     * 體與 catch 臂之間以 boundary ownership CAS（startLateDaemon 之 `daemonClaimed`）恰好
+     * 一次收斂。daemon 先 CAS ⇒ daemon 體收斂（catch 臂 observe 即 benignly no-op）；
+     * catch 臂先 CAS ⇒ daemon 醒後 observe false、直接退出（不重複登記／釋放／計數）。
+     * 勝負不由測試決定性假設， invariant 在兩臂任一成立：
+     * outstanding() 歸零、quarantinedCount()==1、releaseFloorHits()==floorBefore（無雙釋）、
+     * consecutiveCount()==1（恰好一次 breaker 計數）、admission 以 QUARANTINE 拒（gate 7）。
+     * harness 同 (b)（spawn→worker 退出→cancelGate 放行→expireWorker 認領）；
+     * armed killer 於最終 barrier 放行（任一臂勝出皆不依賴 killer 是否被呼叫——daemon 臂
+     * 會呼叫 killer 並阻塞於 latch，catch 臂則不會——故不斷言 killer 次數）。
+     */
+    @Test fun lateDaemonStartThreadThrowsAfterStartConvergesExactlyOnce() {
+        ElevatedCleanupTracker.clearUnverified()
+        ElevatedCleanupTracker.noteClean()
+        pollOutstandingTo(0)
+        pollActiveTo(0)
+        ElevatedCleanupTracker.resetPeak()
+        val spawnEntered = CountDownLatch(1)
+        val spawnRelease = CountDownLatch(1)
+        val cancelGate = CountDownLatch(1)
+        val cancelBlockEntered = CountDownLatch(1)
+        val killerLatch = CountDownLatch(1)
+        val lateRef = AtomicReference<LatchBlockedDestroyProcess?>()
+        val resultRef = AtomicReference<ElevatedCallSupervisor.Res<Process>?>()
+        val kills = AtomicInteger(0)
+        val isCancelled: () -> Boolean = {
+            if (spawnEntered.count > 0) {
+                false
+            } else if (resultRef.get() != null) {
+                false
+            } else {
+                cancelBlockEntered.countDown()
+                stuckAwait(cancelGate)
+                true
+            }
+        }
+        val bg = Thread {
+            resultRef.set(
+                ElevatedCallSupervisor.awaitSpawnWithThreadStarter(
+                    deadlineNanos = System.nanoTime() + TimeUnit.SECONDS.toNanos(60),
+                    isCancelled = isCancelled,
+                    killer = {
+                        kills.incrementAndGet()
+                        stuckAwait(killerLatch)
+                    },
+                    startThread = { t ->
+                        if (t.name == "elevated-late-spawn") {
+                            t.start()
+                            throw OutOfMemoryError("simulated OOM after start (test seam)")
+                        }
+                        t.start()
+                    },
+                ) {
+                    spawnEntered.countDown()
+                    stuckAwait(spawnRelease)
+                    LatchBlockedDestroyProcess(killerLatch).also { lateRef.set(it) }
+                },
+            )
+        }.also { it.isDaemon = true; it.start() }
+        try {
+            assertTrue("spawn must enter", spawnEntered.await(10_000L, TimeUnit.MILLISECONDS))
+            assertTrue(
+                "caller watcher must block in cancel gate",
+                cancelBlockEntered.await(10_000L, TimeUnit.MILLISECONDS),
+            )
+            spawnRelease.countDown()
+            pollRefNonNull(lateRef, "late spawn")
+            pollTrue("spawn worker must exit before cancel gate opens") {
+                countLive("elevated-supervisor") == 1
+            }
+            cancelGate.countDown()
+            val res = pollRefNonNull(resultRef, "caller result")
+            assertTrue("expected Res.Expired, got $res", res is ElevatedCallSupervisor.Res.Expired)
+            // 不斷言 res.hasLinger：daemon 臂勝出時 lateIncomplete 由 blocked-on-killer
+            // daemon 非同步置位（res 可能先產生），catch 臂勝出時則同步置 true——
+            // 兩臂勝出皆合法，hasLinger 非本 invariant 範圍。
+            // 放行 armed killer：daemon 臂勝出時 daemon 阻塞於此；catch 臂勝出時零 kill。
+            killerLatch.countDown()
+            // exactly-once 不變量（兩臂任一勝出皆成立）：
+            pollOutstandingTo(0)
+            pollTrue("late-spawn daemon must exit") { countLive("elevated-late-spawn") == 0 }
+            pollTrue("watcher must exit") { countLive("elevated-supervisor") == 0 }
+            assertEquals(
+                "late victim must be quarantined exactly once",
+                1,
+                ElevatedCleanupTracker.quarantinedCount(),
+            )
+            assertEquals(
+                "no double release (floor must not be hit)",
+                floorBefore,
+                ElevatedCleanupTracker.releaseFloorHits(),
+            )
+            assertEquals(
+                "breaker must count exactly one incomplete cleanup",
+                1,
+                ElevatedCleanupTracker.consecutiveCount(),
+            )
+            assertEquals(1, ElevatedCleanupTracker.peakOutstanding())
+            val admission = ElevatedCleanupTracker.tryEnterReserved()
+            if (admission == ElevatedCleanupTracker.Admission.OK) {
+                ElevatedCleanupTracker.leaveCall()
+            }
+            assertEquals(ElevatedCleanupTracker.Admission.QUARANTINE, admission)
+        } finally {
+            killerLatch.countDown()
+            cancelGate.countDown()
+            spawnRelease.countDown()
+            bg.join(10_000L)
+            pollOutstandingTo(0)
+            pollActiveTo(0)
+            ElevatedCleanupTracker.clearUnverified()
+            ElevatedCleanupTracker.noteClean()
+            awaitNoElevatedThreads()
         }
     }
 

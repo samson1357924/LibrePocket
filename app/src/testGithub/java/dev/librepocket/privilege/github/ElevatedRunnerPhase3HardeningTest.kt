@@ -62,6 +62,7 @@ class ElevatedRunnerPhase3HardeningTest {
         )
         floorBefore = ElevatedCleanupTracker.releaseFloorHits()
         ElevatedCleanupTracker.clearUnverified()
+        ElevatedCleanupTracker.clearRegistrationFailedStickyForTest()
         ElevatedCleanupTracker.noteClean()
         pollOutstandingTo(0)
         pollActiveTo(0)

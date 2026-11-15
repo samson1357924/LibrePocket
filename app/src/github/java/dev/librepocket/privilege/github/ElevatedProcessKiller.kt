@@ -245,7 +245,8 @@ object ElevatedProcessKiller {
      * 經 `ProcessHandle.destroy()`／`destroyForcibly()` Method `invoke` 後布林回傳
      * 為 `false`（EPERM／拒絕）之次數——「handle 信號失敗無聲」自此有計數出口。
      * 僅真正 invoke 且回傳 `false` 才計：latch 抑制／已死跳過／未 invoke 的信號
-     * 不計；`invoke` 擲出（異常路徑，如中途死亡／競態）亦不計（非「拒絕」語義）。
+     * 不計；`invoke` 擲出（異常路徑，如中途死亡／競態）亦不計（非「拒絕」語義；本體臂
+     * invoke-throw 退化為無條件 destroy，獨立計於 [handleSignalInvokeThrewCount]）。
      * once per SIGNAL（子孫兩信號各一次＋本體 attested 臂各一次；unattested 退化
      * 臂經 `process.destroy()`（void）不經此計）。
      * 刻意 telemetry-only：不接 admission／verdict／breaker／計數歸因；
@@ -262,6 +263,23 @@ object ElevatedProcessKiller {
         val delivered = method.invoke(h)
         if (delivered is Boolean && !delivered) handleSignalRefused.incrementAndGet()
     }
+
+    /**
+     * Round-6（#136-B2 D-B2；telemetry-only，產品不讀取）：本體信號 handle 的
+     * `Method.invoke` 擲出（中途死亡／競態／LinkageError 等）之次數——
+     * 對應 [signalBody] 本體臂的 invoke-throw fallback：退化為無條件
+     * `process.destroy()/destroyForcibly()`（fail toward destruction，與平台
+     * unattestable 臂同一 [unattestedSignal] 路徑，該路徑自計 [bodyDestroyUnattested]，
+     * 本計數不重複計）。Android／Shizuku 遠端 unattested handle 一律走同一
+     * unattestedSignal path；本計數專供 B3 device-acceptance 觀測
+     * 「attested 平台 handle 中途失效」之頻度。
+     * B3 telemetry；不接 admission／verdict／breaker。
+     */
+    private val handleSignalInvokeThrew = AtomicInteger(0)
+
+    /** 本體 handle 信號 invoke 擲出次數快照（僅測試／診斷用；#136-B3 device-acceptance）。 */
+    @VisibleForTesting
+    internal fun handleSignalInvokeThrewCount(): Int = handleSignalInvokeThrew.get()
 
     /**
      * Stage 2A（P1-A7）信號判定（純函數 seam，供 JVM 單測直斷；
@@ -459,7 +477,16 @@ object ElevatedProcessKiller {
             bodyPidReuseSkipped.incrementAndGet()
             return true
         }
-        runCatching { invokeHandleSignal(signalMethod, h) }
+        try {
+            invokeHandleSignal(signalMethod, h)
+        } catch (_: Throwable) {
+            // Round-6（#136-B2 D-B2）：handle invoke 擲出（中途死亡／競態／LinkageError 等）
+            // ⇒ 退化為無條件 destroy（fail toward destruction，與平台 unattestable 臂同一
+            // [unattestedSignal] 路徑，該路徑自計 [bodyDestroyUnattested]，此處不重覆計）；
+            // 另計 invoke-throw 專用計數（B3 telemetry）。
+            unattestedSignal(process, forcible)
+            handleSignalInvokeThrew.incrementAndGet()
+        }
         return mismatchLatched
     }
 

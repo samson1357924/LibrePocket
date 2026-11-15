@@ -3875,7 +3875,14 @@ class PolicyCiGateControl(unittest.TestCase):
         self.assertNotIn("    if:", guard_block)
         self.assertIn("    runs-on: ubuntu-latest\n", guard_block)
         self.assertIn("    timeout-minutes: 5\n", guard_block)
-        self.assertEqual(5, guard_block.count("      - name: "))
+        self.assertEqual(6, guard_block.count("      - name: "))
+        self.assertIn(
+            "      - name: \"Pins-absence tripwire (Issue #12)\"\n"
+            "        run: PYTHONPATH=\"$PWD\" PYTHONDONTWRITEBYTECODE=1 "
+            "python3 -P -m unittest scripts/tests/test_build_release_identity.py "
+            "-k CommittedPinsAbsenceControl\n",
+            guard_block,
+        )
         self.assertIn(
             "      - name: Reject Python import shadowing\n"
             "        run: |\n"

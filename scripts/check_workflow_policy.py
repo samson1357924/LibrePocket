@@ -103,7 +103,7 @@ EXPECTED_WORKFLOW_SHA256 = {
         "f8db04a315da8c71b91ab5cb6f6ed575db705b0c1071767d48c775bd47bd0564"
     ),
     "pr-check.yml": (
-        "0f03b1445b19441aa5134caa29cb10dc658c4e9ceb26f5f84c589d3de500e59b"
+        "8e8fbb4b3f719ea617854777ad5425c266ca255372f574844dbd4861a5639190"
     ),
     "release.yml": (
         "acf8d39620362fce1190f6ffb6d75d088ae19c4d9de636be64af0dcbc0cd7d1f"
@@ -157,6 +157,12 @@ GUARD_HARNESS_RUN = (
 )
 GUARD_CHECK_NAME = "Check workflow policy"
 GUARD_HARNESS_NAME = "Run workflow policy harness"
+GUARD_PINS_NAME = "Pins-absence tripwire (Issue #12)"
+GUARD_PINS_RUN = (
+    "PYTHONPATH=\"$PWD\" PYTHONDONTWRITEBYTECODE=1 python3 -P -m "
+    "unittest scripts/tests/test_build_release_identity.py "
+    "-k CommittedPinsAbsenceControl"
+)
 GUARD_INSTALL_NAME = "Install pinned PyYAML"
 SHADOW_PREFLIGHT_NAME = "Reject Python import shadowing"
 EXPECTED_SHADOW_RUN = (
@@ -2141,15 +2147,15 @@ def check_pr_check(path: str, data: dict[Any, Any]) -> list[Finding]:
                 Finding(path, 1, "workflow-guard.timeout-minutes must be 5")
             )
         steps = guard.get("steps")
-        expected_step_count = 5
+        expected_step_count = 6
         if not isinstance(steps, list) or len(steps) != expected_step_count:
             findings.append(
                 Finding(
                     path,
                     1,
-                    "workflow-guard must have exactly five steps (pinned "
+                    "workflow-guard must have exactly six steps (pinned "
                     "checkout, Python shadow preflight, pinned PyYAML install, "
-                    "checker and harness)",
+                    "checker, harness and pins-absence tripwire)",
                 )
             )
             steps = steps if isinstance(steps, list) else []
@@ -2292,14 +2298,34 @@ def check_pr_check(path: str, data: dict[Any, Any]) -> list[Finding]:
                             + " | ".join((GUARD_CHECK_RUN, GUARD_HARNESS_RUN)),
                         )
                     )
+            elif index == 5:
+                findings.extend(
+                    exact_keys(
+                        path,
+                        "workflow-guard pins-absence tripwire step",
+                        step,
+                        frozenset({"name", "run"}),
+                    )
+                )
+                if step.get("name") != GUARD_PINS_NAME or step.get(
+                    "run"
+                ) != GUARD_PINS_RUN:
+                    findings.append(
+                        Finding(
+                            path,
+                            1,
+                            "workflow-guard pins-absence tripwire run command must be "
+                            "exactly: " + GUARD_PINS_RUN,
+                        )
+                    )
         if not steps:
             findings.append(
                 Finding(
                     path,
                     1,
-                    "workflow-guard must have exactly five steps (pinned "
+                    "workflow-guard must have exactly six steps (pinned "
                     "checkout, Python shadow preflight, pinned PyYAML install, "
-                    "checker and harness)",
+                    "checker, harness and pins-absence tripwire)",
                 )
             )
 

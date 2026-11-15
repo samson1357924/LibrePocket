@@ -2385,9 +2385,7 @@ class CommittedPinsAbsenceControl(unittest.TestCase):
     is rejected, whatever its suffix — or lack of one. Only the exact canonical
     placeholder example is exempt.
     Fail-closed if git is unavailable.
-    Executes when the pr-check.yml policy-harness path filter is true, which now includes
-    any `*signer_pins*` path anywhere in the diff (so a pins-shaped file in any diff runs
-    it), while diffs flipping no filter (e.g. pure docs) still skip it.
+    Runs unconditionally in the `workflow-guard` job of `pr-check.yml` on every PR (and additionally in the policy harness on policy-filtered diffs).
     """
 
     def test_no_tracked_production_signer_pins_registry(self) -> None:

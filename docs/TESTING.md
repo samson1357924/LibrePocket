@@ -113,11 +113,13 @@ coverage, or guarantee that the workflow or step executes under every event or
 condition. Review the workflow and run results separately.
 
 `workflow-guard` is deliberately unconditional: it has no `needs`, no `if:`,
-and has exactly five steps — pinned checkout, the Python import-shadow
+and has exactly six steps — pinned checkout, the Python import-shadow
 preflight, the pinned, hash-checked `PyYAML==6.0.3` install from
 `scripts/requirements-docs.txt` (`--require-hashes --no-deps
 --only-binary=:all:`, `PIP_BREAK_SYSTEM_PACKAGES=1`), the checker and the
-harness — with a five-minute timeout. `--no-deps --only-binary=:all:` keeps
+harness, plus the always-on `Pins-absence tripwire (Issue #12)` step that
+runs `CommittedPinsAbsenceControl` on every PR — with a five-minute timeout.
+`--no-deps --only-binary=:all:` keeps
 pip from resolving transitive dependencies or building a local sdist/wheel
 before the checker runs, and the shadow preflight byte-pins
 `scripts/requirements-docs.txt` itself so a PR cannot turn the install step
@@ -180,7 +182,7 @@ boolean `on:` key collision. YAML merge keys (`<<`) are forbidden at
 construction time by `DuplicateKeySafeLoader`. Flow style, quoted keys,
 next-line scalars and anchors/aliases are resolved by the parser rather than by
 text matching. Comprehensive test coverage for the workflow policy checker is
-maintained in `scripts/tests/test_workflow_policy.py` (226 tests). It fails
+maintained in `scripts/tests/test_workflow_policy.py` (231 tests). It fails
 closed with `file:line` diagnostics on these pinned invariants:
 
 - only the reviewed workflow filenames (`codeql.yml`,
@@ -275,9 +277,10 @@ closed with `file:line` diagnostics on these pinned invariants:
   `.github/workflows/**`/`.github/actions/**` while no `workflow` filter
   exists;
 - `workflow-guard` has exact keys `name`/`runs-on`/`timeout-minutes`/`steps`
-  (no `needs` or `if:`), and exactly five steps: pinned checkout, Python
+  (no `needs` or `if:`), and exactly six steps: pinned checkout, Python
   import-shadow preflight, pinned PyYAML install
-  (`PIP_BREAK_SYSTEM_PACKAGES=1`), checker and harness; no step may add
+  (`PIP_BREAK_SYSTEM_PACKAGES=1`), checker, harness and the pins-absence
+  tripwire; no step may add
   `if:`/`continue-on-error`/`shell`/`working-directory`/unexpected `env`, and
   `policy-harness`/`docs-guard` must each keep exactly one preflight step;
 - `pr-gate` pins its exact keys/name/`if: always()`, a `needs` set that still
@@ -292,7 +295,7 @@ closed with `file:line` diagnostics on these pinned invariants:
   `working-directory`; `unit-tests` must keep `fail-fast: false` and
   `matrix.flavor` exactly `[play, foss, github]`, and `policy-harness` must
   keep the pinned PyYAML install, the import-shadow preflight, the unittest
-  command containing `scripts/tests/test_workflow_policy.py` (226 tests) and
+  command containing `scripts/tests/test_workflow_policy.py` (231 tests) and
   the production `verify_verification_metadata.py` gate step (no
   `--dependency-verification` flag on builds — the checked-in
   `verify-metadata=true` already enforces verification on every Gradle build).

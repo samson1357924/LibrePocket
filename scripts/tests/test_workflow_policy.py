@@ -1443,7 +1443,7 @@ jobs:
                 1,
             ),
         )
-        self._assert_rejected("workflow-guard must have exactly five steps")
+        self._assert_rejected("workflow-guard must have exactly six steps")
 
     def test_workflow_guard_missing_run_step_is_rejected(self) -> None:
         self._write(
@@ -1455,7 +1455,7 @@ jobs:
                 1,
             ),
         )
-        self._assert_rejected("workflow-guard must have exactly five steps")
+        self._assert_rejected("workflow-guard must have exactly six steps")
 
     def test_workflow_guard_missing_shadow_preflight_is_rejected(self) -> None:
         self._write(
@@ -1469,7 +1469,7 @@ jobs:
                 1,
             ),
         )
-        self._assert_rejected("workflow-guard must have exactly five steps")
+        self._assert_rejected("workflow-guard must have exactly six steps")
 
     def test_workflow_guard_modified_shadow_preflight_is_rejected(self) -> None:
         self._write(
@@ -1549,7 +1549,56 @@ jobs:
                 1,
             ),
         )
-        self._assert_rejected("workflow-guard must have exactly five steps")
+        self._assert_rejected("workflow-guard must have exactly six steps")
+
+    def test_workflow_guard_missing_pins_tripwire_step_is_rejected(self) -> None:
+        self._write(
+            "pr-check.yml",
+            PR_CHECK.replace(
+                '      - name: "Pins-absence tripwire (Issue #12)"\n'
+                '        run: PYTHONPATH="$PWD" PYTHONDONTWRITEBYTECODE=1 '
+                "python3 -P -m unittest scripts/tests/test_build_release_identity.py "
+                "-k CommittedPinsAbsenceControl\n",
+                "",
+                1,
+            ),
+        )
+        self._assert_rejected("workflow-guard must have exactly six steps")
+
+    def test_workflow_guard_pins_tripwire_run_is_rejected(self) -> None:
+        self._write(
+            "pr-check.yml",
+            PR_CHECK.replace(
+                '      - name: "Pins-absence tripwire (Issue #12)"\n'
+                '        run: PYTHONPATH="$PWD" PYTHONDONTWRITEBYTECODE=1 '
+                "python3 -P -m unittest scripts/tests/test_build_release_identity.py "
+                "-k CommittedPinsAbsenceControl\n",
+                '      - name: "Pins-absence tripwire (Issue #12)"\n'
+                "        run: 'true'\n",
+                1,
+            ),
+        )
+        self._assert_rejected(
+            "workflow-guard pins-absence tripwire run command must be exactly"
+        )
+
+    def test_workflow_guard_pins_tripwire_before_install_is_rejected(self) -> None:
+        pins_step = (
+            '      - name: "Pins-absence tripwire (Issue #12)"\n'
+            '        run: PYTHONPATH="$PWD" PYTHONDONTWRITEBYTECODE=1 '
+            "python3 -P -m unittest scripts/tests/test_build_release_identity.py "
+            "-k CommittedPinsAbsenceControl\n"
+        )
+        workflow = PR_CHECK
+        self.assertIn(pins_step, workflow)
+        workflow = workflow.replace(pins_step, "", 1)
+        anchor = "      - name: Install pinned PyYAML\n"
+        self.assertIn(anchor, workflow)
+        workflow = workflow.replace(anchor, pins_step + anchor, 1)
+        self._write("pr-check.yml", workflow)
+        self._assert_rejected(
+            "workflow-guard pins-absence tripwire run command must be exactly"
+        )
 
     def test_workflow_guard_unpinned_install_is_rejected(self) -> None:
         self._write(

@@ -16,11 +16,16 @@ import java.text.Normalizer
  *   `\n`（U+000A）與 `\t`（U+0009）外之所有 `Character.CONTROL`（Cc）碼點
  *   （ESC／BEL／DEL／C1 如 U+0085 NEL 等一律剔除），涵蓋 bidi
  *   控制（U+061C／U+200E／U+200F／U+202A–U+202E／U+2066–U+2069）與零寬／
- *   Cf（U+200B–U+200D／U+2060／U+FEFF／U+00AD／U+180E／U+2061–U+2064／
+ *   Cf（U+200B–U+200D／U+2060／U+FEFF／U+00AD／U+2061–U+2064／
  *   U+206A–U+206F／U+FFF9–U+FFFB／tags U+E0000–U+E007F 等）；此外亦精確
  *   剔除下列非 Cf 但有混淆／隱匿風險之碼點（見 [EXTRA_STRIP]）：
  *   U+034F（CGJ）、U+115F／U+1160（Hangul fillers）、U+3164（Hangul filler）、
  *   U+FFA0（halfwidth Hangul filler）、U+2028／U+2029（line／paragraph separator）。
+ * - U+180E（MONGOLIAN VOWEL SEPARATOR）之 general category 隨 JDK／ICU 版本而異：
+ *   Unicode 6.3 起歸為 Cf（FORMAT），[sanitize] 會剔除；舊版／部分 Android ICU
+ *   （Unicode < 6.3）將其歸為 Zs（SPACE_SEPARATOR），[sanitize] 不剔除（保留）。
+ *   兩種狀態皆可接受：U+180E 無 NFKC 摺疊映射（無法摺為 ASCII），不構成 marker
+ *   偽造／bidi 通道；Zs 狀態下之保留僅為顯示層差異，不影響 envelope fence。
  * - 按補充平面碼點迭代（[Character.charCount]），不切斷 surrogate pair。
  * - [cleanField] 為 `nfkc → strip → sanitize` 迭代至精確定點（無輪數上限）：
  *   nfkc 先摺 fullwidth／small-form marker 相似字為 ASCII，剝除 marker
@@ -28,7 +33,7 @@ import java.text.Normalizer
  *   終止性：NFKC 僅首輪可擴張（展開為單字元有限映射；首輪後無待展開
  *   字元，其後之 nfkc 至多合併／重排，長度不增、碼點數不增）；自第二輪
  *   起每一輪或達不動點、或碼點數嚴格下降，刪除輪次數以首輪正規化後
- *   長度為上界，故必於有限輪內收斂（最壞 O(n²) 輪數上界）。
+ *   長度為上界，故必於有限輪內收斂（最壞 O(n²) 總工作量上界（輪數 ≤ 首輪正規化後長度；NFKC 冪等））。
  * - 所有迴圈受呼叫方傳入的 `deadlineNs` **與** `checking` 探針雙約束
  *   （預設 `Long.MAX_VALUE`／`{}`，語義與先前版本完全一致）：deadline 到期即拋
  *   [DeadlineExceededException]（WebExtract.kt 定義；與 CancellationException 區分）；
@@ -75,7 +80,7 @@ object WebContentEnvelope {
      * 反覆至不動點即返回。終止性：NFKC 僅首輪可擴張（展開為單字元有限映射；
      * 首輪後無待展開字元，其後 nfkc 至多合併／重排，長度不增、碼點數不增）；
      * 自第二輪起每輪或達不動點、或碼點數嚴格下降，刪除輪次數以首輪
-     * 正規化後長度為上界，故必於有限輪內收斂（最壞 O(n²) 輪數上界）。
+     * 正規化後長度為上界，故必於有限輪內收斂（最壞 O(n²) 總工作量上界（輪數 ≤ 首輪正規化後長度））。
      * 注意：`strip` 非冪等（先剝 BEGIN、後剝 END）：END 之移除可於接縫「造」出
      * 新的 BEGIN（實測例：`<<<EXTERNAL_UNTRUSTED_CONTENT<<<END_EXTERNAL_UNTRUSTED_CONTENT>>>>>>`
      * 單輪後留下 `<<<EXTERNAL_UNTRUSTED_CONTENT>>>`；實測未造出 END），故單輪不足以

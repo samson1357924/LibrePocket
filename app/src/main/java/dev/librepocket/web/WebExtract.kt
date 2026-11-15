@@ -15,6 +15,7 @@ import java.nio.ByteBuffer
 import java.nio.charset.Charset
 import java.nio.charset.CodingErrorAction
 import java.util.Collections
+import java.util.Locale
 import java.util.zip.GZIPInputStream
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
@@ -145,8 +146,9 @@ internal class DeadlineExceededException : RuntimeException()
  *   `snippet`，truncated 時含 sentinel）為模型可見體、置於單層 envelope 之內；
  *   `content` 之 `url/title/siteName/published` 為 marker-free、Cf／Cc 已清理、
  *   硬上限截斷之 untrusted **structured values**，**不在 fence 之內**；D3 wiring
- *   必須僅將 `envelope` 呈現予模型，或於序列化 `content` 前自行 re-wrap／fence；
- *   不得把未 fence 欄位當作攜帶信任語意之內容。
+ *   必須僅將 `envelope` 呈現予模型、於序列化 `content` 前 re-fence **整個 payload**，
+ *   或直接丟棄這些欄位；不得把未 fence 欄位當作攜帶信任語意之內容。
+ *   此為 D3 pre-wire acceptance gate（見 THREAT_MODEL／CAPABILITY_MATRIX D3 追蹤項）。
  *
  * Blocking（production 接線前必解）：[WebExtractHttpGet] 介面現攜帶
  * `pinnedAddresses`＋`maxBytes` 參數（見該介面之契約 KDoc：建連必釘住、
@@ -185,10 +187,11 @@ internal class DeadlineExceededException : RuntimeException()
  *    leader 的 tenant 內容；此為 D3 殘留，不得宣稱完整 redirect 隔離。
  * 2. cache **不解析 `Cache-Control`（含 `no-store`）**：TTL-only，屬刻意
  *    設計（read 工具、無寫副作用）；D3 須決定 honor 或明文件化此行為。
- * 3. `cleanField` 已由共享 15s 全程端到端預算限界（parse→clean 管線逐層
- *    傳入單調 deadline，超過 → [DeadlineExceededException] → `Failed(TIMEOUT)`）；
- *    最壞 O(n²) 定點迭代之上界現由 wall budget 實際兜底（不僅靠 input cap）；
- *    D3 仍可加 marker-count 前掃（pre-scan）進一步壓縮最壞路徑。
+ * 3. `cleanField` 已由共享 15s deadline 限界（parse→clean 管線逐層傳入單調
+ *    deadline，超過 → [DeadlineExceededException] → `Failed(TIMEOUT)`）——
+ *    逐輪／每 512 codepoints 皆有檢查，最壞 O(n²) 定點迭代之上界現由 deadline
+ *    實際兜底（不僅靠 input cap）；decode 與 regex 替換階段不在 deadline 內
+ *    （受位元組／長度上限約束）；D3 仍可加 marker-count 前掃（pre-scan）進一步壓縮最壞路徑。
  * 4. envelope 僅為標記籬笆，**非授權**；D3 須另行接 `#165` consent/授權
  *    流程，envelope 不擔任 authorization 角色。
  * 5. Follower `await()` 已由同一 `withTimeoutOrNull` 預算為界，逾時映射
@@ -239,7 +242,7 @@ object WebExtract {
     const val MAX_REDIRECTS = 5
 
     /**
-     * 全程超時預算（15s）。
+     * 端到端 deadline（decode 與 regex 替換階段除外，受位元組／長度上限約束）。
      *
      * `extract()` 於入口即以單調時鐘（`System.nanoTime()`）計算全程 deadline：
      * per-call 政策重驗（含 DNS preflight）＋`extractUncached`（DNS preflight＋
@@ -294,6 +297,16 @@ object WebExtract {
     const val DETAIL_TRANSPORT = "TRANSPORT"
     const val DETAIL_CLEARTEXT_DOWNGRADE = "CLEARTEXT_DOWNGRADE"
 
+    /** `rawUrl` 長度硬上限（UTF-16 code units）：超過即 [DETAIL_URL_TOO_LONG]。 */
+    const val MAX_URL_CHARS = 8192
+
+    /**
+     * `rawUrl` 長度硬上限（[MAX_URL_CHARS] code units）：超過即 `Unavailable(DETAIL_URL_TOO_LONG, null)`，
+     * 於任何 policy 評估或 cache key 建構之前 fail-closed 返回（不送請求、不查 DNS、不建 key）。
+     * 單位為 UTF-16 code units（`String.length`），與 `rawUrl.isBlank()` 同層次、同時機。
+     */
+    const val DETAIL_URL_TOO_LONG = "URL_TOO_LONG"
+
     /**
      * 打包給 follower 的 typed「leader 已取消」detail（never cached，不寫快取；
      * follower 不得在 leader 取消後另起爐灶 refetch）。
@@ -307,7 +320,20 @@ object WebExtract {
     const val DETAIL_CANCELLED = "CANCELLED"
 }
 
-/** 正規化抽取內容（`title/url/snippet/published/siteName`，全已 sanitize）。 */
+/**
+ * 正規化抽取內容（`title/url/snippet/published/siteName`，全已 sanitize）。
+ *
+ * ⚠ **`title`／`url`／`siteName`／`published` 不在 [WebContentEnvelope.BEGIN]／[END]
+ * envelope fence 之內。**fence 僅涵蓋 [WebExtractOutcome.Ok.envelope]（即清理後 capped 之
+ * `snippet`，truncated 時含 sentinel）。這些欄位只是 marker-free、Cf／Cc 已清理、
+ * 硬上限截斷之 untrusted **structured values**——不攜帶任何信任語意。
+ *
+ * **D3 wiring 之強制規則**：模型可見的 projection 必須 re-fence **整個序列化 payload**
+ * （把 `content` 全欄位置入 envelope 內），或直接丟棄 `title`／`url`／`siteName`／
+ * `published`；**不得**將這些欄位呈現為 in-fence 內容，亦不得把未 fence 之欄位當作
+ * 攜帶信任語意之內容送模型。此規則同時是 **D3 pre-wire acceptance gate**
+ * （見 THREAT_MODEL／CAPABILITY_MATRIX D3 追蹤項）：未滿足本投影規則之 wiring 不得上線。
+ */
 data class WebExtractContent(
     val title: String,
     val url: String,
@@ -324,7 +350,9 @@ sealed interface WebExtractOutcome {
          * 單層 envelope：非 truncated 時為 [WebContentEnvelope.wrap] 於 `capped`；
          * truncated 時為 wrap 於 `capped + "\n[...TRUNCATED AT $N CHARS]"`
          * （見 [WebExtract.TRUNCATED_SENTINEL_MARK]）；模型可見體。fence 僅涵蓋
-         * `snippet`；`content` 之其餘欄位不在 fence 之內（見 header「fence 之範圍」）。
+         * `snippet`；`content` 之其餘欄位不在 fence 之內——D3 wiring 不得把它們
+         * 呈現為 in-fence 內容；模型可見投影必須 re-fence 整個序列化 payload
+         * 或丟棄這些欄位（見 [WebExtractContent] KDoc 與 header「fence 之範圍」）。
          */
         val envelope: String,
         val truncated: Boolean = false,
@@ -376,10 +404,14 @@ data class WebExtractRawResponse(
  *    取消訊號以 [kotlinx.coroutines.CancellationException] 透傳。
  * 4. 僅允許 `Accept` header（無 credentials、無 cookie、無自訂標頭）。
  * 5. 重複 response headers（如兩個 `Content-Encoding` 行）：fixtures 以
- *    `Map<String,String>` 不可表示重複；D3 OkHttp adapter 必須對具語義之
- *    headers（`content-encoding`／`content-type`／`transfer-encoding`）採
- *    fail-closed（重複即拒絕）或以 `getAll` 串接後視為多值（`content-encoding`
- *    多值已由 `extractUncached` 判 `BAD_RESPONSE`）；不得取首值放行。
+ *    `Map<String,String>` 不可表示重複，且本服務之 `headerLookup` 對重複鍵僅回傳
+ *    **首個命中**（first-match-wins，見該函式 KDoc）——因此 **D3 OkHttp adapter 是
+ *    重複 header 的唯一 backstop**，必須對具語義之 headers 採 fail-closed：
+ *    `content-encoding`／`content-type`／`location`／`transfer-encoding` 任一出現
+ *    重複（以 `getAll` 觀察）即拒絕整個 response；或 `getAll` 串接後視為多值並由
+ *    呼叫方之多值規則裁決（`content-encoding` 多值已由 `extractUncached` 判
+ *    `BAD_RESPONSE`；`location`／`content-type` 亦必須拒絕或拒絕該跳）。
+ *    不得取首值放行。
  */
 fun interface WebExtractHttpGet {
     suspend fun get(
@@ -505,7 +537,11 @@ private const val ENTRY_OVERHEAD_BYTES = 256L
  * 記錄該跳**實際被評估並建連**之絕對 URL（fragment 已去除）及當次解析並授權之
  * 位址集合（[sortedDistinctAddressTokens]：去重＋排序之 `hostAddress` 列表）。
  * 逐跳資訊使 cache 命中可逐跳重驗，關閉（僅對 cache 面）redirect 逐跳綁定殘留。
- * token 為純 `hostAddress` 字元集（無 `\u0001`／無控制字元），可安全 join 與 length-prefix。
+ * token 為 `hostAddress` 字串：PUBLIC／LOOPBACK／PRIVATE 答案之字元集僅 digits／`.`／`:`／`-`
+ *（IPv4 dotted／IPv6 冒號 hex）；含 zone id（scoped，如 `fe80::1%eth0`）之位址會攜帶 `%`，
+ * 但 link-local scoped（區域連結）答案一律不會通過政策閘；縱使出現 `%`，
+ * length-prefix 編碼不受影響。
+ * 任何 token 皆不含 `\u0001`／控制字元，可安全 join 與 length-prefix。
  */
 internal data class HopBinding(
     val url: String,
@@ -551,7 +587,7 @@ internal fun sortedDistinctAddressTokens(addresses: List<InetAddress>): List<Str
  *   讀出一律以 `cached=true` 呈現；[WebExtractOutcome.Ok.cached] 預設
  *   `false` 不變）。
  * - entry 攜帶**逐跳信任上下文鏈**（[HopBinding]：url＋該跳已核准位址集合之
- *   sorted token；空鏈＝公開 `put()` 之 scaffold 條目，無從重驗、沿用舊命中語義）。
+ *   sorted token；空鏈＝internal scaffold `put()` 之條目，無從重驗、沿用舊命中語義）。
  *   命中時（[getHitByKey]）呼叫方（`WebExtractService`）必須逐跳重驗：
  *   每跳 `evaluateUrl` 必須 allowed、且當次解析之 token 必須與記錄一致；
  *   任一跳不符即視為 miss、重打 upstream 並覆寫 entry——**不得回傳該 Ok**。
@@ -586,7 +622,7 @@ class WebExtractCache(
         val outcome: WebExtractOutcome.Ok,
         val expiresAt: Long,
         val weight: Long,
-        /** 逐跳信任上下文（url＋已核准位址 token）；公開 `put()` 條目為空鏈。 */
+        /** 逐跳信任上下文（url＋已核准位址 token）；空鏈＝internal scaffold `put()` 條目。 */
         val chain: List<HopBinding>,
     )
 
@@ -646,7 +682,7 @@ class WebExtractCache(
         return "${u.length}:$u\u0001$maxBytes\u0001$maxModelChars\u0001${optIn.policy.name}\u0001${optIn.configRevision}\u0001${token.length}:$token"
     }
 
-    fun get(
+    internal fun get(
         url: String,
         maxBytes: Int,
         maxModelChars: Int,
@@ -657,7 +693,7 @@ class WebExtractCache(
 
     // read-side epoch guard（共用之 lookup）：呼叫方傳入進入時捕獲之 epoch（per-call
     // 重驗後、cache 存取點 a／b 皆傳 epochAtEntry）；不符即視同 miss——invalidate 之後
-    // 陳舊條目不得被讀回。public get() 傳 null（語義不變：讀取當前有效條目）。
+    // 陳舊條目不得被讀回。internal get() 傳 null（語義不變：讀取當前有效條目）。
     private fun lookupEntry(k: String, generationCaptured: Long?): Entry? {
         synchronized(map) {
             if (generationCaptured != null && generation.get() != generationCaptured) return null
@@ -681,7 +717,7 @@ class WebExtractCache(
     internal fun getHitByKey(k: String, generationCaptured: Long? = null): CacheHit? =
         lookupEntry(k, generationCaptured)?.let { CacheHit(outcomeOf(it), it.chain) }
 
-    fun put(
+    internal fun put(
         url: String,
         maxBytes: Int,
         maxModelChars: Int,
@@ -689,8 +725,9 @@ class WebExtractCache(
         addresses: List<InetAddress>,
         outcome: WebExtractOutcome.Ok,
     ) {
-        // 公開 put() 以當下 generation 寫入（呼叫方對陳舊寫入的自辨屬其自身責任；
-        // single-flight leader 路徑則傳入 extract() 入口捕獲之 epoch）。
+        // internal scaffold put()（無 production caller）：以當下 generation 寫入
+        // （呼叫方對陳舊寫入的自辨屬其自身責任；single-flight leader 路徑則傳入
+        // extract() 入口捕獲之 epoch）。
         putByKey(key(url, maxBytes, maxModelChars, optIn, addresses), outcome, generation.get())
     }
 
@@ -805,7 +842,22 @@ class WebExtractService(
      *   （never cached）；follower 自身的取消仍以 `ensureActive()` 優先透傳。
      * - invalidate() 之後之新呼叫走完整 policy／DNS cycle（含 cache 重驗），
      *   不得重用 invalidate 前之 cache 結果（read-side 世代守衛：陳舊條目
-     *   直接 miss 並重打 upstream）；cache 路徑不可能洩漏撤權限內容。
+     *   直接 miss 並重打 upstream）；
+     *   此外，[verifiedCachedHit] 之逐跳重驗完成、回傳 Ok 之前會再做一次
+     *   generation epoch re-check——僅當 `invalidate()` 於該 re-check 執行之前
+     *   已完成，hit 才被抑制；validation 於 revoke 之前開始之 hit
+     *   亦不得於撤權後藉 THIS 路徑落地（視為 miss，走 caller
+     *   之 stale/restart 或 refetch 路徑）。惟 re-check 並非絕對：
+     *   若撤權完成於 re-check 之後、`Ok` 交付 caller 之前那段
+     *   無懸掛點（suspension-free）之窗口內，呼叫端仍可能收到
+     *   post-revoke 之 Ok——此與 pre-drain Ok completion 同屬
+     *   by-design detached 交付殘留類，除非將交付整段串行化入
+     *   cache 監視（monitor）臨界區，否則無法完全關閉。
+     * - 撤權後之 detached 交付殘留（by design；同一殘留類）：
+     *   (i) 已 join 之 follower 於 drain 之前收到 leader 已完成之 Ok（pre-drain Ok completion）；
+     *   (ii) [verifiedCachedHit] 之 post-validation epoch re-check 已通過、revocation
+     *   於該 re-check 與交付 caller 之間之窗口內完成之 post-revoke Ok（見上條）。
+     *   此兩者皆為刻意保留之語義，不再經 cache 路徑落地。
      *   in-flight 路徑依 detached 語義處理：已 join 之 follower 於 drain 前
      *   收到 leader 已完成之 Ok（leader 自身 caller 同理）；drain 時仍 pending
      *   者收到 `CancellationException("web.extract invalidated")` → 映射
@@ -875,6 +927,10 @@ class WebExtractService(
         if (rawUrl.isBlank()) {
             return WebExtractOutcome.Unavailable(WebExtract.DETAIL_EMPTY_URL, null)
         }
+        // URL 長度硬上限：超限即 fail-closed（不做任何 policy 評估／key 建構／DNS）。
+        if (rawUrl.length > WebExtract.MAX_URL_CHARS) {
+            return WebExtractOutcome.Unavailable(WebExtract.DETAIL_URL_TOO_LONG, null)
+        }
         val effBytes = maxBytes.coerceIn(1, WebExtract.ABSOLUTE_MAX_BYTES)
         val effModel = maxModelChars.coerceIn(1, WebExtract.MAX_MODEL_CHARS)
         // 全程單一單調 deadline：per-call 政策重驗（含 DNS preflight）＋
@@ -897,8 +953,10 @@ class WebExtractService(
         val hop0 = stripFragment(rawUrl.trim())
         while (true) {
             // per-call 政策重驗（含 DNS preflight），fail-closed；必須在 cache／
-            // inFlight 存取之前完成——initial peek、lateHit（mutex 內）、follower join
-            // 三個返回點皆位於此檢查之後，單次重驗覆蓋全部三者；通過後才觸 cache。
+            // inFlight 存取之前完成——point (a)（鎖外）與 follower join 兩個
+            // 返回點皆位於此檢查之後；通過後才觸 cache。鎖內（election 臨界區）
+            // 不再評估 policy／DNS（見 verifiedCachedHit 之 KDoc），僅做廉價的
+            // epoch-checked getHitByKey 讀取與 stale/restart election。
             // cache miss 的 hop 0 會再評估一次（revalidate 與 hop-0 評估各一次 DNS；取代：不 memoize，避免讓 gate 變可變狀態）
             val gate = when (val g = policyGate(hop0, optIn, resolver, deadlineNs)) {
                 is GateResult.Allowed -> g.eval
@@ -919,12 +977,24 @@ class WebExtractService(
                 // 世代已變 → 不建立／不加入任何條目（留在鎖內、零寫入），
                 // 由鎖外以新 epoch 有界重試。此檢查與 entry 插入同一臨界區，
                 // invalidate() 的 clear()＋drain 亦在同一世代命名空間下原子生效。
-                // （lateHit 之 chain-recording 逐跳重驗於鎖內執行；空鏈條目零額外成本。）
-                lateHit = verifiedCachedHit(k, epochAtEntry, optIn, resolver, deadlineNs)
-                if (lateHit == null) {
-                    if (cache.currentGeneration != epochAtEntry) {
-                        stale = true
-                    } else {
+                //
+                // 鎖內只做廉價的 epoch-checked [WebExtractCache.getHitByKey]
+                //（無 DNS／policy，不掛起、不佔住全域 mutex）：
+                //   - generation 漂移 → stale（有界重試）；
+                //   - point (a)（鎖外）已對攜帶 chain 之條目完成逐跳重驗——
+                //     失敗（absent／token mismatch／policy denial／TIMEOUT）者
+                //     視為不可信，直接走 leader／join election（refetch 覆寫
+                //     entry），**絕不於鎖內重跑 DNS／policy**；
+                //   - 僅空鏈 scaffold 條目（無從重驗、零 DNS 成本）可於鎖內直接
+                //     命中——此路徑僅在 point (a) 之後、election 之前寫入的新
+                //     entry 才可能走到（與 point (a) 對空鏈條目的語義一致）。
+                if (cache.currentGeneration != epochAtEntry) {
+                    stale = true
+                } else {
+                    lateHit = cache.getHitByKey(k, epochAtEntry)
+                        ?.takeIf { it.chain.isEmpty() }
+                        ?.outcome
+                    if (lateHit == null) {
                         val existing = inFlight[k]
                         if (existing != null && existing.epoch == epochAtEntry) {
                             mine = existing.deferred
@@ -1053,12 +1123,20 @@ class WebExtractService(
      * 2. 每跳 policyGate（含有界 DNS preflight，以全程 deadline 為界）必須 allowed；
      * 3. 當次解析之 sorted distinct hostAddress token 必須與記錄一致。
      * 任一跳不符／失敗 → 視為 cache miss（呼叫方重打 upstream；`putByKey` 覆寫 entry），
-     * **絕不回傳該 Ok**。空 chain 之條目（公開 `put()` scaffold）無從驗證、沿用舊命中語義。
+     * **絕不回傳該 Ok**。空 chain 之條目（internal scaffold `put()`）無從驗證、沿用舊命中語義。
      *
      * 代價：每次 hit 額外付 L×(DNS+policy) 驗證成本（L＝chain 長度）——與 fetch 相同量級之
-     * per-call 重驗合流執行；重驗本身不寫快取、不 purge 快取。注意 lateHit 之重驗於
-     * `mutex` 臨界區內執行（與 entry 插入同鎖，避免驗證與 election 之間 entry 被換掉）；
-     * point a 之重驗於鎖外執行（命中即返回、不佔鎖）。
+     * per-call 重驗合流執行；重驗本身不寫快取、不 purge 快取。本函式**僅於 point (a)
+     *（鎖外）呼叫**——鎖內（election 臨界區）不得評估 policy／DNS，僅做廉價的
+     * epoch-checked `getHitByKey` 讀取（空鏈條目直接命中；point (a) 已判失敗之攜帶 chain
+     * 條目一律走 leader／join election，fetch 覆寫 entry）。重驗完成、回傳 `Ok` 之前會
+     * 再做一次 generation epoch re-check——僅當 `invalidate()` 於該 re-check 執行之前
+     * 已完成，本次 hit 才視為 miss（由 caller 之 stale/restart 或 refetch 路徑處理，
+     * 同 [WebExtractCache.putByKey] 之內部 guard 模式）。此為必要而非充分條件：
+     * 若撤權完成於 re-check 之後、`Ok` 交付 caller 之前那段無懸掛點（suspension-free）
+     * 之窗口內，呼叫端仍可能收到 post-revoke 之 Ok——與 pre-drain Ok completion
+     * 同屬刻意保留之 detached 交付殘留類，除非將交付整段串行化入 cache 監視（monitor）
+     * 臨界區，否則無法完全關閉。
      */
     private suspend fun verifiedCachedHit(
         k: String,
@@ -1069,10 +1147,18 @@ class WebExtractService(
     ): WebExtractOutcome.Ok? {
         val hit = cache.getHitByKey(k, epochAtEntry) ?: return null
         val chain = hit.chain
-        if (chain.isEmpty()) return hit.outcome
+        if (chain.isEmpty()) {
+            return if (cache.currentGeneration == epochAtEntry) hit.outcome else null
+        }
         var effectiveOptIn = optIn
         for ((index, hop) in chain.withIndex()) {
             if (index > 0) {
+                // Defense-in-depth：fetch 路徑永遠拒絕 https→http 降級（chain 理論上
+                // 不會記錄此類鏈——明文請求根本不會發出）；記錄鏈即便遭竄改／注入
+                // 此類降級對，亦視為 miss（fail-closed，不信任該 entry）。
+                val prevScheme = chain[index - 1].url.toHttpUrlOrNull()?.scheme?.lowercase(Locale.ROOT)
+                val curScheme = hop.url.toHttpUrlOrNull()?.scheme?.lowercase(Locale.ROOT)
+                if (prevScheme == "https" && curScheme == "http") return null
                 // 與 fetch 相同之不可逆降級規則（跨 origin → 預設 HTTPS_ONLY 姿態）。
                 effectiveOptIn = downgradedOptInForRedirect(chain[index - 1].url, hop.url, effectiveOptIn)
             }
@@ -1082,6 +1168,13 @@ class WebExtractService(
             }
             if (sortedDistinctAddressTokens(eval.resolvedAddresses) != hop.addresses) return null
         }
+        // Post-validation epoch re-check：重驗（DNS／policy）期間發生、且已於本
+        // re-check 執行之前完成之 invalidate()（clear 與 bump 世代同一臨界區）時，
+        // 本次 hit 不得交付——視為 miss，由 caller 之 stale/restart election 或
+        // refetch 處理（與 [WebExtractCache.putByKey] 之內部 guard 同一模式）。
+        // 注意：re-check 與交付 caller 之間無懸掛點，期間完成之撤權無法被本檢查
+        // 攔截——post-revoke Ok 可至 caller（by-design detached 交付殘留，見 invalidate() KDoc）。
+        if (cache.currentGeneration != epochAtEntry) return null
         return hit.outcome
     }
 
@@ -1138,14 +1231,15 @@ class WebExtractService(
                 is GateResult.Allowed -> g.eval
                 is GateResult.Denied -> return g.outcome
             }
-            // Option B：記錄本跳之信任上下文（url＋已核准位址 sorted token）。
-            chain.add(HopBinding(current, sortedDistinctAddressTokens(eval.resolvedAddresses)))
             // 政策評估可能涉及掛起的 DNS preflight；取消訊號必須在此處即生效，
             // 且不得觸及 normalized 計算與任何建連。
             currentCoroutineContext().ensureActive()
             val normalized = stripFragment(
                 eval.normalizedUrl ?: return WebExtractOutcome.Failed(WebExtract.DETAIL_TRANSPORT),
             )
+            // Option B：記錄本跳之信任上下文。HopBinding.url 必須為該跳**實際建連**之
+            // URL（eval.normalizedUrl 去 fragment＝`normalized`），而非 pre-normalization 之 `current`。
+            chain.add(HopBinding(normalized, sortedDistinctAddressTokens(eval.resolvedAddresses)))
             // https → http 降級永遠拒（含迴環，fail-closed），絕不發出明文請求。
             val curScheme = try {
                 normalized.toHttpUrlOrNull()?.scheme?.lowercase()
@@ -1337,7 +1431,15 @@ class WebExtractService(
     }
 }
 
-/** 不分大小寫的 header 查找（首個命中）。 */
+/**
+ * 不分大小寫的 header 查找（首個命中）：對重複鍵（fixtures 以不可表示的
+ * `Map<String,String>` 無法表達重複）**first-match-wins**。
+ *
+ * 為何如此：production 之重複 header 偵測屬於 transport 層之職責——D3 OkHttp
+ * adapter 為唯一 backstop，必須以 fail-closed（重複即拒絕）或 `getAll` 多值
+ * 裁決兜底（見 [WebExtractHttpGet] 契約第 5 點）；本函式刻意不嘗試偵測重複，
+ * 線性掃描、語義穩定即可。
+ */
 internal fun headerLookup(headers: Map<String, String>, name: String): String? {
     for ((k, v) in headers) {
         if (k.equals(name, ignoreCase = true)) return v
@@ -1528,7 +1630,7 @@ internal fun String.takeExtractPrefix(n: Int): String {
 }
 
 /**
- * parseHtml 輸入上限（chars）；超過者僅取前 [PARSE_INPUT_CAP] 字元解析。
+ * parseHtml 輸入上限（chars）；超過者僅取前綴（至多 [PARSE_INPUT_CAP] code units，surrogate 安全截斷）解析。
  *
  * 此為獨立之 CPU／記憶體硬界，與 model 預算截斷（[WebExtract.MAX_MODEL_CHARS]）
  * 相互獨立，且不隨 `maxBytes` 放大（即使呼叫方放行最大 1 MiB，本值不變）。
@@ -1546,7 +1648,8 @@ internal data class ParseResult(val content: WebExtractContent, val inputCapped:
 /**
  * 最小 HTML→內容解析（無依賴、正規化 schema）。
  *
- * 所有工作皆在 `html.take(PARSE_INPUT_CAP)` 上進行；`html.length > PARSE_INPUT_CAP`
+ * 所有工作皆在 `html.takeExtractPrefix(PARSE_INPUT_CAP)` 上進行（surrogate 安全，不切斷 pair、
+ * 亦不留下 lone high surrogate）；`html.length > PARSE_INPUT_CAP`
  * 時回傳之 [ParseResult.inputCapped] 為 true（input 前綴截斷，與 model 預算截斷
  * 相互獨立；不隨 maxBytes 放大）。title 提取與
  * `<script>/<style>` 剝除皆為 index-based 線性掃描（不使用 lazy backtracking
@@ -1579,7 +1682,7 @@ internal fun parseHtml(html: String, finalUrl: String, deadlineNs: Long = Long.M
         checking()
         if (System.nanoTime() >= deadlineNs) throw DeadlineExceededException()
         val inputCapped = html.length > PARSE_INPUT_CAP
-        val input = html.take(PARSE_INPUT_CAP)
+        val input = html.takeExtractPrefix(PARSE_INPUT_CAP)
         // ASCII 摺疊（長度不變）：所有被搜的 needle（`<title`／`<script`／`<style`／
         // `</title>`／`</script>`／`</style>`）皆 ASCII，索引必然不錯位
         //（ICU lowercase 可能變長度，故不用）。
@@ -1780,47 +1883,88 @@ internal object HtmlExtract {
      * （case-insensitive，tag-name 邊界檢查；**text context**：comment（`<!--`…`-->`／EOF）
      * 與引號屬性值（單／雙引號）內之偽標籤不構成候選；非候選 tag 以
      * [findTagEnd]（引號感知）整體跳過）。無對應關閉標籤者，
-     * 自開始標籤剝至輸入結尾。comment 本身原樣保留在文本流中（含 `<!--`…EOF
+     * 原則上自開始標籤剝至輸入結尾（未閉合開始標籤內嵌之 closeMark 除外，見候選分支註解）。
+     * comment 本身原樣保留在文本流中（含 `<!--`…EOF
      * 的未閉合 comment——其內容一併原樣保留至輸入結尾）。
-     * 以 StringBuilder 逐段拼接，不使用 backtracking regex。
-     * 游標單調前進，總工作量 O(n)（每次外層迭代的兩個候選搜尋掃過的區段
-     * 不重疊，總計兩趟）。外層每趟雙閘（[checking] 先、[deadlineNs] 後）；
-     * 子掃描（[findTagStart]／[findTagEnd]）同樣雙閘。
-     * 內部 `lower.indexOf(closeMark)` 為原生掃描、不可 weave（線性、受 input cap 約束）。
+     * 以 StringBuilder 分段拼接（純文字／comment／非候選 tag 為「待取段」，遇結構性
+     * 邊界一次 append），不使用 backtracking regex。
+     * 實作為**單一前向掃描**（游標單調不減、comment 狀態隨掃描推進）：`<` 處先判
+     * comment（整塊原樣輸出並跳過，不掃描其內容），再判 tag-open，再判是否
+     * script／style（tag-name 邊界）候選；非候選 tag 經 [findTagEnd]（引號感知）
+     * 整體跳過且原樣輸出。各子操作（[findTagEnd]、closeMark 之 indexOf）掃過的
+     * 區段互不重疊且只隨游標前進，故整體 O(n)（input cap 256k 下無二次方項；
+     * 不存在重新掃描尾段的情況）。`<` 結構性邊界（含候選／非候選分支）每迭代雙閘
+     * （[checking] 先、[deadlineNs] 後，同舊版）；純文字路徑以 512 code unit 節流雙閘，
+     * 並於段落 flush 點（待取段落入 sb 之前）雙閘；子掃描（[findTagEnd]）同樣雙閘。
+     * 內部 `lower.indexOf(closeMark)`／`lower.indexOf("-->")` 為原生掃描、不可 weave
+     *（線性、受 input cap 約束）。
      */
     fun stripScriptAndStyle(input: String, lower: String, deadlineNs: Long = Long.MAX_VALUE, checking: () -> Unit = {}): String {
         val sb = StringBuilder(input.length)
+        val n = input.length
         var i = 0
-        while (i < input.length) {
+        var segStart = 0 // 待取段起點：純文字／comment／非候選 tag 皆以原樣輸出
+        var scanned = 0 // 自掃描起點之純文字 code unit 計數（512 為節流粒度）
+        fun gate() {
             checking()
             if (System.nanoTime() >= deadlineNs) throw DeadlineExceededException()
-            val scriptP = findTagStart(lower, i, "<script", deadlineNs, checking)
-            val styleP = findTagStart(lower, i, "<style", deadlineNs, checking)
-            val open: Int
-            val tag: String
-            if (scriptP < 0 && styleP < 0) {
-                sb.append(input, i, input.length)
-                break
-            } else if (scriptP >= 0 && (styleP < 0 || scriptP <= styleP)) {
-                open = scriptP
-                tag = "script"
-            } else {
-                open = styleP
-                tag = "style"
-            }
-            sb.append(input, i, open)
-            // 先以引號感知 findTagEnd 算出「開始標籤的結尾」，closeMark 搜尋必須從
-            // open 標籤的 `>` 之後開始——引號屬性值內的 `</script>`/`</style>` 不得算收尾
-            //（否則屬性內砂/假 closeMark 會把實際標籤 JS/CSS 本文剩餘漏進模型可見體）。
-            // 開始標籤未閉合（findTagEnd == -1）→ strip 至輸入結尾。
-            val openEnd = findTagEnd(lower, open, deadlineNs, checking)
-            val searchFrom = if (openEnd < 0) open else openEnd + 1
-            val closeMark = "</$tag>"
-            // indexOf 為原生掃描、不可 weave；線性且受 input cap 約束，接受此剩餘。
-            val close = lower.indexOf(closeMark, searchFrom)
-            val end = if (openEnd < 0 || close < 0) input.length else close + closeMark.length
-            i = end
         }
+        fun flush() {
+            gate() // 段落 flush 點：待取段落入 sb 之前先雙閘
+            if (segStart < i) sb.append(input, segStart, i)
+        }
+        while (i < n) {
+            if (lower[i] == '<') {
+                // `<` 結構性邊界（含候選分支）：每迭代雙閘，與舊版及 lib 內 stripTags 一致。
+                gate()
+                // comment：整塊原樣輸出並跳過——comment 內容不構成候選（與 findTagStart 之 comment 跳過語義一致）。
+                if (lower.startsWith("<!--", i)) {
+                    // indexOf 為原生掃描、不可 weave（線性、受 input cap 約束），接受此剩餘。
+                    val close = lower.indexOf("-->", i + 4)
+                    flush()
+                    val end = if (close < 0) n else close + 3
+                    sb.append(input, i, end)
+                    i = end
+                    segStart = i
+                    continue
+                }
+                if (isTagOpen(lower, i, deadlineNs, checking)) {
+                    val tag = when {
+                        lower.startsWith("<script", i) && isTagNameBoundary(lower, i + "<script".length) -> "script"
+                        lower.startsWith("<style", i) && isTagNameBoundary(lower, i + "<style".length) -> "style"
+                        else -> null
+                    }
+                    if (tag != null) {
+                        // 候選：先原樣輸出其前之待取段，再整體剝除（不輸出任何此元素之內容）。
+                        flush()
+                        // 先以引號感知 findTagEnd 算出「開始標籤的結尾」，closeMark 搜尋必須從
+                        // open 標籤的 `>` 之後開始——引號屬性值內的 `</script>`/`</style>` 不得算收尾
+                        //（否則屬性內砂/假 closeMark 會把實際標籤 JS/CSS 本文剩餘漏進模型可見體）。
+                        // findTagEnd == -1（開始標籤未閉合）時 searchFrom 退回 i（開始標籤之 `<`），
+                        // closeMark 搜尋涵蓋整個剩餘輸入；未閉合引號屬性內嵌之 `</script>`／`</style>`
+                        // 亦會命中，strip 停於該嵌入 closeMark；僅當全文亦無 closeMark 時，
+                        // 才剝至輸入結尾（既有行為，刻意保留；不更動 searchFrom 邏輯）。
+                        val openEnd = findTagEnd(lower, i, deadlineNs, checking)
+                        val searchFrom = if (openEnd < 0) i else openEnd + 1
+                        val closeMark = "</$tag>"
+                        // indexOf 為原生掃描、不可 weave；線性且受 input cap 約束，接受此剩餘。
+                        val close = lower.indexOf(closeMark, searchFrom)
+                        i = if (openEnd < 0 || close < 0) n else close + closeMark.length
+                        segStart = i
+                        continue
+                    }
+                    // 非候選 tag：整體跳過（原樣輸出，經待取段機制）。
+                    val end = findTagEnd(lower, i, deadlineNs, checking)
+                    i = if (end < 0) n else end + 1
+                    continue
+                }
+            }
+            // 純文字路徑：每 512 code unit 雙閘（與 lib 內多處掃描同一節流粒度）；
+            // 段落 flush 點（flush()）亦雙閘。
+            i++
+            if (++scanned and 511 == 0) gate()
+        }
+        flush() // 尾端 flush：函式收尾之段落落點同樣雙閘（文本已被掃盡，gate 僅作取消探針）
         return sb.toString()
     }
 
@@ -2008,7 +2152,7 @@ internal object HtmlExtract {
      * meta／time：候選**作廢並中止本趟掃描**（前向證明：findTagEnd==-1
      * 代表此候選之後已無任何 `>`（引號感知），之後不可能出現可閉合的
      * meta／time 候選 → 兩迴圈一律 break，整趟 O(n)）；
-     * script／style（見 [stripScriptAndStyle]）：自開始標籤剝至輸入結尾。
+     * script／style（見 [stripScriptAndStyle]）：原則上自開始標籤剝至輸入結尾（未閉合開始標籤內嵌之 closeMark 除外）。
      *
      * 對抗性 `<meta a` 鏈（無 `>`）：首個候選作廢（-1）後 break；
      * metaPublishedLinearFixture 對 44,800 字元 < 10 秒上限穩定通過。

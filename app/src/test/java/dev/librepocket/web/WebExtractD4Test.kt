@@ -882,7 +882,7 @@ class WebExtractD4Test {
         val leader = async { svc.extract("https://example.com/fc", resolver = dns) }
         withTimeout(5_000) { while (http.calls.get() < 1) delay(1) }
         val follower = async { svc.extract("https://example.com/fc", resolver = dns) }
-        delay(30) // 讓 follower 進入 await()
+        delay(150) // 與 Q5(b) 三件 follower-join 競態一致：150ms 讓 follower 進入 await()
         follower.cancelAndJoin()
         val leaderOut = withTimeout(5_000) { leader.await() }
         assertTrue("leader 不應受 follower 取消影響", leaderOut is WebExtractOutcome.Ok)

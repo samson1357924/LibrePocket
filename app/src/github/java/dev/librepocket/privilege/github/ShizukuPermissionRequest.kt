@@ -1,9 +1,28 @@
 package dev.librepocket.privilege.github
 
 import android.content.pm.PackageManager
+import android.util.Log
 import androidx.annotation.VisibleForTesting
 import kotlinx.coroutines.CancellationException
 import rikka.shizuku.Shizuku
+
+private const val TAG = "ShizukuPermissionRequests"
+
+/**
+ * android.util.Log 在非 Robolectric 的 JVM 單元測試中未 mock（呼叫即抛
+ * RuntimeException）；日誌絕不得影響 fail-closed 控制流，故包一層容錯。
+ */
+private fun safeLogW(tag: String, msg: String, e: Throwable? = null) {
+    try {
+        if (e != null) {
+            Log.w(tag, msg, e)
+        } else {
+            Log.w(tag, msg)
+        }
+    } catch (_: Throwable) {
+        // 單元測試環境無 android.util.Log：吞掉
+    }
+}
 
 /**
  * Shizuku 授權請求通道（#136-B1，BACKLOG D09，僅 github 風味）。
@@ -28,6 +47,12 @@ import rikka.shizuku.Shizuku
  * [attach] 僅在上游註冊成功後才將守衛置 true，失敗即回滾並保持 false，
  * 呼叫方可重試；JVM 單測下 Shizuku 類初始化即失敗，attach 恆走失敗路徑。
  *
+ * attach 成功後才能請求：[request]/[requestWithCallback] 在未成功 attach
+ * （含從未 attach、已 [detach]）時一律 fail-closed 回傳 false，不登記任何回呼；
+ * [detach] 會反註冊上游 listener 並作廢進行中請求（遞增 epoch＋清空回呼表），
+ * 過期 listener 的回呼因 listener 身份檢查不會分發到新 epoch。
+ * 一個 requestCode 同時僅一個 outstanding 回呼（見 [requestWithCallback]）。
+ *
  * 誠實邊界：Shizuku 授權（Manager 內的使用者允許）是「使用者把特權委託給
  * 本 app」的開關，不等於 OS sandbox——Root／特權語義見兩 runner KDoc，
  * 本類不作執行，不承諾隔離。
@@ -37,6 +62,9 @@ class ShizukuPermissionRequests(
     private val removeListener: (Shizuku.OnRequestPermissionResultListener) -> Unit = { Shizuku.removeRequestPermissionResultListener(it) },
 ) {
     companion object {
+        /** outstanding 回呼表的總筆數上限（超限時 [requestWithCallback] 拒絕並回傳 false）。 */
+        const val MAX_OUTSTANDING = 32
+
         @Volatile
         private var processInstance: ShizukuPermissionRequests? = null
 
@@ -68,7 +96,15 @@ class ShizukuPermissionRequests(
      */
     private var resultListener: Shizuku.OnRequestPermissionResultListener? = null
 
-    /** 按 requestCode 登記授權結果回呼（#136-B3 接線：回呼內做 grant 持久化＋審計）。 */
+    /**
+     * 按 requestCode 登記授權結果回呼（#136-B3 接線：回呼內做 grant 持久化＋審計）。
+     *
+     * 低階多回呼語義（B3 接線用）：同一 requestCode 可登記多筆回呼，結果到達時
+     * 逐筆分發；每筆回呼執行前仍會重查 epoch（作廢後不再執行）。產品路徑的
+     * 請求＋回呼原子登記請用 [requestWithCallback]（含 attach 門檻與同碼隔離）。
+     * 注意：此處登記的回呼計入 [MAX_OUTSTANDING] 總額，且同碼登記會擋住後續
+     * [requestWithCallback] 對同 requestCode 的請求（同碼隔離以回呼表非空為準）。
+     */
     fun onResult(requestCode: Int, callback: (granted: Boolean) -> Unit) {
         synchronized(lock) {
             callbacks.getOrPut(requestCode) { mutableListOf() } += callback
@@ -78,13 +114,26 @@ class ShizukuPermissionRequests(
     /**
      * 送出授權請求（預設走真實 `Shizuku.requestPermission`）。
      *
-     * @return 請求是否已送出（送出時抛異常即 false，fail-closed；true 不代表
-     * 已授權，結果只經 [onResult] 回呼到達）。
+     * 未成功 [attach] 時 fail-closed：不送出、回傳 false；[detach] 後需重新
+     * [attach] 才能再請求（attach 失敗可重試）。
+     *
+     * @return 請求是否已送出（未 attach 或送出時抛異常即 false，fail-closed；true 不代表
+     * 已授權，結果只經 [onResult] 回呼到達）。`CancellationException` 會原樣傳播（不折成 false）。
      */
     fun request(
         requestCode: Int,
         requestPermission: (Int) -> Unit = { code -> Shizuku.requestPermission(code) },
-    ): Boolean = runCatching { requestPermission(requestCode) }.isSuccess
+    ): Boolean {
+        if (!synchronized(lock) { attached }) return false
+        return try {
+            requestPermission(requestCode)
+            true
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Throwable) {
+            false
+        }
+    }
 
     private fun rollbackCallback(requestCode: Int, callback: (Boolean) -> Unit) {
         synchronized(lock) {
@@ -96,7 +145,15 @@ class ShizukuPermissionRequests(
 
     /**
      * 原子登記回呼並送出授權請求。
+     *
+     * 未成功 [attach]（含從未 attach、已 [detach]）時 fail-closed：不登記、不送出、
+     * 回傳 false；[attach] 失敗可重試，detach 後需重新 attach 才可再請求。
+     * 同一 requestCode 已有 outstanding 回呼時拒絕並回傳 false（不登記）——
+     * 一個 requestCode 同時僅一個 outstanding 回呼；需並行請求用不同 requestCode。
+     * outstanding 回呼總數上限 [MAX_OUTSTANDING]，超限回傳 false。
      * 若送出異常或失敗，自動回滾並移除已登記的回呼。
+     * 回呼登記與實際送出並非對 detach 原子：detach 可能先於送出發生，
+     * 屆時登記的回呼會隨表清空被丟棄、結果不再分發（方向 fail-closed）。
      */
     fun requestWithCallback(
         requestCode: Int,
@@ -104,6 +161,20 @@ class ShizukuPermissionRequests(
         requestPermission: (Int) -> Unit = { code -> Shizuku.requestPermission(code) },
     ): Boolean {
         synchronized(lock) {
+            if (!attached) {
+                safeLogW(TAG, "requestWithCallback rejected: not attached")
+                return false
+            }
+            if (callbacks[requestCode]?.isNotEmpty() == true) {
+                safeLogW(TAG, "requestWithCallback rejected: requestCode in use")
+                return false
+            }
+            var outstanding = 0
+            for (list in callbacks.values) outstanding += list.size
+            if (outstanding >= MAX_OUTSTANDING) {
+                safeLogW(TAG, "requestWithCallback rejected: outstanding capacity exhausted")
+                return false
+            }
             callbacks.getOrPut(requestCode) { mutableListOf() } += callback
         }
         val success = try {
@@ -139,7 +210,8 @@ class ShizukuPermissionRequests(
 
     /**
      * 單次消費回呼分發：按 requestCode 查找並移除回呼（one-shot），
-     * 比對 epoch 一致性；逐個調用並隔離異常。
+     * 比對 epoch 一致性；每個回呼執行前重查 epoch（作廢後批次中止）；
+     * 逐個調用並隔離異常。
      */
     private fun dispatchResult(requestCode: Int, grantResult: Int, epoch: Long) {
         val snapshot: List<(Boolean) -> Unit>
@@ -149,6 +221,9 @@ class ShizukuPermissionRequests(
         }
         val granted = grantResult == PackageManager.PERMISSION_GRANTED
         for (callback in snapshot) {
+            // 逐 callback 重查 epoch：快照取出後若被 invalidatePending()/detach()
+            // 作廢（含回呼自身在批次中途作廢），後續回呼不得再執行。
+            synchronized(lock) { if (epoch != activeEpoch) return }
             try {
                 callback(granted)
             } catch (_: Throwable) {
@@ -157,7 +232,7 @@ class ShizukuPermissionRequests(
         }
     }
 
-    /** 僅真實 listener 轉發用（internal：行程外不可偽造結果）：按碼分發結果快照（異常隔離，逐個收斂）。 */
+    /** 僅供測試驅動 dispatch 路徑用；無 production caller；勿在產品碼呼叫。 */
     @VisibleForTesting(otherwise = VisibleForTesting.PRIVATE)
     internal fun emitResult(
         requestCode: Int,
@@ -176,13 +251,16 @@ class ShizukuPermissionRequests(
      */
     fun attach() {
         val stagedEpoch: Long
-        val listener: Shizuku.OnRequestPermissionResultListener
+        lateinit var listener: Shizuku.OnRequestPermissionResultListener
         synchronized(lock) {
             if (attached) return
             stagedEpoch = activeEpoch
             listener = Shizuku.OnRequestPermissionResultListener { requestCode, grantResult ->
+                // 鎖內讀 attached 與 listener 身份：detach/reattach 後舊 listener 即使
+                // 上游反註冊靜默失敗，也不會以新 epoch 分發 stale 結果。
                 val epoch = synchronized(lock) {
                     if (!attached) return@OnRequestPermissionResultListener
+                    if (resultListener !== listener) return@OnRequestPermissionResultListener
                     activeEpoch
                 }
                 dispatchResult(requestCode, grantResult, epoch)
@@ -192,9 +270,11 @@ class ShizukuPermissionRequests(
         val added = try {
             addListener(listener)
             true
-        } catch (_: Exception) {
+        } catch (e: Exception) {
+            safeLogW(TAG, "Shizuku addRequestPermissionResultListener failed", e)
             false
-        } catch (_: LinkageError) {
+        } catch (e: LinkageError) {
+            safeLogW(TAG, "Shizuku addRequestPermissionResultListener failed", e)
             false
         }
 
@@ -215,8 +295,10 @@ class ShizukuPermissionRequests(
         if (shouldRemove) {
             try {
                 removeListener(listener)
-            } catch (_: Exception) {
-            } catch (_: LinkageError) {
+            } catch (e: Exception) {
+                safeLogW(TAG, "Shizuku removeRequestPermissionResultListener failed", e)
+            } catch (e: LinkageError) {
+                safeLogW(TAG, "Shizuku removeRequestPermissionResultListener failed", e)
             }
         }
     }
@@ -224,6 +306,8 @@ class ShizukuPermissionRequests(
     /**
      * 解除接線：反註冊上游 listener 並清空本地回呼表、丟棄暫存引用、重置守衛。
      * 鎖反轉防禦：在鎖內清空狀態並取出 listener 引用，在鎖外呼叫 [removeListener]。
+     * detach 不向外抛出（removeListener 失敗僅記錄日誌）：呼叫端無法得知上游
+     * 反註冊是否成功，語義安全由三道閘保證（epoch 作廢／守衛重置／listener 身份檢查）。
      */
     fun detach() {
         val staged: Shizuku.OnRequestPermissionResultListener?
@@ -234,8 +318,10 @@ class ShizukuPermissionRequests(
         if (staged != null) {
             try {
                 removeListener(staged)
-            } catch (_: Exception) {
-            } catch (_: LinkageError) {
+            } catch (e: Exception) {
+                safeLogW(TAG, "Shizuku removeRequestPermissionResultListener failed", e)
+            } catch (e: LinkageError) {
+                safeLogW(TAG, "Shizuku removeRequestPermissionResultListener failed", e)
             }
         }
     }

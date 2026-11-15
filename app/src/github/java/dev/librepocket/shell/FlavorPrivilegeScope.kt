@@ -8,7 +8,7 @@ object FlavorPrivilegeScope {
     suspend fun withdraw(context: Context) {
         var failure: Throwable? = null
         try {
-            ShizukuPermissionRequests.process().invalidatePending()
+            ShizukuPermissionRequests.process().detach()
         } catch (t: Throwable) {
             failure = t
         }

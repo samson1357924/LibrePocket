@@ -1238,7 +1238,10 @@ internal object McpWire {
                 // 以 i+=2 消耗——low 無前導 high、high 無後繼 low）：與控制/格式
                 // 字元同待遇轉成 \uXXXX（計入預算）。成對 surrogate 原樣保留。
                 c.isSurrogate() || needsDisplayEscape(c) -> {
-                    val escText = "\\u%04x".format(c.code)
+                    // Keep the escape ASCII-hex in every locale — `format`
+                    // without a locale prefixes with localized digits in some
+                    // locales (e.g. U+0660) and corrupts the escape.
+                    val escText = String.format(java.util.Locale.ROOT, "\\u%04x", c.code)
                     if (escText.length > budget) return sb.toString()
                     sb.append(escText)
                     budget -= escText.length

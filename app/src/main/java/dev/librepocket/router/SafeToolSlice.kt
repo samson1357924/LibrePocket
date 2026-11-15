@@ -219,8 +219,9 @@ class SafeToolSlice(
          * (surrogate pairs whose individual halves report SURROGATE) are
          * properly recognized.
          *
-         * Mirrored by hand in [FastDispatch] (`containsFormatCodePoint` copy) —
-         * edit the two implementations together.
+         * Shared with LspSymbolsExecutor (single source, #19 B3 stage-4) —
+         * the fast-lane executor calls this implementation; [FastDispatch]
+         * no longer carries a copy.
          */
         internal fun containsFormatCodePoint(s: String): Boolean {
             var i = 0
@@ -255,8 +256,8 @@ class SafeToolSlice(
          * already malformed. Work is bounded by `[cap]` (≤ `cap+1` in the
          * split case counting the marker afterwards).
          *
-         * Mirrored by hand in [FastDispatch] (`cappedTake` copy) — edit the
-         * two implementations together.
+         * Shared with LspSymbolsExecutor (single source, #19 B3 stage-4) —
+         * the fast-lane [FastDispatch] no longer carries a copy.
          */
         internal fun cappedTake(value: String, cap: Int): String {
             if (value.length <= cap) return value
@@ -295,8 +296,9 @@ class SafeToolSlice(
          * The 128-bit suffix keeps collision probability negligible even for
          * adversarial inputs. The result never exceeds [MAX_STRING_CHARS].
          *
-         * Mirrored by hand in [FastDispatch] (`boundedCallId` port) — edit the
-         * two implementations together.
+         * Shared with LspSymbolsExecutor (single source, #19 B3 stage-4) —
+         * the fast-lane [FastDispatch] no longer carries a copy (the former
+         * FD port now calls this).
          */
         internal fun boundedRedactedId(callId: String): String {
             val redacted = dev.librepocket.redact.Redactor.redact(callId).text
@@ -459,10 +461,14 @@ class SafeToolSlice(
 
         /**
          * Computes max JSON nesting depth while ignoring string contents.
-         * Mirrored by hand in [FastDispatch] (`jsonNestingDepth` copy) —
-         * edit the two implementations together.
+         *
+         * Shared with LspSymbolsExecutor (single source, #19 B3 stage-4) —
+         * the fast-lane executor calls this implementation; [FastDispatch]
+         * no longer carries a copy. The pinned kotlinx-serialization 1.12.0
+         * also enforces its own 400-layer limit; this pre-scan is the
+         * shared fan-close both parse paths apply before parsing.
          */
-        private fun jsonNestingDepth(s: String): Int {
+        internal fun jsonNestingDepth(s: String): Int {
             var depth = 0
             var max = 0
             var inStr = false
@@ -482,6 +488,99 @@ class SafeToolSlice(
             }
             return max
         }
+
+        /**
+         * Effective item cap shared by [ok] (this slice) and the fast-lane
+         * executor's `okResult` (LspSymbolsExecutor): the requested limit
+         * clamped into 1..[LspTools.MAX_LIMIT]; a null request means
+         * "unspecified" and mirrors the parse-stage default
+         * ([LspTools.DEFAULT_LIMIT], itself clamped).
+         *
+         * Shared with LspSymbolsExecutor (single source, #19 B3 stage-4) —
+         * do not re-inline the clamp.
+         */
+        internal fun effectiveLimitOf(requested: Int?): Int =
+            (requested ?: LspTools.DEFAULT_LIMIT).coerceIn(1, LspTools.MAX_LIMIT)
+
+        /**
+         * Fail-closed scope guard, single shared predicate (no duplicated inline
+         * re-checks): no traversal markers (`..`), no absolute scope form (leading
+         * `/` after trimming), no backslash, NUL, ISO-control chars, or
+         * percent-escapes; `:` additionally rejects scheme/drive-absolute scope
+         * forms (`file:/etc`, `c:/Users`) so a scope can never name another root
+         * namespace.
+         *
+         * Unicode FORMAT code points (U+200B ZWSP, U+202E RLO, U+FEFF BOM,
+         * U+200E/200F LRM/RLM, …) are rejected outright: they are invisible
+         * (or reorder the visible text) and `trimStart()` does NOT remove them,
+         * so `\u200B/etc/passwd` would otherwise pass the leading-`/` check and
+         * name an absolute scope while looking like a relative one. The check is
+         * on the code point's general category (`Character.FORMAT`), so it also
+         * covers format code points that are not whitespace at all. Iteration is
+         * BY CODE POINT (not by UTF-16 char): a supplementary-plane format
+         * character (U+E0001 LANGUAGE TAG, U+E0020 TAG SPACE — a surrogate
+         * PAIR) reports `SURROGATE` for each half, so a char-level scan would
+         * let it slip through and hide the same absolute scope behind an
+         * invisible tag. This is deliberately wider than the bypass needs
+         * (over-rejection of a scope that merely contains a zero-width mark is
+         * the safe direction).
+         *
+         * Filesystem-shaped scope input only — the model-controlled
+         * `query` deliberately keeps its own narrower check (a search string may
+         * contain `..`/`%`/`:` and stays allowed).
+         *
+         * Shared with LspSymbolsExecutor (single source, #19 B3 stage-4) —
+         * the fast-lane [FastDispatch] no longer carries a copy.
+         */
+        internal fun isSafeInput(v: String): Boolean {
+            if (v.contains("..")) return false
+            // Reject any Unicode FORMAT code point outright so it cannot bypass
+            // the leading-`/` check (U+200B/U+202E/U+FEFF etc.). Code-point
+            // iteration: a supplementary-plane format character is a surrogate
+            // pair whose halves report SURROGATE, never FORMAT.
+            if (containsFormatCodePoint(v)) return false
+            if (v.trimStart().startsWith("/")) return false
+            if (v.contains("\\")) return false
+            if (v.contains("\u0000")) return false
+            if (v.contains("%")) return false
+            if (v.contains(":")) return false
+            if (v.any { it.isISOControl() }) return false
+            return true
+        }
+
+        /**
+         * Bounded echo of a backend-controlled (or query) field: over-cap
+         * values are capped surrogate-safely and given a `…[truncated N→cap]`
+         * marker so the model can tell echo from input.
+         *
+         * Shared with LspSymbolsExecutor (single source, #19 B3 stage-4) —
+         * the fast-lane [FastDispatch] no longer carries a copy (identical
+         * logic and marker format).
+         */
+        internal fun cappedEcho(value: String): String =
+            if (value.length > MAX_STRING_CHARS) {
+                cappedTake(value, MAX_STRING_CHARS) + "…[truncated ${value.length}→$MAX_STRING_CHARS]"
+            } else {
+                value
+            }
+
+        /**
+         * Pre-redaction bound for backend-owned strings (see [RAW_BACKEND_FIELD_MAX_CHARS]).
+         * Over-bound values are replaced whole by a fixed receipt: a truncated
+         * prefix could defeat suffix-anchored redaction rules.
+         *
+         * The receipt is FIXED (`[backend field omitted]`, no length): the
+         * omitted length is MODEL/BACKEND-controlled information, and echoing it
+         * back tells the model how much data it fed in — a free side channel
+         * (and an unnecessary leak) on a receipt whose only job is to say
+         * "something was dropped here".
+         *
+         * Shared with LspSymbolsExecutor (single source, #19 B3 stage-4) —
+         * the fast-lane [FastDispatch] no longer carries a copy.
+         */
+        internal fun boundedRawBackendField(value: String): String =
+            if (value.length <= RAW_BACKEND_FIELD_MAX_CHARS) value
+            else "[backend field omitted]"
     }
 
     /**
@@ -985,52 +1084,6 @@ class SafeToolSlice(
     }
 
     /**
-     * Fail-closed scope guard, single shared predicate (no duplicated inline
-     * re-checks): no traversal markers (`..`), no absolute scope form (leading
-     * `/` after trimming), no backslash, NUL, ISO-control chars, or
-     * percent-escapes; `:` additionally rejects scheme/drive-absolute scope
-     * forms (`file:/etc`, `c:/Users`) so a scope can never name another root
-     * namespace.
-     *
-     * Unicode FORMAT code points (U+200B ZWSP, U+202E RLO, U+FEFF BOM/BOM,
-     * U+200E/200F LRM/RLM, …) are rejected outright: they are invisible
-     * (or reorder the visible text) and `trimStart()` does NOT remove them,
-     * so `\u200B/etc/passwd` would otherwise pass the leading-`/` check and
-     * name an absolute scope while looking like a relative one. The check is
-     * on the code point's general category (`Character.FORMAT`), so it also
-     * covers format code points that are not whitespace at all. Iteration is
-     * BY CODE POINT (not by UTF-16 char): a supplementary-plane format
-     * character (U+E0001 LANGUAGE TAG, U+E0020 TAG SPACE — a surrogate
-     * PAIR) reports `SURROGATE` for each half, so a char-level scan would
-     * let it slip through and hide the same absolute scope behind an
-     * invisible tag. This is deliberately wider than the bypass needs
-     * (over-rejection of a scope that merely contains a zero-width mark is
-     * the safe direction).
-     *
-     * Filesystem-shaped scope input only — the model-controlled
-     * `query` deliberately keeps its own narrower check (a search string may
-     * contain `..`/`%`/`:` and stays allowed).
-     *
-     * Mirrored by hand in [FastDispatch] (`isSafeInput` copy) — edit the
-     * two implementations together.
-     */
-    private fun isSafeInput(v: String): Boolean {
-        if (v.contains("..")) return false
-        // Reject any Unicode FORMAT code point outright so it cannot bypass
-        // the leading-`/` check (U+200B/U+202E/U+FEFF etc.). Code-point
-        // iteration: a supplementary-plane format character is a surrogate
-        // pair whose halves report SURROGATE, never FORMAT.
-        if (containsFormatCodePoint(v)) return false
-        if (v.trimStart().startsWith("/")) return false
-        if (v.contains("\\")) return false
-        if (v.contains("\u0000")) return false
-        if (v.contains("%")) return false
-        if (v.contains(":")) return false
-        if (v.any { it.isISOControl() }) return false
-        return true
-    }
-
-    /**
      * Typed denial receipt for [call].
      *
      * [wireId] is the id that rides the wire (the bounded redacted form of
@@ -1070,36 +1123,14 @@ class SafeToolSlice(
     }
 
     /**
-     * Mirrored by hand in [FastDispatch] (`cappedEcho` copy) — edit the two
-     * implementations together.
-     */
-    private fun cappedEcho(value: String): String =
-        if (value.length > MAX_STRING_CHARS) {
-            cappedTake(value, MAX_STRING_CHARS) + "…[truncated ${value.length}→$MAX_STRING_CHARS]"
-        } else {
-            value
-        }
-
-    /** Pre-redaction bound for backend-owned strings (see [RAW_BACKEND_FIELD_MAX_CHARS]).
-     *  Over-bound values are replaced whole by a fixed receipt: a truncated
-     *  prefix could defeat suffix-anchored redaction rules.
-     *
-     *  The receipt is FIXED (`[backend field omitted]`, no length): the
-     *  omitted length is MODEL/BACKEND-controlled information, and echoing it
-     *  back tells the model how much data it fed in — a free side channel
-     *  (and an unnecessary leak) on a receipt whose only job is to say
-     *  "something was dropped here".
-     *
-     *  Mirrored by hand in [FastDispatch] (`boundedRawBackendField` copy) —
-     *  edit the two implementations together. */
-    private fun boundedRawBackendField(value: String): String =
-        if (value.length <= RAW_BACKEND_FIELD_MAX_CHARS) value
-        else "[backend field omitted]"
-
-    /**
-     * Mirrored by hand in [FastDispatch] (`okResult` copy) — edit the two
-     * implementations together (item-cap clamp, effective limit, omittedCount /
-     * truncated computation).
+     * The slice's success-receipt pipeline; the fast-lane executor's
+     * `okResult` ([LspSymbolsExecutor]) mirrors this projection by hand
+     * (item-cap clamp via the shared [effectiveLimitOf], the effective
+     * limit, `omittedCount`/`truncated` computation) — [SymbolReceiptParityTest]
+     * pins the two Ok receipts byte-/semantic-identical modulo the documented
+     * asymmetries (this receipt's `clockMillis`, the tool echo rule, key
+     * order). Shared helpers live in this companion (single source, #19 B3
+     * stage-4); never re-copy them into [FastDispatch].
      */
     private fun ok(
         call: ToolCall,
@@ -1120,7 +1151,7 @@ class SafeToolSlice(
         val redactedSymbols: List<Triple<String, String, String>>
         val anyFieldTruncated: Boolean
         try {
-            val effectiveLimit = requestedLimit.coerceIn(1, LspTools.MAX_LIMIT)
+            val effectiveLimit = effectiveLimitOf(requestedLimit)
             available = outcome.symbols.take(effectiveLimit)
             limitOmitted = (outcome.symbols.size - available.size).coerceAtLeast(0)
             redactedQuery = dev.librepocket.redact.Redactor.redact(query).text

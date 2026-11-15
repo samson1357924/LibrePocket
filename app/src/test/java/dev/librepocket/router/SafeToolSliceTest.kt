@@ -1241,6 +1241,14 @@ class SafeToolSliceTest {
         assertTrue("floor must retain a ≥2× margin (cross-constant coupling)", r.resultJson.length <= SafeToolSlice.MAX_RESULT_CHARS / 2)
     }
 
+    /** Null request is unreachable from both call sites; pin the documented
+     * null→DEFAULT_LIMIT→clamp semantics so the signature's null branch
+     * cannot silently drift. */
+    @Test fun effectiveLimitOfPinsNullToDefaultAndClampsOversizedRequest() {
+        assertEquals(LspTools.DEFAULT_LIMIT, SafeToolSlice.effectiveLimitOf(null))
+        assertEquals(LspTools.MAX_LIMIT, SafeToolSlice.effectiveLimitOf(9999))
+    }
+
     @Test fun postRedactionInflationMarksTruncatedField() = runBlocking {
         // Truncation is decided on POST-redaction lengths: a raw field ≤
         // MAX_STRING_CHARS can exceed the cap after redaction inflates each

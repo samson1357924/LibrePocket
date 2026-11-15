@@ -19,7 +19,6 @@ import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.intOrNull
 import kotlinx.serialization.json.put
 import java.text.Normalizer
-import java.security.MessageDigest
 import kotlin.coroutines.coroutineContext
 
 /**
@@ -296,7 +295,7 @@ class FastDispatcher(
         // 有界化自身爆掉（非取消、非 fatal Error）→ 型別化 EXEC_ERROR skip，
         // 維持 contract「never throws except CancellationException / fatal Error」。
         val boundedId = try {
-            boundedCallId(result.callId)
+            SafeToolSlice.boundedRedactedId(result.callId)
         } catch (e: CancellationException) {
             throw e
         } catch (_: Exception) {
@@ -450,11 +449,12 @@ interface FastToolExecutor {
  * backend invocations):
  * - gross arguments ≤ [SafeToolSlice.MAX_GROSS_ARGS_CHARS] (16 KiB) and
  *   nesting depth ≤ [SafeToolSlice.MAX_NESTING_DEPTH] (32), checked before
- *   parsing (mirrors the slice's pre-parse fan-close);
+ *   parsing via [SafeToolSlice.jsonNestingDepth] (the same shared pre-parse
+ *   fan-close the slice applies);
  * - `query` ≤ [SafeToolSlice.MAX_INPUT_CHARS], no ISO control chars / NUL /
- *   Unicode FORMAT code points;
+ *   Unicode FORMAT code points ([SafeToolSlice.containsFormatCodePoint]);
  * - `pathPrefix` ≤ [SafeToolSlice.MAX_INPUT_CHARS], must be NFKC-stable, and
- *   must pass the shared [isSafeInput] predicate (no `..`, no leading `/`
+ *   must pass the shared [SafeToolSlice.isSafeInput] predicate (no `..`, no leading `/`
  *   after trimming, no backslash, no NUL, no ISO control chars, no
  *   percent-escapes, no `:`, no FORMAT code points).
  *
@@ -470,10 +470,10 @@ interface FastToolExecutor {
  * redaction rules), then redacted, then a >[SafeToolSlice.MAX_STRING_CHARS]
  * post-redaction length flags truncation; `line` passes through as Int;
  * `query` and `callId` echoes are redacted; `query` is capped to
- * [SafeToolSlice.MAX_STRING_CHARS] (surrogate-safe [cappedTake]) while
- * `callId` uses [boundedCallId] (slice `boundedRedactedId` semantics:
- * redact → ≤cap pass through → surrogate-safe cap + `#` + 32-hex SHA-256
- * of the full redacted string); raw ids never ride the receipt. The
+ * [SafeToolSlice.MAX_STRING_CHARS] (surrogate-safe [SafeToolSlice.cappedTake]) while
+ * `callId` uses [SafeToolSlice.boundedRedactedId] (redact → ≤cap pass through
+ * → surrogate-safe cap + `#` + 32-hex SHA-256 of the full redacted string);
+ * raw ids never ride the receipt. The
  * serialized result JSON is shrunk item-wise
  * to [SafeToolSlice.MAX_RESULT_CHARS] (dropping the tail, bumping
  * `omittedCount`); a single-symbol remainder still over budget is a typed
@@ -494,14 +494,18 @@ interface FastToolExecutor {
  * reaching the call-site catch in [execute] — same outcome type, same
  * fixed message.
  *
- * Kept in sync with [SafeToolSlice] by hand (same module, same constants):
- * the copied predicates ([jsonNestingDepth], [containsFormatCodePoint],
- * [isSafeInput], [boundedRawBackendField], [cappedTake], [cappedEcho]), the
- * copied [PAIRING_SUFFIX_CHARS] constant, the [boundedCallId] port, and the
- * [okResult]/[LspSymbolsExecutor.parseArgs] pair (this file's Ok-receipt
- * pipeline mirrors the slice's `ok()`/`parseArgs()` item-cap clamp, effective
- * limit, `omittedCount`/`truncated` computation — edit together with their
- * slice counterparts).
+ * Predicate/cap/id-bounding helpers are single-sourced in [SafeToolSlice]'s
+ * companion object and CALLED here ([SafeToolSlice.jsonNestingDepth],
+ * [SafeToolSlice.containsFormatCodePoint], [SafeToolSlice.isSafeInput],
+ * [SafeToolSlice.boundedRawBackendField], [SafeToolSlice.cappedTake],
+ * [SafeToolSlice.cappedEcho], [SafeToolSlice.boundedRedactedId],
+ * [SafeToolSlice.effectiveLimitOf]) — there is exactly ONE implementation,
+ * shared with the slice. Only the pipeline shapes themselves remain
+ * hand-mirrored with the slice: [parseArgs] ↔ the slice's `parseArgs()` and
+ * [okResult] ↔ the slice's `ok()` (same module, same constants). The Ok
+ * receipts those two pipelines produce are pinned byte-/semantic-identical
+ * (modulo the slice's extra `clockMillis`, the tool echo rule, and key
+ * order) by `SymbolReceiptParityTest` — do not fork the shared helpers.
  */
 class LspSymbolsExecutor(
     private val backend: LspTools.Backend = LspTools.StubBackend,
@@ -513,7 +517,7 @@ class LspSymbolsExecutor(
     private fun parseArgs(argumentsJson: String): LspArgs? {
         // 粗防線：與切片相同的 gross 上限與巢狀深度 pre-scan（在任何 parse 之前）。
         if (argumentsJson.length > SafeToolSlice.MAX_GROSS_ARGS_CHARS) return null
-        if (jsonNestingDepth(argumentsJson) > SafeToolSlice.MAX_NESTING_DEPTH) return null
+        if (SafeToolSlice.jsonNestingDepth(argumentsJson) > SafeToolSlice.MAX_NESTING_DEPTH) return null
         val root = try {
             Json.parseToJsonElement(argumentsJson)
         } catch (_: Exception) {
@@ -524,7 +528,7 @@ class LspSymbolsExecutor(
             ?.takeIf { it.isNotBlank() }
             ?.takeIf { it.length <= SafeToolSlice.MAX_INPUT_CHARS }
             ?.takeIf { it.none { c -> c.isISOControl() || c == '\u0000' } }
-            ?.takeIf { !containsFormatCodePoint(it) } ?: return null
+            ?.takeIf { !SafeToolSlice.containsFormatCodePoint(it) } ?: return null
         val limit = when (val raw = root["limit"]) {
             null -> LspTools.DEFAULT_LIMIT
             is JsonPrimitive -> if (raw.isString) {
@@ -542,7 +546,7 @@ class LspSymbolsExecutor(
                 if (v.length > SafeToolSlice.MAX_INPUT_CHARS) return null
                 // Reject any input that changes under NFKC normalization.
                 if (Normalizer.normalize(v, Normalizer.Form.NFKC) != v) return null
-                if (!isSafeInput(v)) return null
+                if (!SafeToolSlice.isSafeInput(v)) return null
                 v
             }
             else -> return null
@@ -607,7 +611,7 @@ class LspSymbolsExecutor(
         // 一次快照：以「請求的 limit」（預設 DEFAULT_LIMIT、coerceIn 保險）做上限
         // 擷取；MAX_LIMIT 是絕對上限，請求上限更嚴格。後端超給屬 backend
         // contract violation，只數一次 → limitOmitted。
-        val effectiveLimit = requestedLimit.coerceIn(1, LspTools.MAX_LIMIT)
+        val effectiveLimit = SafeToolSlice.effectiveLimitOf(requestedLimit)
         val available = outcome.symbols.take(effectiveLimit)
         val limitOmitted = (outcome.symbols.size - available.size).coerceAtLeast(0)
         val redactedQuery = dev.librepocket.redact.Redactor.redact(query).text
@@ -617,9 +621,9 @@ class LspSymbolsExecutor(
             val rawOmitted = s.name.length > SafeToolSlice.RAW_BACKEND_FIELD_MAX_CHARS ||
                 s.kind.length > SafeToolSlice.RAW_BACKEND_FIELD_MAX_CHARS ||
                 s.path.length > SafeToolSlice.RAW_BACKEND_FIELD_MAX_CHARS
-            val rn = dev.librepocket.redact.Redactor.redact(boundedRawBackendField(s.name)).text
-            val rk = dev.librepocket.redact.Redactor.redact(boundedRawBackendField(s.kind)).text
-            val rp = dev.librepocket.redact.Redactor.redact(boundedRawBackendField(s.path)).text
+            val rn = dev.librepocket.redact.Redactor.redact(SafeToolSlice.boundedRawBackendField(s.name)).text
+            val rk = dev.librepocket.redact.Redactor.redact(SafeToolSlice.boundedRawBackendField(s.kind)).text
+            val rp = dev.librepocket.redact.Redactor.redact(SafeToolSlice.boundedRawBackendField(s.path)).text
             if (rawOmitted || rn.length > SafeToolSlice.MAX_STRING_CHARS ||
                 rk.length > SafeToolSlice.MAX_STRING_CHARS ||
                 rp.length > SafeToolSlice.MAX_STRING_CHARS
@@ -631,19 +635,19 @@ class LspSymbolsExecutor(
         val symbolJsons = redactedSymbols.mapIndexed { idx, (rn, rk, rp) ->
             val s = available[idx]
             buildJsonObject {
-                put("name", cappedEcho(rn))
-                put("kind", cappedEcho(rk))
-                put("path", cappedEcho(rp))
+                put("name", SafeToolSlice.cappedEcho(rn))
+                put("kind", SafeToolSlice.cappedEcho(rk))
+                put("path", SafeToolSlice.cappedEcho(rp))
                 put("line", s.line)
             }
         }
-        val boundedId = boundedCallId(call.callId)
+        val boundedId = SafeToolSlice.boundedRedactedId(call.callId)
         fun build(chosen: List<JsonObject>, omittedCount: Int, truncated: Boolean): JsonObject =
             buildJsonObject {
                 put("tool", toolName)
                 put("callId", boundedId)
                 put("denied", false)
-                put("query", cappedEcho(redactedQuery))
+                put("query", SafeToolSlice.cappedEcho(redactedQuery))
                 put("fromStub", outcome.fromStub)
                 put("symbols", buildJsonArray { for (o in chosen) add(o) })
                 put("returnedCount", chosen.size)
@@ -683,142 +687,9 @@ class LspSymbolsExecutor(
                 put("denied", true)
                 put("code", code)
                 put("tool", toolName)
-                put("callId", boundedCallId(call.callId))
+                put("callId", SafeToolSlice.boundedRedactedId(call.callId))
             }.toString(),
             denied = true,
             denyCode = code,
         )
-
-    /**
-     * Must stay in sync with SafeToolSlice.cappedEcho — identical logic and
-     * marker format; only the reference constants differ (this file quotes
-     * SafeToolSlice's MAX_STRING_CHARS directly).
-     */
-    private fun cappedEcho(value: String): String =
-        if (value.length > SafeToolSlice.MAX_STRING_CHARS) {
-            cappedTake(value, SafeToolSlice.MAX_STRING_CHARS) +
-                "…[truncated ${value.length}→${SafeToolSlice.MAX_STRING_CHARS}]"
-        } else {
-            value
-        }
-
-    /**
-     * Pre-redaction bound for backend-owned strings (mirrors the slice's
-     * [SafeToolSlice.boundedRawBackendField]).
-     *
-     * must stay in sync with SafeToolSlice.boundedRawBackendField
-     */
-    private fun boundedRawBackendField(value: String): String =
-        if (value.length <= SafeToolSlice.RAW_BACKEND_FIELD_MAX_CHARS) value
-        else "[backend field omitted]"
-
-    /**
-     * Computes max JSON nesting depth while ignoring string contents.
-     *
-     * must stay in sync with SafeToolSlice.jsonNestingDepth; the pinned
-     * kotlinx-serialization 1.12.0 also enforces its own 400-layer limit,
-     * this mirror keeps behavior aligned.
-     */
-    private fun jsonNestingDepth(s: String): Int {
-        var depth = 0
-        var max = 0
-        var inStr = false
-        var esc = false
-        for (c in s) {
-            if (inStr) {
-                if (esc) esc = false
-                else if (c == '\\') esc = true
-                else if (c == '"') inStr = false
-            } else {
-                when (c) {
-                    '"' -> inStr = true
-                    '{', '[' -> { depth++; if (depth > max) max = depth }
-                    '}', ']' -> { if (depth > 0) depth-- }
-                }
-            }
-        }
-        return max
-    }
-
-    /**
-     * Returns true if [s] contains any Unicode FORMAT (Cf) code points.
-     * Scans by code point so supplementary-plane format characters are
-     * properly recognized.
-     *
-     * must stay in sync with SafeToolSlice.containsFormatCodePoint
-     */
-    private fun containsFormatCodePoint(s: String): Boolean {
-        var i = 0
-        while (i < s.length) {
-            val codePoint = s.codePointAt(i)
-            if (Character.getType(codePoint) == Character.FORMAT.toInt()) return true
-            i += Character.charCount(codePoint)
-        }
-        return false
-    }
-
-    /**
-     * Fail-closed scope guard (mirrors the slice's [SafeToolSlice.isSafeInput]):
-     * no `..`, no leading `/` after trimming, no backslash, NUL, ISO control
-     * chars, percent-escapes, `:`, or FORMAT code points.
-     *
-     * must stay in sync with SafeToolSlice.isSafeInput
-     */
-    private fun isSafeInput(v: String): Boolean {
-        if (v.contains("..")) return false
-        if (containsFormatCodePoint(v)) return false
-        if (v.trimStart().startsWith("/")) return false
-        if (v.contains("\\")) return false
-        if (v.contains("\u0000")) return false
-        if (v.contains("%")) return false
-        if (v.contains(":")) return false
-        if (v.any { it.isISOControl() }) return false
-        return true
-    }
-}
-
-/**
- * Over-cap redacted id 的確定性配對後綴長度：`#` + 32-hex（128 位元
- * SHA-256 前綴）＝ `1 + 16 * 2` UTF-16 units。
- *
- * must stay in sync with SafeToolSlice.PAIRING_SUFFIX_CHARS
- */
-private const val PAIRING_SUFFIX_CHARS = 1 + 16 * 2
-
-/**
- * Surrogate-safe cap slice.
- *
- * must stay in sync with SafeToolSlice.cappedTake
- */
-private fun cappedTake(value: String, cap: Int): String {
-    if (value.length <= cap) return value
-    var end = cap
-    while (end > 0 && value[end - 1].code in 0xD800..0xDBFF) {
-        end--
-    }
-    return value.substring(0, end)
-}
-
-/**
- * Bounded, collision-disambiguated redacted id（對 slice
- * `boundedRedactedId` 語義的忠實 port）：先 redact（可能膨風），redacted
- * 長度 ≤ [SafeToolSlice.MAX_STRING_CHARS] 原樣放行；否則 surrogate-safe
- * [cappedTake] 到 `MAX_STRING_CHARS - PAIRING_SUFFIX_CHARS` 前綴，接上
- * `#` + 對「完整 redacted 字串」的 SHA-256 前 16 bytes 摘要（小寫 32-hex）。
- * 結果長度永不超過 [SafeToolSlice.MAX_STRING_CHARS]。
- *
- * must stay in sync with SafeToolSlice.boundedRedactedId
- *
- * File-private so [FastDispatcher] can bind its [FastDispatchOutcome.Executed]
- * outcome to the same bounded form used by the receipt channel.
- */
-private fun boundedCallId(callId: String): String {
-    val redacted = dev.librepocket.redact.Redactor.redact(callId).text
-    if (redacted.length <= SafeToolSlice.MAX_STRING_CHARS) return redacted
-    val digest = MessageDigest.getInstance("SHA-256").digest(redacted.toByteArray(Charsets.UTF_8))
-    val hex = digest.take(16).joinToString("") { byte ->
-        (byte.toInt() and 0xFF).toString(16).padStart(2, '0')
-    }
-    val suffix = "#$hex"
-    return cappedTake(redacted, SafeToolSlice.MAX_STRING_CHARS - PAIRING_SUFFIX_CHARS) + suffix
 }

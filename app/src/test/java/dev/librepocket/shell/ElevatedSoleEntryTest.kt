@@ -57,7 +57,7 @@ import org.junit.Test
  *   （whitespace/newline 容忍、token 前邊界非識別字組成；`ShellExecTool.executeElevatedFrozen(`／
  *   裸 `executeElevatedFrozen(` 皆涵蓋；反引號內容原樣輸出後仍命中）或
  *   callable reference（`::executeElevatedFrozen`，結尾邊界非識別字組成）或
- *   Java interop（`ShellExecTool\s*\.\s*INSTANCE\s*\.\s*executeElevatedFrozen\s*\(`）；
+ *   Java interop（`ShellExecTool\s*\.\s*INSTANCE\s*\.\s*executeElevatedFrozen(\$[A-Za-z0-9_]*)?\s*\(`）；
  *   上述 token 皆可帶可選 `\$<suffix>`，涵蓋 JVM mangled internal；
  *   命中僅允許 `dev/librepocket/router/ElevatedDispatch.kt`（唯一產品調用方）；
  *   宣明檔 `dev/librepocket/shell/ShellExecTool.kt` 跳過（宣明並內部呼叫 `executeElevatedFrozen`）；
@@ -65,7 +65,7 @@ import org.junit.Test
  *   （不含 `executeElevatedFrozen(`——`executeElevated` 後必須緊接可選 `\$<suffix>` 再 `\s*\(`，`F` 擋下；
  *   `executeElevatedFrozen$app_debug(` 亦不命中）或
  *   callable reference（`::executeElevated`，結尾邊界非識別字組成）或
- *   Java interop（`ShellExecTool\s*\.\s*INSTANCE\s*\.\s*executeElevated\s*\(`，
+ *   Java interop（`ShellExecTool\s*\.\s*INSTANCE\s*\.\s*executeElevated(\$[A-Za-z0-9_]*)?\s*\(`，
  *   同樣不匹配 `INSTANCE.executeElevatedFrozen(`）；
  *   上述 token 皆可帶可選 `\$<suffix>`，涵蓋 JVM mangled internal；全產品源集零命中；
  *   宣明檔 ShellExecTool.kt 跳過（宣明 `executeElevated` 且內部呼叫 `executeElevatedFrozen`）；

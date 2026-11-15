@@ -111,8 +111,9 @@ class ShellStage5Test {
                 code.append(c)
                 i++
             }
-            // 允許 JVM-mangled suffix（internal $<module> 由 @JvmSynthetic 於編譯期
-            // 封死；此處為 tripwire 對照形，覆蓋任何 $<suffix> 直呼；fail-closed）。
+            // 允許 JVM-mangled suffix 的 `.executeElevated$…(` arm（internal $<module>
+            // 由 @JvmSynthetic 於編譯期封死；此檔僅涵蓋 `.executeElevated$` 形；
+            // `.executeElevatedFrozen$…(`／bare 直呼由 ElevatedSoleEntryTest 對應 pin 涵蓋）。
             if (code.contains(".executeElevated(")) return true
             if (Regex("""\.executeElevated\$[A-Za-z0-9_]*\s*\(""").containsMatchIn(code)) return true
         }

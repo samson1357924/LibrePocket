@@ -51,6 +51,27 @@ import java.util.concurrent.atomic.AtomicBoolean
  */
 class ElevatedWiringTest {
 
+    // ---- T4 pin：四個 gate-bearing internal 成員皆編譯為 JVM synthetic（@JvmSynthetic）----
+    // （外部（如 Java 透過 mangled 名稱 `execute$app`）呼叫面在編譯期封死；
+    //  反射驗證 ACC_SYNTHETIC——防註解被靜默移除而不觸發任何測試）
+
+    @Test fun internalGateMembersAreJvmSynthetic() {
+        val dispatchMethods = dev.librepocket.router.ElevatedDispatch::class.java.declaredMethods
+        val execToolMethods = dev.librepocket.shell.ShellExecTool::class.java.declaredMethods
+        val gateMethods = listOf(
+            dispatchMethods.filter { it.name.startsWith("execute") },
+            execToolMethods.filter { it.name.startsWith("executeElevated") },
+        )
+        // 對四個 mangled 名稱（$<module>）＋可能的 $default bridges 皆須 synthetic；
+        // Kotlin 側 internal 成員對測試源集可見，但 JVM ACC_SYNTHETIC 阻擋 Java 編譯。
+        val targets = gateMethods.flatten()
+        assertTrue("gate methods must exist in class files: ${targets.map { it.name }}", targets.isNotEmpty())
+        val nonSynthetic = targets.filter { !it.isSynthetic }
+        assertTrue("all gate-bearing members must be JVM synthetic: ${nonSynthetic.map { it.name }}", nonSynthetic.isEmpty())
+        // 且至少包含四個目標（execute/executeWithFrozen/executeElevated/executeElevatedFrozen 各一）。
+        assertTrue("must have >=4 gate members", targets.size >= 4)
+    }
+
     private companion object {
         const val TEST_PROVIDER_ID = "preset:openai"
         const val TEST_REVISION = 3L

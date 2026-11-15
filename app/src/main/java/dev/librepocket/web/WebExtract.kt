@@ -452,8 +452,9 @@ class WebExtractCache(
 
     /**
      * 快取 generation epoch：每次 [clear]（含 `WebExtractService.invalidate()`）
-     * 先 bump 此值，再清空 map；寫入方以進入時捕獲之 epoch 通過 [putByKey]
-     * 的 guard，否則寫入被拒絕（stale write 不得在 invalidate 之後重填快取）。
+     * 於 map 鎖內 bump 此值並清空 map（同一臨界區，原子）；寫入方／讀取方以
+     * 進入時捕獲之 epoch 通過 [putByKey]／[getByKey] 的 guard，否則寫入被拒絕、
+     * 讀取視同 miss（invalidate 之後陳舊條目不得重填快取、亦不得被讀回）。
      */
     private val generation = java.util.concurrent.atomic.AtomicLong(0)
 
@@ -468,9 +469,13 @@ class WebExtractCache(
     fun get(url: String, maxBytes: Int, maxModelChars: Int, optIn: EndpointNetworkOptIn): WebExtractOutcome.Ok? =
         getByKey(key(url, maxBytes, maxModelChars, optIn))
 
-    internal fun getByKey(k: String): WebExtractOutcome.Ok? {
+    // read-side epoch guard：呼叫方傳入進入時捕獲之 epoch（per-call 重驗後、
+    // cache 存取點 a／b 皆傳 epochAtEntry）；不符即視同 miss——invalidate 之後
+    // 陳舊條目不得被讀回。public get() 傳 null（語義不變：讀取當前有效條目）。
+    internal fun getByKey(k: String, generationCaptured: Long? = null): WebExtractOutcome.Ok? {
         val entry: Entry?
         synchronized(map) {
+            if (generationCaptured != null && generation.get() != generationCaptured) return null
             entry = map[k]
             if (entry != null && clockMs() >= entry.expiresAt) {
                 map.remove(k)
@@ -494,9 +499,8 @@ class WebExtractCache(
         val weight = weightOf(k, snapshot)
         synchronized(map) {
             // epoch guard（置於 map 鎖內）：進入時捕獲之 generation 已變
-            //（clear()/invalidate() 已 bump），拒絕本次寫入——陳舊 leader
-            // 不得在 invalidate 之後重填快取（bump 先於 map.clear()，
-            // 故鎖內看到 bump 即知 clear 已開始或完成）。
+            //（clear()/invalidate() 已 bump——bump 與清空同一臨界區），拒絕本次
+            // 寫入——陳舊 leader 不得在 invalidate 之後重填快取。
             if (generation.get() != generationCaptured) return
             sweepLocked(now)
             if (weight > maxBytes) {
@@ -527,10 +531,10 @@ class WebExtractCache(
     }
 
     fun clear() {
-        // 先 bump generation 再清 map：任何捕獲舊 epoch 的寫入從此刻起一律被
-        // [putByKey] 拒絕（即使 map 清空與寫入競爭，guard 也以 epoch 判決）。
-        generation.incrementAndGet()
+        // bump 與清空同一個 map 臨界區（原子）：任何捕獲舊 epoch 的寫入／讀取
+        // 從此刻起一律被 [putByKey]／[getByKey] 拒絕（guard 以鎖內之 generation 判決）。
         synchronized(map) {
+            generation.incrementAndGet()
             map.clear()
             currentBytes = 0L
         }
@@ -577,7 +581,7 @@ class WebExtractService(
     /**
      * 撤銷原語：revocation primitive。
      *
-     * - `cache.clear()`（先 bump generation epoch，再清空 map）：
+     * - `cache.clear()`（bump generation epoch 與清空 map 同一 map 臨界區）：
      *   invalidate() 之前建立之快取條目永遠無法再被回傳。
      * - 排空當前 in-flight entries：`inFlight` 內所有 pending leader 之
      *   `CompletableDeferred` 以 `CancellationException("web.extract invalidated")`
@@ -642,6 +646,7 @@ class WebExtractService(
             // per-call 政策重驗（含 DNS preflight），fail-closed；必須在 cache／
             // inFlight 存取之前完成——initial peek、lateHit（mutex 內）、follower join
             // 三個返回點皆位於此檢查之後，單次重驗覆蓋全部三者；通過後才觸 cache。
+            // cache miss 的 hop 0 會再評估一次（revalidate 與 hop-0 評估各一次 DNS；取代：不 memoize，避免讓 gate 變可變狀態）
             val gate = try {
                 if (NetworkPolicy.requiresDnsLookup(hop0, optIn)) {
                     when (
@@ -673,13 +678,13 @@ class WebExtractService(
                     gate.denyCode,
                 )
             }
-            cache.getByKey(k)?.let { return it }
+            cache.getByKey(k, epochAtEntry)?.let { return it }
 
             var lateHit: WebExtractOutcome.Ok? = null
             var mine: CompletableDeferred<WebExtractOutcome>? = null
             var leader = false
             mutex.withLock {
-                lateHit = cache.getByKey(k)
+                lateHit = cache.getByKey(k, epochAtEntry)
                 if (lateHit == null) {
                     val existing = inFlight[k]
                     if (existing != null) {
@@ -693,7 +698,7 @@ class WebExtractService(
                 }
             }
             lateHit?.let { return it }
-            val m = mine ?: continue
+            val m = mine ?: error("extract() invariant violated: no epoch for in-flight entry")
             if (!leader) {
                 try {
                     // per-follower deadline：以整體預算為界包住 await；
@@ -1028,17 +1033,17 @@ class WebExtractService(
                 published = cleanPublished,
                 siteName = cleanSiteName,
             )
-            val envelope = if (!truncated) {
-                WebContentEnvelope.wrap(capped)
-            } else if (modelTruncated) {
-                WebContentEnvelope.wrap(capped + "\n${WebExtract.TRUNCATED_SENTINEL_MARK} AT $effModel CHARS]")
-            } else {
-                // truncated 僅由 parser 輸入前綴截斷觸發（model 預算未截）：input sentinel。
-                WebContentEnvelope.wrap(capped + "\n${WebExtract.TRUNCATED_INPUT_SENTINEL_MARK}$PARSE_INPUT_CAP CHARS]")
-            }
             // pre-Ok gate：預算已耗盡則絕不建構／返回逾越預算之 Ok
             //（parse／gunzip 內部 deadline 檢查之外的最後一道守門）。
             if (System.nanoTime() >= deadlineNs) throw DeadlineExceededException()
+            val envelope = if (!truncated) {
+                WebContentEnvelope.wrap(capped, deadlineNs)
+            } else if (modelTruncated) {
+                WebContentEnvelope.wrap(capped + "\n${WebExtract.TRUNCATED_SENTINEL_MARK} AT $effModel CHARS]", deadlineNs)
+            } else {
+                // truncated 僅由 parser 輸入前綴截斷觸發（model 預算未截）：input sentinel。
+                WebContentEnvelope.wrap(capped + "\n${WebExtract.TRUNCATED_INPUT_SENTINEL_MARK}$PARSE_INPUT_CAP CHARS]", deadlineNs)
+            }
             return WebExtractOutcome.Ok(
                 content = content,
                 envelope = envelope,
@@ -1122,6 +1127,7 @@ internal enum class Pipeline { Html, RawText }
  *
  * [isAllowedContentType] 仍為位元組／型別閘（byte/type gate），不在此調整；
  * 管線分派為下游關注點。
+ * Content-Type 如 `text/html x`（無 `;`）fallthrough 到 RawText，envelope 仍單層密封；malformed 但放行即為 legacy 行為。
  */
 internal fun pipelineOf(contentType: String?): Pipeline {
     if (contentType == null) return Pipeline.Html
@@ -1576,6 +1582,7 @@ private object HtmlExtract {
     /**
      * 單趟、前向游標的 published 抽取器（O(n)；取代先前 META_PUBLISHED／
      * META_PUBLISHED_REV／TIME_DATETIME 三 regex 的病態回溯風險）。
+     * alias 清單比對先於 NFKC（fullwidth alias 不符；fail-closed，no published）。
      *
      * 先掃 `<meta` 候選（依文件順序），每候選標籤以引號感知的掃描取得 `>`
      * 收尾（`content="a>>>b"` 內的 `>` 不算收尾），再切出

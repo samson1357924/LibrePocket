@@ -135,13 +135,14 @@ object WebContentEnvelope {
 
     /**
      * 先以 [cleanField] 定點處理（NFKC＋sanitize＋剝偽造 marker）、
-     * 最後包一層。
+     * 最後包一層。工作受 `deadlineNs` 約束（預設 `Long.MAX_VALUE`，語義不變）：
+     * 逾時拋 [DeadlineExceededException]（不回傳部分結果）。
      *
      * 輸出形狀：`BEGIN + "\n" + cleaned + "\n" + END`，恰含一組 marker；
      * 輸入內容無論為何（含偽造 marker／bidi）皆 fail-closed 為單層乾淨 envelope。
      */
-    fun wrap(raw: String): String {
-        val cleaned = cleanField(raw)
+    fun wrap(raw: String, deadlineNs: Long = Long.MAX_VALUE): String {
+        val cleaned = cleanField(raw, deadlineNs)
         return "$BEGIN\n$cleaned\n$END"
     }
 

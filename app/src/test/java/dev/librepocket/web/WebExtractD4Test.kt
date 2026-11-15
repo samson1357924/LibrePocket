@@ -787,7 +787,8 @@ class WebExtractD4Test {
     @Test fun serviceInvalidateClearsCacheForcingRefetch() = runBlocking {
         // invalidate() 亦會 drain in-flight entries（exceptionally）：進行中的
         // leader 不受影響地完成並把 outcome 交給自己的 caller，但其 cache 寫入
-        // 被 epoch guard 抑制；follower 見 Unavailable(CANCELLED)。
+        // 被 epoch guard 抑制；後續呼叫之 cache 讀取亦經 read-side epoch guard
+        // （不得循 cache 讀回 invalidate 前之條目）；follower 見 Unavailable(CANCELLED)。
         val dns = publicDns("example.com")
         val http = FakeExtract { okResp(html()) }
         val svc = WebExtractService(http)
@@ -1639,6 +1640,17 @@ class WebExtractD4Test {
         assertFalse("script 標籤內容必須被剝除", content.content.snippet.contains("hidden"))
         assertTrue("title 後的正文必須保留", content.content.snippet.contains("AfterText"))
         assertEquals("RealTitle", content.content.title)
+        // <style> 亦須剝除（CSS 不得進 snippet）；`<styleee>` 為 tag-name 邊界不符，不得誤判
+        val styleDoc = """<html><head><title>RealTitle</title></head><body><styleee>Visible</styleee><style>.x{display:none}</style>AfterText</body></html>"""
+        val styleContent = parseHtml(styleDoc, "https://example.com/")
+        assertTrue("parseHtml 應成功，got null", styleContent != null)
+        assertFalse("短輸入不得回報 inputCapped", styleContent!!.inputCapped)
+        assertTrue(
+            "`<styleee>` 不得誤判為 style 標籤，got ${styleContent.content.snippet}",
+            styleContent.content.snippet.contains("Visible"),
+        )
+        assertFalse("style 標籤內 CSS 必須被剝除", styleContent.content.snippet.contains("display:none"))
+        assertTrue("style 之後的正文必須保留", styleContent.content.snippet.contains("AfterText"))
     }
 
     @Test fun titleTagBoundaryFixture() {
@@ -1720,5 +1732,141 @@ class WebExtractD4Test {
         assertEquals(CapabilityLevel.NATIVE, ToolRegistry.projectAll(on)[WebExtract.TOOL_NAME]!!.level)
         assertTrue(ToolRegistry.projectedTools(on).any { it.name == WebExtract.TOOL_NAME })
         assertFalse(ToolRegistry.visibleTools(on).any { it.name == WebExtract.TOOL_NAME })
+    }
+
+    @Test fun invalidateMakesPreRevokeContentUnreachable() = runBlocking {
+        // invalidate() 之後：pre-revoke 之 cache 條目不得被後續呼叫讀回
+        //（read-side epoch guard）；必須重打 upstream、不得以撤權限前之內容作答。
+        val dns = publicDns("example.com")
+        val http = FakeExtract { okResp(html()) }
+        val svc = WebExtractService(http)
+        svc.extract("https://example.com/revoke", resolver = dns) as WebExtractOutcome.Ok
+        assertEquals(1, http.calls.get())
+        svc.invalidate()
+        val again = svc.extract("https://example.com/revoke", resolver = dns) as WebExtractOutcome.Ok
+        assertFalse("invalidate 後不得循 cache 讀回撤權限前內容", again.cached)
+        assertEquals(2, http.calls.get())
+    }
+
+    @Test fun findTagTimeAndQuotedContentFixture() = runBlocking {
+        // findTagEnd 為引號感知：content="a>>>b" 之 `>` 不算 tag 收尾，published 必須原樣取出；
+        // 未閉合引號（content="unterminated，無收尾引號）→ 無可解析 <meta> 候選，
+        // extract 仍成功、published 為 null（不得 crash）。
+        val dns = publicDns("example.com")
+        val docQuoted = """<html><head><title>T</title></head><body><meta property="article:published_time" content="a>>>b"></body></html>"""
+        val http = FakeExtract { url ->
+            when (url) {
+                "https://example.com/pubQuoted" -> okResp(docQuoted)
+                else -> okResp("""<html><head><title>T</title></head><body><meta property="article:published_time" content="unterminated</body></html>""")
+            }
+        }
+        val svc = WebExtractService(http)
+        val outQuoted = svc.extract("https://example.com/pubQuoted", resolver = dns) as WebExtractOutcome.Ok
+        assertEquals("a>>>b", outQuoted.content.published)
+        val outUnterminated = svc.extract("https://example.com/pubUnterminated", resolver = dns) as WebExtractOutcome.Ok
+        assertEquals(null, outUnterminated.content.published)
+    }
+
+    @Test fun publishedMetaWinsOverTime() = runBlocking {
+        // <time datetime> 出現於文件早處、<meta article:published_time> 於其後：
+        // published 抽取器先掃 <meta> 候選（文件順序），meta 命中即回——meta 必須勝過 <time>。
+        val doc = """<html><head><title>T</title></head><body><time datetime="2030-05-06">2030</time><meta property="article:published_time" content="2024-01-02"></body></html>"""
+        val dns = publicDns("example.com")
+        val http = FakeExtract { okResp(doc) }
+        val svc = WebExtractService(http)
+        val out = svc.extract("https://example.com/metaWins", resolver = dns) as WebExtractOutcome.Ok
+        assertEquals("2024-01-02", out.content.published)
+    }
+
+    @Test fun cacheOverwriteAccountingPin() {
+        // 同 key 覆寫（小→大）：舊 entry 權重必須扣除，不得雙計、不得洩漏；
+        // 之後再放入第三個 key，逐出順序必須是 {K, other} 之最舊者（K 先於 other1 寫入，K 最舊）。
+        val optIn = EndpointNetworkOptIn()
+        val snippetA = "a".repeat(100)
+        val envelopeA = "a".repeat(100)
+        val snippetB = "b".repeat(1_000)
+        val envelopeB = "b".repeat(1_000)
+        val kUrl = "https://e.com/aaaa"
+        val other1 = "https://e.com/bbbb"
+        val other2 = "https://e.com/cccc"
+        val wA = expectedEntryWeight(kUrl, snippetA, envelopeA, optIn)
+        val wB = expectedEntryWeight(kUrl, snippetB, envelopeB, optIn)
+        // 僅容 K(B)＋other(A) 一筆之餘裕
+        val cache = WebExtractCache(ttlMs = 60_000, clockMs = { 1_000L }, maxBytes = wB + wA + 1)
+        cache.put(kUrl, WebExtract.DEFAULT_MAX_BYTES, WebExtract.DEFAULT_MODEL_CHARS, optIn, byteCacheOk(snippetA, envelopeA))
+        assertEquals(1, cache.size)
+        // 覆寫同 key：size 維持 1（不得因舊 entry 未扣除而雙計）
+        cache.put(kUrl, WebExtract.DEFAULT_MAX_BYTES, WebExtract.DEFAULT_MODEL_CHARS, optIn, byteCacheOk(snippetB, envelopeB))
+        assertEquals("覆寫同 key 後 size 必須為 1", 1, cache.size)
+        cache.put(other1, WebExtract.DEFAULT_MAX_BYTES, WebExtract.DEFAULT_MODEL_CHARS, optIn, byteCacheOk(snippetA, envelopeA))
+        assertEquals("覆寫後之 bytes 計數必須容得下 other1（舊 entry 權重已扣除）", 2, cache.size)
+        // 再放入 other2：必須逐出最舊者 K（K 先於 other1 寫入；other1 為 MRU）
+        cache.put(other2, WebExtract.DEFAULT_MAX_BYTES, WebExtract.DEFAULT_MODEL_CHARS, optIn, byteCacheOk(snippetA, envelopeA))
+        assertEquals(2, cache.size)
+        assertTrue(
+            "最舊者（K）應被逐出",
+            cache.get(kUrl, WebExtract.DEFAULT_MAX_BYTES, WebExtract.DEFAULT_MODEL_CHARS, optIn) == null,
+        )
+        assertTrue(
+            "other1 應在快取",
+            cache.get(other1, WebExtract.DEFAULT_MAX_BYTES, WebExtract.DEFAULT_MODEL_CHARS, optIn) != null,
+        )
+        assertTrue(
+            "other2 應在快取",
+            cache.get(other2, WebExtract.DEFAULT_MAX_BYTES, WebExtract.DEFAULT_MODEL_CHARS, optIn) != null,
+        )
+    }
+
+    @Test fun rawTextBlankSnippetFailsBadResponse() = runBlocking {
+        // text/plain、body 僅空白：decoded 為 blank → BAD_RESPONSE（與 HTML 管線之契約一致）
+        val dns = publicDns("example.com")
+        val http = FakeExtract {
+            okResp("   \n  \t  ", headers = mapOf("Content-Type" to "text/plain; charset=utf-8"))
+        }
+        val svc = WebExtractService(http)
+        val out = svc.extract("https://example.com/blank", resolver = dns)
+        assertTrue("expected Failed, got $out", out is WebExtractOutcome.Failed)
+        assertEquals(WebExtract.DETAIL_BAD_RESPONSE, (out as WebExtractOutcome.Failed).detail)
+    }
+
+    @Test fun webExtractDefaultsStayConstant() {
+        // 常數釘死：預設不得在未經審查的 commit 中變動
+        assertEquals(4L * 1024 * 1024, WebExtract.MAX_CACHE_BYTES)
+        assertEquals(200, WebExtract.MAX_CACHE_ENTRIES)
+        assertEquals(262_144, WebExtract.DEFAULT_MAX_BYTES)
+    }
+
+    @Test fun bothTruncationCapsModelSentinelWinsFixture() = runBlocking {
+        // 雙觸發：inputCapped（y×290_000 filler in <script>，html.length > PARSE_INPUT_CAP(256k)，
+        // input cap 不隨 maxBytes 放大）＋ model cap（可見文字 30_000 chars > DEFAULT_MODEL_CHARS(20_000)）。
+        // 兩者並存時 model sentinel 勝出（envelope 分支順序：modelTruncated 先於 inputCapped）；
+        // envelope 不得含 TRUNCATED_INPUT_SENTINEL_MARK。
+        val dns = publicDns("example.com")
+        val body = "<html><head><title>T</title></head><body>" +
+            "z".repeat(30_000) +
+            "<script>" + "y".repeat(290_000) + "</script>" +
+            "</body></html>"
+        val http = FakeExtract {
+            WebExtractRawResponse(
+                200,
+                body.toByteArray(Charsets.UTF_8),
+                mapOf("Content-Type" to "text/html; charset=utf-8"),
+            )
+        }
+        val svc = WebExtractService(http)
+        val out = svc.extract(
+            "https://example.com/bothcaps",
+            resolver = dns,
+            maxBytes = WebExtract.ABSOLUTE_MAX_BYTES,
+        ) as WebExtractOutcome.Ok
+        assertTrue("兩上限並存時 truncated 必為 true", out.truncated)
+        assertTrue(
+            "model sentinel 必須出現（model cap 勝出）",
+            out.envelope.contains(WebExtract.TRUNCATED_SENTINEL_MARK),
+        )
+        assertFalse(
+            "input sentinel 不得出現（model cap 觸發時 model sentinel 勝出）",
+            out.envelope.contains(WebExtract.TRUNCATED_INPUT_SENTINEL_MARK),
+        )
     }
 }

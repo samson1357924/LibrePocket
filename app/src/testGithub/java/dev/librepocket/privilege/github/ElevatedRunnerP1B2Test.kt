@@ -294,7 +294,7 @@ class ElevatedRunnerP1B2Test {
     /**
      * verify-stall 模型（Stage 3 item 6，`drainVerifyStallSealsAdmissionWithLingeringVerifyWorker`）：
      * kill 路徑 cleanup block 為 no-op destroy＋`isAlive()` 恆為 true；kill 路徑照常收斂，唯一卡死點為
-     * verify 的 5s `waitFor(5, SECONDS)` 門控（有界 verify 的 `elevated-verify` worker 其 `waitFor(5, SECONDS)` 進入 [verifyGate] 閘門
+     * verify 的 5s `waitFor(5, SECONDS)` 門控（有界 verify 的 `elevated-verify` worker 進入 [verifyGate] 閘門
      * 後**永不返回**（吞 interrupt＋無上界 await，模擬 Binder stall）——drain 的
      * `VERIFY_JOIN_MS(5500)+GRACE_MS(500)` 之後即宣告 verify 失敗（return false）並
      * `markLingering` 記槽（worker 存活期間持有一槽）；閘門 countDown 後 waitFor 回 true，
@@ -1087,8 +1087,10 @@ class ElevatedRunnerP1B2Test {
             assertTrue("timedOut must stay true (kill path)", d.timedOut)
             assertEquals(-1, d.exitCode)
             // Stage 3（drain/verdict hardening，admitted residual surfacing）：起線程失敗 arm
-            // 亦置 untrackedOut——未持槽／無 worker／killer 未信號（handle 無 outstanding 追蹤；
-            // quarantine 以無條件登記另行涵蓋——僅登記拋出且 caller verify 臂 helper 重試再拋時方無任何追蹤接管），
+            // 亦置 untrackedOut——無 worker／killer 未信號（quarantine 以無條件登記另行涵蓋——
+            // 登記拋出則槽經 caller verify 臂保留（helper 登記拋出不釋槽），admission 續拒
+            // fail-closed；handle 不入 quarantine，outstanding 追蹤持續——僅 acquire 拋臂在雙登記
+            // 皆拋時方無任何追蹤接管），
             // Drained.untrackedResidual 必須 surface。tracker
             // noteUntrackedResidual 計數仍只飽和臂計（與 kill-never-attempted 互斥語義不變），
             // 見下方 untrackedResidualCount 斷言。

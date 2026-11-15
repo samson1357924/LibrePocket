@@ -3,6 +3,7 @@ package dev.librepocket.web
 import dev.librepocket.policy.EndpointNetworkOptIn
 import dev.librepocket.policy.HostResolver
 import dev.librepocket.policy.NetworkDenyCode
+import dev.librepocket.policy.NetworkEvaluation
 import dev.librepocket.policy.NetworkPolicy
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
@@ -83,8 +84,13 @@ internal class DeadlineExceededException : RuntimeException()
  *   相同 policy/revision 但不同首跳解析答案不互撞）仍須 per-call 政策重驗
  *   （含 DNS preflight，fail-closed）；重驗通過才回 `cached=true` 之副本，HTTP upstream 不再出發。
  *   同 policy＋`configRevision` 不代表同一信任上下文——resolver／endpoint 為
- *   call-scoped；hop-0 位址集合綁定首跳決策結果，但**不含 redirect 逐跳之信任上下文**
- *   （已知殘留，見 D3 追蹤項 #1）；per-call 重驗仍是真正的權威；
+ *   call-scoped；hop-0 位址集合綁定首跳決策結果，redirect 逐跳之信任上下文由
+ *   entry 攜帶之 [HopBinding] 鏈（每跳 url＋已核准位址 sorted token）逐跳重驗把關：
+ *   每跳 policy（含 DNS）必須 allowed、且當次解析之 token 必須與記錄一致；
+ *   任一跳不符即視為 miss、重打 upstream（`putByKey` 覆寫），絕不回傳該 Ok——
+ *   **成本：每次 cache hit 額外付 L×(DNS+policy) 驗證成本（L＝chain 長度）**；
+ *   single-flight follower 之 chain-face 仍為 D3 pinning-identity 殘留（見 D3 追蹤項 #1）；
+ *   per-call 重驗仍是真正的權威；
  *   重驗失敗（denial／`Failed(TIMEOUT)`）不讀取快取，亦不觸 upstream。
  *   `Failed`／`Unavailable`／取消一律不寫。
  *   有界雙上限（正交）：筆數 [MAX_CACHE_ENTRIES]（200）＋位元組 [MAX_CACHE_BYTES]
@@ -95,7 +101,8 @@ internal class DeadlineExceededException : RuntimeException()
  *   跨 tier 內容永不共用。
  * - `inFlight` single-flight map：無界，但受 per-key timeout 有界（leader 受
  *   [TIMEOUT_MS] 端到端約束，逾時即完成並出 map；與 `WebSearchService` 同姿態）。
- *   key 同樣綁 hop-0 位址集合（與快取相同 identity；redirect 逐跳殘留見 D3 追蹤項 #1）。
+ *   key 同樣綁 hop-0 位址集合（與快取相同 identity；redirect 逐跳殘留——
+ *   follower 之 chain-face——見 D3 追蹤項 #1）。
  *   `invalidate()` bump 快取 generation epoch、清空快取，並 drain 所有在途 entry
  *   例外完成（`CancellationException`）→ follower 映射 `Unavailable(CANCELLED)`；
  *   invalidate 之前建立之條目／在途結果永遠無法重新出現在 cache 或 follower 路徑。
@@ -151,10 +158,17 @@ internal class DeadlineExceededException : RuntimeException()
  *    取用是允許的用法，呼叫方每次呼叫僅多付一次 policy preflight。
  *    **不含 port 維度之語義**（port 已內含於 URL 字串，無遺失，但 D3 須確認與政策側
  *    port 處理一致）。
- *    **已知殘留：redirect 逐跳之信任上下文尚未綁入 key**——僅 hop-0 綁定；
- *    跨 redirect 之 A/B 位址差異目前仍可能命中（redirect 鏈上的 hop 不會改變
- *    hop-0 的 key）；chain-recording 綁定（記錄逐跳 (url, 位址集合) 於 entry，
- *    命中時逐跳重驗）於本 PR（#138）Phase 1 後續 commit 處理。
+ *    **chain-recording 綁定（Option B）**：cache entry 記錄每一跳之
+ *    （url, 已核准位址 sorted token）鏈（[HopBinding]）；命中時逐跳重驗——
+ *    每跳 `evaluateUrl` 必須 allowed、且當次解析之 token 必須與記錄一致；
+ *    opt-in 降級走與 fetch 相同之 `downgradedOptInForRedirect` walker；
+ *    任一跳不符／失敗即視為 miss、重打 upstream（`putByKey` 覆寫 entry），
+ *    絕不回傳該 Ok；代價為每次 hit 額外 L×(DNS+policy) 驗證成本（L＝chain 長度）。
+ *    **follower 面仍為 D3 pinning-identity 殘留**：single-flight follower 收到
+ *    leader 產出之 Ok 時，無法對自己的 resolver 再次逐跳驗證（entry 之 chain
+ *    僅供 cache 命中路徑把關）——follower 之隔離依賴 hop-0 key 綁定＋當次
+ *    per-call 政策重驗；redirect 逐跳之 A/B 位址差異下 follower 仍可能收到
+ *    leader 的 tenant 內容；此為 D3 殘留，不得宣稱完整 redirect 隔離。
  * 2. cache **不解析 `Cache-Control`（含 `no-store`）**：TTL-only，屬刻意
  *    設計（read 工具、無寫副作用）；D3 須決定 honor 或明文件化此行為。
  * 3. `cleanField` 已由共享 15s 全程端到端預算限界（parse→clean 管線逐層
@@ -409,8 +423,86 @@ internal suspend fun fetchRawWithTimeout(
     return RawFetchOut.Resp(response)
 }
 
+/** 逐跳政策閘之結果（fail-closed）：允許（含 eval）或拒絕（outcome 已映射）。 */
+private sealed interface GateResult {
+    data class Allowed(val eval: NetworkEvaluation) : GateResult
+
+    data class Denied(val outcome: WebExtractOutcome) : GateResult
+}
+
+/**
+ * 逐跳政策閘（單一真相；extract() 首跳重驗、`extractUncachedInner` 逐跳、
+ * cache hit chain-recording 逐跳重驗三處共用，避免三份邏輯漂移）。
+ *
+ * - DNS 需查則經有界 preflight（[NetworkPolicy.runPreflightSuspend]，
+ *   與全程 deadline 共用預算）；純 pre-DNS 決策直接評估、不阻塞。
+ * - 映射與既有行為一致：TimedOut→`Failed(TIMEOUT)`；OverloadRejected／任何
+ *   例外→`Failed(TRANSPORT)`；denial→`Unavailable(denyCode name)`——逐跳政策
+ *   拒絕（含 redirect hop）刻意以內層 denyCode 映射（保留內層碼供稽核），
+ *   偏離 WebFetch 之 `REDIRECT_BLOCKED` 正規化；收斂列為 #138/D5 追蹤項。
+ * - 政策評估（pre-parse）不產生 DeadlineExceededException；CancellationException 原樣透傳。
+ */
+private suspend fun policyGate(
+    url: String,
+    optIn: EndpointNetworkOptIn,
+    resolver: HostResolver,
+    deadlineNs: Long,
+): GateResult {
+    val gate = try {
+        if (NetworkPolicy.requiresDnsLookup(url, optIn)) {
+            when (
+                val pre = NetworkPolicy.runPreflightSuspend(deadlineNs) {
+                    NetworkPolicy.evaluateUrl(url, optIn, resolver)
+                }
+            ) {
+                is NetworkPolicy.PreflightOutcome.Completed -> pre.value
+                NetworkPolicy.PreflightOutcome.TimedOut ->
+                    return GateResult.Denied(WebExtractOutcome.Failed(WebExtract.DETAIL_TIMEOUT))
+                NetworkPolicy.PreflightOutcome.OverloadRejected ->
+                    return GateResult.Denied(WebExtractOutcome.Failed(WebExtract.DETAIL_TRANSPORT))
+            }
+        } else {
+            // 純 pre-DNS 決策（literal IP 或不需查 DNS）：直接評估，不阻塞。
+            NetworkPolicy.evaluateUrl(url, optIn, resolver)
+        }
+    } catch (e: CancellationException) {
+        throw e
+    } catch (_: Exception) {
+        // 政策評估（pre-parse）不產生 DeadlineExceededException；
+        // evaluateUrl／resolver 之例外一律 fail-closed TRANSPORT。
+        return GateResult.Denied(WebExtractOutcome.Failed(WebExtract.DETAIL_TRANSPORT))
+    }
+    if (!gate.allowed) {
+        return GateResult.Denied(
+            WebExtractOutcome.Unavailable(
+                gate.denyCode?.name ?: NetworkDenyCode.INVALID_HOST.name,
+                gate.denyCode,
+            ),
+        )
+    }
+    return GateResult.Allowed(gate)
+}
+
 /** entry 權重之固定開銷（Object header／map node／bookkeeping 之近似估算）。 */
 private const val ENTRY_OVERHEAD_BYTES = 256L
+
+/**
+ * 鏈式信任上下文之單跳記錄（chain-recorded cache binding，#138 PR Phase 1 / Option B）：
+ * 記錄該跳**實際被評估並建連**之絕對 URL（fragment 已去除）及當次解析並授權之
+ * 位址集合（[sortedDistinctAddressTokens]：去重＋排序之 `hostAddress` 列表）。
+ * 逐跳資訊使 cache 命中可逐跳重驗，關閉（僅對 cache 面）redirect 逐跳綁定殘留。
+ * token 為純 `hostAddress` 字元集（無 `\u0001`／無控制字元），可安全 join 與 length-prefix。
+ */
+internal data class HopBinding(
+    val url: String,
+    val addresses: List<String>,
+)
+
+/** cache 命中之內部檢視（outcome 已正規化 `cached=true`；chain 供逐跳重驗）。 */
+internal data class CacheHit(
+    val outcome: WebExtractOutcome.Ok,
+    val chain: List<HopBinding>,
+)
 
 /**
  * 解析後位址集合之正規化 token 列表：先以位元組 `contentToString()` 去重
@@ -437,15 +529,24 @@ internal fun sortedDistinctAddressTokens(addresses: List<InetAddress>): List<Str
  *  join 為 `,`；length-prefix 附於 key 尾端）；不同預算／不同 tier／
  *  不同 revision／不同首跳解析答案絕不互撞；`round-robin` 返回答案順序不影響 key；
  *  key 不含 resolver／endpoint 身份（per-call 重驗才是真正的權威），hop-0 位址
- *  集合僅綁定當次決策之結果；key 不含 redirect 逐跳之信任上下文（已知殘留，
- *  見 header「D3 追蹤項」#1）。
+ *  集合僅綁定當次決策之結果；redirect 逐跳之信任上下文由 entry 之
+ *  [HopBinding] 鏈記錄並於命中時逐跳重驗（不符即 miss）——key 仍只綁 hop-0，
+ *  chain 為 hit-path 之信任把關（見 header「D3 追蹤項」#1）。
  * - 只存 `Ok`（`Failed`／`Unavailable`／取消不寫）；寫入時 `cached` 正規化
  *   為 `false`，讀回時正規化為 `true`（快取內一律以 `cached=false` 儲存，
  *   讀出一律以 `cached=true` 呈現；[WebExtractOutcome.Ok.cached] 預設
  *   `false` 不變）。
+ * - entry 攜帶**逐跳信任上下文鏈**（[HopBinding]：url＋該跳已核准位址集合之
+ *   sorted token；空鏈＝公開 `put()` 之 scaffold 條目，無從重驗、沿用舊命中語義）。
+ *   命中時（[getHitByKey]）呼叫方（`WebExtractService`）必須逐跳重驗：
+ *   每跳 `evaluateUrl` 必須 allowed、且當次解析之 token 必須與記錄一致；
+ *   任一跳不符即視為 miss、重打 upstream 並覆寫 entry——**不得回傳該 Ok**。
+ *   代價：每次 hit 額外 L×(DNS+policy) 驗證成本（L＝chain 長度）；見
+ *   header「快取」與 header「D3 追蹤項」#1。
  * - 快取命中仍須 per-call 政策重驗（含 DNS preflight，fail-closed）：相同
  *  `policy`＋`configRevision` 但不同首跳解析答案（或不同 resolver／endpoint 安全上下文）
  *  不得重用結果——key 已綁 hop-0 位址集合，不同解析答案根本不會命中；
+ *  redirect 逐跳之信任上下文由 entry 之 [HopBinding] 鏈逐跳重驗把關（不符即 miss），
  *  重驗失敗（denial／TIMEOUT）不讀取快取；重驗本身不 purge
  *   快取；授權撤銷僅能經 `invalidate()`／bump `configRevision` 生效；跨 tier
  *  （不同 `policy`／`configRevision`）內容永不共用。
@@ -453,7 +554,8 @@ internal fun sortedDistinctAddressTokens(addresses: List<InetAddress>): List<Str
  *  筆數上限 [WebExtract.MAX_CACHE_ENTRIES]（200）＋位元組上限
  *  [WebExtract.MAX_CACHE_BYTES]（4 MiB；建構子可注入小值測試）。
  *  entry 權重（near-weighted）＝key／snippet／envelope／title／url／published／
- *  siteName 之長度×2＋固定 [ENTRY_OVERHEAD_BYTES]；`put` 時先 sweep expired
+ *  siteName 之長度×2＋**chain 各跳**（`url`＋`addresses` 各 token 長度）×2
+ *  ＋固定 [ENTRY_OVERHEAD_BYTES]；`put` 時先 sweep expired
  *  → 單筆超限直接不寫 → LRU（accessOrder）逐出直到放得下；`clear()` 歸零
  *  `currentBytes`；TTL sweep／覆寫同 key 皆即時調整 bytes 計。
  */
@@ -466,12 +568,18 @@ class WebExtractCache(
         require(ttlMs > 0) { "ttlMs must be > 0" }
     }
 
-    private data class Entry(val outcome: WebExtractOutcome.Ok, val expiresAt: Long, val weight: Long)
+    private data class Entry(
+        val outcome: WebExtractOutcome.Ok,
+        val expiresAt: Long,
+        val weight: Long,
+        /** 逐跳信任上下文（url＋已核准位址 token）；公開 `put()` 條目為空鏈。 */
+        val chain: List<HopBinding>,
+    )
 
     /** 目前快取內 entry 權重之總和（bytes 近似；與 map.size 同鎖維護）。 */
     private var currentBytes = 0L
 
-    private fun weightOf(k: String, o: WebExtractOutcome.Ok): Long {
+    private fun weightOf(k: String, o: WebExtractOutcome.Ok, chain: List<HopBinding>): Long {
         val c = o.content
         var w = ENTRY_OVERHEAD_BYTES
         w += k.length * 2L
@@ -481,6 +589,10 @@ class WebExtractCache(
         w += c.url.length * 2L
         w += (c.published?.length ?: 0) * 2L
         w += (c.siteName?.length ?: 0) * 2L
+        // chain 視為額外字元計入位元組預算（near-weighted LRU 記帳；保守膨脹）。
+        for (hop in chain) {
+            w += (hop.url.length + hop.addresses.sumOf { it.length }) * 2L
+        }
         return w
     }
 
@@ -529,22 +641,31 @@ class WebExtractCache(
     ): WebExtractOutcome.Ok? =
         getByKey(key(url, maxBytes, maxModelChars, optIn, addresses))
 
-    // read-side epoch guard：呼叫方傳入進入時捕獲之 epoch（per-call 重驗後、
-    // cache 存取點 a／b 皆傳 epochAtEntry）；不符即視同 miss——invalidate 之後
+    // read-side epoch guard（共用之 lookup）：呼叫方傳入進入時捕獲之 epoch（per-call
+    // 重驗後、cache 存取點 a／b 皆傳 epochAtEntry）；不符即視同 miss——invalidate 之後
     // 陳舊條目不得被讀回。public get() 傳 null（語義不變：讀取當前有效條目）。
-    internal fun getByKey(k: String, generationCaptured: Long? = null): WebExtractOutcome.Ok? {
-        val entry: Entry?
+    private fun lookupEntry(k: String, generationCaptured: Long?): Entry? {
         synchronized(map) {
             if (generationCaptured != null && generation.get() != generationCaptured) return null
-            entry = map[k]
-            if (entry != null && clockMs() >= entry.expiresAt) {
+            val entry = map[k] ?: return null
+            if (clockMs() >= entry.expiresAt) {
                 map.remove(k)
                 currentBytes -= entry.weight
                 return null
             }
+            return entry
         }
-        return entry?.outcome?.copy(cached = true, content = entry.outcome.content.copy())
     }
+
+    private fun outcomeOf(entry: Entry): WebExtractOutcome.Ok =
+        entry.outcome.copy(cached = true, content = entry.outcome.content.copy())
+
+    internal fun getByKey(k: String, generationCaptured: Long? = null): WebExtractOutcome.Ok? =
+        lookupEntry(k, generationCaptured)?.let(::outcomeOf)
+
+    /** 單一讀取路徑（避免 double-read 競態）：outcome＋chain 一次回傳。 */
+    internal fun getHitByKey(k: String, generationCaptured: Long? = null): CacheHit? =
+        lookupEntry(k, generationCaptured)?.let { CacheHit(outcomeOf(it), it.chain) }
 
     fun put(
         url: String,
@@ -559,11 +680,16 @@ class WebExtractCache(
         putByKey(key(url, maxBytes, maxModelChars, optIn, addresses), outcome, generation.get())
     }
 
-    internal fun putByKey(k: String, outcome: WebExtractOutcome.Ok, generationCaptured: Long) {
+    internal fun putByKey(
+        k: String,
+        outcome: WebExtractOutcome.Ok,
+        generationCaptured: Long,
+        chain: List<HopBinding> = emptyList(),
+    ) {
         val now = clockMs()
         val expiresAt = now.coerceAtMost(Long.MAX_VALUE - ttlMs) + ttlMs
         val snapshot = outcome.copy(cached = false, content = outcome.content.copy())
-        val weight = weightOf(k, snapshot)
+        val weight = weightOf(k, snapshot, chain)
         synchronized(map) {
             // epoch guard（置於 map 鎖內）：進入時捕獲之 generation 已變
             //（clear()/invalidate() 已 bump——bump 與清空同一臨界區），拒絕本次
@@ -586,7 +712,7 @@ class WebExtractCache(
                 currentBytes -= eldest.value.weight
                 it.remove()
             }
-            map[k] = Entry(snapshot, expiresAt, weight)
+            map[k] = Entry(snapshot, expiresAt, weight, chain)
             currentBytes += weight
         }
     }
@@ -628,7 +754,9 @@ class WebExtractCache(
  * - 命中快取 → `cached=true`（per-call 重驗通過後，[WebExtractCache.getByKey]
  *   回傳副本即正規化 `cached=true`；HTTP upstream 不再出發，但當次政策重驗
  *   （含 DNS preflight）仍執行）；快取 key 含 policy identity（`policy`＋`configRevision`）
- *   ＋hop-0 已核准位址集合；
+ *   ＋hop-0 已核准位址集合；redirect 逐跳之信任上下文由 entry 之
+ *   [HopBinding] 鏈逐跳重驗（不符即 miss）；follower 之 chain-face 仍為
+ *   D3 pinning-identity 殘留；
  *   快取 key 刻意不含 resolver／endpoint 身份；重驗失敗不讀取快取；
  *   命中前仍須 per-call 政策重驗（含 DNS preflight），不同 resolver／endpoint
  *   同 policy＋revision 不得重用結果；重驗本身不 purge 快取；
@@ -751,42 +879,15 @@ class WebExtractService(
             // inFlight 存取之前完成——initial peek、lateHit（mutex 內）、follower join
             // 三個返回點皆位於此檢查之後，單次重驗覆蓋全部三者；通過後才觸 cache。
             // cache miss 的 hop 0 會再評估一次（revalidate 與 hop-0 評估各一次 DNS；取代：不 memoize，避免讓 gate 變可變狀態）
-            val gate = try {
-                if (NetworkPolicy.requiresDnsLookup(hop0, optIn)) {
-                    when (
-                        val pre = NetworkPolicy.runPreflightSuspend(deadlineNs) {
-                            NetworkPolicy.evaluateUrl(hop0, optIn, resolver)
-                        }
-                    ) {
-                        is NetworkPolicy.PreflightOutcome.Completed -> pre.value
-                        NetworkPolicy.PreflightOutcome.TimedOut ->
-                            return WebExtractOutcome.Failed(WebExtract.DETAIL_TIMEOUT)
-                        NetworkPolicy.PreflightOutcome.OverloadRejected ->
-                            return WebExtractOutcome.Failed(WebExtract.DETAIL_TRANSPORT)
-                    }
-                } else {
-                    // 純 pre-DNS 決策（literal IP 或不需查 DNS）：直接評估，不阻塞。
-                    NetworkPolicy.evaluateUrl(hop0, optIn, resolver)
-                }
-            } catch (e: CancellationException) {
-                throw e
-            } catch (_: Exception) {
-                // 政策評估（pre-parse）不產生 DeadlineExceededException；
-                // evaluateUrl／resolver 之例外一律 fail-closed TRANSPORT。
-                return WebExtractOutcome.Failed(WebExtract.DETAIL_TRANSPORT)
-            }
-            if (!gate.allowed) {
-                // 與跳０ policy 拒絕同一映射；fail-closed、不觸 network、不寫快取。
-                return WebExtractOutcome.Unavailable(
-                    gate.denyCode?.name ?: NetworkDenyCode.INVALID_HOST.name,
-                    gate.denyCode,
-                )
+            val gate = when (val g = policyGate(hop0, optIn, resolver, deadlineNs)) {
+                is GateResult.Allowed -> g.eval
+                is GateResult.Denied -> return g.outcome
             }
             // hop-0 綁定：key 納入當次重驗所解析並授權之位址集合（與閘共用同一份
             // eval，不二次查 DNS）；sorted set 語義（去重＋排序），round-robin
             // 返回答案順序不影響 key identity。
             val k = cache.key(hop0, effBytes, effModel, optIn, gate.resolvedAddresses)
-            cache.getByKey(k, epochAtEntry)?.let { return it }
+            verifiedCachedHit(k, epochAtEntry, optIn, resolver, deadlineNs)?.let { return it }
 
             var lateHit: WebExtractOutcome.Ok? = null
             var mine: CompletableDeferred<WebExtractOutcome>? = null
@@ -797,7 +898,8 @@ class WebExtractService(
                 // 世代已變 → 不建立／不加入任何條目（留在鎖內、零寫入），
                 // 由鎖外以新 epoch 有界重試。此檢查與 entry 插入同一臨界區，
                 // invalidate() 的 clear()＋drain 亦在同一世代命名空間下原子生效。
-                lateHit = cache.getByKey(k, epochAtEntry)
+                // （lateHit 之 chain-recording 逐跳重驗於鎖內執行；空鏈條目零額外成本。）
+                lateHit = verifiedCachedHit(k, epochAtEntry, optIn, resolver, deadlineNs)
                 if (lateHit == null) {
                     if (cache.currentGeneration != epochAtEntry) {
                         stale = true
@@ -860,8 +962,11 @@ class WebExtractService(
             }
 
             var okForFollowers: WebExtractOutcome.Ok? = null
+            // Option B：extractUncached 以 collector 交回逐跳信任上下文（非 invasive：
+            // Ok 仍為公開契約，chain 經內部 channel 傳回）。
+            var chain = emptyList<HopBinding>()
             try {
-                val outcome = extractUncached(rawUrl, optIn, resolver, effBytes, effModel, deadlineNs)
+                val outcome = extractUncached(rawUrl, optIn, resolver, effBytes, effModel, deadlineNs) { chain = it }
                 if (outcome is WebExtractOutcome.Ok) okForFollowers = outcome
                 currentCoroutineContext().ensureActive()
                 if (outcome is WebExtractOutcome.Ok && cache.currentGeneration == epochAtEntry) {
@@ -871,7 +976,7 @@ class WebExtractService(
                     // pre-cache-write gate：預算已耗盡則跳過寫入
                     //（caller 仍正常拿到 outcome；僅 cache 寫入被抑制）。
                     if (System.nanoTime() < deadlineNs) {
-                        cache.putByKey(k, outcome, epochAtEntry)
+                        cache.putByKey(k, outcome, epochAtEntry, chain)
                     }
                 }
                 m.complete(outcome)
@@ -919,6 +1024,46 @@ class WebExtractService(
         }
     }
 
+    /**
+     * Cache hit 之 chain-recording 逐跳重驗（Option B；關閉 cache 面之 redirect 逐跳綁定殘留）。
+     *
+     * entry 攜帶 chain 時，依序逐跳重驗：
+     * 1. 以與 fetch 相同之 downgradedOptInForRedirect 規則重走 opt-in 降級（跨 origin 不可逆）；
+     * 2. 每跳 policyGate（含有界 DNS preflight，以全程 deadline 為界）必須 allowed；
+     * 3. 當次解析之 sorted distinct hostAddress token 必須與記錄一致。
+     * 任一跳不符／失敗 → 視為 cache miss（呼叫方重打 upstream；`putByKey` 覆寫 entry），
+     * **絕不回傳該 Ok**。空 chain 之條目（公開 `put()` scaffold）無從驗證、沿用舊命中語義。
+     *
+     * 代價：每次 hit 額外付 L×(DNS+policy) 驗證成本（L＝chain 長度）——與 fetch 相同量級之
+     * per-call 重驗合流執行；重驗本身不寫快取、不 purge 快取。注意 lateHit 之重驗於
+     * `mutex` 臨界區內執行（與 entry 插入同鎖，避免驗證與 election 之間 entry 被換掉）；
+     * point a 之重驗於鎖外執行（命中即返回、不佔鎖）。
+     */
+    private suspend fun verifiedCachedHit(
+        k: String,
+        epochAtEntry: Long,
+        optIn: EndpointNetworkOptIn,
+        resolver: HostResolver,
+        deadlineNs: Long,
+    ): WebExtractOutcome.Ok? {
+        val hit = cache.getHitByKey(k, epochAtEntry) ?: return null
+        val chain = hit.chain
+        if (chain.isEmpty()) return hit.outcome
+        var effectiveOptIn = optIn
+        for ((index, hop) in chain.withIndex()) {
+            if (index > 0) {
+                // 與 fetch 相同之不可逆降級規則（跨 origin → 預設 HTTPS_ONLY 姿態）。
+                effectiveOptIn = downgradedOptInForRedirect(chain[index - 1].url, hop.url, effectiveOptIn)
+            }
+            val eval = when (val g = policyGate(hop.url, effectiveOptIn, resolver, deadlineNs)) {
+                is GateResult.Allowed -> g.eval
+                is GateResult.Denied -> return null
+            }
+            if (sortedDistinctAddressTokens(eval.resolvedAddresses) != hop.addresses) return null
+        }
+        return hit.outcome
+    }
+
     private suspend fun extractUncached(
         rawUrl: String,
         optIn: EndpointNetworkOptIn,
@@ -926,11 +1071,12 @@ class WebExtractService(
         effBytes: Int,
         effModel: Int,
         deadlineNs: Long,
+        chainSink: ((List<HopBinding>) -> Unit)? = null,
     ): WebExtractOutcome =
         // 任何 DeadlineExceededException（gunzip／parse／cleanup 之 deadline 耗盡）
         // → 與預算耗盡同 detail：Failed(TIMEOUT)；never Ok、never cached。
         try {
-            extractUncachedInner(rawUrl, optIn, resolver, effBytes, effModel, deadlineNs)
+            extractUncachedInner(rawUrl, optIn, resolver, effBytes, effModel, deadlineNs, chainSink)
         } catch (e: DeadlineExceededException) {
             WebExtractOutcome.Failed(WebExtract.DETAIL_TIMEOUT)
         }
@@ -942,10 +1088,15 @@ class WebExtractService(
         effBytes: Int,
         effModel: Int,
         deadlineNs: Long,
+        chainSink: ((List<HopBinding>) -> Unit)? = null,
     ): WebExtractOutcome {
         // 全程單一單調 deadline（由 extract() 入口計算並傳入）：DNS preflight
         // ＋所有 redirect hop＋解壓共用；與 per-call 政策重驗共享同一預算。
         var current = stripFragment(rawUrl.trim())
+        // 鏈式信任上下文記錄（Option B：僅 cache 面綁定 redirect 逐跳）：
+        // 每一跳（含首跳與 redirect hops）policy 放行後記錄 (url, sorted distinct token)；
+        // Ok 時隨 chainSink 回傳給 extract()；非 Ok 路徑不觸 chainSink。
+        val chain = mutableListOf<HopBinding>()
         // 有效 opt-in：跨 origin 跳轉即不可逆降級為預設 `HTTPS_ONLY` 姿態
         //（見 downgradedOptInForRedirect）。
         var effectiveOptIn = optIn
@@ -959,39 +1110,12 @@ class WebExtractService(
                 return WebExtractOutcome.Failed(WebExtract.DETAIL_TIMEOUT)
             }
             // 建連前必經政策（含首跳；redirect 逐跳重驗；DNS 需查則經有界 preflight）。
-            val eval = try {
-                if (NetworkPolicy.requiresDnsLookup(current, effectiveOptIn)) {
-                    when (
-                        val pre = NetworkPolicy.runPreflightSuspend(deadlineNs) {
-                            NetworkPolicy.evaluateUrl(current, effectiveOptIn, resolver)
-                        }
-                    ) {
-                        is NetworkPolicy.PreflightOutcome.Completed -> pre.value
-                        NetworkPolicy.PreflightOutcome.TimedOut ->
-                            return WebExtractOutcome.Failed(WebExtract.DETAIL_TIMEOUT)
-                        NetworkPolicy.PreflightOutcome.OverloadRejected ->
-                            return WebExtractOutcome.Failed(WebExtract.DETAIL_TRANSPORT)
-                    }
-                } else {
-                    // 純 pre-DNS 決策（literal IP 或不需查 DNS）：直接評估，不阻塞。
-                    NetworkPolicy.evaluateUrl(current, effectiveOptIn, resolver)
-                }
-            } catch (e: CancellationException) {
-                throw e
-            } catch (_: Exception) {
-                // 逐跳政策評估（pre-fetch／pre-parse）不產生 DeadlineExceededException；
-                // evaluateUrl／resolver 之例外一律 fail-closed TRANSPORT。
-                return WebExtractOutcome.Failed(WebExtract.DETAIL_TRANSPORT)
+            val eval = when (val g = policyGate(current, effectiveOptIn, resolver, deadlineNs)) {
+                is GateResult.Allowed -> g.eval
+                is GateResult.Denied -> return g.outcome
             }
-            if (!eval.allowed) {
-                // 逐跳 policy 拒絕（含 redirect hop）亦以內層 denyCode 映射為 Unavailable——
-                // 刻意偏離 WebFetch 之 `REDIRECT_BLOCKED` 正規化：web.extract 保留內層碼供稽核；
-                // 收斂列為 #138/D5 追蹤項。
-                return WebExtractOutcome.Unavailable(
-                    eval.denyCode?.name ?: NetworkDenyCode.INVALID_HOST.name,
-                    eval.denyCode,
-                )
-            }
+            // Option B：記錄本跳之信任上下文（url＋已核准位址 sorted token）。
+            chain.add(HopBinding(current, sortedDistinctAddressTokens(eval.resolvedAddresses)))
             // 政策評估可能涉及掛起的 DNS preflight；取消訊號必須在此處即生效，
             // 且不得觸及 normalized 計算與任何建連。
             currentCoroutineContext().ensureActive()
@@ -1175,6 +1299,8 @@ class WebExtractService(
                 // truncated 僅由 parser 輸入前綴截斷觸發（model 預算未截）：input sentinel。
                 WebContentEnvelope.wrap(capped + "\n${WebExtract.TRUNCATED_INPUT_SENTINEL_MARK}$PARSE_INPUT_CAP CHARS]", deadlineNs)
             }
+            // Option B：成功路徑——把鏈式信任上下文交回 extract()（供 cache 寫入）。
+            chainSink?.invoke(chain.toList())
             return WebExtractOutcome.Ok(
                 content = content,
                 envelope = envelope,

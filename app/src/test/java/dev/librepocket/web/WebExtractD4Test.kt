@@ -267,6 +267,85 @@ class WebExtractD4Test {
         assertEquals(2, http.calls.get())
     }
 
+    @Test fun cacheChainBindingMismatchForcesRefetch() = runBlocking {
+        // Option B（cache 面 redirect 逐跳綁定）決定性 fixture：
+        // hop-0（x.example.com）A/B 皆解析到 SAME IP 10.0.0.30 → key 相同 → 命中路徑；
+        // redirect 目標 Y（cross-origin，REDIRECT 不可逆降級 HTTPS_ONLY——Y 必須為
+        // synthetic public TEST-NET-3，否則跳一即被降級擋下）：
+        // A → 203.0.113.41（TENANT_A）、B → 203.0.113.42（TENANT_B）。
+        // B 之 hit-path chain 逐跳重驗：hop-0 token 一致、hop-Y token 不符 →
+        // 視為 miss、重打 upstream → 只可能收到 TENANT_B，絕不可能拿到 TENANT_A。
+        // （原計畫書草稿的私有 Y＝10.0.0.41/42 與現行降級語義衝突：跨 origin redirect
+        // 於 HTTPS_ONLY 下 PRIVATE 一律拒——fixture 採 TEST-NET-3 公網佔位。）
+        val dnsA = fakeDns(
+            "x.example.com" to listOf("10.0.0.30"),
+            "y.example.net" to listOf("203.0.113.41"),
+        )
+        val dnsB = fakeDns(
+            "x.example.com" to listOf("10.0.0.30"),
+            "y.example.net" to listOf("203.0.113.42"),
+        )
+        val http = FakeExtract(
+            pinnedHandler = { url, pinned ->
+                when {
+                    url == "https://x.example.com/start" ->
+                        WebExtractRawResponse(302, ByteArray(0), mapOf("Location" to "https://y.example.net/secret"))
+                    pinned.any { it.hostAddress == "203.0.113.41" } -> okResp(html(body = "TENANT_A data"))
+                    pinned.any { it.hostAddress == "203.0.113.42" } -> okResp(html(body = "TENANT_B data"))
+                    else -> okResp(html(body = "UNEXPECTED_MARKER"))
+                }
+            },
+            handler = { okResp(html(body = "UNREACHABLE_MARKER")) },
+        )
+        val svc = WebExtractService(http)
+        val optIn = EndpointNetworkOptIn(NetworkEgressPolicy.ALLOW_PRIVATE_DNS)
+        val first = svc.extract("https://x.example.com/start", optIn = optIn, resolver = dnsA) as WebExtractOutcome.Ok
+        assertTrue(
+            "A 之回應必須為 TENANT_A，got ${first.content.snippet}",
+            first.content.snippet.contains("TENANT_A"),
+        )
+        assertEquals("hop0＋Y：A 共 2 次上游", 2, http.calls.get())
+        val second = svc.extract("https://x.example.com/start", optIn = optIn, resolver = dnsB) as WebExtractOutcome.Ok
+        assertFalse("chain 逐跳不符必須強制 refetch（cached=false）", second.cached)
+        assertTrue(
+            "B 必須收到 TENANT_B，got ${second.content.snippet}",
+            second.content.snippet.contains("TENANT_B"),
+        )
+        assertFalse("B 絕不得收到 TENANT_A", second.content.snippet.contains("TENANT_A"))
+        assertEquals("A(2)＋B refetch(2)＝4 次上游", 4, http.calls.get())
+    }
+
+    @Test fun cacheChainBindingMatchServesCached() = runBlocking {
+        // A 兩次：chain 逐跳重驗全部一致 → cached=true；HTTP upstream 不再出發。
+        val dnsA = fakeDns(
+            "x.example.com" to listOf("10.0.0.30"),
+            "y.example.net" to listOf("203.0.113.41"),
+        )
+        val http = FakeExtract(
+            pinnedHandler = { url, pinned ->
+                when {
+                    url == "https://x.example.com/start" ->
+                        WebExtractRawResponse(302, ByteArray(0), mapOf("Location" to "https://y.example.net/secret"))
+                    pinned.any { it.hostAddress == "203.0.113.41" } -> okResp(html(body = "TENANT_A data"))
+                    else -> okResp(html(body = "UNEXPECTED_MARKER"))
+                }
+            },
+            handler = { okResp(html(body = "UNREACHABLE_MARKER")) },
+        )
+        val svc = WebExtractService(http)
+        val optIn = EndpointNetworkOptIn(NetworkEgressPolicy.ALLOW_PRIVATE_DNS)
+        val first = svc.extract("https://x.example.com/start", optIn = optIn, resolver = dnsA) as WebExtractOutcome.Ok
+        assertFalse(first.cached)
+        assertEquals(2, http.calls.get())
+        val second = svc.extract("https://x.example.com/start", optIn = optIn, resolver = dnsA) as WebExtractOutcome.Ok
+        assertTrue("chain 一致 → 命中快取（cached=true）", second.cached)
+        assertTrue(
+            "命中之內容必須仍為 TENANT_A，got ${second.content.snippet}",
+            second.content.snippet.contains("TENANT_A"),
+        )
+        assertEquals("hit path 不觸 upstream（仍為 2 次）", 2, http.calls.get())
+    }
+
     @Test fun cacheHitDnsThrowsFailsClosed() = runBlocking {
         // 快取中有條目，但當次呼叫的 resolver 拋例外：fail-closed Unavailable(INVALID_HOST)，
         // 快取不得被消費（calls 不增加）。

@@ -249,6 +249,30 @@ class ShizukuGrantTest {
     }
 
     /**
+     * 攔截第 N 次（1-based）updateData：在委託 delegate 套用原 transform 之前，
+     * 先執行 [interceptHandler]（此處用於注入一次並發 save：寫新 grant 鍵＋清 journal，
+     * 模擬 save 落在 clear() 的 journal 寫入（call #2）與 erase edit（call #3）之間）。
+     * 計數只對「經本假件」的呼叫生效（handler 直取 backing，不重複計數）。
+     */
+    private class InterceptOnUpdateDataCallDataStore(
+        private val delegate: DataStore<Preferences>,
+    ) : DataStore<Preferences> by delegate {
+        var interceptCall: Int = -1
+        var interceptHandler: (suspend () -> Unit)? = null
+        private var call = 0
+
+        override suspend fun updateData(
+            transform: suspend (t: Preferences) -> Preferences,
+        ): Preferences {
+            call += 1
+            if (call == interceptCall) {
+                interceptHandler?.invoke()
+            }
+            return delegate.updateData(transform)
+        }
+    }
+
+    /**
      * 精準失敗第 N 次（1-based）updateData 的假件：
      * save() 消耗 call #1，clear() 的 journal 寫入為 call #2、擦除 edit 為 call #3。
      * failOnCall=2 亦有測試使用（journal 寫入失敗 → best-effort wipe →
@@ -564,6 +588,47 @@ class ShizukuGrantTest {
             it[SHIZUKU_GRANT_SERVICE_VERSION] = 15
         }
         assertNull(ShizukuGrantStore(blank).load())
+    }
+
+    @Test fun saveLandsBetweenJournalAndErase_clearKeepsFreshGrant() = runBlocking {
+        // clear() 的 erase edit 是條件式（journal==true 才擦）；並發 save 落在
+        // journal 寫入與 erase edit 之間時，save 已寫新 grant 鍵並清 journal，
+        // erase transform 必須 no-op，新 grant 存活、journal 不在盤上。
+        val backing = PreferenceDataStoreFactory.create(scope = scope) {
+            File(dir, "save_between_journal_and_erase.preferences_pb")
+        }
+        val interceptor = InterceptOnUpdateDataCallDataStore(backing)
+        val markerFile = File(dir, "save_between_journal_and_erase.pending")
+        val store = ShizukuGrantStore(interceptor, revokeMarker = PendingRevokeMarker(markerFile))
+
+        // 既有授權（updateData call #1）。
+        store.save(ShizukuGrantPolicy.grant("provider-old", 1L, 15))
+
+        // erase edit＝call #3（call #2＝journal 寫入）；套用前注入一次 save。
+        val freshGrant = ShizukuGrantPolicy.grant("provider-new", 2L, 16)
+        interceptor.interceptCall = 3
+        interceptor.interceptHandler = {
+            backing.edit { prefs ->
+                prefs[SHIZUKU_GRANT_PROVIDER_ID] = freshGrant.providerId
+                prefs[SHIZUKU_GRANT_CONFIG_REVISION] = freshGrant.configRevision
+                prefs[SHIZUKU_GRANT_AT_MS] = freshGrant.grantedAtMs
+                prefs[SHIZUKU_GRANT_SERVICE_VERSION] = freshGrant.serviceVersion
+                // 新授權取代撤權日誌（同 save() 語義）。
+                prefs.remove(SHIZUKU_REVOKE_JOURNAL)
+            }
+        }
+
+        store.clear()
+
+        val prefs = backing.data.first()
+        assertEquals(
+            "並發 save 落在 journal 與 erase 之間：新 grant 必須存活",
+            "provider-new",
+            prefs[SHIZUKU_GRANT_PROVIDER_ID],
+        )
+        assertEquals(2L, prefs[SHIZUKU_GRANT_CONFIG_REVISION])
+        assertNull("新授權 save 已清 journal：journal 必須不在盤上", prefs[SHIZUKU_REVOKE_JOURNAL])
+        assertEquals("fresh grant 必須可解析", freshGrant, store.load())
     }
 
     @Test fun cancellationExceptionPropagatesWithoutBeingSwallowed() {

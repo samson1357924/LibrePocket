@@ -5,6 +5,8 @@ import androidx.test.core.app.ApplicationProvider
 import java.io.File
 import java.nio.file.Files
 import kotlinx.coroutines.runBlocking
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNotNull
 import org.junit.After
 import org.junit.Before
 import org.junit.Test
@@ -79,5 +81,20 @@ class FlavorPrivilegeScopeCommonTest {
     fun withdrawCompletesWithoutException() = runBlocking {
         val context = ApplicationProvider.getApplicationContext<Context>()
         FlavorPrivilegeScope.withdraw(context)
+        // github：withdraw 會 process() 建立單例並 detach；反射斷言不崩潰＋singleton 可取、
+        // attached=false（detach 語義）。play/foss 無此類即略過（src/test 三 flavor 共用）。
+        try {
+            val cls = Class.forName("dev.librepocket.privilege.github.ShizukuPermissionRequests")
+            val companion = cls.getDeclaredField("Companion").apply { isAccessible = true }.get(null)
+            val instance = companion.javaClass.getMethod("process").invoke(companion)
+            assertNotNull("github withdraw 後 ShizukuPermissionRequests singleton 應可取得", instance)
+            assertEquals(
+                "github withdraw 後 singleton 應已 detach（attached=false）",
+                false,
+                cls.getMethod("isAttached").invoke(instance),
+            )
+        } catch (_: ClassNotFoundException) {
+            // play/foss：無此類，僅需不崩潰。
+        }
     }
 }

@@ -860,6 +860,73 @@ class PrivilegeBridgeGrantTest {
         assertNull(restartedStore.load())
     }
 
+    /**
+     * 攔截第 N 次（1-based）updateData：在委託 backing 套用原 transform 之前，
+     * 先執行 [interceptHandler]（此處用於注入一次並發 save：寫新 grant 鍵＋清 journal，
+     * 模擬 save 落在 clear() 的 journal 寫入（call #2）與 erase edit（call #3）之間）。
+     * 計數只對「經本假件」的呼叫生效（handler 直取 backing，不重複計數）。
+     */
+    private class InterceptOnUpdateDataCallDataStore(
+        private val delegate: DataStore<Preferences>,
+    ) : DataStore<Preferences> by delegate {
+        var interceptCall: Int = -1
+        var interceptHandler: (suspend () -> Unit)? = null
+        private var call = 0
+
+        override suspend fun updateData(transform: suspend (t: Preferences) -> Preferences): Preferences {
+            call += 1
+            if (call == interceptCall) {
+                interceptHandler?.invoke()
+            }
+            return delegate.updateData(transform)
+        }
+    }
+
+    @Test fun saveLandsBetweenJournalAndErase_clearKeepsFreshGrant() = runBlocking {
+        // clear() 的 erase edit 是條件式（journal==true 才擦）；並發 save 落在
+        // journal 寫入與 erase edit 之間時，save 已寫新 grant 鍵並清 journal，
+        // erase transform 必須 no-op，新 grant 存活、journal 不在盤上。
+        val backing = PreferenceDataStoreFactory.create(scope = scope) {
+            File(dir, "save_between_journal_and_erase.preferences_pb")
+        }
+        val interceptor = InterceptOnUpdateDataCallDataStore(backing)
+        val markerFile = File(dir, "save_between_journal_and_erase.pending")
+        val store = PrivilegeBridgeStore(interceptor, revokeMarker = PendingRevokeMarker(markerFile))
+
+        // 既有授權（updateData call #1）。
+        store.save(PrivilegeGrantPolicy.grant("provider-old", 1L))
+
+        // erase edit＝call #3（call #2＝journal 寫入）；套用前注入一次 save。
+        val freshGrant = PrivilegeGrantPolicy.grant("provider-new", 2L)
+        interceptor.interceptCall = 3
+        interceptor.interceptHandler = {
+            backing.edit { prefs ->
+                prefs[PRIVILEGE_GRANT_PROVIDER_ID] = freshGrant.providerId
+                prefs[PRIVILEGE_GRANT_CONFIG_REVISION] = freshGrant.configRevision
+                prefs[PRIVILEGE_GRANT_AT_MS] = freshGrant.grantedAtMs
+                if (freshGrant.expiresAtMs != null) {
+                    prefs[PRIVILEGE_GRANT_EXPIRES_AT_MS] = freshGrant.expiresAtMs
+                } else {
+                    prefs.remove(PRIVILEGE_GRANT_EXPIRES_AT_MS)
+                }
+                // 新授權取代撤權日誌（同 save() 語義）。
+                prefs.remove(PRIVILEGE_REVOKE_JOURNAL)
+            }
+        }
+
+        store.clear()
+
+        val prefs = backing.data.first()
+        assertEquals(
+            "並發 save 落在 journal 與 erase 之間：新 grant 必須存活",
+            "provider-new",
+            prefs[PRIVILEGE_GRANT_PROVIDER_ID],
+        )
+        assertEquals(2L, prefs[PRIVILEGE_GRANT_CONFIG_REVISION])
+        assertNull("新授權 save 已清 journal：journal 必須不在盤上", prefs[PRIVILEGE_REVOKE_JOURNAL])
+        assertEquals("fresh grant 必須可解析", freshGrant, store.load())
+    }
+
     @Test fun processSingletonIsStableUntilReset() {
         val first = PrivilegeBridgeState.process()
         assertSame(first, PrivilegeBridgeState.process())

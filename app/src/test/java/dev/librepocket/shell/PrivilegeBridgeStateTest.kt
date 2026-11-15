@@ -287,6 +287,23 @@ class PrivilegeBridgeStateTest {
         assertFalse(state.bridgeEffective)
     }
 
+    @Test fun grantWithFutureAtMs_failsFast() = runBlocking {
+        // atMs 晚於當下：fail-fast（AT_MS_IN_FUTURE），防止簽發一個「未來才生效」的授權。
+        val backing = PreferenceDataStoreFactory.create(scope = scope) {
+            File(dir, "future_atms.preferences_pb")
+        }
+        val store = PrivilegeBridgeStore(backing)
+        val state = PrivilegeBridgeState(bridgeSwitchOn = true)
+
+        val error = assertThrows(IllegalArgumentException::class.java) {
+            runBlocking {
+                state.grant(store, "preset:openai", 1L, ttlMs = 1_000L, atMs = System.currentTimeMillis() + 60_000L)
+            }
+        }
+        assertEquals("AT_MS_IN_FUTURE", error.message)
+        assertNull(store.load())
+    }
+
     @Test fun revokeWithStuckDataStore_failsBoundedlyAndMemoryRevoked() = runBlocking {
         // 假 Store 的 clear() 永不返回：revoke 必須在 revokeOpTimeoutMs 量級內
         // fail-closed 拋 IllegalStateException（不得無界掛起），且記憶體旗標已落 false。

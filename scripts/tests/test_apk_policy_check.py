@@ -1147,9 +1147,12 @@ class ApkPolicyHarness(unittest.TestCase):
             "            '        A: p:writePermission(0x01010008)=\"android.permission.INTERNET\" (Raw: \"android.permission.INTERNET\")' \\\n"
             "            '        A: p:authorities(0x01010018)=\"dev.librepocket.agent.github.shizuku\" (Raw: \"dev.librepocket.agent.github.shizuku\")' ;;\n"
             "        shizuku-read-write-only)\n"
-            "          # Positive control: provider guarded ONLY by explicit\n"
+            "          # Negative control: provider guarded ONLY by explicit\n"
             "          # readPermission+writePermission (no 'permission' attr),\n"
-            "          # exported=true/multiprocess=false. Must PASS.\n"
+            "          # exported=true/multiprocess=false. The base\n"
+            "          # android:permission is the framework's only gate on\n"
+            "          # ContentProvider.call(), so a missing base permission\n"
+            "          # must FAIL closed even with FULL read/write.\n"
             "          printf '%s\\n' 'E: manifest' '  E: application' \\\n"
             "            '    A: android:fullBackupContent(0x010104eb)=@0x7f010000' \\\n"
             "            '    A: android:dataExtractionRules(0x0101063e)=@0x7f010001' \\\n"
@@ -1158,6 +1161,21 @@ class ApkPolicyHarness(unittest.TestCase):
             "            '      A: android:name(0x01010003)=\"rikka.shizuku.ShizukuProvider\" (Raw: \"rikka.shizuku.ShizukuProvider\")' \\\n"
             "            '      A: android:readPermission(0x01010007)=\"android.permission.INTERACT_ACROSS_USERS_FULL\" (Raw: \"android.permission.INTERACT_ACROSS_USERS_FULL\")' \\\n"
             "            '      A: android:writePermission(0x01010008)=\"android.permission.INTERACT_ACROSS_USERS_FULL\" (Raw: \"android.permission.INTERACT_ACROSS_USERS_FULL\")' \\\n"
+            "            '      A: android:exported(0x01010010)=(type 0x12)0xffffffff' \\\n"
+            "            '      A: android:multiprocess(0x01010013)=(type 0x12)0x0' \\\n"
+            "            '      A: android:authorities(0x01010018)=\"dev.librepocket.agent.github.shizuku\" (Raw: \"dev.librepocket.agent.github.shizuku\")' ;;\n"
+            "        shizuku-base-weak)\n"
+            "          # Negative control: base 'permission' weakened to\n"
+            "          # INTERACT_ACROSS_USERS (the non-FULL sibling); read/write\n"
+            "          # unset. Must FAIL closed: the base permission alone\n"
+            "          # guards ContentProvider.call().\n"
+            "          printf '%s\\n' 'E: manifest' '  E: application' \\\n"
+            "            '    A: android:fullBackupContent(0x010104eb)=@0x7f010000' \\\n"
+            "            '    A: android:dataExtractionRules(0x0101063e)=@0x7f010001' \\\n"
+            "            '    A: android:networkSecurityConfig(0x01010527)=@0x7f010002' \\\n"
+            "            '    E: provider (line=4)' \\\n"
+            "            '      A: android:name(0x01010003)=\"rikka.shizuku.ShizukuProvider\" (Raw: \"rikka.shizuku.ShizukuProvider\")' \\\n"
+            "            '      A: android:permission(0x01010006)=\"android.permission.INTERACT_ACROSS_USERS\" (Raw: \"android.permission.INTERACT_ACROSS_USERS\")' \\\n"
             "            '      A: android:exported(0x01010010)=(type 0x12)0xffffffff' \\\n"
             "            '      A: android:multiprocess(0x01010013)=(type 0x12)0x0' \\\n"
             "            '      A: android:authorities(0x01010018)=\"dev.librepocket.agent.github.shizuku\" (Raw: \"dev.librepocket.agent.github.shizuku\")' ;;\n"
@@ -2864,7 +2882,7 @@ class ApkPolicyHarness(unittest.TestCase):
         self.assertNotEqual(uri_grant.returncode, 0, uri_grant.stderr + uri_grant.stdout)
         self.assertIn("grantUriPermissions", uri_grant.stderr)
 
-        # Positive controls: explicit read+write permissions and nested child meta-data
+        # Positive controls: explicit base + read+write permissions and nested child meta-data
         # under <provider> (child attributes at +4 must not shadow provider attrs at +2).
         # exported=true rides along: the upstream attachInfo() hard contract is pinned.
         policy_inspect._check_github_shizuku_provider(
@@ -2881,6 +2899,7 @@ class ApkPolicyHarness(unittest.TestCase):
             "  E: application\n"
             "    E: provider\n"
             '      A: http://schemas.android.com/apk/res/android:name="rikka.shizuku.ShizukuProvider"\n'
+            '      A: http://schemas.android.com/apk/res/android:permission="android.permission.INTERACT_ACROSS_USERS_FULL"\n'
             '      A: http://schemas.android.com/apk/res/android:readPermission="android.permission.INTERACT_ACROSS_USERS_FULL"\n'
             '      A: http://schemas.android.com/apk/res/android:writePermission="android.permission.INTERACT_ACROSS_USERS_FULL"\n'
             '      A: http://schemas.android.com/apk/res/android:exported="true"\n'
@@ -3269,19 +3288,34 @@ class ApkPolicyHarness(unittest.TestCase):
         ):
             policy_inspect._check_github_shizuku_provider("E: manifest\n")
 
-    def test_github_mode_provider_read_write_only_permissions_pass(self) -> None:
-        # Positive control: provider guarded ONLY by explicit readPermission
-        # and writePermission (no `permission` attribute) - still a compliant
-        # ShizukuProvider; the github artifact gate must PASS (exit 0).
+    def test_github_mode_provider_base_permission_fail_closed(self) -> None:
+        # The base android:permission is the framework's only gate on
+        # ContentProvider.call(): a missing or weakened base permission must
+        # FAIL closed even when explicit read/write permissions are set to
+        # FULL. shizuku-ok covers the positive control (base FULL, no
+        # explicit read/write).
         apk = complete_apk(
-            self.tmp / "github-read-write-only.apk",
+            self.tmp / "github-base-permission.apk",
             minimal_dex(type_descriptors=("Ljava/lang/Object;",)),
         )
-        result = self._run_scanner_cli(
+        # No base permission, read/write FULL => exit 1, stderr mentions permission.
+        missing = self._run_scanner_cli(
             apk, "github", xmltree_mode="shizuku-read-write-only"
         )
-        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
-        self.assertIn("policy: github OK", result.stdout)
+        self.assertEqual(missing.returncode, 1, missing.stderr + missing.stdout)
+        self.assertIn("permission", missing.stderr)
+        # Base weakened to INTERACT_ACROSS_USERS (no read/write) => exit 1.
+        weak = self._run_scanner_cli(
+            apk, "github", xmltree_mode="shizuku-base-weak"
+        )
+        self.assertEqual(weak.returncode, 1, weak.stderr + weak.stdout)
+        self.assertIn("INTERACT_ACROSS_USERS_FULL", weak.stderr)
+        # Positive control: base FULL, no read/write => exit 0.
+        base_only = self._run_scanner_cli(
+            apk, "github", xmltree_mode="shizuku-ok"
+        )
+        self.assertEqual(base_only.returncode, 0, base_only.stderr + base_only.stdout)
+        self.assertIn("policy: github OK", base_only.stdout)
 
     def test_github_mode_rejects_non_boolean_typed_grant_uri_permission(self) -> None:
         # grantUriPermissions is a boolean by binary-XML type; (type 0x12)0x1

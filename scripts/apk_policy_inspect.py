@@ -2131,9 +2131,15 @@ def _check_github_shizuku_provider(xmltree: str) -> None:
 
     In ``--mode github`` the real APK declares ``rikka.shizuku.ShizukuProvider``
     (compact synthetic unit fixtures may omit ``<provider>`` elements).
-    Whenever a Shizuku provider appears in the merged manifest xmltree, verify
-    that effective read and write permissions resolve to
-    ``android.permission.INTERACT_ACROSS_USERS_FULL``, ``grantUriPermissions``
+    Whenever a Shizuku provider appears in the merged manifest xmltree, the
+    base ``android:permission`` must resolve to
+    ``android.permission.INTERACT_ACROSS_USERS_FULL`` (the base permission is
+    the framework's only gate on ``ContentProvider.call()``; a missing or
+    weakened base permission fails closed, even when explicit read/write
+    permissions are set). Any explicitly declared ``readPermission`` /
+    ``writePermission`` must likewise resolve to
+    ``android.permission.INTERACT_ACROSS_USERS_FULL`` (an unset read/write
+    inherits the base permission, which is fine), ``grantUriPermissions``
     is not enabled, and no ``<path-permission>`` / ``<grant-uri-permission>``
     children exist.
 
@@ -2151,6 +2157,12 @@ def _check_github_shizuku_provider(xmltree: str) -> None:
         ):
             continue
         perm = attrs.get("permission")
+        if perm != _SHIZUKU_PROVIDER_PERMISSION:
+            raise PolicyError(
+                "github APK ShizukuProvider must declare "
+                f"android:permission={_SHIZUKU_PROVIDER_PERMISSION} "
+                f"(got {perm!r})"
+            )
         read_perm = attrs["readPermission"] if "readPermission" in attrs else perm
         write_perm = attrs["writePermission"] if "writePermission" in attrs else perm
         if (

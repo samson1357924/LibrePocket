@@ -1,5 +1,6 @@
 package dev.librepocket.shell
 
+import android.util.Log
 import androidx.annotation.VisibleForTesting
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
@@ -10,6 +11,24 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
+
+private const val TAG = "PrivilegeBridgeState"
+
+/**
+ * android.util.Log 在非 Robolectric 的 JVM 單元測試中未 mock（呼叫即抛
+ * RuntimeException）；日誌絕不得影響 fail-closed 控制流，故包一層容錯。
+ */
+private fun safeLogW(tag: String, msg: String, e: Throwable? = null) {
+    try {
+        if (e != null) {
+            Log.w(tag, msg, e)
+        } else {
+            Log.w(tag, msg)
+        }
+    } catch (_: Throwable) {
+        // 單元測試環境無 android.util.Log：吞掉
+    }
+}
 
 /**
  * S3 提權橋產品態（BACKLOG D09，矩陣 §3）：審計表 + `privilege_bridge`
@@ -110,6 +129,14 @@ class PrivilegeBridgeState @VisibleForTesting internal constructor(
      * 若在排隊、落庫或校驗期間有撤銷發生，立即使授權失效、清除 Store 並抛出
      * [IllegalStateException]。
      *
+     * 落庫後並發撤銷的 best-effort 清庫（revoke-in-flight 補償）失敗時必留一行
+     * logcat（不靜默）；此路徑為 revoke-in-flight 補償，fail-closed 語義不變
+     * （記憶體旗標已先落 false、`IllegalStateException` 照拋，`CancellationException`
+     * 原樣上拋）。
+     *
+     * 呼叫端不得傳入未來時間戳（否則授權可能在簽發前即「有效」）；
+     * `atMs` 逾現在時刻即 fail-fast 抛 [IllegalArgumentException]（`AT_MS_IN_FUTURE`）。
+     *
      * 已知限制：本函數 opMutex 臨界區無 `withTimeout`（與 [revoke] 不對稱，
      * #136-B3 接線前應評估有界化）。
      */
@@ -121,6 +148,7 @@ class PrivilegeBridgeState @VisibleForTesting internal constructor(
         atMs: Long = System.currentTimeMillis(),
     ): PrivilegeGrant {
         val epochBefore = revokeEpoch.get()
+        require(atMs <= System.currentTimeMillis()) { "AT_MS_IN_FUTURE" }
         return opMutex.withLock {
             if (revokeEpoch.get() != epochBefore) {
                 bridgeGranted = false
@@ -131,9 +159,11 @@ class PrivilegeBridgeState @VisibleForTesting internal constructor(
             if (revokeEpoch.get() != epochBefore) {
                 bridgeGranted = false
                 // best-effort 清庫：失敗可接受（revoke 側具備 marker/journal 復活防護），
-                // 但不得吞 CancellationException（會掩蓋取消語義）。
+                // 但不得吞 CancellationException（會掩蓋取消語義）；
+                // 失敗必留一行 logcat（不靜默）。
                 try { store.clear() } catch (t: Throwable) {
                     if (t is CancellationException) throw t
+                    safeLogW(TAG, "revoke-compensation clear failed", t)
                 }
                 throw IllegalStateException("PRIVILEGE_GRANT_REVOKED_CONCURRENTLY")
             }
@@ -142,9 +172,10 @@ class PrivilegeBridgeState @VisibleForTesting internal constructor(
             val postCheck = PrivilegeGrantPolicy.check(grant, providerId, configRevision, System.currentTimeMillis())
             if (revokeEpoch.get() != epochBefore) {
                 bridgeGranted = false
-                // best-effort 清庫（同上，不吞 CancellationException）。
+                // best-effort 清庫（同上，不吞 CancellationException；失敗必留一行 logcat）。
                 try { store.clear() } catch (t: Throwable) {
                     if (t is CancellationException) throw t
+                    safeLogW(TAG, "revoke-compensation clear failed", t)
                 }
                 throw IllegalStateException("PRIVILEGE_GRANT_REVOKED_CONCURRENTLY")
             }
@@ -212,6 +243,11 @@ class PrivilegeBridgeState @VisibleForTesting internal constructor(
      * opMutex 等待逾時（鎖未取得）時：記憶體旗標已收回；另以鎖外同有界
      * best-effort `store.clear()`（journal/marker 為持久兜底）嘗試落持久撤銷；
      * 仍失敗即呼叫端重試語義。
+     * 不對稱對照：臨界區內 `store.clear()` 抛出的 [CancellationException] 直接
+     * 作 primaryFailure 原樣上拋（CE-first：呼叫端可識別上層取消）；鎖外
+     * best-effort 路徑的主失敗已是 `PRIVILEGE_REVOKE_TIMEOUT`（ISE），該路徑
+     * clear 抛的 CE 一律包 `IllegalStateException`（`PRIVILEGE_REVOKE_BEST_EFFORT_CLEAR_FAILED`）
+     * 作 suppressed 附加，避免呼叫端把主失敗誤判為上層取消（補償只附隨，不改寫主失敗語義）。
      * 正常 scope 拋錯時沿用既有 primaryFailure／addSuppressed 合併邏輯；
      * 複合逾時時（已有 primaryFailure 又遇 withdrawScope 逾時）
      * `PRIVILEGE_REVOKE_SCOPE_TIMEOUT` 以 suppressed [IllegalStateException]

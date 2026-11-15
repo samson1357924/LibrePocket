@@ -49,6 +49,7 @@ class PrivilegeBridgeRevokeRunnerTest {
     private lateinit var scope: CoroutineScope
     private lateinit var bridgeStore: PrivilegeBridgeStore
     private lateinit var shizukuStore: ShizukuGrantStore
+    private var hermeticExec: HermeticExecFixture? = null
 
     private var curProvider: String? = "provider-a"
     private var curRev: Long? = 1L
@@ -59,6 +60,10 @@ class PrivilegeBridgeRevokeRunnerTest {
         pollOutstandingTo(0)
         pollActiveTo(0)
         dir = kotlin.io.path.createTempDirectory("bridge-revoke-runner-test").toFile()
+        // Hermetic 可信 executable fixture（`id`）：searchDirs/allowedRoots/systemOwned
+        // 顯式注入兩 runner，不依賴宿主 /usr/bin/id 版面（symlink→containment 外），
+        // 本機與 CI ubuntu-latest 皆綠。
+        hermeticExec = HermeticExecFixture("bridge-revoke-hermetic", "id")
         scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
         bridgeStore = PrivilegeBridgeStore(
             PreferenceDataStoreFactory.create(scope = scope) { File(dir, "bridge.preferences_pb") },
@@ -75,6 +80,8 @@ class PrivilegeBridgeRevokeRunnerTest {
         pollActiveTo(0)
         scope.cancel()
         dir.deleteRecursively()
+        hermeticExec?.close()
+        hermeticExec = null
     }
 
     private fun pollOutstandingTo(expected: Int, boundMs: Long = 10_000L) {
@@ -110,6 +117,9 @@ class PrivilegeBridgeRevokeRunnerTest {
         spawn = spawn::spawn,
         suBinary = "/system/bin/su",
         grantCheck = { runBlocking { shizukuStore.check(curProvider, curRev) } },
+        execSearchDirs = hermeticExec!!.searchDirs,
+        execAllowedRoots = hermeticExec!!.allowedRoots,
+        execIsWritable = hermeticExec!!.systemOwned,
     )
 
     private fun shizukuRunner(state: PrivilegeBridgeState, spawn: SpawnCounter) = ShizukuShellRunner(
@@ -120,6 +130,9 @@ class PrivilegeBridgeRevokeRunnerTest {
         spawn = spawn::spawn,
         status = { ShizukuStatus.Available(15) },
         grantCheck = { runBlocking { shizukuStore.check(curProvider, curRev) } },
+        execSearchDirs = hermeticExec!!.searchDirs,
+        execAllowedRoots = hermeticExec!!.allowedRoots,
+        execIsWritable = hermeticExec!!.systemOwned,
     )
 
     private fun grantBoth(state: PrivilegeBridgeState) = runBlocking {
@@ -429,8 +442,8 @@ class PrivilegeBridgeRevokeRunnerTest {
         // （marker heal 之前）；「重啟」（新 State＋fresh Store＋fresh file-backed marker）後
         // refresh→Invalid(NEVER_GRANTED)；load() 見 marker（無條件擦除分支）擦掉 grant 鍵＋刪 marker；
         // runner Denied 且零 spawn（失敗撤權不得跨重啟死灰復燃）。
-        // 註：Denied 訊息斷言須經 /usr/bin/id resolve 成功方可到達橋門；本機（symlink→cargo
-        // coreutils，containment 外）resolve 先拒 → 本機同級紅，標準 coreutils/CI 佈局方綠。
+        // 註：Denied 訊息斷言經 hermetic fixture（注入 execSearchDirs/execAllowedRoots/
+        // execIsWritable）下的 id resolve 到達橋門；與宿主 coreutils 版面無關，本機與 CI 皆綠。
         val bridgeBacking = PreferenceDataStoreFactory.create(scope = scope) {
             File(dir, "bridge_fail_twice.preferences_pb")
         }
@@ -490,8 +503,8 @@ class PrivilegeBridgeRevokeRunnerTest {
         // 零 spawn 與環境無關（resolve 失敗亦零 spawn）——先驗。
         assertEquals("重啟後 runner 必零 spawn", 0, spawn2.calls)
         // production Denied 字串（RootSuRunner「privilege bridge off (fail-closed, no spawn)」）：
-        // bridge 門拒（reason＝ShellDeny.NOT_WHITELISTED）。須經 /usr/bin/id resolve 成功方可
-        // 到達橋門——本機 resolve 先拒（BLACKLISTED）→ 本機紅、標準 coreutils/CI 佈局方綠。
+        // bridge 門拒（reason＝ShellDeny.NOT_WHITELISTED）。經 hermetic fixture
+        // 的 id resolve 到達橋門（與宿主版面無關，本機／CI 皆綠）。
         assertEquals(ShellDeny.NOT_WHITELISTED, (denied as ElevatedBinaryResult.Denied).reason)
         assertTrue("${denied.message}", denied.message.contains("privilege bridge off"))
     }
@@ -502,7 +515,8 @@ class PrivilegeBridgeRevokeRunnerTest {
         // 「重啟」時 isPending()==false → load() 走 journal 條件式 heal（journal==true 才擦），
         // 擦除 grant 鍵與 journal → refresh Invalid(NEVER_GRANTED) → runner Denied 且零 spawn。
         // 計數：grant save＝第 1 次 updateData、journal 寫入＝第 2 次、erase 擦除＝第 3 次（本案只注入第 3 次失敗）。
-        // 註：Denied 訊息斷言須經 /usr/bin/id resolve 成功方可到達橋門；本機同級紅，標準佈局/CI 方綠。
+        // 註：Denied 訊息斷言經 hermetic fixture（注入 execSearchDirs/execAllowedRoots/
+        // execIsWritable）下的 id resolve 到達橋門；與宿主 coreutils 版面無關，本機與 CI 皆綠。
         val bridgeBacking = PreferenceDataStoreFactory.create(scope = scope) {
             File(dir, "bridge_erase_fail.preferences_pb")
         }
@@ -567,8 +581,8 @@ class PrivilegeBridgeRevokeRunnerTest {
         // 零 spawn 與環境無關（resolve 失敗亦零 spawn）——先驗。
         assertEquals("重啟後 runner 必零 spawn", 0, spawn2.calls)
         // production Denied 字串（RootSuRunner「privilege bridge off (fail-closed, no spawn)」）：
-        // bridge 門拒（reason＝ShellDeny.NOT_WHITELISTED）。須經 /usr/bin/id resolve 成功方可
-        // 到達橋門——本機 resolve 先拒（BLACKLISTED）→ 本機紅、標準 coreutils/CI 佈局方綠。
+        // bridge 門拒（reason＝ShellDeny.NOT_WHITELISTED）。經 hermetic fixture
+        // 的 id resolve 到達橋門（與宿主版面無關，本機／CI 皆綠）。
         assertEquals(ShellDeny.NOT_WHITELISTED, (denied as ElevatedBinaryResult.Denied).reason)
         assertTrue("${denied.message}", denied.message.contains("privilege bridge off"))
     }

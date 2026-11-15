@@ -192,7 +192,10 @@ class ShizukuPermissionRequests(
 
     /**
      * 作廢所有進行中的請求：遞增 activeEpoch 並清空回呼表（synchronized）。
+     *
+     * 僅測試用；production 請用 [detach]（同時反註冊上游 listener，避免上游殘留）。
      */
+    @VisibleForTesting
     fun invalidatePending() {
         synchronized(lock) {
             activeEpoch++
@@ -324,17 +327,6 @@ class ShizukuPermissionRequests(
                 safeLogW(TAG, "Shizuku removeRequestPermissionResultListener failed", e)
             }
         }
-    }
-
-    /**
-     * 清空本地回呼表並重置 [attached] 守衛與暫存 listener 引用
-     * （synchronized；測試/生命週期重建用）。
-     *
-     * 注意：此函數不觸碰上游註冊（純 JVM，JVM 單測安全）；
-     * 產品路徑請用 [detach] 以同時反註冊上游，避免上游殘留累積。
-     */
-    internal fun clear() {
-        synchronized(lock) { clearLocked() }
     }
 
     private fun clearLocked() {

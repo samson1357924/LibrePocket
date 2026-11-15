@@ -98,9 +98,11 @@ import java.util.concurrent.atomic.AtomicLong
  *    （`查 AlarmManager 符號` 會落到 alarm.create 的缺時間澄清）。
  *    前閘保證 `查 AlarmManager 符號` 綁 lsp.symbols 而非 alarm.create；
  *    #4（B3 re-review）：問句/知識/教學（how-to）語句絕不滿足 symbol 前閘——
- *    英文開頭疑問詞/教學動詞（why|how|who|what|when|where|explain|teach|tell，
- *    word-anchored）、中文開頭教學/疑問起始語（教我|學我|学我|請教|请教|請問|请问|問|
- *    问|如何|怎麼|怎么|為什麼|为什么|何時|何时|何地|何处|何處|可否|是否|怎樣|怎样）、
+ *    英文開頭疑問詞/教學動詞（why|how|who|what|when|where|explain|teach|tell|show|
+ *    describe|demonstrate|walk，word-anchored）、中文開頭教學/疑問起始語（教我|學我|
+ *    学我|請教|请教|請問|请问|問|问|如何|怎麼|怎么|為什麼|为什么|何時|何时|何地|何处|
+ *    何處|可否|是否|怎樣|怎样|告訴我|告诉我|告訴|告诉|我想知道|請告訴我|请告诉我|
+ *    講解|讲解|說明|说明|介紹|介绍|示範|演示）、
  *    或以疑問尾標收尾（? ？ 嗎 吗 呢）者一律不進 symbol 前閘 ⇒ 該語句不走 lsp.symbols
  *    （絕不 FAST）；無其他規則命中時 no-match DENIED（reasonCode null），
  *    命中 keyword 規則時落到該規則原有的 fail-closed 語意（例如查 AlarmManager
@@ -327,15 +329,15 @@ class FastRouter(
         // 命中豁免只免除 symbol 模板；其餘 keyword 規則照常套用（如查 AlarmManager
         // 符號呢 → alarm.create 缺時間澄清，DENIED 絕不 FAST），當無任何 keyword
         // 規則命中時才落 no-match DENIED（reasonCode null）。
-        // 英文：開頭為疑問詞/教學動詞（word-anchored，IGNORE_CASE；`tell` 涵蓋
-        // 「tell me …」）；中文：開頭為 教我|學我|学我|請教|請問|问… 等教學/疑問起始語；
-        // 或整句以疑問尾標（? ？ 嗎 吗 呢）收尾——問句不是查詢命令。
+        // 英文：開頭為疑問詞/教學動詞（word-anchored，IGNORE_CASE；`tell`/`show` 涵蓋
+        // 「tell me …」「show me …」）；中文：開頭為 教我|學我|学我|請教|請問|告訴我|告诉我… 等
+        // 教學/疑問起始語；或整句以疑問尾標（? ？ 嗎 吗 呢）收尾——問句不是查詢命令。
         // 命中 ⇒ symbol 模板不成立；其餘模板（其他工具）不受影響（fail-safe 只關 symbol
         // 前閘，其餘模板維持原語意）。
         private val INTERROGATIVE_EN_PREFIX =
-            Regex("^(?:why|how|who|what|when|where|explain|teach|tell)\\b", RegexOption.IGNORE_CASE)
+            Regex("^(?:why|how|who|what|when|where|explain|teach|tell|show|describe|demonstrate|walk)\\b", RegexOption.IGNORE_CASE)
         private val INTERROGATIVE_CJK_PREFIX =
-            Regex("^(?:教我|學我|学我|請教|请教|請問|请问|问|問|如何|怎麼|怎么|為什麼|为什么|何時|何时|何地|何处|何處|可否|是否|怎樣|怎样)")
+            Regex("^(?:教我|學我|学我|請教|请教|請問|请问|问|問|如何|怎麼|怎么|為什麼|为什么|何時|何时|何地|何处|何處|可否|是否|怎樣|怎样|告訴我|告诉我|告訴|告诉|我想知道|請告訴我|请告诉我|講解|讲解|說明|说明|介紹|介绍|示範|演示)")
         private val INTERROGATIVE_ENDINGS = charArrayOf('?', '？', '嗎', '吗', '呢')
 
         /**

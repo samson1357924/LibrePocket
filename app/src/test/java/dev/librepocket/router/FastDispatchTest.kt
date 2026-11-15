@@ -192,6 +192,29 @@ class FastDispatchTest {
         assertNull(d3.toolCall)
     }
 
+    @Test fun interrogativeKeywordFallbackClarifiesButNeverFast() = runBlocking {
+        // 問句豁免只關 symbol 前閘：marker+問句形式仍要符合 keyword 規則的
+        // fail-closed 語意——絕不 FAST。`查 AlarmManager 符號呢` → alarm.create
+        // 缺時間澄清（keyword 規則命中），後端零呼叫；`查 Foo 符號呢` → 無
+        // keyword 規則命中 ⇒ no-match DENIED（reasonCode null）。
+        val backend = CountingBackend()
+        val dispatcher = lspDispatcher(backend)
+        val d = decide("查 AlarmManager 符號呢")
+        assertEquals(RouteKind.DENIED, d.route)
+        assertEquals(DenyReason.NEED_CLARIFICATION, d.reasonCode)
+        assertEquals("alarm.create", d.header.toolName)
+        assertNull(d.toolCall)
+        skippedOf(dispatcher.dispatch(d, lspOn), "interrogative keyword fallback")
+        assertEquals(0, backend.invocations.get())
+
+        val d2 = decide("查 Foo 符號呢")
+        assertEquals(RouteKind.DENIED, d2.route)
+        assertNull(d2.reasonCode)
+        assertNull(d2.toolCall)
+        skippedOf(dispatcher.dispatch(d2, lspOn), "interrogative no-match fallback")
+        assertEquals(0, backend.invocations.get())
+    }
+
     @Test fun negatedIntentsNeverExecute() = runBlocking {
         val backend = CountingBackend()
         val phoneFake = CountingFake("phone.dial")
@@ -1655,6 +1678,12 @@ class FastDispatchTest {
             "延遲查 Foo 符號",
             "延後查 Foo 符號",
             "推遲查 Foo 符號",
+            "查 prohibit 符號 Foo",
+            "查 defer 符號 Foo",
+            "查 延期 符號 Foo",
+            "查 推後 符號 Foo",
+            "查 寬限 符號 Foo",
+            "查 延宕 符號 Foo",
             "I forbid you to search symbol Foo",
             "suspend lookup of symbol Foo",
         )
@@ -1750,6 +1779,18 @@ class FastDispatchTest {
             "為什麼查 Foo 符號",
             // 以疑問尾標 嗎 收尾 ⇒ 問句，即使含 marker 亦不執行。
             "查 Foo 符號嗎？",
+            // #4（B3 re-review）追加：show-me/describe 族 + 中文教學起始語族
+            "Show me how to find symbol Foo",
+            "Describe how to search symbols",
+            "Demonstrate lookup of symbol Foo",
+            "Walk me through finding symbols",
+            "告訴我如何查 Foo 符號",
+            "請告訴我如何查 Foo 符號",
+            "我想知道如何查 Foo 符號",
+            "講解如何查 Foo 符號",
+            "說明如何查 Foo 符號",
+            "介紹如何查 Foo 符號",
+            "示範如何查 Foo 符號",
         )) {
             val d = decide(text)
             assertEquals(text, RouteKind.DENIED, d.route)

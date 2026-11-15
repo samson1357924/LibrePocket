@@ -57,10 +57,13 @@ class ElevatedCleanupTrackerB2Test {
         val leakedActive = ElevatedCleanupTracker.activeCalls()
         val leakedQuarantine = ElevatedCleanupTracker.quarantinedCount()
         ElevatedCleanupTracker.clearUnverified()
-        while (ElevatedCleanupTracker.outstanding() > 0) {
+        // 有界強制收斂：避免無界 while 在洩漏時卡死 CI；pollOutstandingTo(0) 隨後仍 fail-fast 報錯。
+        val forcedDeadline = System.currentTimeMillis() + 5_000L
+        while (ElevatedCleanupTracker.outstanding() > 0 && System.currentTimeMillis() < forcedDeadline) {
             ElevatedCleanupTracker.releaseSlot()
         }
-        while (ElevatedCleanupTracker.activeCalls() > 0) {
+        val forcedActiveDeadline = System.currentTimeMillis() + 5_000L
+        while (ElevatedCleanupTracker.activeCalls() > 0 && System.currentTimeMillis() < forcedActiveDeadline) {
             ElevatedCleanupTracker.leaveCall()
         }
         pollOutstandingTo(0)

@@ -106,7 +106,7 @@ class ElevatedRunnerP1FixTest {
     // ---- P1-1: ghost race ----
 
     /**
-     * ghost 機率性迴歸（P0-1 三態）：短命 worker finally 與 mark 賽跑，終值必須回 0。
+     * ghost 機率性迴歸（P0-1 三態、現四態）：短命 worker finally 與 mark 賽跑，終值必須回 0。
      * 機率性（非 barrier 精控）：精確交錯由下兩確定性測試覆蓋
      *（[markBeforeFinallyReleasesOnce]／[finallyBeforeMarkTakesNoSlot]），此處僅以
      * 200 次循環掃描殘留 ghost（舊碼 CAS＋雙讀窗口下偶發 +1 永久殘留）。

@@ -569,11 +569,18 @@ class FastDispatchTest {
             "查 Foo, 符號" to "Foo",
             "查 Foo， 符號" to "Foo",
             "查 Foo，符號" to "Foo",
-            // EN keyword-inline comma (F7, recorded residual — documented-
-            // residual route): step A's command-form opener (`^symbols?\b[\s]*`)
-            // eats the keyword but not the inline comma, so `,Foo` stands as
-            // the query verbatim (READ-only):
-            "find symbol,Foo" to ",Foo",
+            // EN keyword-inline comma (A4, stage-7.4 — CLOSED; was the F7
+            // recorded residual): step A's command-form opener
+            // (`^symbols?\b[\s,，]*`) now eats the keyword AND a glued or
+            // following inline comma (READ-only):
+            "find symbol,Foo" to "Foo",
+            "find symbol, Foo" to "Foo",
+            // 記錄殘餘（stage-7.4 收尾）：opener 分隔類吸收前置 `,`/`，`/` `（Cue 位置）：
+            "查 ,Foo 符號" to "Foo",
+            "查 ，Foo 符號" to "Foo",
+            "search symbol ,Foo" to "Foo",
+            // 記錄殘餘（stage-2）：開頭 `.` 不在 deny 尾端類（`.bar` 為合法識別字開頭）：
+            "查 .bar 符號" to ".bar",
             // Unspaced 這個符號 glued to the identifier (recorded residual):
             "查 AlarmManager這個符號" to "AlarmManager",
             // #19 B3 stage-7.3 (A3)：CJK 識別字以 `符號` 結尾、無空白黏合的單一 cue
@@ -647,6 +654,14 @@ class FastDispatchTest {
             // ⇒ step E 拒絕 ⇒ NEED_CLARIFICATION（絕不執行）。
             // 非句末自然標點情形，per stage-6.3 reviewer pin 放本 clarify 測試記錄。
             "查 AlarmManager 这個符號",
+            // Stage-7.4（A4）：殘餘以半形/全形 `;` 開頭 ⇒ step E 首標點拒絕 ⇒
+            // NEED_CLARIFICATION（絕不執行）——任何 opener 都不吃 `;`，前導分號
+            // 直達 step E。（`,` 前導的形態——`查 ,Foo 符號`／`查 ，Foo 符號`／
+            // `search symbol ,Foo`——被 opener separator 類吸收 ⇒ FAST `Foo`，
+            // 非澄清；見 positionalCueGrammarPins 與提取 KDoc。）
+            "查 ;Foo 符號",
+            "查 ；Foo 符號",
+            "search symbol ;Foo",
         )) {
             val d = decide(text)
             assertEquals(text, RouteKind.DENIED, d.route)
@@ -1438,6 +1453,12 @@ class FastDispatchTest {
             // （reasonCode null，**不是** NEED_CLARIFICATION）——DENIED + toolCall null、
             // 絕不執行；此為 check-outcome 後如實釘錄（見 PR #171 stage-7.2）。
             "查詢的",
+            // #19 B3 stage-7.4（A4 收尾）：command-form opener 分隔類不含前置標點 `,` ⇒
+            // `symbols,Foo` 不符正向命令形（^symbols?\\s+\\S 不匹配）、RULES 無命中 ⇒
+            // no-match DENIED（reasonCode null），絕不執行（見 positionalCueGrammarPins
+            // 記錄的吸收類 pin 與提取 KDoc 的 stage-7.4 收尾 entry）：
+            "symbols,Foo",
+            "symbols，Foo",
         )) {
             // A2: 無 lookup marker ⇒ 模板不成立 ⇒ no-match DENIED（reasonCode null），
             // 不是澄清。

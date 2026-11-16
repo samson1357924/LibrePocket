@@ -1070,7 +1070,11 @@ class FastRouter(
          * Step E — immutable remainder validation (replacing the old
          *   global-deletion aftermath): after steps A–D the remainder is
          *   NEVER rewritten, only admitted or rejected —
-         *   (i) an EMPTY remainder fails; (ii) ANY remaining whitespace fails;
+         *   (i) an EMPTY remainder fails;
+         *   (i-bis) a remainder OPENING with `,` `，` `;` `；` fails
+         *   (stage-7.4, A4 — the halfwidth forms are allow-list-legal and need
+         *   this explicit rejection; the fullwidth forms are unreachable in (iv));
+         *   (ii) ANY remaining whitespace fails;
          *   (iii) a remainder ending in `.` `,` `;` fails
          *   (sentence-final natural-punctuation hazard; a trailing `:` is
          *   already eaten by step D's edge class, so no `:` check is kept
@@ -1170,13 +1174,21 @@ class FastRouter(
          *   個 U+500B — matches NEITHER `這個` nor `这个` suffix alternative,
          *   so the remainder stays multi-token and clarifies:
          *   `查 AlarmManager 这個符號` → NEED_CLARIFICATION, pinned.)
-         * - EN keyword-inline comma (stage-6.3 pin, documented-residual route):
-         *   `find symbol,Foo` → FAST `,Foo` — step A's command-form opener
-         *   (`^symbols?\b[\s]*`) eats the keyword but NOT the inline comma,
-         *   so the comma survives as the leading query character (step E admits
-         *   intra-token `,`; its `endsWith(',')` hazard is not in play).
-         *   Recorded, not fixed; the tool is READ-only. (`find symbol, Foo`
-         *   clarifies — residual carries whitespace after the keyword.)
+         * - EN keyword-inline comma (stage-7.4, A4 — CLOSED; was stage-6.3
+         *   documented-residual route): `find symbol,Foo` → FAST `Foo` —
+         *   step A's command-form opener (`^symbols?\b[\s,，]*`) now eats the
+         *   keyword AND a glued or following inline comma; `find symbol, Foo`
+         *   → FAST `Foo`. A stray leading SEMICOLON — which no opener eats —
+         *   never executes: `查 ;Foo 符號` / `查 ；Foo 符號` / `search symbol
+         *   ;Foo` clarify via step E's leading-punctuation rejection
+         *   (stage-7.4). The CJK/EN openers absorb a stray user-typed comma
+         *   after the command by design (`查 ,Foo 符號` / `查 ，Foo 符號` /
+         *   `search symbol ,Foo` → FAST `Foo`) — the comma is part of the
+         *   (CJK/EN-verb/command-form) opener separator class; halfwidth `.`
+         *   stays legal (`查 .bar 符號`
+         *   → FAST `.bar`, pinned). Bare `symbols,Foo` (no imperative verb)
+         *   fails the affirmative-command admission gate and is no-match
+         *   DENIED — never FAST. The old `,Foo` residual never executes again.
          *
          * Invalid-charset / multi-token / cue-less remainders never execute:
          * they fail extraction (empty) and route NEED_CLARIFICATION via
@@ -1189,7 +1201,7 @@ class FastRouter(
             "^(?:please[\\s,]+)?(?:find|search|lookup|locate)\\b[\\s,]*(?:for\\s+|the\\s+|a\\s+|an\\s+)?",
             RegexOption.IGNORE_CASE,
         )
-        private val SYMBOL_OPENER_CMD = Regex("^symbols?\\b[\\s]*", RegexOption.IGNORE_CASE)
+        private val SYMBOL_OPENER_CMD = Regex("^symbols?\\b[\\s,，]*", RegexOption.IGNORE_CASE)
         // #19 B3 stage-6.3 (positional cue grammar) — Step B keeps exactly ONE
         // leading EN `symbol(s)` cue, word-anchored, stripped at most once
         // (e.g. `symbols Foo` → `Foo`, `Symbol Foo.` → `Foo.`); it never
@@ -1310,6 +1322,7 @@ class FastRouter(
             // outside {Unicode L*, N*} ∪ `. _ - $ # @ / ( ) : , ; + = ~` ⇒
             // fail (incl. Format/control); at least one L/N anchor required.
             if (s.isEmpty()) return ""
+            if (s.startsWith(',') || s.startsWith('；') || s.startsWith('，') || s.startsWith(';')) return ""
             if (s.endsWith('.') || s.endsWith(',') || s.endsWith(';')) return ""
             var hasLetterOrDigit = false
             var i = 0

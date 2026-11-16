@@ -16,6 +16,13 @@ this helper): about 17-20 root DEX shards, largest shard about 43.8 MB, and
 about 65-80 MB total DEX. Limits below leave headroom for that inventory; they
 are resource limits, not evidence that any real APK passed this scanner.
 
+Provider attribute decoding (blast-radius note): the six Shizuku security
+attributes are decoded for EVERY provider in EVERY mode; a non-Shizuku
+provider carrying an untypable boolean encoding fails the whole artifact
+gate. This is deliberate and documented - compiled 0x12 is the only legal
+boolean encoding, so real builds cannot hit it; the foss/play lanes inherit
+this for their provider checks as well.
+
 Backup-binding authority: this scanner asserts that the MERGED manifest
 (what the final APK will actually run) still carries
 ``android:fullBackupContent``/``android:dataExtractionRules`` bound to the
@@ -2439,6 +2446,11 @@ def _github_required_provider_total(
     (suffix-spelled) matches never consume: a detected block whose name
     merely suffix-matches an evidenced class still counts (the suffix match
     is an attribution convenience, not an identity proof).
+    Example: a manifest block spelled ``android:name=".Bridge"`` whose
+    authority is ``${applicationId}.shizuku``, with an evidenced java name
+    ``com.example.Bridge`` - the suffix-matching block never consumes the
+    evidenced name (exact-FQN-only), so this assembly counts as "found 2"
+    (fail-closed).
 
     ``total = |{detected blocks NOT consumed by an exact evidenced match}|
     + |evidenced java names|``.

@@ -75,8 +75,8 @@ private fun safeLogW(tag: String, msg: String, e: Throwable? = null) {
  * 單測用新實例（`PrivilegeBridgeState()`）互不污染，僅單例語義測試經
  * [resetProcessForTest] 前後隔離。
  *
- * 已知限制：[grant]／[refresh] opMutex 臨界區無 `withTimeout`
- * （與 [revoke] 不對稱，#136-B3 接線前應評估有界化）。
+ * 已知限制：[grant]／[refresh] opMutex 等待無 `withTimeout`
+ * （與 [revoke] 不對稱；grant 臨界區內補償清庫已於補償常數有界，#136-B3 接線前仍應評估 opMutex 等待有界化）。
  */
 class PrivilegeBridgeState @VisibleForTesting internal constructor(
     val audit: PrivilegeAuditLog = PrivilegeAuditLog(),
@@ -296,8 +296,8 @@ class PrivilegeBridgeState @VisibleForTesting internal constructor(
      * 呼叫端不得傳入未來時間戳（否則授權可能在簽發前即「有效」）；
      * `atMs` 逾現在時刻即 fail-fast 抛 [IllegalArgumentException]（`AT_MS_IN_FUTURE`）。
      *
-     * 已知限制：本函數 opMutex 臨界區無 `withTimeout`（與 [revoke] 不對稱，
-     * #136-B3 接線前應評估有界化）。
+     * 已知限制：本函數 opMutex 等待無 `withTimeout`（與 [revoke] 不對稱；
+     * 補償清庫已於 [REVOKE_OP_TIMEOUT_MS] 有界，#136-B3 接線前仍應評估 opMutex 等待有界化）。
      */
     suspend fun grant(
         store: PrivilegeBridgeStore,
@@ -397,8 +397,8 @@ class PrivilegeBridgeState @VisibleForTesting internal constructor(
      * 產品 #136-B3 以此供給 runner `bridgeGranted`
      *（blocking 包裝，見 [PrivilegeBridgeStore.check] KDoc 契約）。
      *
-     * 已知限制：本函數 opMutex 臨界區無 `withTimeout`（與 [revoke] 不對稱，
-     * #136-B3 接線前應評估有界化）。
+     * 已知限制：本函數 opMutex 等待無 `withTimeout`（與 [revoke] 不對稱；
+     * 補償清庫已於 [REVOKE_OP_TIMEOUT_MS] 有界，#136-B3 接線前仍應評估 opMutex 等待有界化）。
      */
     suspend fun refresh(
         store: PrivilegeBridgeStore,

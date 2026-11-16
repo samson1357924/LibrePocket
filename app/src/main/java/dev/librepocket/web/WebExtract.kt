@@ -114,7 +114,9 @@ internal class DeadlineExceededException : RuntimeException()
  *   follower 之 Ok 交付前 chain-face 驗證把關——見 D3 追蹤項 #1）。
  *   `invalidate()` bump 快取 generation epoch、清空快取，並 drain 所有在途 entry
  *   例外完成（`CancellationException`）→ follower 映射 `Unavailable(CANCELLED)`；
- *   invalidate 之前建立之條目／在途結果永遠無法重新出現在 cache 或 follower 路徑。
+ *   invalidate 完成之後，invalidate 之前建立之條目／在途結果不得重新出現在 cache 或 follower 路徑
+ *   （個別 detached 交付殘留類見 invalidate() KDoc：(i) pre-drain Ok、(ii) cache arm re-check 窗口、
+ *   (iii) follower chain-face re-check 窗口）。
  * - `bytesKept`：`Ok.bytesKept`＝（若 gzip 解壓後之）實際位元組數；identity
  *   編碼時即 raw body 位元組數。
  * - 取消語義：外部取消（leader／呼叫方自身）原樣透傳 [CancellationException]，
@@ -1088,6 +1090,11 @@ class WebExtractService(
                     lateHit = cache.getHitByKey(k, epochAtEntry)
                         ?.takeIf { it.chain.isEmpty() }
                         ?.outcome
+                    // post-read epoch re-check：getHitByKey 與此處之間無懸掛點，但
+                    // 防禦性地鏡像 verifiedCachedHit 之 re-check——世代已漂移即視為 miss（stale 路徑）。
+                    if (lateHit != null && cache.currentGeneration != epochAtEntry) {
+                        lateHit = null
+                    }
                     if (lateHit == null) {
                         // follower chain-face 驗證失敗後：skipJoinForDeferred === 該條目之 deferred
                         // 表示該 leader（內容）已被本 caller 判定不可信——不得 join，
@@ -1184,6 +1191,8 @@ class WebExtractService(
                     // 無懸掛點，期間完成之撤權無法攔截（與 cache arm 同一脫管交付殘留類，
                     // 見 invalidate() KDoc）。
                     if (cache.currentGeneration != epochAtEntry) {
+                        // 註：此 re-check→`continue` 後的下一圈 stale arm 會重捕世代並清 skipJoinForDeferred，
+                        // 故本臂之 skipJoinForDeferred 於漂移輪倖免於誤傷、於下一圈被清——刻意如此（兩臂耦合說明）。
                         bindingRestarts += 1
                         if (bindingRestarts > WebExtract.MAX_STALE_RESTARTS) {
                             return WebExtractOutcome.Failed(WebExtract.DETAIL_TRANSPORT)
@@ -1429,7 +1438,7 @@ class WebExtractService(
             }
             // 建連前必經政策（含首跳；redirect 逐跳重驗；DNS 需查則經有界 preflight）。
             // 首跳：沿用 extract() 傳入之 hop-0 決策（`hop0Eval`；key 建構與本處 fetch 共用
-            // 同一份已授權之見解——key binding == fetched binding）；不再二次 resolve。
+            // 同一份已授權之決策——key binding == fetched binding）；不再二次 resolve。
             // redirect 逐跳永遠全量過閘。`first` 於下方設為 false 後不再沿用 hop0Eval。
             val eval = if (first && hop0Eval != null) {
                 hop0Eval.eval

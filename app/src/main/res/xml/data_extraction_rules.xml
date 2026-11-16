@@ -32,7 +32,9 @@
         <exclude domain="sharedpref" path="assistant_role.xml" />
         <!-- Device-bound: privilege bridge & Shizuku grant DataStores must not migrate across devices (not in BackupPolicy.KEY_FILES_EXCLUDED). -->
         <exclude domain="file" path="datastore/librepocket_privilege_bridge.preferences_pb" />
+        <exclude domain="file" path="datastore/librepocket_privilege_bridge.preferences_pb.tmp" />
         <exclude domain="file" path="datastore/librepocket_shizuku_grant.preferences_pb" />
+        <exclude domain="file" path="datastore/librepocket_shizuku_grant.preferences_pb.tmp" />
     </cloud-backup>
     <device-transfer>
         <exclude domain="sharedpref" path="librepocket_keys.xml" />
@@ -44,6 +46,8 @@
         <exclude domain="sharedpref" path="assistant_role.xml" />
         <!-- Device-bound: privilege bridge & Shizuku grant DataStores must not migrate across devices (not in BackupPolicy.KEY_FILES_EXCLUDED). -->
         <exclude domain="file" path="datastore/librepocket_privilege_bridge.preferences_pb" />
+        <exclude domain="file" path="datastore/librepocket_privilege_bridge.preferences_pb.tmp" />
         <exclude domain="file" path="datastore/librepocket_shizuku_grant.preferences_pb" />
+        <exclude domain="file" path="datastore/librepocket_shizuku_grant.preferences_pb.tmp" />
     </device-transfer>
 </data-extraction-rules>

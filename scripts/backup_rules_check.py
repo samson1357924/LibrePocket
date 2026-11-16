@@ -122,13 +122,21 @@ REQUIRED_EXCLUDES: tuple[tuple[str, str], ...] = (
 #   - ("file", "datastore/librepocket_shizuku_grant.preferences_pb"):
 #     device-bound Shizuku authorization grant DataStore (#136-B1); must not
 #     migrate across backup or device transfer.
+#   - ("file", "datastore/librepocket_privilege_bridge.preferences_pb.tmp") and
+#     ("file", "datastore/librepocket_shizuku_grant.preferences_pb.tmp"):
+#     the DataStore FileStorageConnection writes <name>.preferences_pb.tmp then
+#     renames; the read path never resolves a leftover .tmp, but a restored .tmp
+#     would migrate stale grant metadata across devices, so exact rules exclude
+#     the siblings too.
 # Deliberately NOT part of BackupPolicy.KEY_FILES_EXCLUDED (key/vault-only);
 # the drift guard in scripts/tests/test_apk_policy_check.py pins that 5-item
 # Kotlin list separately.
 REQUIRED_DEVICE_BOUND_EXCLUDES: tuple[tuple[str, str], ...] = (
     ("sharedpref", "assistant_role.xml"),
     ("file", "datastore/librepocket_privilege_bridge.preferences_pb"),
+    ("file", "datastore/librepocket_privilege_bridge.preferences_pb.tmp"),
     ("file", "datastore/librepocket_shizuku_grant.preferences_pb"),
+    ("file", "datastore/librepocket_shizuku_grant.preferences_pb.tmp"),
 )
 
 # Allowlisted device-bound extras (NOT key material, NOT part of

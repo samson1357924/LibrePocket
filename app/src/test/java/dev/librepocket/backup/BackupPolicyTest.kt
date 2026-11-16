@@ -79,7 +79,9 @@ class BackupPolicyTest {
     @Test fun privilegeGrants_excludedFromBothRuleFiles() {
         val privilegePaths = listOf(
             "datastore/librepocket_privilege_bridge.preferences_pb",
+            "datastore/librepocket_privilege_bridge.preferences_pb.tmp",
             "datastore/librepocket_shizuku_grant.preferences_pb",
+            "datastore/librepocket_shizuku_grant.preferences_pb.tmp",
         )
         for (path in privilegePaths) {
             assertExcludedOnceInBothRuleFiles(domain = "file", path = path)

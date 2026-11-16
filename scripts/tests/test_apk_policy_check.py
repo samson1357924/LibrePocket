@@ -542,7 +542,13 @@ class ApkPolicyHarness(unittest.TestCase):
             "              '    A: path=\"datastore/librepocket_privilege_bridge.preferences_pb\" (Raw: \"datastore/librepocket_privilege_bridge.preferences_pb\")' \\\n"
             "              '  E: exclude' \\\n"
             "              '    A: domain=\"file\" (Raw: \"file\")' \\\n"
-            "              '    A: path=\"datastore/librepocket_shizuku_grant.preferences_pb\" (Raw: \"datastore/librepocket_shizuku_grant.preferences_pb\")'\n"
+            "              '    A: path=\"datastore/librepocket_privilege_bridge.preferences_pb.tmp\" (Raw: \"datastore/librepocket_privilege_bridge.preferences_pb.tmp\")' \\\n"
+            "              '  E: exclude' \\\n"
+            "              '    A: domain=\"file\" (Raw: \"file\")' \\\n"
+            "              '    A: path=\"datastore/librepocket_shizuku_grant.preferences_pb\" (Raw: \"datastore/librepocket_shizuku_grant.preferences_pb\")'\\\n"
+            "              '  E: exclude' \\\n"
+            "              '    A: domain=\"file\" (Raw: \"file\")' \\\n"
+            "              '    A: path=\"datastore/librepocket_shizuku_grant.preferences_pb.tmp\" (Raw: \"datastore/librepocket_shizuku_grant.preferences_pb.tmp\")'\n"
             "          else\n"
             "            printf '%s\\n' \\\n"
             "              'E: data-extraction-rules (line=1)' \\\n"
@@ -567,7 +573,13 @@ class ApkPolicyHarness(unittest.TestCase):
             "              '      A: path=\"datastore/librepocket_privilege_bridge.preferences_pb\" (Raw: \"datastore/librepocket_privilege_bridge.preferences_pb\")' \\\n"
             "              '    E: exclude' \\\n"
             "              '      A: domain=\"file\" (Raw: \"file\")' \\\n"
+            "              '      A: path=\"datastore/librepocket_privilege_bridge.preferences_pb.tmp\" (Raw: \"datastore/librepocket_privilege_bridge.preferences_pb.tmp\")' \\\n"
+            "              '    E: exclude' \\\n"
+            "              '      A: domain=\"file\" (Raw: \"file\")' \\\n"
             "              '      A: path=\"datastore/librepocket_shizuku_grant.preferences_pb\" (Raw: \"datastore/librepocket_shizuku_grant.preferences_pb\")' \\\n"
+            "              '    E: exclude' \\\n"
+            "              '      A: domain=\"file\" (Raw: \"file\")' \\\n"
+            "              '      A: path=\"datastore/librepocket_shizuku_grant.preferences_pb.tmp\" (Raw: \"datastore/librepocket_shizuku_grant.preferences_pb.tmp\")' \\\n"
             "              '  E: device-transfer (line=7)' \\\n"
             "              '    E: exclude (line=8)' \\\n"
             "              '      A: domain=\"sharedpref\" (Raw: \"sharedpref\")' \\\n"
@@ -589,11 +601,17 @@ class ApkPolicyHarness(unittest.TestCase):
             "              '      A: path=\"datastore/librepocket_privilege_bridge.preferences_pb\" (Raw: \"datastore/librepocket_privilege_bridge.preferences_pb\")' \\\n"
             "              '    E: exclude' \\\n"
             "              '      A: domain=\"file\" (Raw: \"file\")' \\\n"
-            "              '      A: path=\"datastore/librepocket_shizuku_grant.preferences_pb\" (Raw: \"datastore/librepocket_shizuku_grant.preferences_pb\")'\n"
+            "              '      A: path=\"datastore/librepocket_privilege_bridge.preferences_pb.tmp\" (Raw: \"datastore/librepocket_privilege_bridge.preferences_pb.tmp\")' \\\n"
+            "              '    E: exclude' \\\n"
+            "              '      A: domain=\"file\" (Raw: \"file\")' \\\n"
+            "              '      A: path=\"datastore/librepocket_shizuku_grant.preferences_pb\" (Raw: \"datastore/librepocket_shizuku_grant.preferences_pb\")'\\\n"
+            "              '    E: exclude' \\\n"
+            "              '      A: domain=\"file\" (Raw: \"file\")' \\\n"
+            "              '      A: path=\"datastore/librepocket_shizuku_grant.preferences_pb.tmp\" (Raw: \"datastore/librepocket_shizuku_grant.preferences_pb.tmp\")'\n"
             "          fi ;;\n"
             "        extra-one)\n"
             "          # The mirror image of missing-one: every REQUIRED + DEVICE-BOUND\n"
-            "          # exclude stays and ONE entry beyond the pinned eight adds itself\n"
+            "          # exclude stays and ONE entry beyond the pinned ten adds itself\n"
             "          # to EVERY section: the exact-set rule must reject the\n"
             "          # compiled bytes in both members (dump succeeds, content\n"
             "          # differs).\n"
@@ -620,7 +638,13 @@ class ApkPolicyHarness(unittest.TestCase):
             "              '    A: path=\"datastore/librepocket_privilege_bridge.preferences_pb\" (Raw: \"datastore/librepocket_privilege_bridge.preferences_pb\")' \\\n"
             "              '  E: exclude' \\\n"
             "              '    A: domain=\"file\" (Raw: \"file\")' \\\n"
+            "              '    A: path=\"datastore/librepocket_privilege_bridge.preferences_pb.tmp\" (Raw: \"datastore/librepocket_privilege_bridge.preferences_pb.tmp\")' \\\n"
+            "              '  E: exclude' \\\n"
+            "              '    A: domain=\"file\" (Raw: \"file\")' \\\n"
             "              '    A: path=\"datastore/librepocket_shizuku_grant.preferences_pb\" (Raw: \"datastore/librepocket_shizuku_grant.preferences_pb\")' \\\n"
+            "              '  E: exclude' \\\n"
+            "              '    A: domain=\"file\" (Raw: \"file\")' \\\n"
+            "              '    A: path=\"datastore/librepocket_shizuku_grant.preferences_pb.tmp\" (Raw: \"datastore/librepocket_shizuku_grant.preferences_pb.tmp\")' \\\n"
             "              '  E: exclude (line=6)' \\\n"
             "              '    A: domain=\"file\" (Raw: \"file\")' \\\n"
             "              '    A: path=\"librepocket_keysets\" (Raw: \"librepocket_keysets\")' \\\n"
@@ -651,7 +675,13 @@ class ApkPolicyHarness(unittest.TestCase):
             "              '      A: path=\"datastore/librepocket_privilege_bridge.preferences_pb\" (Raw: \"datastore/librepocket_privilege_bridge.preferences_pb\")' \\\n"
             "              '    E: exclude' \\\n"
             "              '      A: domain=\"file\" (Raw: \"file\")' \\\n"
+            "              '      A: path=\"datastore/librepocket_privilege_bridge.preferences_pb.tmp\" (Raw: \"datastore/librepocket_privilege_bridge.preferences_pb.tmp\")' \\\n"
+            "              '    E: exclude' \\\n"
+            "              '      A: domain=\"file\" (Raw: \"file\")' \\\n"
             "              '      A: path=\"datastore/librepocket_shizuku_grant.preferences_pb\" (Raw: \"datastore/librepocket_shizuku_grant.preferences_pb\")' \\\n"
+            "              '    E: exclude' \\\n"
+            "              '      A: domain=\"file\" (Raw: \"file\")' \\\n"
+            "              '      A: path=\"datastore/librepocket_shizuku_grant.preferences_pb.tmp\" (Raw: \"datastore/librepocket_shizuku_grant.preferences_pb.tmp\")' \\\n"
             "              '    E: exclude (line=7)' \\\n"
             "              '      A: domain=\"file\" (Raw: \"file\")' \\\n"
             "              '      A: path=\"librepocket_keysets\" (Raw: \"librepocket_keysets\")' \\\n"
@@ -679,7 +709,13 @@ class ApkPolicyHarness(unittest.TestCase):
             "              '      A: path=\"datastore/librepocket_privilege_bridge.preferences_pb\" (Raw: \"datastore/librepocket_privilege_bridge.preferences_pb\")' \\\n"
             "              '    E: exclude' \\\n"
             "              '      A: domain=\"file\" (Raw: \"file\")' \\\n"
+            "              '      A: path=\"datastore/librepocket_privilege_bridge.preferences_pb.tmp\" (Raw: \"datastore/librepocket_privilege_bridge.preferences_pb.tmp\")' \\\n"
+            "              '    E: exclude' \\\n"
+            "              '      A: domain=\"file\" (Raw: \"file\")' \\\n"
             "              '      A: path=\"datastore/librepocket_shizuku_grant.preferences_pb\" (Raw: \"datastore/librepocket_shizuku_grant.preferences_pb\")' \\\n"
+            "              '    E: exclude' \\\n"
+            "              '      A: domain=\"file\" (Raw: \"file\")' \\\n"
+            "              '      A: path=\"datastore/librepocket_shizuku_grant.preferences_pb.tmp\" (Raw: \"datastore/librepocket_shizuku_grant.preferences_pb.tmp\")' \\\n"
             "              '    E: exclude (line=14)' \\\n"
             "              '      A: domain=\"file\" (Raw: \"file\")' \\\n"
             "              '      A: path=\"librepocket_keysets\" (Raw: \"librepocket_keysets\")' \\\n"
@@ -715,7 +751,13 @@ class ApkPolicyHarness(unittest.TestCase):
             "              '      A: path=\"datastore/librepocket_privilege_bridge.preferences_pb\" (Raw: \"datastore/librepocket_privilege_bridge.preferences_pb\")' \\\n"
             "              '    E: exclude' \\\n"
             "              '      A: domain=\"file\" (Raw: \"file\")' \\\n"
+            "              '      A: path=\"datastore/librepocket_privilege_bridge.preferences_pb.tmp\" (Raw: \"datastore/librepocket_privilege_bridge.preferences_pb.tmp\")' \\\n"
+            "              '    E: exclude' \\\n"
+            "              '      A: domain=\"file\" (Raw: \"file\")' \\\n"
             "              '      A: path=\"datastore/librepocket_shizuku_grant.preferences_pb\" (Raw: \"datastore/librepocket_shizuku_grant.preferences_pb\")' \\\n"
+            "              '    E: exclude' \\\n"
+            "              '      A: domain=\"file\" (Raw: \"file\")' \\\n"
+            "              '      A: path=\"datastore/librepocket_shizuku_grant.preferences_pb.tmp\" (Raw: \"datastore/librepocket_shizuku_grant.preferences_pb.tmp\")' \\\n"
             "              '    E: exclude (line=7)' \\\n"
             "              '      A: domain=\"file\" (Raw: \"file\")' \\\n"
             "              '      A: path=\"librepocket_keysets\" (Raw: \"librepocket_keysets\")' \\\n"
@@ -740,7 +782,13 @@ class ApkPolicyHarness(unittest.TestCase):
             "              '      A: path=\"datastore/librepocket_privilege_bridge.preferences_pb\" (Raw: \"datastore/librepocket_privilege_bridge.preferences_pb\")' \\\n"
             "              '    E: exclude' \\\n"
             "              '      A: domain=\"file\" (Raw: \"file\")' \\\n"
+            "              '      A: path=\"datastore/librepocket_privilege_bridge.preferences_pb.tmp\" (Raw: \"datastore/librepocket_privilege_bridge.preferences_pb.tmp\")' \\\n"
+            "              '    E: exclude' \\\n"
+            "              '      A: domain=\"file\" (Raw: \"file\")' \\\n"
             "              '      A: path=\"datastore/librepocket_shizuku_grant.preferences_pb\" (Raw: \"datastore/librepocket_shizuku_grant.preferences_pb\")' \\\n"
+            "              '    E: exclude' \\\n"
+            "              '      A: domain=\"file\" (Raw: \"file\")' \\\n"
+            "              '      A: path=\"datastore/librepocket_shizuku_grant.preferences_pb.tmp\" (Raw: \"datastore/librepocket_shizuku_grant.preferences_pb.tmp\")' \\\n"
             "              '    E: exclude (line=13)' \\\n"
             "              '      A: domain=\"file\" (Raw: \"file\")' \\\n"
             "              '      A: path=\"librepocket_keysets\" (Raw: \"librepocket_keysets\")' \\\n"
@@ -771,7 +819,13 @@ class ApkPolicyHarness(unittest.TestCase):
             "              '    A: path=\"datastore/librepocket_privilege_bridge.preferences_pb\" (Raw: \"datastore/librepocket_privilege_bridge.preferences_pb\")' \\\n"
             "              '  E: exclude' \\\n"
             "              '    A: domain=\"file\" (Raw: \"file\")' \\\n"
+            "              '    A: path=\"datastore/librepocket_privilege_bridge.preferences_pb.tmp\" (Raw: \"datastore/librepocket_privilege_bridge.preferences_pb.tmp\")' \\\n"
+            "              '  E: exclude' \\\n"
+            "              '    A: domain=\"file\" (Raw: \"file\")' \\\n"
             "              '    A: path=\"datastore/librepocket_shizuku_grant.preferences_pb\" (Raw: \"datastore/librepocket_shizuku_grant.preferences_pb\")' \\\n"
+            "              '  E: exclude' \\\n"
+            "              '    A: domain=\"file\" (Raw: \"file\")' \\\n"
+            "              '    A: path=\"datastore/librepocket_shizuku_grant.preferences_pb.tmp\" (Raw: \"datastore/librepocket_shizuku_grant.preferences_pb.tmp\")' \\\n"
             "              '  E: exclude (line=6)' \\\n"
             "              '    A: domain=\"file\" (Raw: \"file\")' \\\n"
             "              '    A: path=\"librepocket_keysets\" (Raw: \"librepocket_keysets\")'\n"
@@ -802,7 +856,13 @@ class ApkPolicyHarness(unittest.TestCase):
             "              '    A: path=\"datastore/librepocket_privilege_bridge.preferences_pb\" (Raw: \"datastore/librepocket_privilege_bridge.preferences_pb\")' \\\n"
             "              '  E: exclude' \\\n"
             "              '    A: domain=\"file\" (Raw: \"file\")' \\\n"
+            "              '    A: path=\"datastore/librepocket_privilege_bridge.preferences_pb.tmp\" (Raw: \"datastore/librepocket_privilege_bridge.preferences_pb.tmp\")' \\\n"
+            "              '  E: exclude' \\\n"
+            "              '    A: domain=\"file\" (Raw: \"file\")' \\\n"
             "              '    A: path=\"datastore/librepocket_shizuku_grant.preferences_pb\" (Raw: \"datastore/librepocket_shizuku_grant.preferences_pb\")' \\\n"
+            "              '  E: exclude' \\\n"
+            "              '    A: domain=\"file\" (Raw: \"file\")' \\\n"
+            "              '    A: path=\"datastore/librepocket_shizuku_grant.preferences_pb.tmp\" (Raw: \"datastore/librepocket_shizuku_grant.preferences_pb.tmp\")' \\\n"
             "              '  E: exclude (line=6)' \\\n"
             "              '    A: domain=\"file\" (Raw: \"file\")' \\\n"
             "              '    A: path=\"librepocket_keysets\" (Raw: \"librepocket_keysets\")'\n"
@@ -830,7 +890,13 @@ class ApkPolicyHarness(unittest.TestCase):
             "              '      A: path=\"datastore/librepocket_privilege_bridge.preferences_pb\" (Raw: \"datastore/librepocket_privilege_bridge.preferences_pb\")' \\\n"
             "              '    E: exclude' \\\n"
             "              '      A: domain=\"file\" (Raw: \"file\")' \\\n"
+            "              '      A: path=\"datastore/librepocket_privilege_bridge.preferences_pb.tmp\" (Raw: \"datastore/librepocket_privilege_bridge.preferences_pb.tmp\")' \\\n"
+            "              '    E: exclude' \\\n"
+            "              '      A: domain=\"file\" (Raw: \"file\")' \\\n"
             "              '      A: path=\"datastore/librepocket_shizuku_grant.preferences_pb\" (Raw: \"datastore/librepocket_shizuku_grant.preferences_pb\")' \\\n"
+            "              '    E: exclude' \\\n"
+            "              '      A: domain=\"file\" (Raw: \"file\")' \\\n"
+            "              '      A: path=\"datastore/librepocket_shizuku_grant.preferences_pb.tmp\" (Raw: \"datastore/librepocket_shizuku_grant.preferences_pb.tmp\")' \\\n"
             "              '    E: exclude (line=7)' \\\n"
             "              '      A: domain=\"file\" (Raw: \"file\")' \\\n"
             "              '      A: path=\"librepocket_keysets\" (Raw: \"librepocket_keysets\")' \\\n"
@@ -855,7 +921,13 @@ class ApkPolicyHarness(unittest.TestCase):
             "              '      A: path=\"datastore/librepocket_privilege_bridge.preferences_pb\" (Raw: \"datastore/librepocket_privilege_bridge.preferences_pb\")' \\\n"
             "              '    E: exclude' \\\n"
             "              '      A: domain=\"file\" (Raw: \"file\")' \\\n"
+            "              '      A: path=\"datastore/librepocket_privilege_bridge.preferences_pb.tmp\" (Raw: \"datastore/librepocket_privilege_bridge.preferences_pb.tmp\")' \\\n"
+            "              '    E: exclude' \\\n"
+            "              '      A: domain=\"file\" (Raw: \"file\")' \\\n"
             "              '      A: path=\"datastore/librepocket_shizuku_grant.preferences_pb\" (Raw: \"datastore/librepocket_shizuku_grant.preferences_pb\")' \\\n"
+            "              '    E: exclude' \\\n"
+            "              '      A: domain=\"file\" (Raw: \"file\")' \\\n"
+            "              '      A: path=\"datastore/librepocket_shizuku_grant.preferences_pb.tmp\" (Raw: \"datastore/librepocket_shizuku_grant.preferences_pb.tmp\")' \\\n"
             "              '    E: exclude (line=13)' \\\n"
             "              '      A: domain=\"file\" (Raw: \"file\")' \\\n"
             "              '      A: path=\"librepocket_keysets\" (Raw: \"librepocket_keysets\")'\n"
@@ -2283,8 +2355,8 @@ class ApkPolicyHarness(unittest.TestCase):
     def test_compiled_backup_rules_missing_exclude_rejected(self) -> None:
         # A resources-overlay/merger rewrite can change the COMPILED rule
         # content while every source file and the manifest binding stay
-        # faithful. The artifact bytes must still carry the EXACT eight
-        # excludes (5 key + 3 device-bound): dropping one entry fails the
+        # faithful. The artifact bytes must still carry the EXACT ten
+        # excludes (5 key + 5 device-bound): dropping one entry fails the
         # run even though the dump
         # succeeded and the binding survived.
         apk = complete_apk(
@@ -2301,8 +2373,8 @@ class ApkPolicyHarness(unittest.TestCase):
     def test_compiled_backup_rules_unexpected_exclude_rejected(self) -> None:
         # The mirror image of the missing-one control: a resources-overlay /
         # merger rewrite can also ADD an exclude to the COMPILED rule
-        # content. The artifact bytes must still carry EXACTLY the eight
-        # excludes (5 key + 3 device-bound): adding one entry
+        # content. The artifact bytes must still carry EXACTLY the ten
+        # excludes (5 key + 5 device-bound): adding one entry
         # (domain="path", path="extra.xml") fails
         # the run even though every required entry survives and the dump
         # succeeded.
@@ -2318,8 +2390,8 @@ class ApkPolicyHarness(unittest.TestCase):
         self.assertIn("compiled res/xml/", result.stdout)
 
     def test_compiled_backup_rules_valid_bytes_accepted(self) -> None:
-        # Positive control: the exactly-pinned eight-exclude set (5 key +
-        # 3 device-bound, any order)
+        # Positive control: the exactly-pinned ten-exclude set (5 key +
+        # 5 device-bound, any order)
         # passes both members, keeping the default artifact runs positive.
         apk = complete_apk(
             self.tmp / "rules-ok.apk",
@@ -2375,8 +2447,8 @@ class ApkPolicyHarness(unittest.TestCase):
         ):
             self.assertEqual(engine_call.args[1], member)
             self.assertEqual(engine_call.args[2], expected_root)
-            # Exact-set mode is ON at artifact level: extras beyond the eight
-            # required excludes (5 key + 3 device-bound) are refused,
+            # Exact-set mode is ON at artifact level: extras beyond the ten
+            # required excludes (5 key + 5 device-bound) are refused,
             # not tolerated.
             self.assertIs(engine_call.kwargs.get("exact_excludes"), True)
 
@@ -5203,13 +5275,15 @@ class BackupRulesValidator(unittest.TestCase):
         '        <exclude domain="file" path="librepocket_keysets" />\n'
         '        <exclude domain="sharedpref" path="assistant_role.xml" />\n'
         '        <exclude domain="file" path="datastore/librepocket_privilege_bridge.preferences_pb" />\n'
+        '        <exclude domain="file" path="datastore/librepocket_privilege_bridge.preferences_pb.tmp" />\n'
         '        <exclude domain="file" path="datastore/librepocket_shizuku_grant.preferences_pb" />\n'
+        '        <exclude domain="file" path="datastore/librepocket_shizuku_grant.preferences_pb.tmp" />\n'
         # Device-bound (finding #3 [P3] + #136-B1 grant lifecycle): always
         # required alongside the five key entries, in EVERY checked scope
         # (both extraction branches).
     )
 
-    # REQUIRED (5 key) + DEVICE-BOUND (3) total expected in every scope.
+    # REQUIRED (5 key) + DEVICE-BOUND (5) total expected in every scope.
     _TOTAL_EXCLUDES = len(backup_rules_check.REQUIRED_EXCLUDES) + len(
         backup_rules_check.REQUIRED_DEVICE_BOUND_EXCLUDES
     )
@@ -5567,7 +5641,9 @@ class BackupRulesValidator(unittest.TestCase):
             '    <exclude domain="file" path="librepocket_keysets" />\n'
             '    <exclude domain="sharedpref" path="assistant_role.xml" />\n'
             '    <exclude domain="file" path="datastore/librepocket_privilege_bridge.preferences_pb" />\n'
+            '    <exclude domain="file" path="datastore/librepocket_privilege_bridge.preferences_pb.tmp" />\n'
             '    <exclude domain="file" path="datastore/librepocket_shizuku_grant.preferences_pb" />\n'
+            '    <exclude domain="file" path="datastore/librepocket_shizuku_grant.preferences_pb.tmp" />\n'
             "    -->\n"
         )
         path = self._write(
@@ -5689,7 +5765,7 @@ class BackupRulesValidator(unittest.TestCase):
     def test_exclude_moved_into_duplicate_section_fails_gate(self) -> None:
         # Splitting the required excludes across duplicate cloud-backup
         # sections must not satisfy the gate: every occurrence must carry the
-        # full eight-exclude set (5 key + 3 device-bound).
+        # full ten-exclude set (5 key + 5 device-bound).
         split = (
             "    <cloud-backup>\n"
             '        <exclude domain="sharedpref" path="librepocket_keys.xml" />\n'
@@ -5708,8 +5784,8 @@ class BackupRulesValidator(unittest.TestCase):
         )
         path = self._write("data_extraction_rules.xml", body)
         errors = self._check(path)
-        # First occurrence misses 7 (4 key + 3 device-bound), second misses 4
-        # (keys + 3 device-bound; sharedpref key covered there, first misses
+        # First occurrence misses 9 (4 key + 5 device-bound), second misses 6
+        # (keys + 5 device-bound; sharedpref key covered there, first misses
         # it) — every occurrence must be complete.
         self.assertTrue(
             any("missing exclude domain=database path=librepocket_vault" in e for e in errors),
@@ -5842,7 +5918,7 @@ class BackupRulesValidator(unittest.TestCase):
     def test_exact_excludes_mode_flags_set_differences(self) -> None:
         # Artifact-level authority: `exact_excludes=True` (the compiled-bytes
         # scan) demands the exact REQUIRED + DEVICE-BOUND set (5 key +
-        # 3 device-bound, single-sourced as the allowlist) - a missing entry
+        # 5 device-bound, single-sourced as the allowlist) - a missing entry
         # fails as usual AND an unexpected extra is a set difference too,
         # order-free. Source-level default stays presence-only (over-shielding
         # tolerated at source: the exact-set pin is deliberately compiled-byte
@@ -5894,7 +5970,7 @@ class BackupRulesValidator(unittest.TestCase):
     def test_exact_excludes_allows_required_device_bound_entry(self) -> None:
         # Finding #3 [P3] + #136-B1 positive control: all allowlisted
         # device-bound entries are REQUIRED, not merely tolerated - the exact
-        # eight-entry set (5 key + 3 device-bound) passes with zero errors and
+        # ten-entry set (5 key + 5 device-bound) passes with zero errors and
         # is reported as NEITHER missing NOR unexpected (no double-report).
         tree = ET.fromstring(self._full_backup(self._ALL_EXCLUDES))
         self.assertEqual(
@@ -6221,6 +6297,57 @@ class BackupRulesValidator(unittest.TestCase):
             ),
             [],
         )
+
+    def test_exact_excludes_rejects_missing_privilege_tmp_siblings(self) -> None:
+        # #136-B1 grant lifecycle: the DataStore FileStorageConnection writes
+        # <name>.preferences_pb.tmp before rename; the exact-set gate demands
+        # the .tmp siblings too (5 key + 5 device-bound).
+        for grant_path in (
+            "datastore/librepocket_privilege_bridge.preferences_pb.tmp",
+            "datastore/librepocket_shizuku_grant.preferences_pb.tmp",
+        ):
+            with self.subTest(missing=grant_path):
+                without_tmp = self._ALL_EXCLUDES.replace(
+                    f'        <exclude domain="file" path="{grant_path}" />\n',
+                    "",
+                )
+                self.assertNotEqual(without_tmp, self._ALL_EXCLUDES)
+                tree = ET.fromstring(self._full_backup(without_tmp))
+                errors = backup_rules_check.validate_tree(
+                    tree,
+                    "x",
+                    backup_rules_check.EXPECTED_ROOT_BACKUP_RULES,
+                    exact_excludes=True,
+                )
+                self.assertTrue(
+                    any(f"missing exclude domain=file path={grant_path}" in e for e in errors),
+                    errors,
+                )
+                self.assertFalse(any("unexpected exclude" in e for e in errors), errors)
+
+                for branch, cloud, device in (
+                    ("<cloud-backup>", without_tmp, self._ALL_EXCLUDES),
+                    ("<device-transfer>", self._ALL_EXCLUDES, without_tmp),
+                ):
+                    with self.subTest(branch=branch):
+                        branch_tree = ET.fromstring(self._data_extraction(cloud, device))
+                        branch_errors = backup_rules_check.validate_tree(
+                            branch_tree,
+                            "x",
+                            backup_rules_check.EXPECTED_ROOT_DATA_EXTRACTION,
+                            exact_excludes=True,
+                        )
+                        self.assertTrue(
+                            any(
+                                f"{branch} missing exclude domain=file path={grant_path}" in e
+                                for e in branch_errors
+                            ),
+                            branch_errors,
+                        )
+                        self.assertFalse(
+                            any("unexpected exclude" in e for e in branch_errors),
+                            branch_errors,
+                        )
 
     def test_source_level_requires_privilege_grant_excludes(self) -> None:
         # #136-B1 grant lifecycle at the source face: missing either
@@ -8627,7 +8754,9 @@ class BackupRulesGateEndToEnd(unittest.TestCase):
             "    <exclude domain=\"file\" path=\"librepocket_keysets\" />\n"
             "    <exclude domain=\"sharedpref\" path=\"assistant_role.xml\" />\n"
             "    <exclude domain=\"file\" path=\"datastore/librepocket_privilege_bridge.preferences_pb\" />\n"
+            "    <exclude domain=\"file\" path=\"datastore/librepocket_privilege_bridge.preferences_pb.tmp\" />\n"
             "    <exclude domain=\"file\" path=\"datastore/librepocket_shizuku_grant.preferences_pb\" />\n"
+            "    <exclude domain=\"file\" path=\"datastore/librepocket_shizuku_grant.preferences_pb.tmp\" />\n"
             "</full-backup-content>\n",
             encoding="utf-8",
         )
@@ -8642,7 +8771,9 @@ class BackupRulesGateEndToEnd(unittest.TestCase):
             "        <exclude domain=\"file\" path=\"librepocket_keysets\" />\n"
             "        <exclude domain=\"sharedpref\" path=\"assistant_role.xml\" />\n"
             "        <exclude domain=\"file\" path=\"datastore/librepocket_privilege_bridge.preferences_pb\" />\n"
+            "        <exclude domain=\"file\" path=\"datastore/librepocket_privilege_bridge.preferences_pb.tmp\" />\n"
             "        <exclude domain=\"file\" path=\"datastore/librepocket_shizuku_grant.preferences_pb\" />\n"
+            "        <exclude domain=\"file\" path=\"datastore/librepocket_shizuku_grant.preferences_pb.tmp\" />\n"
             "    </cloud-backup>\n"
             "    <device-transfer>\n"
             "        <exclude domain=\"sharedpref\" path=\"librepocket_keys.xml\" />\n"
@@ -8652,7 +8783,9 @@ class BackupRulesGateEndToEnd(unittest.TestCase):
             "        <exclude domain=\"file\" path=\"librepocket_keysets\" />\n"
             "        <exclude domain=\"sharedpref\" path=\"assistant_role.xml\" />\n"
             "        <exclude domain=\"file\" path=\"datastore/librepocket_privilege_bridge.preferences_pb\" />\n"
+            "        <exclude domain=\"file\" path=\"datastore/librepocket_privilege_bridge.preferences_pb.tmp\" />\n"
             "        <exclude domain=\"file\" path=\"datastore/librepocket_shizuku_grant.preferences_pb\" />\n"
+            "        <exclude domain=\"file\" path=\"datastore/librepocket_shizuku_grant.preferences_pb.tmp\" />\n"
             "    </device-transfer>\n"
             "</data-extraction-rules>\n",
             encoding="utf-8",
@@ -8750,7 +8883,9 @@ class BackupRulesGateEndToEnd(unittest.TestCase):
                 "        <exclude domain=\"file\" path=\"librepocket_keysets\" />\n"
                 "        <exclude domain=\"sharedpref\" path=\"assistant_role.xml\" />\n"
                 "        <exclude domain=\"file\" path=\"datastore/librepocket_privilege_bridge.preferences_pb\" />\n"
+                "        <exclude domain=\"file\" path=\"datastore/librepocket_privilege_bridge.preferences_pb.tmp\" />\n"
                 "        <exclude domain=\"file\" path=\"datastore/librepocket_shizuku_grant.preferences_pb\" />\n"
+                "        <exclude domain=\"file\" path=\"datastore/librepocket_shizuku_grant.preferences_pb.tmp\" />\n"
                 "    </cloud-backup>\n"
                 "    <device-transfer>\n"
                 "        <exclude domain=\"sharedpref\" path=\"librepocket_keys.xml\" />\n"
@@ -8760,7 +8895,9 @@ class BackupRulesGateEndToEnd(unittest.TestCase):
                 "        <exclude domain=\"file\" path=\"librepocket_keysets\" />\n"
                 "        <exclude domain=\"sharedpref\" path=\"assistant_role.xml\" />\n"
                 "        <exclude domain=\"file\" path=\"datastore/librepocket_privilege_bridge.preferences_pb\" />\n"
+                "        <exclude domain=\"file\" path=\"datastore/librepocket_privilege_bridge.preferences_pb.tmp\" />\n"
                 "        <exclude domain=\"file\" path=\"datastore/librepocket_shizuku_grant.preferences_pb\" />\n"
+                "        <exclude domain=\"file\" path=\"datastore/librepocket_shizuku_grant.preferences_pb.tmp\" />\n"
                 "    </device-transfer>\n"
                 "</data-extraction-rules>\n",
                 encoding="utf-8",
@@ -8787,7 +8924,9 @@ class BackupRulesGateEndToEnd(unittest.TestCase):
                 "    <exclude domain=\"file\" path=\"librepocket_keysets\" />\n"
                 "    <exclude domain=\"sharedpref\" path=\"assistant_role.xml\" />\n"
                 "    <exclude domain=\"file\" path=\"datastore/librepocket_privilege_bridge.preferences_pb\" />\n"
+                "    <exclude domain=\"file\" path=\"datastore/librepocket_privilege_bridge.preferences_pb.tmp\" />\n"
                 "    <exclude domain=\"file\" path=\"datastore/librepocket_shizuku_grant.preferences_pb\" />\n"
+                "    <exclude domain=\"file\" path=\"datastore/librepocket_shizuku_grant.preferences_pb.tmp\" />\n"
                 "</full-backup-content>\n",
                 encoding="utf-8",
             )
@@ -8804,7 +8943,9 @@ class BackupRulesGateEndToEnd(unittest.TestCase):
                 "        <exclude domain=\"file\" path=\"librepocket_keysets\" />\n"
                 "        <exclude domain=\"sharedpref\" path=\"assistant_role.xml\" />\n"
                 "        <exclude domain=\"file\" path=\"datastore/librepocket_privilege_bridge.preferences_pb\" />\n"
+                "        <exclude domain=\"file\" path=\"datastore/librepocket_privilege_bridge.preferences_pb.tmp\" />\n"
                 "        <exclude domain=\"file\" path=\"datastore/librepocket_shizuku_grant.preferences_pb\" />\n"
+                "        <exclude domain=\"file\" path=\"datastore/librepocket_shizuku_grant.preferences_pb.tmp\" />\n"
                 "    </cloud-backup>\n"
                 "    <device-transfer>\n"
                 "        <exclude domain=\"sharedpref\" path=\"librepocket_keys.xml\" />\n"
@@ -8814,7 +8955,9 @@ class BackupRulesGateEndToEnd(unittest.TestCase):
                 "        <exclude domain=\"file\" path=\"librepocket_keysets\" />\n"
                 "        <exclude domain=\"sharedpref\" path=\"assistant_role.xml\" />\n"
                 "        <exclude domain=\"file\" path=\"datastore/librepocket_privilege_bridge.preferences_pb\" />\n"
+                "        <exclude domain=\"file\" path=\"datastore/librepocket_privilege_bridge.preferences_pb.tmp\" />\n"
                 "        <exclude domain=\"file\" path=\"datastore/librepocket_shizuku_grant.preferences_pb\" />\n"
+                "        <exclude domain=\"file\" path=\"datastore/librepocket_shizuku_grant.preferences_pb.tmp\" />\n"
                 "    </device-transfer>\n"
                 "</data-extraction-rules>\n",
                 encoding="utf-8",
@@ -8847,7 +8990,9 @@ class BackupRulesGateEndToEnd(unittest.TestCase):
                 "        <exclude domain=\"file\" path=\"librepocket_keysets\" />\n"
                 "        <exclude domain=\"sharedpref\" path=\"assistant_role.xml\" />\n"
                 "        <exclude domain=\"file\" path=\"datastore/librepocket_privilege_bridge.preferences_pb\" />\n"
+                "        <exclude domain=\"file\" path=\"datastore/librepocket_privilege_bridge.preferences_pb.tmp\" />\n"
                 "        <exclude domain=\"file\" path=\"datastore/librepocket_shizuku_grant.preferences_pb\" />\n"
+                "        <exclude domain=\"file\" path=\"datastore/librepocket_shizuku_grant.preferences_pb.tmp\" />\n"
                 "    </cloud-backup>\n"
                 "    <device-transfer>\n"
                 "        <exclude domain=\"sharedpref\" path=\"librepocket_keys.xml\" />\n"
@@ -8857,7 +9002,9 @@ class BackupRulesGateEndToEnd(unittest.TestCase):
                 "        <exclude domain=\"file\" path=\"librepocket_keysets\" />\n"
                 "        <exclude domain=\"sharedpref\" path=\"assistant_role.xml\" />\n"
                 "        <exclude domain=\"file\" path=\"datastore/librepocket_privilege_bridge.preferences_pb\" />\n"
+                "        <exclude domain=\"file\" path=\"datastore/librepocket_privilege_bridge.preferences_pb.tmp\" />\n"
                 "        <exclude domain=\"file\" path=\"datastore/librepocket_shizuku_grant.preferences_pb\" />\n"
+                "        <exclude domain=\"file\" path=\"datastore/librepocket_shizuku_grant.preferences_pb.tmp\" />\n"
                 "    </device-transfer>\n"
                 "</data-extraction-rules>\n",
                 encoding="utf-8",
@@ -9528,7 +9675,9 @@ class BackupRulesGateEndToEnd(unittest.TestCase):
                 '        <exclude domain="file" path="librepocket_keysets" />\n'
                 '        <exclude domain="sharedpref" path="assistant_role.xml" />\n'
                 '        <exclude domain="file" path="datastore/librepocket_privilege_bridge.preferences_pb" />\n'
+                '        <exclude domain="file" path="datastore/librepocket_privilege_bridge.preferences_pb.tmp" />\n'
                 '        <exclude domain="file" path="datastore/librepocket_shizuku_grant.preferences_pb" />\n'
+                '        <exclude domain="file" path="datastore/librepocket_shizuku_grant.preferences_pb.tmp" />\n'
                 "    </cloud-backup>\n"
                 "    <device-transfer>\n"
                 '        <exclude domain="sharedpref" path="librepocket_keys.xml" />\n'
@@ -9538,7 +9687,9 @@ class BackupRulesGateEndToEnd(unittest.TestCase):
                 '        <exclude domain="file" path="librepocket_keysets" />\n'
                 '        <exclude domain="sharedpref" path="assistant_role.xml" />\n'
                 '        <exclude domain="file" path="datastore/librepocket_privilege_bridge.preferences_pb" />\n'
+                '        <exclude domain="file" path="datastore/librepocket_privilege_bridge.preferences_pb.tmp" />\n'
                 '        <exclude domain="file" path="datastore/librepocket_shizuku_grant.preferences_pb" />\n'
+                '        <exclude domain="file" path="datastore/librepocket_shizuku_grant.preferences_pb.tmp" />\n'
                 "    </device-transfer>\n"
                 "</data-extraction-rules>\n",
                 encoding="utf-8",

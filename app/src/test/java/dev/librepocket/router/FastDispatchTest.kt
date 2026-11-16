@@ -3385,6 +3385,8 @@ class FastDispatchTest {
             // Leading-colon token-body residual（記錄已接受殘餘：冒號開頭入 Step E）：
             "查 ::,Foo 符號" to "::,Foo",
             "查 :;Foo 符號" to ":;Foo",
+            // EN-delimited 尾端 `::` verbatim 保留；全形 `：` 拒 ⇒ clarify（見下方澄清 pins）：
+            "find symbol Foo::" to "Foo::",
         )) {
             val d = decide(text)
             assertEquals(text, RouteKind.FAST, d.route)
@@ -3415,6 +3417,9 @@ class FastDispatchTest {
             "查 Foo： 符號",
             "symbols Foo：",
             "查 ::符號 符號",
+            // 裸 cue＋尾端冒號：BARE_SYMBOL_CUE_WRAP（包夾守衛）夾尾拒 ⇒ 澄清（不受 stage-9.3 尾端 verbatim 放行影響）：
+            "查 符號:",
+            "查 符號::",
         )) {
             val d = decide(text)
             assertEquals(text, RouteKind.DENIED, d.route)
@@ -3503,6 +3508,9 @@ class FastDispatchTest {
             // #19 B3 stage-9.1 新增 arm H/I 負向釘：
             "查Foo符號如果我同意",
             "查Foo符號明天再做",
+            // stage-9.4（release-gate 鎳）：arm H 代表攻擊形（未列舉亦必否決）：
+            "查Foo再做符號",
+            "symbols 再佔再做",
             "查Foo符號等審批後再做",
         )) {
             val d = decide(text)

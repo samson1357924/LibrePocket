@@ -862,7 +862,7 @@ class FastRouter(
          * - `查 find 符號`/`查 search 符號` 等（stage-9.2 起）：CJK-leading 語句先讀
          *   CJK 語法——尾綴 cue 剝去後 `find`/`search` 為合法 verbatim 識別字
          *   ⇒ FAST `find`／`search`（stage-8.3 的 EN-delimited `符號` verbatim 解讀
-         *   已被 CJK-preferred 兩階段取代——三支 stage-8.3 pin 翻轉，見 extraction
+         *   已被 CJK-preferred 兩階段取代——五支 stage-8.3 pin 翻轉（find/Symbol/symbols/lookup/locate；三支規格明列＋lookup/locate 同族同根），見 extraction
          *   KDoc 與 FastDispatchTest pins）；
          *   非 cue 位置的動詞不再剝離（見 extraction KDoc）。
          */
@@ -1160,7 +1160,7 @@ class FastRouter(
          * legal `Symbol(s)` identifier was destroyed (`find symbol symbol` /
          * `symbols symbols` mapped to 空 ⇒ 澄清 — stage-9.2, Re-review #9 A2).
          * `查 Symbol 符號` → FAST `Symbol`、`查 symbols 符號` → FAST
-         * `symbols`、`查 find 符號` → FAST `find`（三支 stage-8.3 pin 翻轉，
+         * `symbols`、`查 find 符號` → FAST `find`（五支 stage-8.3 pin 翻轉；三支規格明列＋lookup/locate 同族同根），
          * EN 動詞/ cue 形字詞被 CJK 語境繫結為識別字 verbatim——READ-only 查詢、
          * 不改寫；CJK-leading 語句一律先讀 CJK 語法）；`find symbol symbol` ⇒
          * FAST `symbol`、`symbols symbols` ⇒ FAST `symbols`、
@@ -1622,7 +1622,8 @@ class FastRouter(
                 // guard rejection, …) ⇒ fall through to the EN pipeline, which
                 // re-consumes the same CJK opener and runs the full A/B machine.
                 // The EN path's own guards reproduce any CJK-branch rejection —
-                // never silently trading the CJK result for an execution.
+                // never silently trading the CJK result for an execution when no EN consumption occurs;
+                // when EN grammar delimits the carve-out, the documented stage-8.3 verbatim binding applies.
             }
             var s = trimmed
             // #19 B3 stage-8.3 — EN-delimited 殘餘旗標：EN opener（SYMBOL_OPENER_EN）、

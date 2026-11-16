@@ -135,7 +135,7 @@ internal class DeadlineExceededException : RuntimeException()
  *   例外：leader 於取消前已完整產出 Ok（okForFollowers 路徑）者，follower
  *   收到該 Ok 而非 CANCELLED——但 Ok 仍須先通過下方之 chain-face 驗證及其後之
  *   post-validation epoch re-check 才交付。
- *   單飛 follower 之 chain-face（leader 路徑產出 Ok 後交付 follower 前）契約：
+ *   單飛 follower 之 chain-face（leader 路徑產出 Ok 交付前／HTTP status 非 Ok replay 前）契約：
  *   follower await 回 Ok 後，**leader 記錄之 chain 須以 follower 自己的 opt-in／
  *   resolver／deadline 逐跳重驗**（規則與 fetch 相同：跨 origin opt-in 不可逆降級、
  *   https→http 連續對拒、per-hop policyGate＋sorted distinct token 相等；
@@ -145,19 +145,31 @@ internal class DeadlineExceededException : RuntimeException()
  *   以有界重選舉（`bindingRestarts` ≤ [MAX_STALE_RESTARTS]）以自己的 binding 重 fetch；
  *   leader 內容不得跨越不符之驗證邊界；
  *   驗證成功則 leader 之 Ok verbatim 交付（不修改內容）。
- *   非 Ok 之 completed outcome 絕不賦予 follower：leader 之拒絕／錯誤可能是針對
- *   *它自己的* resolver/opt-in 評估（含 redirect 各跳）所為之決策，跨上下文共享＝
- *   錯誤歸因＋false denial（可得性隔離缺陷）；follower await 回非 Ok 之完成
- *   [LeaderOutcome] 時一律視為 miss、不 join 該 deferred、改以自己的 opt-in／resolver／
- *   deadline 有界重選舉重評估全鏈（`bindingRestarts` ≤ [MAX_STALE_RESTARTS]；超過即
- *   fail-closed `Failed(TRANSPORT)`）。代價（刻意取捨）：一個失敗的 leader 對每個
- *   follower 各多花一次有界重選舉，而非即時回 surface leader 之拒絕——以確保
- *   政策相依之失敗歸因於產生該失敗之評估者。
+ *   非 Ok 之 completed outcome 預設絕不賦予 follower，唯一例外為 binding-validated 之
+ *   HTTP status 失敗（round 6）：`Failed` 且 detail 以 `HTTP_` 開頭、leader 終態 chain
+ *   非空（chain 於所有終態路徑——Ok／非 Ok 返回／例外逸出——一律由 chainSink 之 finally 交付），
+ *   follower 須先以**自己的** opt-in／resolver／deadline 對該 chain 做 bounded 重驗
+ *   （`validateChain`，規則與 fetch 相同；以 follower 剩餘預算為界 `withTimeoutOrNull`；
+ *   `DeadlineExceededException` → 驗證失敗）且 epoch 未漂移，方可 verbatim 交付該 HTTP verdict
+ *   （binding-validated shared fact；同 hop binding、同 status；不寫快取——cache 寫入規則 Ok-only 不變）。
+ *   其餘非 Ok（非 `HTTP_` 之 Failed——TRANSPORT／TIMEOUT／BAD_RESPONSE／TOO_LARGE／…、
+ *   所有 Unavailable、缺 chain 之 HTTP_、重驗失敗或 epoch 漂移）一律絕不賦予 follower：
+ *   leader 之拒絕／錯誤可能是針對 *它自己的* resolver/opt-in 評估（含 redirect 各跳）所為之決策，
+ *   跨上下文共享＝錯誤歸因＋false denial（可得性隔離缺陷）；follower await 回該等完成
+ *   [LeaderOutcome] 時視為 miss、不 join 該 deferred、改以自己的 opt-in／resolver／deadline
+ *   有界重選舉重評估全鏈（`bindingRestarts` ≤ [MAX_STALE_RESTARTS]；超過即 fail-closed
+ *   `Failed(TRANSPORT)`）。代價（刻意取捨）：一個失敗的 leader 對每個 follower 各多花一次
+ *   有界重選舉，而非即時回 surface leader 之拒絕——以確保政策相依之失敗歸因於產生該失敗之評估者。
+ * - `bindingValidatedHttpStatusReplay`：對 binding-validated 之共享綁定，
+ *   caller 一律取得 HTTP status verdict（`Failed(HTTP_xxx)`）——follower 以自己的 binding
+ *   重驗 leader 記錄之 chain 且 epoch 未漂移即 verbatim 交付（同 hop binding、同 status）；
+ *   跨 binding（驗證失敗／epoch 漂移／鏈缺失）即各自 refetch（follower 以自己的 binding 有界重選舉）。
  *   例外 carve-outs（皆為例外／逾時路徑、非 completed outcome，行為不變）：leader 被
  *   取消而 follower 仍 active → follower 映射 `Unavailable(CANCELLED)`（不重進單飛迴圈）；
  *   follower 自身 await 預算耗盡（leader 仍在跑）→ `Failed(TIMEOUT)`。
  *   （注意：leader 自身 deadline 耗盡而 complete 之 `Failed(TIMEOUT)` 屬 completed
- *   non-Ok outcome——follower 不繼承、走上述有界重選舉；非 carve-out。）
+ *   non-Ok outcome 且 detail 不以 `HTTP_` 開頭——不可 replay，follower 不繼承、走上述
+ *   有界重選舉；非 carve-out。）
  * - 內容：`title/url/snippet/published/siteName` 正規化（HTML-family 見 [parseHtml]：
  *   tag 剝除＋entity unescape；非 HTML-family 已放行型別走 raw-text 管線，
  *   不刪 tag、不 unescape，raw `&` 原樣保留，見 [pipelineOf]；raw-text 保留原文
@@ -223,15 +235,24 @@ internal class DeadlineExceededException : RuntimeException()
  *    token 相等；以 follower 剩餘預算為界）——驗證失敗即 miss 語義（follower 不收
  *    到該 Ok；以自己的 binding 有界重選舉，`bindingRestarts` ≤ [MAX_STALE_RESTARTS]，
  *    超過 fail-closed `Failed(TRANSPORT)`）；leader 內容不得跨越不符之驗證邊界。
- *    同理，leader 之 **非 Ok completed outcome** 亦絕不賦予 follower（round 5）：follower
- *    await 回非 Ok 之完成 [LeaderOutcome] 時視為 miss、不 join 該 deferred、以自己的
+ *    同理，leader 之 **非 Ok completed outcome** 預設絕不賦予 follower（round 6 細化 round 5）：
+ *    唯一例外為 binding-validated 之 HTTP status 失敗——`Failed` 且 detail 以 `HTTP_` 開頭、
+ *    leader 終態 chain 非空（chainSink 於所有終態路徑交付）者，follower await 回該完成
+ *    [LeaderOutcome] 時，僅於以自己的 opt-in／resolver／deadline 對 leader 記錄之 chain 完成
+ *    bounded 重驗（`validateChain`，規則與 fetch 相同；以 follower 剩餘預算為界；
+ *    `DeadlineExceededException` → 驗證失敗）且 epoch 未漂移後，verbatim 交付該 HTTP
+ *    verdict（binding-validated shared fact；不寫快取）。其餘非 Ok——非 `HTTP_` 之 Failed
+ *    （TRANSPORT／TIMEOUT／BAD_RESPONSE／TOO_LARGE／…）、所有 Unavailable、缺 chain 之
+ *    HTTP_、重驗失敗或 epoch 漂移——一律視為 miss、不 join 該 deferred、以自己的
  *    binding 有界重選舉重評估全鏈（`bindingRestarts` ≤ [MAX_STALE_RESTARTS]，超過 fail-closed
  *    `Failed(TRANSPORT)`）——leader 之拒絕／錯誤可能是針對 *它自己的* resolver/opt-in
  *    評估（含 redirect 各跳）所為之決策，跨上下文共享＝錯誤歸因＋false denial。
+ *    （`bindingValidatedHttpStatusReplay`：binding-validated 之共享綁定——
+ *    caller 一律取得 HTTP status verdict；跨 binding 則各自 refetch。）
  *    殘餘（誠實聲明，**非**「完整 redirect 隔離」已達成）：(a) awaited Ok 內容仍由
  *    leader 於其 hop-0 等效信任之 binding 下產出——成功之 follower 信任 hop-0 key
  *    綁定＋其自身之逐跳 re-validation 結果（同 URL、同解析答案者信任成立）；
- *    (b) Ok 交付窗口含 follower 之鏈重驗（L×(DNS+policy)）時段；`validateChain` 通過後之 epoch re-check 後完成之撤權仍可能落在 re-check→delivery 之靜默窗口內（與 cache arm 同一脫管交付殘留類），絕不經 cache 寫回；follower 重驗不改變 leader Ok 之內容。
+ *    (b) Ok 交付窗口含 follower 之鏈重驗（L×(DNS+policy)）時段；`validateChain` 通過後之 epoch re-check 後完成之撤權仍可能落在 re-check→delivery 之靜默窗口內（與 cache arm 同一脫管交付殘留類），絕不經 cache 寫回；follower 重驗不改變 leader Ok 之內容；HTTP status verdict 之 replay 交付為同窗口類（re-check→delivery 靜默窗口內之撤權仍可能攔截不到；同 detached 交付殘留類），同樣不經 cache 寫回。
  *    (c) 解析答案與 chain 相符之 follower 須付 L×(DNS+policy) 驗證成本——與 cache
  *    hit 同一成本類別；(d) 驗證僅涵蓋 delivery 前之窗口，不承諾對之後撤權之追溯
  *    失效（同 detached 交付殘留類）。
@@ -246,13 +267,20 @@ internal class DeadlineExceededException : RuntimeException()
  *    流程，envelope 不擔任 authorization 角色。
  * 5. Follower `await()` 已由同一 `withTimeoutOrNull` 預算為界，逾時映射
  *    `Failed(TIMEOUT)`（audit 上與 `CANCELLED` 區分）；per-follower 獨立
- *    deadline 仍為可能的 D3 強化項。leader 之 **非 Ok completed outcome** 一律不賦予
- *    follower（round 5）：follower 視為 miss、以自己的 binding 有界重選舉重評估全鏈
- *    （`bindingRestarts` ≤ [MAX_STALE_RESTARTS]，超過 → fail-closed
- *    `Failed(TRANSPORT)`）；僅例外／逾時路徑（leader 取消 → `Unavailable(CANCELLED)`；
- *    follower 自身 await 預算耗盡＝leader 仍在跑 → `Failed(TIMEOUT)`）不進重選舉。
+ *    deadline 仍為可能的 D3 強化項。leader 之 **非 Ok completed outcome** 預設不賦予
+ *    follower（round 6 細化 round 5）：唯一例外為 `Failed` 且 detail 以 `HTTP_` 開頭、
+ *    leader 終態 chain 非空，且 follower 以自己的 opt-in／resolver／deadline 對該 chain
+ *    完成 bounded 重驗（`validateChain`，以 follower 剩餘預算為界）＋ epoch 未漂移者，
+ *    方 verbatim 交付該 HTTP status verdict（binding-validated shared fact；不寫快取；
+ *    `bindingValidatedHttpStatusReplay`：caller 一律取得 HTTP status verdict；
+ *    跨 binding 則各自 refetch）。其餘非 Ok——非 `HTTP_` 之 Failed、所有 Unavailable、
+ *    缺 chain 之 HTTP_、重驗失敗或 epoch 漂移——一律不賦予 follower：follower 視為 miss、
+ *    以自己的 binding 有界重選舉重評估全鏈（`bindingRestarts` ≤ [MAX_STALE_RESTARTS]，
+ *    超過 → fail-closed `Failed(TRANSPORT)`）；僅例外／逾時路徑（leader 取消 →
+ *    `Unavailable(CANCELLED)`；follower 自身 await 預算耗盡＝leader 仍在跑 →
+ *    `Failed(TIMEOUT)`）不進重選舉。
  *    （leader 自身 deadline 耗盡而 complete 之 `Failed(TIMEOUT)` 屬 completed non-Ok
- *    outcome——follower 不繼承、走上述有界重選舉。）
+ *    outcome，detail 不以 `HTTP_` 開頭——不可 replay；follower 不繼承、走上述有界重選舉。）
  * 6. `timeoutMs <= 0` 會被 `coerceAtLeast(1)` 收斂為 1ms 預算 — 幾乎立即
  *    fail-closed `TIMEOUT`；屬保守方向，安全可接受。
  * 7. 位元組加權 LRU 快取上限已實作（[MAX_CACHE_BYTES] 4 MiB：near-weighted
@@ -378,7 +406,9 @@ object WebExtract {
      * follower 收到該 Ok 而非 CANCELLED（仍須先通過 follower 自己之
      * chain-face 逐跳重驗；見 D3 追蹤項 #1）。
      * （本 detail 僅覆蓋例外／取消路徑；completed 之非 Ok outcome 不在此語義內——
-     * 該路徑一律非直接交付，而是 follower 有界重選舉重評估全鏈；見 `extract()` KDoc。）
+     * 該路徑預設非直接交付，而是 follower 有界重選舉重評估全鏈；唯 binding-validated 之
+     * HTTP status 失敗（`Failed`，detail 以 `HTTP_` 開頭，leader 終態 chain 非空，follower
+     * 以自己的 binding 重驗通過且 epoch 未漂移）會 verbatim 交付；見 `extract()` KDoc。）
      */
     const val DETAIL_CANCELLED = "CANCELLED"
 }
@@ -884,7 +914,9 @@ class WebExtractCache(
  *   （含 DNS preflight）仍執行）；快取 key 含 policy identity（`policy`＋`configRevision`）
  *   ＋hop-0 已核准位址集合；redirect 逐跳之信任上下文由 entry 之
  *   [HopBinding] 鏈逐跳重驗（不符即 miss）；follower 於 Ok 交付前亦以自己的
- *   opt-in／resolver／deadline 逐跳重驗 leader 記錄之 chain（見 D3 追蹤項 #1）；
+ *   opt-in／resolver／deadline 逐跳重驗 leader 記錄之 chain（見 D3 追蹤項 #1；
+ *   HTTP status 非 Ok 失敗亦經 follower 自己 binding 之同一重驗後方可 replay 交付——
+ *   非 `HTTP_` 之非 Ok 一律 bounded 重選舉，見 `extract()` KDoc）；
  *   快取 key 刻意不含 resolver／endpoint 身份；重驗失敗不讀取快取；
  *   命中前仍須 per-call 政策重驗（含 DNS preflight），不同首跳解析答案
  *   （同 policy＋revision 亦然）不得重用結果；重驗本身不 purge 快取；
@@ -979,6 +1011,7 @@ class WebExtractService(
      * 完成給自己的 caller；僅 map 中的入口改掛新世代）。
      *
      * 單飛 follower 之 chain-face 契約：follower await 回 **Ok** 後，不得直接交付；
+     * HTTP status 之非 Ok（`Failed` 且 detail 以 `HTTP_` 開頭、chain 非空）後，亦僅經同一重驗始得交付；
      * leader 記錄之 chain 須先以 follower 自己的 opt-in／resolver／deadline 逐跳重驗
      * （規則與 fetch 相同；以 follower 剩餘預算為界）；驗證失敗即 miss 語義——
      * follower 不取得該 Ok、不寫快取、不 purge 快取，以有界重選舉
@@ -986,21 +1019,30 @@ class WebExtractService(
      * 驗證成功則 leader 之 Ok verbatim 交付（不修改內容）——但交付前另有一道
      * post-validation epoch re-check（鏡射 [verifiedCachedHit]；撤權於 re-check 之前
      * 完成者抑制交付，視為 miss）。leader 內容不得跨越不符之驗證邊界。
-     * 非 Ok 之 completed outcome 亦絕不賦予 follower（round 5）：follower await 回非 Ok 之
-     * 完成 [LeaderOutcome] 時一律視為 miss、不 join 該 deferred（`skipJoinForDeferred`）、
-     * 改以自己的 opt-in／resolver／deadline 有界重選舉重評估全鏈
+     * 非 Ok 之 completed outcome 預設不賦予 follower（round 6 細化 round 5）：唯一例外為
+     * `Failed` 且 detail 以 `HTTP_` 開頭、leader 終態 chain 非空（chainSink 於所有終態路徑
+     * 交付）之 HTTP status 失敗——follower await 回該完成 [LeaderOutcome] 時，僅於以自己的
+     * opt-in／resolver／deadline 對 leader 記錄之 chain 完成 bounded 重驗（規則與 fetch 相同；
+     * 以 follower 剩餘預算為界；`DeadlineExceededException` → 驗證失敗）且 epoch 未漂移後，
+     * verbatim 交付該 HTTP verdict（binding-validated shared fact；不寫快取）。其餘非 Ok
+     * （非 `HTTP_` 之 Failed、所有 Unavailable、缺 chain 之 HTTP_、重驗失敗或 epoch 漂移）
+     * 一律視為 miss、不 join 該 deferred（`skipJoinForDeferred`）、改以自己的
+     * opt-in／resolver／deadline 有界重選舉重評估全鏈
      * （`bindingRestarts` ≤ [MAX_STALE_RESTARTS]，超過即 fail-closed `Failed(TRANSPORT)`）；
      * leader 之拒絕／錯誤不得跨 resolver／政策上下文共享（錯誤歸因＋false denial）。
      * 例外 carve-outs（例外／逾時路徑、非 completed outcome，行為不變）：leader 被取消 →
      * follower 映射 `Unavailable(CANCELLED)`；follower 自身 await 預算耗盡
      * （leader 仍在跑）→ `Failed(TIMEOUT)`。leader 自身 deadline 耗盡而 complete 之
-     * `Failed(TIMEOUT)` 屬 completed non-Ok outcome——follower 不繼承、走上述有界重選舉。
+     * `Failed(TIMEOUT)` 屬 completed non-Ok outcome 且 detail 不以 `HTTP_` 開頭——不可 replay、
+     * follower 不繼承、走上述有界重選舉。
      * mismatch 時 election 不得 join 該 deferred 之 `inFlight` 條目（`skipJoinForDeferred`），
      * 而由 caller 自己當 leader（自己的 binding 自行 fetch）。
      *
      * deferred 攜帶之值為 [LeaderOutcome]（結果＋leader 記錄之 chain）——chain 經由
      * deferred completion edge 跨協程傳遞（happens-before 由 `CompletableDeferred.complete`
-     * 保證）：follower await 回 Ok 後即見 leader 發布之 chain，並以自己的 binding 重驗。
+     * 保證）：follower await 回完成（Ok 或非 Ok；chain 於終態統一交付，可能為空）即見
+     * leader 發布之 chain——Ok 以自己的 binding 重驗後交付；HTTP status 非 Ok 依同一重驗
+     * 交付；其餘非 Ok 不交付、bounded 重選舉。
      */
     private data class InFlightEntry(val epoch: Long, val deferred: CompletableDeferred<LeaderOutcome>)
 
@@ -1008,18 +1050,27 @@ class WebExtractService(
      * leader 交付給 follower 之載體：outcome ＋ leader 記錄之逐跳
      * 信任上下文 chain。經 deferred completion edge 同步給 follower；follower 於 Ok
      * 交付前執行 [validateChain]（規則與 fetch 相同；以 follower 自己的 opt-in／resolver／
-     * deadline 為準）。僅 Ok 路徑可能非空；非 Ok 為 emptyList()。
-     * **非 Ok 之 completed outcome 絕不賦予 follower**——leader 之拒絕／錯誤不得跨
-     * resolver／政策上下文共享（follower 自身之 hop-Y 乃至 hop-0 可能解析到不同位址＝allowed）：
-     * follower 視為 miss、不 join 該 deferred、以自己的 binding 有界重選舉重評估全鏈
-     * （`bindingRestarts` ≤ [MAX_STALE_RESTARTS]，超過即 fail-closed `Failed(TRANSPORT)`）；
-     * follower 不讀取非 Ok 之 chain（僅 is Ok 分支驗證）。
+     * deadline 為準）。chain 於 **所有終態路徑**（Ok／非 Ok 返回／例外逸出）由 chainSink
+     * 之 `finally` 統一交付——非 Ok 亦可能非空；僅 Ok delivery 與 HTTP status replay arm
+     * 消費非空之非 Ok chain。
+     * **非 Ok 之 completed outcome 預設絕不賦予 follower**（round 6 細化）——唯一例外為
+     * `Failed` 且 detail 以 `HTTP_` 開頭、chain 非空之 HTTP status 失敗：follower 以自己的
+     * opt-in／resolver／deadline 對該 chain 完成 bounded 重驗（[validateChain]，以 follower
+     * 剩餘預算為界）且 epoch 未漂移後，方 verbatim 交付該 HTTP verdict（binding-validated
+     * shared fact；不寫快取）。其餘非 Ok——非 `HTTP_` 之 Failed、所有 Unavailable、
+     * 缺 chain 之 HTTP_、重驗失敗或 epoch 漂移——follower 視為 miss、不 join 該 deferred、
+     * 以自己的 binding 有界重選舉重評估全鏈（`bindingRestarts` ≤ [MAX_STALE_RESTARTS]，
+     * 超過即 fail-closed `Failed(TRANSPORT)`）；leader 之拒絕／錯誤不得跨
+     * resolver／政策上下文共享（follower 自身之 hop-Y 乃至 hop-0 可能解析到不同位址＝allowed）。
      */
     private data class LeaderOutcome(val outcome: WebExtractOutcome, val chain: List<HopBinding>?)
 
     // 載體語義：null＝follower 判定之 pathology（Ok 無 chain）→ follower 端 fail-closed（TRANSPORT）；
-    // 空 list＝非 Ok 載體，或 scaffold 語義（僅 internal put() 產生，本 arm 不交付）——非 Ok 載體
-    // 一律不賦予 follower（miss 語義；follower 有界重選舉）；follower Ok arm 兩者皆 fail-closed。
+    // 空 list＝無任何 HopBinding 被記錄（例如首跳前之預算耗盡 TIMEOUT／TRANSPORT），或 scaffold 語義
+    //（僅 internal put() 產生，本 arm 不交付）——Ok arm 兩者皆 fail-closed。非 Ok 載體可能攜帶非空 chain
+    //（chainSink 於所有終態路徑交付）；唯 `Failed` 且 detail 以 "HTTP_" 開頭、chain 非空、且 follower
+    // 以自己的 binding 完成 bounded 重驗（validateChain）＋epoch 未漂移者，方 verbatim 交付該 HTTP
+    // status verdict（不寫快取）；其餘非 Ok 一律不賦予 follower（miss 語義；follower 有界重選舉）。
 
     private val mutex = Mutex()
     private val inFlight: MutableMap<String, InFlightEntry> = mutableMapOf()
@@ -1045,26 +1096,38 @@ class WebExtractService(
      * `Unavailable(CANCELLED)`；leader 於 drain 前已完整產出 Ok 者 follower 照收
      * （但 Ok 仍須先通過 follower 自己之 chain-face 逐跳重驗才交付——見上方
      * `InFlightEntry` KDoc 與 D3 追蹤項 #1）。
-     * follower 之非 Ok 規則（round 5）：follower await 回**非 Ok completed outcome**
-     * 絕不直接交付——leader 之拒絕／錯誤可能是針對 *它自己的* resolver/opt-in 評估
+     * follower 之非 Ok 規則（round 6 細化 round 5）：follower await 回**非 Ok completed
+     * outcome**——leader 之拒絕／錯誤可能是針對 *它自己的* resolver/opt-in 評估
      * （含 redirect 各跳）所為之決策，follower 自身之 hop-Y（乃至 hop-0）可能解析到
      * 不同位址（allowed）；直接繼承＝錯誤歸因＋false denial（可得性隔離缺陷）。
-     * follower 一律視為 miss、不 join 該 deferred（`skipJoinForDeferred`）、以自己的
-     * opt-in／resolver／deadline 有界重選舉重評估全鏈（`bindingRestarts` ≤
-     * [MAX_STALE_RESTARTS]，超過即 fail-closed `Failed(TRANSPORT)`）。刻意取捨：一個
-     * 失敗的 leader 現對每個 follower 各多花一次有界重選舉，而非即時回 surface
-     * leader 之拒絕——以確保政策相依之失敗歸因於產生該失敗之評估者。例外 carve-outs
+     * 唯一例外為 binding-validated 之 HTTP status 失敗（round 6）：`Failed` 且 detail
+     * 以 `HTTP_` 開頭、且 leader 終態 chain 非空（chain 於所有終態路徑一律由 chainSink
+     * `finally` 交付）者，follower 先以**自己的** opt-in／resolver／deadline 對該 chain
+     * 做 bounded 重驗（[validateChain]；以 follower 剩餘預算為界 `withTimeoutOrNull`；
+     * `DeadlineExceededException` → 驗證失敗）且 `cache.currentGeneration == epochAtEntry`
+     * 時，verbatim 交付該 HTTP verdict（同 hop binding、同 status；binding-validated
+     * shared fact；不寫快取）。驗證失敗或 epoch 漂移 → miss 語義（有界重選舉）。
+     * 其餘非 Ok——非 `HTTP_` 之 Failed（TRANSPORT／TIMEOUT／BAD_RESPONSE／TOO_LARGE／…）、
+     * 所有 Unavailable、缺 chain 之 HTTP_——絕不直接交付：follower 視為 miss、不 join
+     * 該 deferred（`skipJoinForDeferred`）、以自己的 opt-in／resolver／deadline
+     * 有界重選舉重評估全鏈（`bindingRestarts` ≤ [MAX_STALE_RESTARTS]，超過即 fail-closed
+     * `Failed(TRANSPORT)`）。刻意取捨：一個失敗的 leader 現對每個 follower 各多花一次
+     * 有界重選舉，而非即時回 surface leader 之拒絕——以確保政策相依之失敗歸因於產生
+     * 該失敗之評估者。例外 carve-outs
      * （例外／逾時路徑、非 completed outcome，行為不變）：leader 被取消 → follower
      * 映射 `Unavailable(CANCELLED)`；follower 自身 await 預算耗盡（leader 仍在跑）→
      * `Failed(TIMEOUT)`。（leader 自身 deadline 耗盡而 complete 之 `Failed(TIMEOUT)`
-     * 屬 completed non-Ok outcome——follower 不繼承、走上述有界重選舉；非 carve-out。）
+     * 屬 completed non-Ok outcome 且 detail 不以 `HTTP_` 開頭——不可 replay；follower
+     * 不繼承、走上述有界重選舉；非 carve-out。）
      * election 另有一個 follower 面例外：`skipJoinForDeferred === 該條目之 deferred` 時不 join 該
      * in-flight 條目（先前之 Ok 未通過本 follower 之 chain-face 驗證，或先前之非 Ok
-     * completed outcome——該 leader 對本 follower 而言已不可信），呼叫方就地
+     * completed outcome 未獲 replay 授權或重驗失敗——該 leader 對本 follower 而言已不可信），
+     * 呼叫方就地
      * 插入新世代條目並自己當 leader；與世代漂移之有界重試正交（後者另計
      * `staleRestarts`）。
      * follower Ok 交付前亦有一道 post-validation epoch re-check（鏡射 [verifiedCachedHit]）：
-     * 重驗通過後、交付前若世代已漂移，視為 miss（同驗證失敗之有界重選舉），不交付。
+     * 重驗通過後、交付前若世代已漂移，視為 miss（同驗證失敗之有界重選舉），不交付；
+     * HTTP status 之 replay 交付亦鏡射同一 re-check（epoch 漂移即 miss、有界重選舉）。
      */
     suspend fun extract(
         rawUrl: String,
@@ -1101,7 +1164,7 @@ class WebExtractService(
         var epochAtEntry = cache.currentGeneration
         var staleRestarts = 0
         var bindingRestarts = 0
-        // A2：follower 驗證失敗／epoch-drift／非 Ok completed outcome 後 skipJoin 之對象——
+        // A2：follower 驗證失敗／epoch-drift／非 Ok completed outcome（未獲 replay 授權或重驗失敗）後 skipJoin 之對象——
         // election 見此 deferred 即不 join 該 in-flight 條目（僅 identity 相等時），改為就地
         // 插入新條目（自己當 leader）。以 deferred identity 為範圍而非 key，同 key 之後續 leader 不受誤傷。
         var skipJoinForDeferred: CompletableDeferred<LeaderOutcome>? = null
@@ -1158,7 +1221,7 @@ class WebExtractService(
                         lateHit = null
                     }
                     if (lateHit == null) {
-                        // follower chain-face 驗證失敗／非 Ok completed outcome 後：
+                        // follower chain-face 驗證失敗／非 Ok completed outcome（未獲 replay 授權）後：
                         // skipJoinForDeferred === 該條目之 deferred 表示該 leader（內容或其失敗決策）
                         // 已被本 caller 判定為不可信——不得 join，
                         // 改為就地插入新世代條目，由本 caller 以自己的 binding 當 leader
@@ -1209,8 +1272,10 @@ class WebExtractService(
                     // 並返回，不再進入單飛迴圈（never cached，不得 out-fetch a
                     // cancelled leader）。
                     // （本 arm 為例外路徑、非 completed outcome；behavior 不變。
-                    // completed 之非 Ok outcome 不走本 arm——見下方 `!is Ok` 分支，
-                    // 該路徑一律有界重選舉、絕不交付 leader 之 non-Ok。）
+                    // completed 之非 Ok outcome 不走本 arm——見下方 `!is Ok` 分支：
+                    // 該路徑預設一律有界重選舉；唯 binding-validated 之 HTTP status
+                    // 失敗（`HTTP_` 開頭＋非空 chain＋bounded 重驗通過＋epoch 未漂移）
+                    // 會 verbatim 交付，其餘 non-Ok 絕不交付。）
                     // 例外：若 leader 於取消前已完整產出 Ok（okForFollowers 路徑，
                     // complete(ok) 而非 completeExceptionally），follower 收到該 Ok
                     // 而非 CANCELLED——`await()` 會直接回傳已落定的結果（仍須通過下方
@@ -1227,6 +1292,60 @@ class WebExtractService(
                 } ?: return WebExtractOutcome.Failed(WebExtract.DETAIL_TIMEOUT)
                 // awaited 為 LeaderOutcome（經 deferred completion edge 同步之載體）。
                 if (awaited.outcome !is WebExtractOutcome.Ok) {
+                    // Round 6：non-Ok 之中唯一可共享者＝HTTP status 失敗（Failed 且
+                    // detail 為 "HTTP_"＋數字後綴，涵蓋 4xx/5xx/206/304），且僅在 follower
+                    // 以**自己的** opt-in／resolver／deadline 完成 bounded chain-face
+                    // 重驗（[validateChain]，規則與 fetch 相同）且 epoch 未漂移之後——
+                    // 此時 verdict 為 binding-validated shared fact：每個 hop 都在失敗讀取
+                    // **之前**記錄（chain 邊記錄邊走），follower 重驗了**自己的**每一跳
+                    // 決策，綁定集合逐位一致 ⇒ 重放所攜帶的僅是「綁定一致之共用綁定」上的
+                    // origin status 事實（同 hop binding、同狀態），而非跨評估者資訊；
+                    // 殘餘為同一 single-flight 窗口內 time／後端差異（可得性類殘留，
+                    // 絕不寫快取、絕不攜內容）。非 HTTP_ 數字 detail 之 Failed（TRANSPORT／
+                    // TIMEOUT／BAD_RESPONSE／TOO_LARGE／…）、所有 Unavailable、以及缺 chain
+                    // （null／空）或無數字後綴之 Failed——一律不可 replay，走下方 round-5
+                    // bounded 重選舉。
+                    val failedOutcome = awaited.outcome as? WebExtractOutcome.Failed
+                    val replayChain = awaited.chain
+                    // awaited.chain 即 chainSink 於終態（Ok 或非 Ok）統一交付之鏈；
+                    // 非 Ok 終態現在亦攜帶 chain，故此處可判定 replay provenance。
+                    // 數字後綴硬閘：拒絕任何未來新生的非 origin 語義 "HTTP_*" 字串落入重放。
+                    val replayable = failedOutcome != null &&
+                        failedOutcome.detail.removePrefix("HTTP_").toIntOrNull() != null &&
+                        !replayChain.isNullOrEmpty()
+                    if (replayable) {
+                        // Bound validation，鏡射 Ok arm 之 try/withTimeout 模式：以 follower
+                        // 剩餘預算為界；逾時＝驗證失敗（fail-closed 於 re-election）。
+                        val replayWaitMs = ((deadlineNs - System.nanoTime()) / 1_000_000).coerceAtLeast(1)
+                        val replayValidated = try {
+                            withTimeoutOrNull(replayWaitMs) {
+                                validateChain(replayChain, optIn, resolver, deadlineNs)
+                            } == true
+                        } catch (_: DeadlineExceededException) {
+                            // Belt-and-braces（鏡射 Ok arm）：policyGate 從不產生此例外；
+                            // 一旦未來出現新的 throw site，此臂保留 miss 語義（fail-closed 於 re-election）。
+                            false
+                        }
+                        if (replayValidated) {
+                            // Post-validation epoch re-check（鏡射 Ok arm）：撤權於本 re-check
+                            // 之前完成 → 抑制交付，視為 miss（走下方有界重選舉）。
+                            if (cache.currentGeneration == epochAtEntry) {
+                                // Binding-validated shared fact：verbatim 交付 leader 之 HTTP
+                                // status verdict（同 hop binding、同 status）；不寫快取；
+                                // 非「leader 的物件」被不安全洩漏——共享 binding 下之 shared fact，
+                                // 與 Ok 交付同一模式。
+                                return awaited.outcome
+                            }
+                            // 驗證通過但 epoch 漂移 → miss 語義：有界重選舉。
+                            bindingRestarts += 1
+                            if (bindingRestarts > WebExtract.MAX_STALE_RESTARTS) {
+                                return WebExtractOutcome.Failed(WebExtract.DETAIL_TRANSPORT)
+                            }
+                            skipJoinForDeferred = m
+                            continue
+                        }
+                        // validation false → fall through 至 round-5 bounded 重選舉（不交付）。
+                    }
                     // 不得跨 resolver／政策上下文共享 non-Ok：leader 之拒絕／錯誤可能是
                     // 針對 *它自己的* resolver/opt-in 評估（含 redirect 各跳）之決策，
                     // follower 自身的 hop-Y（乃至 hop-0）可能解析到不同位址（allowed）——
@@ -1317,8 +1436,9 @@ class WebExtractService(
                         cache.putByKey(k, outcome, epochAtEntry, chain)
                     }
                 }
-                // follower 之 chain-face 驗證所需：leader 完成前（Ok cache-write 區塊
-                // 之後、無論是否寫入）發布本跳之 chain——以 LeaderOutcome 載體經 deferred
+                // follower 之 chain-face 驗證／HTTP status replay 所需：leader 完成前
+                // （cache-write 區塊之後、無論是否寫入）發布本次收集之 chain——終態一律
+                // 由 chainSink `finally` 交回（Ok 或非 Ok；可能為空）；以 LeaderOutcome 載體經 deferred
                 // completion edge 跨協程傳遞（happens-before 保證）。
                 m.complete(LeaderOutcome(outcome, chain))
                 return outcome
@@ -1336,16 +1456,22 @@ class WebExtractService(
                 // parse／gunzip 內部 deadline 耗盡逸出（本 commit 起由
                 // extractUncached 的 wrapper 先接為 Failed(TIMEOUT)，此 arm 為
                 // extract() 側 backstop）：m 必須 settle 為 Failed(TIMEOUT)，
-                // never Ok、never cached；follower 不繼承該 non-Ok——視為 miss、
-                // 以自己的 binding 有界重選舉重評估全鏈（見 follower arm `!is Ok` 分支）。
+                // never Ok、never cached；follower 不繼承該 non-Ok（detail 不以
+                // `HTTP_` 開頭——不可 replay）——視為 miss、以自己的 binding
+                // 有界重選舉重評估全鏈（見 follower arm `!is Ok` 分支）。
+                // chain 由 chainSink 之 finally 於終態統一交付；TIMEOUT 不可 replay，
+                // 隨載體交付或不攜帶之零行為差異——此處原樣交付已收集之 chain。
                 val failed = WebExtractOutcome.Failed(WebExtract.DETAIL_TIMEOUT)
-                m.complete(LeaderOutcome(failed, emptyList()))
+                m.complete(LeaderOutcome(failed, chain))
                 return failed
             } catch (_: Exception) {
                 // 剩餘例外（非 DeadlineExceededException）一律 fail-closed
                 // TRANSPORT（m 必須 settle；follower 不得 hang）；
-                // follower 不繼承該 non-Ok——視為 miss、以自己的 binding 有界重選舉
+                // follower 不繼承該 non-Ok（detail 為 TRANSPORT，不以 `HTTP_` 開頭——
+                // 不可 replay）——視為 miss、以自己的 binding 有界重選舉
                 // 重評估全鏈（見 follower arm `!is Ok` 分支）。
+                // chain 由 chainSink 之 finally 於終態統一交付；TRANSPORT 不可 replay，
+                // 隨載體交付或不攜帶之零行為差異——此處原樣交付已收集之 chain。
                 try {
                     currentCoroutineContext().ensureActive()
                 } catch (ce: CancellationException) {
@@ -1353,7 +1479,7 @@ class WebExtractService(
                     throw ce
                 }
                 val failed = WebExtractOutcome.Failed(WebExtract.DETAIL_TRANSPORT)
-                m.complete(LeaderOutcome(failed, emptyList()))
+                m.complete(LeaderOutcome(failed, chain))
                 return failed
             } catch (e: Throwable) {
                 // DeadlineExceededException 屬 Exception，已於上方 arm 攔截
@@ -1510,7 +1636,9 @@ class WebExtractService(
         var current = stripFragment(rawUrl.trim())
         // 鏈式信任上下文記錄（Option B：僅 cache 面綁定 redirect 逐跳）：
         // 每一跳（含首跳與 redirect hops）policy 放行後記錄 (url, sorted distinct token)；
-        // Ok 時隨 chainSink 回傳給 extract()；非 Ok 路徑不觸 chainSink。
+        // 任何終態（Ok／非 Ok 返回／例外逸出，含 CancellationException）一律於下方
+        // finally 隨 chainSink 交回 extract()——chain 於所有終態路徑皆可獲得（可能為空）；
+        // Ok delivery 與新 HTTP status replay arm（follower 以自己 binding 重驗後）為其消費者。
         val chain = mutableListOf<HopBinding>()
         // 有效 opt-in：跨 origin 跳轉即不可逆降級為預設 `HTTPS_ONLY` 姿態
         //（見 downgradedOptInForRedirect）。
@@ -1518,6 +1646,10 @@ class WebExtractService(
         var fromSchemeHttps = false
         var first = true
         var hops = 0
+        // try/finally 語義：finally 於每一終態路徑（含所有 return／例外逸出）皆執行，
+        // 把當下累積之 chain（可能為空——例如下一跳前預算耗盡之 TIMEOUT）交給 chainSink。
+        // （體內不重縮排以保持 fetch/gate 邏輯零變更。）
+        try {
         while (true) {
             // 逐跳剩餘預算；耗盡即 TIMEOUT，不再發請求。
             val remainingMs = (deadlineNs - System.nanoTime()) / 1_000_000
@@ -1736,8 +1868,7 @@ class WebExtractService(
                 // truncated 僅由 parser 輸入前綴截斷觸發（model 預算未截）：input sentinel。
                 WebContentEnvelope.wrap(capped + "\n${WebExtract.TRUNCATED_INPUT_SENTINEL_MARK}$PARSE_INPUT_CAP CHARS]", deadlineNs, checking)
             }
-            // Option B：成功路徑——把鏈式信任上下文交回 extract()（供 cache 寫入）。
-            chainSink?.invoke(chain.toList())
+            // 終態交付：chain 改由 finally 統一交出（所有終態路徑，含 Ok）——此處不再觸 chainSink。
             return WebExtractOutcome.Ok(
                 content = content,
                 envelope = envelope,
@@ -1745,6 +1876,12 @@ class WebExtractService(
                 cached = false,
                 bytesKept = bytes.size,
             )
+        }
+        } finally {
+            // 終態（Ok／非 Ok 返回／例外逸出，含 CancellationException）一律交出當下累積之 chain
+            //（可能為空）——chainSink 不得於任何終態路徑缺席；follower 端據此判定 replay
+            // provenance（僅 HTTP status Failed 且 chain 非空者可進 bounded 重驗）。
+            chainSink?.invoke(chain.toList())
         }
     }
 }

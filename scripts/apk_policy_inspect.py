@@ -16,7 +16,7 @@ this helper): about 17-20 root DEX shards, largest shard about 43.8 MB, and
 about 65-80 MB total DEX. Limits below leave headroom for that inventory; they
 are resource limits, not evidence that any real APK passed this scanner.
 
-Provider attribute decoding (blast-radius note): the six Shizuku security
+Provider attribute decoding (blast-radius note): the seven Shizuku security
 attributes are decoded for EVERY provider in EVERY mode; a non-Shizuku
 provider carrying an untypable boolean encoding fails the whole artifact
 gate. This is deliberate and documented - compiled 0x12 is the only legal
@@ -1894,11 +1894,13 @@ _NS_DECL_LINE_RE = re.compile(
     r"^([ \t]*)N:\s*([^\s=]+)=([^\s(]+)(?:\s*\(line=\d+\))?\s*$"
 )
 _PROVIDER_ATTR_LINE_RE = re.compile(r"^([ \t]*)A:\s+([^=]+)=(.*)$")
-# android:exported = 0x01010010, android:multiprocess = 0x01010013 (stable
-# SDK definitions). ShizukuProvider carries the hard upstream contract:
-# exported=true (the Manager must reach the binder) and multiprocess=false
-# (attachInfo() throws IllegalStateException otherwise), so the github
-# artifact gate pins both on the merged manifest.
+# android:exported = 0x01010010, android:multiprocess = 0x01010013,
+# android:enabled = 0x0101000e (stable SDK definitions). ShizukuProvider
+# carries the hard upstream contract: exported=true (the Manager must reach
+# the binder), multiprocess=false (attachInfo() throws IllegalStateException
+# otherwise), and enabled=true (the binder channel cannot reach a disabled
+# provider), so the github artifact gate pins all three on the merged
+# manifest.
 _PROVIDER_ANDROID_ATTR_IDS = {
     "0x01010003": "name",
     "0x01010018": "authorities",
@@ -1906,6 +1908,7 @@ _PROVIDER_ANDROID_ATTR_IDS = {
     "0x01010007": "readPermission",
     "0x01010008": "writePermission",
     "0x0101001b": "grantUriPermissions",
+    "0x0101000e": "enabled",
     "0x01010010": "exported",
     "0x01010013": "multiprocess",
 }
@@ -1972,7 +1975,7 @@ def _active_xmltree_namespaces(
 
 
 # #166 blast-radius note (changelog-style): all providers now decode the
-# six Shizuku security attributes in EVERY mode; decode failures fail closed
+# seven Shizuku security attributes in EVERY mode; decode failures fail closed
 # for runs whose providers are unrelated to Shizuku. Real compiled boolean
 # (type 0x12) attribute values are unaffected.
 def _iter_application_providers(
@@ -1986,7 +1989,7 @@ def _iter_application_providers(
     ``versionCode=(type 0x10)0x1`` elsewhere). Own attributes sit at exact
     two-space indent past the ``E: provider`` line and precede any child
     element so child attributes (e.g. nested ``<meta-data android:name=...>``)
-    never overwrite them. The six Shizuku-relevant security attributes are
+    never overwrite them. The seven Shizuku-relevant security attributes are
     decoded for EVERY provider (not only the name/authority-matched ones): a
     DEX-evidenced renamed ShizukuProvider subclass can declare an arbitrary
     authority, so the github artifact gate must be able to see its attribute
@@ -2151,7 +2154,8 @@ def _iter_application_providers(
                 if attr_local != expected_local:
                     raise PolicyError(
                         f"merged manifest <provider> attribute {attr_lhs!r} disagrees "
-                        f"with Android attribute ID {attr_id}"
+                        f"with Android attribute ID {attr_id} "
+                        f"(that ID is {expected_local!r})"
                     )
                 target_attr = expected_local
             elif attr_local in _PROVIDER_ATTR_NAMES:
@@ -2186,7 +2190,7 @@ def _iter_application_providers(
             else ""
         )
         decoded: dict[str, str] = {"name": name, "authorities": authorities}
-        # Decode the six security attributes for EVERY provider: a renamed
+        # Decode the seven security attributes for EVERY provider: a renamed
         # DEX-evidenced ShizukuProvider subclass can carry an arbitrary
         # authority, so the attribute gate cannot rely on the name/authority
         # heuristic to decide whose attrs to decode. Same decoding and error
@@ -2196,6 +2200,7 @@ def _iter_application_providers(
             "readPermission",
             "writePermission",
             "grantUriPermissions",
+            "enabled",
             "exported",
             "multiprocess",
         ):
@@ -2210,7 +2215,11 @@ def _iter_application_providers(
 
 
 def _check_provider_attrs(
-    decoded: dict[str, str], child_tags: set[str], label: str
+    decoded: dict[str, str],
+    child_tags: set[str],
+    label: str,
+    expected_authority: str | None = None,
+    require_enabled: bool = True,
 ) -> None:
     """Enforce the ShizukuProvider permission & URI-grant attribute contract.
 
@@ -2219,6 +2228,17 @@ def _check_provider_attrs(
     (``_check_github_dex_shizuku_providers``). ``label`` names the provider
     in error messages (``ShizukuProvider`` for the manifest-detected path,
     ``DEX-evidenced ShizukuProvider subclass <java-name>`` otherwise).
+
+    ``expected_authority`` pins the merged-APK ``android:authorities``
+    value EXACTLY (not a suffix, not a set): pass
+    ``f"{merged_package}.shizuku"`` for the officially declared binder
+    channel, or ``None`` to leave authorities recorded-but-unconstrained
+    (the DEX-evidenced arbitrary-authority design - the contract is the
+    permission, not the name). ``require_enabled`` gates the
+    ``android:enabled`` check; it defaults to True and every current caller
+    keeps the default - both the manifest-detected and the DEX-evidenced
+    paths prove the same binder channel, which cannot reach a disabled
+    provider.
 
     The base ``android:permission`` must resolve to
     ``android.permission.INTERACT_ACROSS_USERS_FULL`` (the base permission is
@@ -2238,6 +2258,21 @@ def _check_provider_attrs(
     anything else trips an IllegalStateException at runtime. A missing or
     unproven ``exported`` fails closed: a merged manifest that cannot prove
     the provider exported is treated as non-compliant.
+
+    ``android:enabled`` must likewise be exactly the compiled boolean true:
+    the Shizuku binder channel cannot reach a disabled provider, so a merged
+    manifest that cannot prove ``enabled=true`` is treated as non-compliant.
+    Resource references (``@0x…`` / ``?0x…``) pass through verbatim by design
+    of ``_xmltree_attr_value`` and are never equal to the compiled boolean
+    true, so a resource-unproven value fails closed here - that is the
+    desired behavior: the gate never guesses what an unresolved resource
+    resolves to.
+
+    The two binder-channel contract checks (enabled, then authority) run
+    LAST, after every pre-existing attribute check: pre-existing
+    contract failures keep their original, specifically-asserted error
+    messages, and the new checks fire only once the rest of the attribute
+    contract already holds.
     """
     perm = decoded.get("permission")
     if perm != _SHIZUKU_PROVIDER_PERMISSION:
@@ -2282,9 +2317,58 @@ def _check_provider_attrs(
                 f"github APK {label} must not declare "
                 f"<{forbidden_child}> children"
             )
+    # -- binder-channel contract (Re-review #10 Findings 2+3) --
+    if require_enabled:
+        # The merged manifest must prove android:enabled=true on the
+        # provider: the Shizuku binder resolves the provider by authority and
+        # the platform will not deliver to a disabled component, so a
+        # merged artifact without the compiled boolean true is not proven to
+        # serve the binder. Reference encodings (``@0x…`` / ``?0x…``) pass
+        # through verbatim (see _xmltree_attr_value) and therefore never
+        # equal "true" - resource-unproven values fail closed, deliberately.
+        enabled = decoded.get("enabled")
+        if enabled is None:
+            raise PolicyError(
+                f"github APK {label} must declare "
+                "android:enabled=true (Shizuku binder channel contract); "
+                "the merged attribute is missing"
+            )
+        if enabled != "true":
+            raise PolicyError(
+                f"github APK {label} must declare "
+                f"android:enabled=true (Shizuku binder channel contract; "
+                f"got {enabled!r})"
+            )
+    if expected_authority is not None:
+        # The Shizuku binder channel looks the provider up by the authority
+        # ``<merged package>.shizuku`` (the official Shizuku provider
+        # resolves its authority as ``getPackageName() + ".shizuku"``). Any
+        # other value - a rewritten authority, a foreign package, a
+        # multi-authority list, or a missing/empty one - is a surface the
+        # binder CANNOT reach, and a permission-gated surface the binder
+        # cannot reach is not "Shizuku binder availability proven".
+        # Exact-value comparison, not a suffix test: ``pkg.shizuku;extra``
+        # is an exact-string violation even though it starts with the
+        # expected channel.
+        #
+        # NOTE: ``_is_shizuku_provider`` is name-or-authority based, so a
+        # renamed subclass whose authorities end in ``.shizuku`` is ALSO
+        # subject to this exact check: the design pins "the contract is the
+        # permission" for ARBITRARY authorities, but as soon as the
+        # authority CLAIMS the binder-channel suffix it must equal the real
+        # channel. (The arbitrary-authority design stays for the
+        # DEX-evidenced path, which passes ``expected_authority=None``.)
+        authorities = decoded.get("authorities", "")
+        if authorities != expected_authority:
+            raise PolicyError(
+                f"github APK {label} must declare android:authorities "
+                f"exactly {expected_authority!r} (the Shizuku binder "
+                f"channel resolves package+'.shizuku'; "
+                f"got {authorities!r})"
+            )
 
 
-def _check_github_shizuku_provider(xmltree: str) -> None:
+def _check_github_shizuku_provider(xmltree: str, merged_package: str) -> None:
     """Enforce the manifest-detected ShizukuProvider path.
 
     In ``--mode github`` the real APK declares ``rikka.shizuku.ShizukuProvider``
@@ -2297,15 +2381,26 @@ def _check_github_shizuku_provider(xmltree: str) -> None:
     ``package`` - arbitrary suffix is never an alias, and only a canonical
     exact-FQN match consumes a detected block in the counting path).
 
-    The signature is UNCHANGED in this stage: authorities/exact-authority
-    work (Stage 10B) threads ``package`` through here as well.
+    ``merged_package`` is the merged manifest package resolved by
+    ``_merged_manifest_package`` (threaded from ``inspect_apk`` - never
+    recomputed here). For every heuristic-detected provider the exact
+    binder-channel authority ``f"{merged_package}.shizuku"`` is pinned:
+    the Shizuku binder resolves the provider by the authority
+    ``<package>.shizuku``, so a merged ShizukuProvider whose authority is
+    anything else - rewritten, foreign-package, or missing - is a surface
+    the binder cannot reach, and a permission-gated surface the binder
+    cannot reach is not "Shizuku binder availability proven".
     """
+    expected_authority = f"{merged_package}.shizuku"
     for attrs, child_tags in _iter_application_providers(xmltree):
         if not _is_shizuku_provider(
             attrs.get("name", ""), attrs.get("authorities", "")
         ):
             continue
-        _check_provider_attrs(attrs, child_tags, "ShizukuProvider")
+        _check_provider_attrs(
+            attrs, child_tags, "ShizukuProvider",
+            expected_authority=expected_authority,
+        )
 
 
 def _shizuku_provider_evidenced_descriptors(parsed_dexes: list[ParsedDex]) -> set[str]:
@@ -2639,6 +2734,18 @@ def _check_github_dex_shizuku_providers(
                 decoded,
                 child_tags,
                 f"DEX-evidenced ShizukuProvider subclass {java_name}",
+                # Arbitrary authorities stay unconstrained on this path by
+                # design ("the contract is the permission, not the name"):
+                # authorities are recorded but never equality-pinned here.
+                # The official-FQN/name heuristic path
+                # (``_check_github_shizuku_provider``) pins
+                # ``<package>.shizuku`` exactly. When the matched provider is
+                # ALSO heuristic-detected, it flows through BOTH validators:
+                # names/attribute contract by this one, the authority by the
+                # heuristic branch alone - no double error. The official
+                # detector handles the binder-channel proof; this path never
+                # guesses at an arbitrary authority.
+                expected_authority=None,
             )
     return matched_java_names
 
@@ -2830,7 +2937,7 @@ def inspect_apk(apk: Path, mode: str, aapt: str, dexdump: str, expect_provider: 
                     "github APK must declare exactly one ShizukuProvider "
                     f"(found {total})"
                 )
-        _check_github_shizuku_provider(xmltree)
+        _check_github_shizuku_provider(xmltree, merged_package)
         print(
             f"  structure: APK ZIP/manifest OK ({len(dex_infos)} root DEX "
             f"shard(s), DEX tables parsed: {len(parsed_dexes)} shard(s))"

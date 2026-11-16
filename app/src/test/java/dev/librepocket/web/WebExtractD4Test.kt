@@ -2152,8 +2152,8 @@ class WebExtractD4Test {
     }
 
     @Test fun unterminatedCommentRunsToEof() = runBlocking {
-        // 未閉合 comment（無 `-->`）：自 `<!--` 至 EOF 整體視為 comment；內容原樣
-        // 保留在文本流中（不 crash），snippet 仍含 comment 起點之前的 HEAD
+        // comment（含未閉合至 EOF 者）整段不產出任何內容（新 stripTags 語義）；
+        // 不 crash、snippet 仍含 comment 起點之前的 HEAD
         val dns = publicDns("example.com")
         val doc = "<p>HEAD</p><!-- <script>"
         val http = FakeExtract { okResp(doc) }
@@ -2997,5 +2997,446 @@ class WebExtractD4Test {
             .extract("https://example.com/u3", resolver = dns) as WebExtractOutcome.Ok
         assertTrue("U3：VISIBLE_E 保留，got ${outU3.content.snippet}", outU3.content.snippet.contains("VISIBLE_E"))
         assertFalse("U3：script 內文必須被剝除", outU3.content.snippet.contains("SECRET_C"))
+    }
+
+    // ==== Round-2 review fixture pins（P1#1／P1#2／P2#3／P2#4／P3#5／F1 epoch-drift arm） ====
+
+    // P1#1（barrier）：leader 之建連釘住 .11；同一 resolver 之 follower 以**相同 hop-0
+    // 綁定**（key 相同）join leader 的 in-flight——follower 絕不可能收到 .12 之 TENANT_B。
+    // 注意：下方 pinnedAddressesSeen 全為 [.11] 之斷言**並非** hop0Eval reuse 之
+    // red-on-old-code pin——fakeDns 為固定答案，兩次評估（hop-0 gate／fetch 重評估）
+    // 皆回 [.11]，新舊碼皆會通過；它只釘住「follower 未多打 upstream、未見 .12 釘住」。
+    // hop0Eval reuse（fetch 沿用進入 gate 之同一份 eval、不二次 resolve）之
+    // red-on-old-code pin 見 hop0FetchBindingPinnedToEntryGateEvaluation（變動 resolver fixture）。
+    @Test fun leaderBarrierFollowerNeverSeesOtherPinnedTenant() = runBlocking {
+        val dns = fakeDns("service.example" to listOf("10.0.0.11"))
+        val release = CompletableDeferred<Unit>()
+        val http = FakeExtract(
+            pinnedHandler = { _, pinned ->
+                // 兩個分支都卡在同一道 latch：測試放行前任何一支都不得完成。
+                val body = if (pinned.any { it.hostAddress == "10.0.0.11" }) {
+                    "TENANT_A data marker"
+                } else {
+                    "TENANT_B data marker"
+                }
+                release.await()
+                okResp(html(body = body))
+            },
+            handler = { okResp(html(body = "UNREACHABLE_MARKER")) },
+        )
+        val svc = WebExtractService(http)
+        val optIn = EndpointNetworkOptIn(NetworkEgressPolicy.ALLOW_PRIVATE_DNS)
+        val url = "https://service.example/follow"
+        val leader = async { svc.extract(url, optIn = optIn, resolver = dns) }
+        withTimeout(5_000) { while (http.calls.get() < 1) delay(1) }
+        // follower 與 leader 使用**完全相同**的 resolver 答案（[.11]）→ 同一 key binding。
+        val follower = async { svc.extract(url, optIn = optIn, resolver = dns) }
+        // Q5(b)：service/FakeExtract 未暴露 inFlight join 可觀測面（無公開 API 可輪詢
+        // follower 是否已註冊為 joiner），故以最小 150ms 延遲＋保留 withTimeout 護欄。
+        delay(150)
+        release.complete(Unit)
+        val leaderOut = withTimeout(5_000) { leader.await() }
+        val followerOut = withTimeout(5_000) { follower.await() }
+        val leaderOk = leaderOut as WebExtractOutcome.Ok
+        assertTrue(
+            "leader 必須收到 TENANT_A，got ${leaderOk.content.snippet}",
+            leaderOk.content.snippet.contains("TENANT_A"),
+        )
+        // follower 與 leader 綁定相同：只能 join（verbatim Ok）或 late cache read——
+        // 兩條路徑都不得見到 TENANT_B。
+        val followerOk = followerOut as WebExtractOutcome.Ok
+        assertTrue(
+            "follower 絕不得收到 TENANT_B，got ${followerOk.content.snippet}",
+            followerOk.content.snippet.contains("TENANT_A"),
+        )
+        assertFalse(followerOk.content.snippet.contains("TENANT_B"))
+        // 固定答案 fakeDns 下，fetch 重評估（若存在）亦回 [.11]——此斷言於新舊碼皆綠，
+        // 釘住的是「僅 leader 一次 upstream、全程無 .12 釘住」，非 hop0Eval reuse 本身。
+        assertEquals(1, http.pinnedAddressesSeen.size)
+        assertTrue(
+            "所有建連必須釘住 [.11]，got ${http.pinnedAddressesSeen}",
+            http.pinnedAddressesSeen.all { it == listOf(addr("10.0.0.11")) },
+        )
+        // 第二次呼叫：cache under key(A) 僅含 A 內容 → cached==true TENANT_A。
+        // （round-2 碼上決定性走 join 路徑：follower 零上游、第二次命中零上游 → calls 恆為 1；
+        //   覆核 review 計畫原稿之 calls==2 預期——該預期隱含 follower 重選舉，與相同綁定
+        //   下 chain-face 驗證必過（tokens 相等）之事實不符，現行碼實測為 1。）
+        val second = svc.extract(url, optIn = optIn, resolver = dns) as WebExtractOutcome.Ok
+        assertTrue("second 必須命中快取，got cached=${second.cached}", second.cached)
+        assertTrue(
+            "cache 條目必須為 TENANT_A，got ${second.content.snippet}",
+            second.content.snippet.contains("TENANT_A"),
+        )
+        assertFalse(second.content.snippet.contains("TENANT_B"))
+        assertEquals("second 命中不得再打 upstream", 1, http.calls.get())
+    }
+
+    // A1（hop-0 binding reuse）：fetch 必須沿用進入 gate 之 hop-0 eval（同一份已授權之
+    // 決策），不得再次 resolve。fixture 以**變動** resolver（第 1 次呼叫 → [.11]；第 2 次
+    // 起 → [.12]）使兩種行為可分辨；fakeDns 固定答案無法做到這點（見
+    // leaderBarrierFollowerNeverSeesOtherPinnedTenant 之說明）。
+    //   修正後：hop-0 gate eval（call #1）得 [.11]；key 與 fetch 共用同一 eval →
+    //     建連釘住 [.11] → pinnedHandler 命中 BINDING_A 分支 → snippet 含 BINDING_A_CONTENT。
+    //   修正前（8103dc5b 之前）：fetch 重新評估 → call #2 得 [.12] → 建連釘住 [.12]
+    //     → pinnedHandler 命中 BINDING_B 分支 → snippet 不含 BINDING_A_CONTENT（本測試 FAIL）。
+    // 本 fixture 為 deterministic：resolver 答案僅由呼叫次數決定，與排程／執行緒無關
+    //（call #1 必為 per-call 重驗之 hop-0 gate preflight；fresh cache 下 verifiedCachedHit
+    // 零 DNS——getHitByKey miss 直接返回）。任何未來引入 double-eval 之 regression 都會
+    // 令本測試 loud fail（內容斷言 .11／.12 二擇一，無靜默通過路徑）。
+    @Test fun hop0FetchBindingPinnedToEntryGateEvaluation() = runBlocking {
+        val resolverCalls = AtomicInteger(0)
+        val dns = HostResolver { _ ->
+            if (resolverCalls.getAndIncrement() == 0) listOf(addr("10.0.0.11")) else listOf(addr("10.0.0.12"))
+        }
+        val optIn = EndpointNetworkOptIn(NetworkEgressPolicy.ALLOW_PRIVATE_DNS)
+        val url = "https://flip.example.com/hop0"
+        val http = FakeExtract(
+            pinnedHandler = { _, pinned ->
+                val body = if (pinned.any { it.hostAddress == "10.0.0.11" }) {
+                    "BINDING_A_CONTENT"
+                } else {
+                    "BINDING_B_CONTENT"
+                }
+                okResp(html(body = body))
+            },
+            handler = { okResp(html(body = "UNREACHABLE_MARKER")) },
+        )
+        val svc = WebExtractService(http)
+        val out = svc.extract(url, optIn = optIn, resolver = dns) as WebExtractOutcome.Ok
+        assertTrue(
+            "fetch 必須重用 hop-0 eval 之 binding（[.11]→A），got ${out.content.snippet}",
+            out.content.snippet.contains("BINDING_A_CONTENT"),
+        )
+        assertFalse(
+            "不得出現 fetch 重評估之 [.12] 內容，got ${out.content.snippet}",
+            out.content.snippet.contains("BINDING_B_CONTENT"),
+        )
+        assertEquals(1, http.pinnedAddressesSeen.size)
+        assertTrue(
+            "唯一 fetch 之 pins 必須全為 [.11]，got ${http.pinnedAddressesSeen}",
+            http.pinnedAddressesSeen.all { it.any { a -> a.hostAddress == "10.0.0.11" } },
+        )
+    }
+
+    // P1#1（對稱 arm）：兩則 resolver 皆答 [.12]——follower join leader 之 in-flight，
+    // 全程零上游重複、body 為 TENANT_B。
+    @Test fun leaderBarrierFollowerJoinBothPinned12() = runBlocking {
+        val dns = fakeDns("service.example" to listOf("10.0.0.12"))
+        val release = CompletableDeferred<Unit>()
+        val http = FakeExtract(
+            pinnedHandler = { _, pinned ->
+                val body = if (pinned.any { it.hostAddress == "10.0.0.11" }) {
+                    "TENANT_A data marker"
+                } else {
+                    "TENANT_B data marker"
+                }
+                release.await()
+                okResp(html(body = body))
+            },
+            handler = { okResp(html(body = "UNREACHABLE_MARKER")) },
+        )
+        val svc = WebExtractService(http)
+        val optIn = EndpointNetworkOptIn(NetworkEgressPolicy.ALLOW_PRIVATE_DNS)
+        val url = "https://service.example/follow"
+        val leader = async { svc.extract(url, optIn = optIn, resolver = dns) }
+        withTimeout(5_000) { while (http.calls.get() < 1) delay(1) }
+        val follower = async { svc.extract(url, optIn = optIn, resolver = dns) }
+        // Q5(b)：service/FakeExtract 未暴露 inFlight join 可觀測面（無公開 API 可輪詢
+        // follower 是否已註冊為 joiner），故以最小 150ms 延遲＋保留 withTimeout 護欄。
+        delay(150)
+        release.complete(Unit)
+        val leaderOut = withTimeout(5_000) { leader.await() }
+        val followerOut = withTimeout(5_000) { follower.await() }
+        val leaderOk = leaderOut as WebExtractOutcome.Ok
+        val followerOk = followerOut as WebExtractOutcome.Ok
+        assertTrue(
+            "leader 必須收到 TENANT_B，got ${leaderOk.content.snippet}",
+            leaderOk.content.snippet.contains("TENANT_B"),
+        )
+        assertTrue(
+            "follower 必須收到 TENANT_B（join），got ${followerOk.content.snippet}",
+            followerOk.content.snippet.contains("TENANT_B"),
+        )
+        assertFalse(followerOk.content.snippet.contains("TENANT_A"))
+        assertEquals("follower join 不得多打 upstream", 1, http.calls.get())
+    }
+
+    // P1#2（allowed/allowed redirect hop）：dnsA（leader）hop-Y→203.0.113.41＝TENANT_A；
+    // dnsB（follower）hop-Y→203.0.113.42＝TENANT_B——兩者皆 policy-allowed（公網），
+    // 但非同一 tenant／非同一綁定。follower 以相同 hop-0（x→10.0.0.30）join 後，
+    // chain-face 重驗 hop-Y token 不符（203.0.113.42 ≠ 203.0.113.41）→ miss 語義
+    //（bindingRestarts=1）→ 重選舉＋以自己的 binding 重 fetch → 只可能得到 TENANT_B。
+    @Test fun allowedRedirectHopFollowerNeverReceivesOtherTenantOk() = runBlocking {
+        val dnsA = fakeDns(
+            "x.example.com" to listOf("10.0.0.30"),
+            "y.example.net" to listOf("203.0.113.41"),
+        )
+        val dnsB = fakeDns(
+            "x.example.com" to listOf("10.0.0.30"),
+            "y.example.net" to listOf("203.0.113.42"),
+        )
+        val release = CompletableDeferred<Unit>()
+        val http = FakeExtract(
+            pinnedHandler = { url, pinned ->
+                when {
+                    url == "https://x.example.com/start" ->
+                        WebExtractRawResponse(302, ByteArray(0), mapOf("Location" to "https://y.example.net/secret"))
+                    pinned.any { it.hostAddress == "203.0.113.41" } -> {
+                        release.await()
+                        okResp(html(body = "TENANT_A data"))
+                    }
+                    pinned.any { it.hostAddress == "203.0.113.42" } -> okResp(html(body = "TENANT_B data"))
+                    else -> okResp(html(body = "UNEXPECTED_MARKER"))
+                }
+            },
+            handler = { okResp(html(body = "UNREACHABLE_MARKER")) },
+        )
+        val svc = WebExtractService(http)
+        val optIn = EndpointNetworkOptIn(NetworkEgressPolicy.ALLOW_PRIVATE_DNS)
+        val url = "https://x.example.com/start"
+        // leader：經 dnsA 走 https→302→y(.41)，卡在 hop-Y 之 pinned fetch。
+        val leader = async { svc.extract(url, optIn = optIn, resolver = dnsA) }
+        withTimeout(5_000) { while (http.calls.get() < 2) delay(1) }
+        // follower：dnsB（x→相同 .30 → 同 key），hop-Y→.42（皆 allowed）。
+        val follower = async { svc.extract(url, optIn = optIn, resolver = dnsB) }
+        // Q5(b) join-unobservability 容差：service/FakeExtract 未暴露 inFlight join 可觀測面
+        //（無公開 API 可輪詢 follower 是否已註冊為 joiner），故以最小 150ms 延遲＋withTimeout 護欄。
+        // 跨允許綁定之 chain-face 驗證必敗（token 不符可靜態推得）→ follower 決定性走
+        // 重選舉路徑，此處的 150ms 僅用於讓 follower 進入 await；不論 join 是否先行發生，
+        // 不變式「follower 不得收到 TENANT_A」不受影響。
+        delay(150)
+        release.complete(Unit)
+        val leaderOut = withTimeout(5_000) { leader.await() }
+        val followerOut = withTimeout(5_000) { follower.await() }
+        val leaderOk = leaderOut as WebExtractOutcome.Ok
+        assertTrue(
+            "leader 必須收到 TENANT_A，got ${leaderOk.content.snippet}",
+            leaderOk.content.snippet.contains("TENANT_A"),
+        )
+        // follower 絕不得收到 TENANT_A——現行碼決定性走 re-election＋.42 refetch（TENANT_B）。
+        val followerOk = followerOut as WebExtractOutcome.Ok
+        assertTrue(
+            "follower 必須收到 TENANT_B，got ${followerOk.content.snippet}",
+            followerOk.content.snippet.contains("TENANT_B"),
+        )
+        assertFalse(
+            "follower 絕不得收到 TENANT_A，got ${followerOk.content.snippet}",
+            followerOk.content.snippet.contains("TENANT_A"),
+        )
+        assertEquals("leader(2)＋follower refetch(2)＝4 次上游", 4, http.calls.get())
+    }
+
+    // P1#2（allowed/denied redirect hop）：dnsB 之 hop-Y→169.254.169.254（metadata）。
+    // follower 之 chain-face 重驗 hop-Y 被 policy gate 拒（METADATA_ADDRESS_BLOCKED）→
+    // miss 語義 → 重選舉＋自己 fetch；re-fetch 於 hop-Y 同樣被 gate 拒於 upstream 之前
+    //（never Ok、never TENANT_A）。
+    @Test fun allowedDeniedRedirectHopFollowerBlockedAtHopY() = runBlocking {
+        val dnsA = fakeDns(
+            "x.example.com" to listOf("10.0.0.30"),
+            "y.example.net" to listOf("203.0.113.41"),
+        )
+        val dnsB = fakeDns(
+            "x.example.com" to listOf("10.0.0.30"),
+            "y.example.net" to listOf("169.254.169.254"),
+        )
+        val release = CompletableDeferred<Unit>()
+        val http = FakeExtract(
+            pinnedHandler = { url, pinned ->
+                when {
+                    url == "https://x.example.com/start" ->
+                        WebExtractRawResponse(302, ByteArray(0), mapOf("Location" to "https://y.example.net/secret"))
+                    pinned.any { it.hostAddress == "203.0.113.41" } -> {
+                        release.await()
+                        okResp(html(body = "TENANT_A data"))
+                    }
+                    else -> okResp(html(body = "UNEXPECTED_MARKER"))
+                }
+            },
+            handler = { okResp(html(body = "UNREACHABLE_MARKER")) },
+        )
+        val svc = WebExtractService(http)
+        val optIn = EndpointNetworkOptIn(NetworkEgressPolicy.ALLOW_PRIVATE_DNS)
+        val url = "https://x.example.com/start"
+        val leader = async { svc.extract(url, optIn = optIn, resolver = dnsA) }
+        withTimeout(5_000) { while (http.calls.get() < 2) delay(1) }
+        val follower = async { svc.extract(url, optIn = optIn, resolver = dnsB) }
+        // Q5(b)：join-unobservability 容差（見上一測試）；此處不變式為「follower 絕不 Ok、
+        // 絕不見 TENANT_A」——re-election 之 hop-Y gate 必拒，與 join 是否先行發生無關。
+        delay(150)
+        release.complete(Unit)
+        val leaderOut = withTimeout(5_000) { leader.await() }
+        val followerOut = withTimeout(5_000) { follower.await() }
+        val leaderOk = leaderOut as WebExtractOutcome.Ok
+        assertTrue(
+            "leader 必須收到 TENANT_A，got ${leaderOk.content.snippet}",
+            leaderOk.content.snippet.contains("TENANT_A"),
+        )
+        assertTrue(
+            "follower 必須 Unavailable（B 之 re-election 於 hop-Y 被 gate 拒），got $followerOut",
+            followerOut is WebExtractOutcome.Unavailable,
+        )
+        val u = followerOut as WebExtractOutcome.Unavailable
+        assertEquals(NetworkDenyCode.METADATA_ADDRESS_BLOCKED, u.denyCode)
+        assertEquals("METADATA_ADDRESS_BLOCKED", u.detail)
+        assertEquals("leader(2: x 302＋hop-Y .41)＋follower x refetch(1)＝3 次上游（B hop-Y 於 upstream 前被拒）", 3, http.calls.get())
+    }
+
+    // P2#3（exact-output fixtures）：comment／引號屬性／裸 `<` 之 parseHtml snippet 精確輸出。
+    @Test fun parseHtmlCommentQuoteExactOutputFixtures() {
+        // (a) 引號屬性值內之 `>` 不構成 tag 結束（ATTR 保留、屬性內容不洩漏）。
+        val attr = parseHtml("""<div data-test="a > b">ATTR_VISIBLE</div>""", "https://example.com/")
+        assertTrue("parseHtml 應成功，got null", attr != null)
+        assertEquals("ATTR_VISIBLE", attr!!.content.snippet)
+        // (b) comment（含內部 `>`）整段不產出任何內容；SECRET 絕不得出現在 snippet。
+        val comment = parseHtml("HELLO</p><!-- note > SECRET --> WORLD", "https://example.com/")
+        assertTrue("parseHtml 應成功，got null", comment != null)
+        assertEquals("HELLO WORLD", comment!!.content.snippet)
+        assertFalse(
+            "comment 內容（SECRET）絕不得出現，got ${comment.content.snippet}",
+            comment.content.snippet.contains("SECRET"),
+        )
+        // (c) 裸 `<`（數學關係式）原樣保留。
+        val operators = parseHtml("<p>Price < 10 > 3 units</p>", "https://example.com/")
+        assertTrue("parseHtml 應成功，got null", operators != null)
+        assertEquals("Price < 10 > 3 units", operators!!.content.snippet)
+    }
+
+    // P2#4：redirect `Location` 原文超過 MAX_URL_CHARS（8192 code units）→ 下一跳
+    // DNS／HTTP／chain 處理之前 fail-closed（Unavailable(URL_TOO_LONG, denyCode=null)）。
+    @Test fun redirectLocationOverCapFailsClosedUrlTooLongNoHop2Fetch() = runBlocking {
+        val longLocation = "https://same.example/" + "a".repeat(20_000)
+        assertTrue(longLocation.length > WebExtract.MAX_URL_CHARS)
+        val dns = publicDns("same.example")
+        val http = FakeExtract { _ ->
+            WebExtractRawResponse(302, ByteArray(0), mapOf("Location" to longLocation))
+        }
+        val svc = WebExtractService(http)
+        val out = svc.extract("https://same.example/", resolver = dns)
+        assertTrue("expected Unavailable, got $out", out is WebExtractOutcome.Unavailable)
+        val u = out as WebExtractOutcome.Unavailable
+        assertEquals(WebExtract.DETAIL_URL_TOO_LONG, u.detail)
+        assertEquals(null, u.denyCode)
+        assertEquals("hop-2 絕不得被 fetch（gate 於 DNS/HTTP 之前）", 1, http.calls.get())
+    }
+
+    // P3#5（B1 正規化契約 service 路徑）：service 建 key 前經 stripFragment 正規化
+    // host（小寫）／default port（依 scheme 去除）／fragment（一律去除）——等價 URL 必同 key、
+    // 第二次呼叫 cached==true 且零上游。
+    @Test fun equivalentUrlsShareCacheEntry() = runBlocking {
+        val dns = publicDns("example.com")
+        // (a) host case（OkHttp 正規化小寫）＋ fragment（一律去除）：與全小寫無 fragment 同 key。
+        val httpA = FakeExtract { okResp(html()) }
+        val svcA = WebExtractService(httpA)
+        svcA.extract("https://EXAMPLE.com/path#f", resolver = dns) as WebExtractOutcome.Ok
+        val secondA = svcA.extract("https://example.com/path", resolver = dns) as WebExtractOutcome.Ok
+        assertTrue(
+            "等價 URL（host case＋fragment）必須命中，got cached=${secondA.cached}",
+            secondA.cached,
+        )
+        assertEquals("等價 URL 命中不得再打 upstream", 1, httpA.calls.get())
+        // (b) default port（https→443）：與省略 port 同 key。
+        val httpB = FakeExtract { okResp(html()) }
+        val svcB = WebExtractService(httpB)
+        svcB.extract("https://example.com:443/path", resolver = dns) as WebExtractOutcome.Ok
+        val secondB = svcB.extract("https://example.com/path", resolver = dns) as WebExtractOutcome.Ok
+        assertTrue(
+            "等價 URL（default port 443）必須命中，got cached=${secondB.cached}",
+            secondB.cached,
+        )
+        assertEquals("等價 URL 命中不得再打 upstream", 1, httpB.calls.get())
+        // public key() 自身**不**正規化（raw string as given；正規化責任在 service 路徑之
+        // stripFragment）：直呼 key() 對混合 host case 產生不同 key——Pin B1 之邊界
+        //（service 路徑之 stripFragment 才是 host case／default port／fragment 正規化的所在）。
+        val probe = WebExtractCache()
+        val optIn = EndpointNetworkOptIn()
+        val kMixed = probe.key(
+            "https://EXAMPLE.com/p", WebExtract.DEFAULT_MAX_BYTES, WebExtract.DEFAULT_MODEL_CHARS, optIn, fixtureAddresses(),
+        )
+        val kLower = probe.key(
+            "https://example.com/p", WebExtract.DEFAULT_MAX_BYTES, WebExtract.DEFAULT_MODEL_CHARS, optIn, fixtureAddresses(),
+        )
+        assertTrue("public key() 不得正規化 host case（正規化在 service 路徑）", kMixed != kLower)
+    }
+
+    // F1（epoch-drift arm；round-2 code-reviewer flagged）：follower 之 chain-face
+    // 驗證『通過』之後、交付 caller 之前，invalidate() 落地——post-validation epoch
+    // re-check 必須抑制該 pre-revocation Ok 之交付（miss 語義：bindingRestarts=1），
+    // 改走重選舉＋以自己的 binding 重 fetch；絕不交付 invalidate 前之（cached）Ok。
+    // 手法：follower 之 validateChain 對 hop-Y 之 DNS 重驗以 gated resolver 阻斷，
+    // 測試主執行緒於阻斷中呼叫 invalidate()，再放行——驗證通過但世代已漂移，
+    // re-check 必須擋下交付。
+    @Test fun followerEpochDriftBeforeDeliverySuppressesCachedOk() = runBlocking {
+        val dnsA = fakeDns(
+            "x.example.com" to listOf("10.0.0.30"),
+            "y.example.net" to listOf("203.0.113.41"),
+        )
+        // follower 專用 resolver：hop-Y 之**首次** resolve 阻斷於 gate（chain-face 驗證點）；
+        // 其餘（含之後 re-fetch 之 hop-Y）直接放行至 dnsA 之相同答案。
+        val yGateSeen = AtomicBoolean(false)
+        val entered = CountDownLatch(1)
+        val releaseValidation = CountDownLatch(1)
+        val dnsFollower = HostResolver { host ->
+            if (host == "y.example.net" && yGateSeen.compareAndSet(false, true)) {
+                entered.countDown()
+                // 2s 上限：避免 invalidate 路徑損壞時鎖死；逾時仍放行，
+                // epoch re-check 會大聲失敗（交付 pre-revoke Ok → cached=true → 斷言失敗），絕非靜默通過。
+                releaseValidation.await(2_000, TimeUnit.MILLISECONDS)
+                listOf(addr("203.0.113.41"))
+            } else {
+                dnsA.resolve(host)
+            }
+        }
+        val releaseHandler = CompletableDeferred<Unit>()
+        val http = FakeExtract(
+            pinnedHandler = { url, pinned ->
+                when {
+                    url == "https://x.example.com/start" ->
+                        WebExtractRawResponse(302, ByteArray(0), mapOf("Location" to "https://y.example.net/secret"))
+                    pinned.any { it.hostAddress == "203.0.113.41" } -> {
+                        releaseHandler.await()
+                        okResp(html(body = "TENANT_A data"))
+                    }
+                    else -> okResp(html(body = "UNEXPECTED_MARKER"))
+                }
+            },
+            handler = { okResp(html(body = "UNREACHABLE_MARKER")) },
+        )
+        val cache = WebExtractCache()
+        val svc = WebExtractService(http, cache = cache)
+        val optIn = EndpointNetworkOptIn(NetworkEgressPolicy.ALLOW_PRIVATE_DNS)
+        val url = "https://x.example.com/start"
+        // leader：dnsA（ungated）——卡在 hop-Y 之 pinned fetch。
+        val leader = async { svc.extract(url, optIn = optIn, resolver = dnsA) }
+        withTimeout(5_000) { while (http.calls.get() < 2) delay(1) }
+        // follower：相同 hop-0 綁定（x→10.0.0.30 → 同 key）→ join；hop-Y 驗證以 gated resolver 阻斷。
+        val follower = async { svc.extract(url, optIn = optIn, resolver = dnsFollower) }
+        // Q5(b)：service/FakeExtract 未暴露 inFlight join 可觀測面（無公開 API 可輪詢
+        // follower 是否已註冊為 joiner），故以最小 150ms 延遲＋保留 withTimeout 護欄。
+        delay(150)
+        releaseHandler.complete(Unit)
+        // 等 leader 完成（cache 已寫入 pre-revocation entry）、follower 進入 chain-face 驗證之 hop-Y gate。
+        withTimeout(5_000) { while (entered.count > 0L) delay(1) }
+        assertEquals("follower 必須阻斷於 hop-Y 之 chain-face 驗證（DNS 重驗）", 0L, entered.count)
+        assertEquals("leader 之 pre-revocation Ok 必須在 cache 內", 1, cache.size)
+        // invalidate()：bump 世代＋清空 cache＋drain in-flight（此時 leader 已 settle、無 pending）。
+        svc.invalidate()
+        assertEquals("invalidate 必須清空 cache（bump 世代）", 0, cache.size)
+        // 放行 follower 之 hop-Y 驗證：token 一致 → 驗證『通過』——但世代已漂移，
+        // post-validation epoch re-check 必須抑制交付（bindingRestarts=1 → miss 語義）。
+        releaseValidation.countDown()
+        val followerOut = withTimeout(10_000) { follower.await() }
+        val leaderOut = withTimeout(5_000) { leader.await() }
+        assertTrue("leader 必須 Ok，got $leaderOut", leaderOut is WebExtractOutcome.Ok)
+        // 關鍵斷言：絕不交付 pre-revocation Ok；重選舉＋以自己的 binding 重 fetch
+        // （hop-Y gate 已放行、答案與 leader 相同 → tokens 一致）→ 交付 cached==false
+        // 之全新 Ok，且上游多了 2 次（x 302＋hop-Y 終端）。
+        assertTrue("follower 必須 Ok（refetch 後），got $followerOut", followerOut is WebExtractOutcome.Ok)
+        val fOk = followerOut as WebExtractOutcome.Ok
+        assertFalse("invalidate 後不得交付 pre-revocation cached Ok", fOk.cached)
+        assertTrue(
+            "refetch 之內容必須為 TENANT_A（全新 upstream），got ${fOk.content.snippet}",
+            fOk.content.snippet.contains("TENANT_A"),
+        )
+        assertEquals("leader(2)＋follower refetch(2)＝4 次上游", 4, http.calls.get())
     }
 }

@@ -1293,7 +1293,7 @@ class WebExtractService(
                 // awaited 為 LeaderOutcome（經 deferred completion edge 同步之載體）。
                 if (awaited.outcome !is WebExtractOutcome.Ok) {
                     // Round 6：non-Ok 之中唯一可共享者＝HTTP status 失敗（Failed 且
-                    // detail 為 "HTTP_"＋數字後綴，涵蓋 4xx/5xx/206/304），且僅在 follower
+                    // detail 為 "HTTP_"＋100–599 數字後綴，涵蓋 1xx/206/304/305/306/4xx/5xx），且僅在 follower
                     // 以**自己的** opt-in／resolver／deadline 完成 bounded chain-face
                     // 重驗（[validateChain]，規則與 fetch 相同）且 epoch 未漂移之後——
                     // 此時 verdict 為 binding-validated shared fact：每個 hop 都在失敗讀取
@@ -1312,6 +1312,7 @@ class WebExtractService(
                     // 數字後綴硬閘＋範圍：100–599 之 origin-fact status（涵蓋 206/304/4xx/5xx）——
                     // 拒絕任何未來新生的非 origin 語義 "HTTP_*" 字串落入重放。
                     val replayable = failedOutcome != null &&
+                        failedOutcome.detail.startsWith("HTTP_") &&
                         (failedOutcome.detail.removePrefix("HTTP_").toIntOrNull()
                             ?.let { it in 100..599 } == true) &&
                         !replayChain.isNullOrEmpty()

@@ -3658,10 +3658,10 @@ class WebExtractD4Test {
         assertEquals("leader hop-0＋follower hop-0＝2 次上游（雙方皆於 hop-Y 閘前拒）", 2, http.calls.get())
     }
 
-    // Round-6 P2：同 binding＋同 URL 之多 caller 一致 HTTP 404/429/500/206 → 皆得
+    // Round-6 P2：同 binding＋同 URL 之多 caller 一致 HTTP 404/429/500/206/305/306 → 皆得
     // binding-validated 之 status verdict（重放），非假 TRANSPORT；upstream calls==1。
     @Test fun httpFailureSameBindingStatusReplayForAllCallers() = runBlocking {
-        for (code in listOf(404, 429, 500, 206)) {
+        for (code in listOf(404, 429, 500, 206, 305, 306)) {
             val freshDns = publicDns("down.example")
             val release = CompletableDeferred<Unit>()
             val http = FakeExtract(
@@ -3679,7 +3679,7 @@ class WebExtractD4Test {
             val followers = (1..4).map { async { svc.extract(url, optIn = optIn, resolver = freshDns) } }
             // Q5(b) best-effort barrier：follower 須於 leader 完成前登記為 joiner；join 窗口內
             // 兩種交錯皆收斂（重放→HTTP_code、re-elect→自己 fetch 出 HTTP_code）；判別點為 calls==1；
-            // 若 follower 於 leader 完成後才排程，caller 會自行 election、各 fetch 一次（calls==2）
+            // 若 follower 於 leader 完成後才排程，caller 會自行 election、各 fetch 一次（calls≈2+）
             // ——此為預期退化為 solo 路徑，本 fixture 假設窗口內交錯（與檔案內 Q5(b) 同一約定）。
             delay(150)
             release.complete(Unit)
@@ -3758,7 +3758,7 @@ class WebExtractD4Test {
         withTimeout(5_000) { while (http.calls.get() < 1) delay(1) }
         val follower = async { svc.extract(url, optIn = optIn, resolver = dnsB) }
         // Q5(b)：leader 停於 hop-0 pinnedHandler 之 release.await()——follower 登記為 joiner；
-        // barrier 精確度不影響斷言（兩種交錯皆收斂：re-fetch→own HTTP_404、calls==3）。
+        // barrier 精確度不影響斷言（兩種交錯皆收斂：re-fetch→own HTTP_404、calls==4）。
         delay(150)
         release.complete(Unit)
         val leaderOut = withTimeout(5_000) { leader.await() }

@@ -8,6 +8,7 @@ import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Assert.fail
+import org.junit.Assume.assumeTrue
 import org.junit.Test
 
 /**
@@ -366,7 +367,8 @@ class ShellTrustedExecTest {
         } catch (_: Exception) {
             false
         }
-        if (!probe) return
+        // `env` 二進位不可用（如無 coreutils/busybox env）時跳過（SKIP，非靜默綠燈）。
+        assumeTrue("shell env binary unavailable", probe)
         val out = DefaultProcessRunner().run(listOf("env"), 5_000L, null)
         val text = String(out.stdout, Charsets.UTF_8)
         val keys = text.lineSequence()
@@ -811,6 +813,17 @@ class ShellTrustedExecTest {
         } finally {
             dir.deleteRecursively()
         }
+    }
+
+    @Test fun systemRealPrefixes_coversUbuntu26CargoCoreutils() {
+        // ubuntu-26.04 的 coreutils 改為 rust 實作：/usr/bin/id 等為 symlink 至
+        // /usr/lib/cargo/bin/coreutils/*；real 落點必須落入允許集，否則 containment 拒。
+        assertTrue(ShellExecutables.SYSTEM_REAL_PREFIXES.contains("/usr/lib/cargo/bin/coreutils"))
+        val snap = ShellExecutables.snapshotRealRoots(listOf("/nonexistent-xyz-123"))
+        assertTrue(ShellExecutables.isUnderRoots("/usr/lib/cargo/bin/coreutils/id", snap))
+        // 邊界感知：同名兄弟 /usr/lib/cargo/bin/coreutils2 不得沾光。
+        assertFalse(ShellExecutables.isUnderRoots("/usr/lib/cargo/bin/coreutils2/id", snap))
+        assertFalse(ShellExecutables.isUnderRoots("/usr/lib/cargo", snap))
     }
 
     // ---- S3 × S2：multicall 不豁免 containment（逃逸照拒） ----

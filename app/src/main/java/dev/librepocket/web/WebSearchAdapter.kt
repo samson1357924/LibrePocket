@@ -75,6 +75,10 @@ object WebSearchAdapter {
         val readyCheck: suspend (WebSearchProvider) -> Boolean =
             isReady ?: { it.probe() is WebProbe.Ready }
 
+        /**
+         * 單一候選就緒探測：例外→false 是刻意的容錯（單一候選失敗不卡死選舉）；與 dispatch 層 fail-loud 不同，勿互換。
+         * [CancellationException] 原樣透傳；其餘 `Exception` → false（`Error` 原樣拋）。
+         */
         suspend fun safeReady(p: WebSearchProvider): Boolean {
             return try {
                 val ready = readyCheck(p)

@@ -145,6 +145,19 @@ internal class DeadlineExceededException : RuntimeException()
  *   以有界重選舉（`bindingRestarts` ≤ [MAX_STALE_RESTARTS]）以自己的 binding 重 fetch；
  *   leader 內容不得跨越不符之驗證邊界；
  *   驗證成功則 leader 之 Ok verbatim 交付（不修改內容）。
+ *   非 Ok 之 completed outcome 絕不賦予 follower：leader 之拒絕／錯誤可能是針對
+ *   *它自己的* resolver/opt-in 評估（含 redirect 各跳）所為之決策，跨上下文共享＝
+ *   錯誤歸因＋false denial（可得性隔離缺陷）；follower await 回非 Ok 之完成
+ *   [LeaderOutcome] 時一律視為 miss、不 join 該 deferred、改以自己的 opt-in／resolver／
+ *   deadline 有界重選舉重評估全鏈（`bindingRestarts` ≤ [MAX_STALE_RESTARTS]；超過即
+ *   fail-closed `Failed(TRANSPORT)`）。代價（刻意取捨）：一個失敗的 leader 對每個
+ *   follower 各多花一次有界重選舉，而非即時回 surface leader 之拒絕——以確保
+ *   政策相依之失敗歸因於產生該失敗之評估者。
+ *   例外 carve-outs（皆為例外／逾時路徑、非 completed outcome，行為不變）：leader 被
+ *   取消而 follower 仍 active → follower 映射 `Unavailable(CANCELLED)`（不重進單飛迴圈）；
+ *   follower 自身 await 預算耗盡（leader 仍在跑）→ `Failed(TIMEOUT)`。
+ *   （注意：leader 自身 deadline 耗盡而 complete 之 `Failed(TIMEOUT)` 屬 completed
+ *   non-Ok outcome——follower 不繼承、走上述有界重選舉；非 carve-out。）
  * - 內容：`title/url/snippet/published/siteName` 正規化（HTML-family 見 [parseHtml]：
  *   tag 剝除＋entity unescape；非 HTML-family 已放行型別走 raw-text 管線，
  *   不刪 tag、不 unescape，raw `&` 原樣保留，見 [pipelineOf]；raw-text 保留原文
@@ -210,6 +223,11 @@ internal class DeadlineExceededException : RuntimeException()
  *    token 相等；以 follower 剩餘預算為界）——驗證失敗即 miss 語義（follower 不收
  *    到該 Ok；以自己的 binding 有界重選舉，`bindingRestarts` ≤ [MAX_STALE_RESTARTS]，
  *    超過 fail-closed `Failed(TRANSPORT)`）；leader 內容不得跨越不符之驗證邊界。
+ *    同理，leader 之 **非 Ok completed outcome** 亦絕不賦予 follower（round 5）：follower
+ *    await 回非 Ok 之完成 [LeaderOutcome] 時視為 miss、不 join 該 deferred、以自己的
+ *    binding 有界重選舉重評估全鏈（`bindingRestarts` ≤ [MAX_STALE_RESTARTS]，超過 fail-closed
+ *    `Failed(TRANSPORT)`）——leader 之拒絕／錯誤可能是針對 *它自己的* resolver/opt-in
+ *    評估（含 redirect 各跳）所為之決策，跨上下文共享＝錯誤歸因＋false denial。
  *    殘餘（誠實聲明，**非**「完整 redirect 隔離」已達成）：(a) awaited Ok 內容仍由
  *    leader 於其 hop-0 等效信任之 binding 下產出——成功之 follower 信任 hop-0 key
  *    綁定＋其自身之逐跳 re-validation 結果（同 URL、同解析答案者信任成立）；
@@ -228,7 +246,13 @@ internal class DeadlineExceededException : RuntimeException()
  *    流程，envelope 不擔任 authorization 角色。
  * 5. Follower `await()` 已由同一 `withTimeoutOrNull` 預算為界，逾時映射
  *    `Failed(TIMEOUT)`（audit 上與 `CANCELLED` 區分）；per-follower 獨立
- *    deadline 仍為可能的 D3 強化項。
+ *    deadline 仍為可能的 D3 強化項。leader 之 **非 Ok completed outcome** 一律不賦予
+ *    follower（round 5）：follower 視為 miss、以自己的 binding 有界重選舉重評估全鏈
+ *    （`bindingRestarts` ≤ [MAX_STALE_RESTARTS]，超過 → fail-closed
+ *    `Failed(TRANSPORT)`）；僅例外／逾時路徑（leader 取消 → `Unavailable(CANCELLED)`；
+ *    follower 自身 await 預算耗盡＝leader 仍在跑 → `Failed(TIMEOUT)`）不進重選舉。
+ *    （leader 自身 deadline 耗盡而 complete 之 `Failed(TIMEOUT)` 屬 completed non-Ok
+ *    outcome——follower 不繼承、走上述有界重選舉。）
  * 6. `timeoutMs <= 0` 會被 `coerceAtLeast(1)` 收斂為 1ms 預算 — 幾乎立即
  *    fail-closed `TIMEOUT`；屬保守方向，安全可接受。
  * 7. 位元組加權 LRU 快取上限已實作（[MAX_CACHE_BYTES] 4 MiB：near-weighted
@@ -353,6 +377,8 @@ object WebExtract {
      * 若 leader 於取消前已完整產出 Ok（`okForFollowers` 路徑，complete(ok)），
      * follower 收到該 Ok 而非 CANCELLED（仍須先通過 follower 自己之
      * chain-face 逐跳重驗；見 D3 追蹤項 #1）。
+     * （本 detail 僅覆蓋例外／取消路徑；completed 之非 Ok outcome 不在此語義內——
+     * 該路徑一律非直接交付，而是 follower 有界重選舉重評估全鏈；見 `extract()` KDoc。）
      */
     const val DETAIL_CANCELLED = "CANCELLED"
 }
@@ -960,6 +986,15 @@ class WebExtractService(
      * 驗證成功則 leader 之 Ok verbatim 交付（不修改內容）——但交付前另有一道
      * post-validation epoch re-check（鏡射 [verifiedCachedHit]；撤權於 re-check 之前
      * 完成者抑制交付，視為 miss）。leader 內容不得跨越不符之驗證邊界。
+     * 非 Ok 之 completed outcome 亦絕不賦予 follower（round 5）：follower await 回非 Ok 之
+     * 完成 [LeaderOutcome] 時一律視為 miss、不 join 該 deferred（`skipJoinForDeferred`）、
+     * 改以自己的 opt-in／resolver／deadline 有界重選舉重評估全鏈
+     * （`bindingRestarts` ≤ [MAX_STALE_RESTARTS]，超過即 fail-closed `Failed(TRANSPORT)`）；
+     * leader 之拒絕／錯誤不得跨 resolver／政策上下文共享（錯誤歸因＋false denial）。
+     * 例外 carve-outs（例外／逾時路徑、非 completed outcome，行為不變）：leader 被取消 →
+     * follower 映射 `Unavailable(CANCELLED)`；follower 自身 await 預算耗盡
+     * （leader 仍在跑）→ `Failed(TIMEOUT)`。leader 自身 deadline 耗盡而 complete 之
+     * `Failed(TIMEOUT)` 屬 completed non-Ok outcome——follower 不繼承、走上述有界重選舉。
      * mismatch 時 election 不得 join 該 deferred 之 `inFlight` 條目（`skipJoinForDeferred`），
      * 而由 caller 自己當 leader（自己的 binding 自行 fetch）。
      *
@@ -973,12 +1008,18 @@ class WebExtractService(
      * leader 交付給 follower 之載體：outcome ＋ leader 記錄之逐跳
      * 信任上下文 chain。經 deferred completion edge 同步給 follower；follower 於 Ok
      * 交付前執行 [validateChain]（規則與 fetch 相同；以 follower 自己的 opt-in／resolver／
-     * deadline 為準）。僅 Ok 路徑可能非空；非 Ok 為 emptyList()，follower 不讀取（僅 is Ok 分支驗證）。
+     * deadline 為準）。僅 Ok 路徑可能非空；非 Ok 為 emptyList()。
+     * **非 Ok 之 completed outcome 絕不賦予 follower**——leader 之拒絕／錯誤不得跨
+     * resolver／政策上下文共享（follower 自身之 hop-Y 乃至 hop-0 可能解析到不同位址＝allowed）：
+     * follower 視為 miss、不 join 該 deferred、以自己的 binding 有界重選舉重評估全鏈
+     * （`bindingRestarts` ≤ [MAX_STALE_RESTARTS]，超過即 fail-closed `Failed(TRANSPORT)`）；
+     * follower 不讀取非 Ok 之 chain（僅 is Ok 分支驗證）。
      */
     private data class LeaderOutcome(val outcome: WebExtractOutcome, val chain: List<HopBinding>?)
 
     // 載體語義：null＝follower 判定之 pathology（Ok 無 chain）→ follower 端 fail-closed（TRANSPORT）；
-    // 空 list＝非 Ok 載體，或 scaffold 語義（僅 internal put() 產生，本 arm 不交付）；follower Ok arm 兩者皆 fail-closed。
+    // 空 list＝非 Ok 載體，或 scaffold 語義（僅 internal put() 產生，本 arm 不交付）——非 Ok 載體
+    // 一律不賦予 follower（miss 語義；follower 有界重選舉）；follower Ok arm 兩者皆 fail-closed。
 
     private val mutex = Mutex()
     private val inFlight: MutableMap<String, InFlightEntry> = mutableMapOf()
@@ -1000,12 +1041,26 @@ class WebExtractService(
      * 重試時以當下世代重捕 `epochAtEntry` 並重新走完整 policy／DNS cycle
      * （含 key 重算）。入口（epochAtEntry 捕獲點）至 election 之間被
      * invalidate 的請求因此**不會**在 invalidate 之後建立陳舊世代的 inFlight 條目。
-     * follower 映射語義不變：leader drain 時 pending 者見
+     * follower 映射語義（例外路徑）不變：leader drain 時 pending 者見
      * `Unavailable(CANCELLED)`；leader 於 drain 前已完整產出 Ok 者 follower 照收
      * （但 Ok 仍須先通過 follower 自己之 chain-face 逐跳重驗才交付——見上方
      * `InFlightEntry` KDoc 與 D3 追蹤項 #1）。
+     * follower 之非 Ok 規則（round 5）：follower await 回**非 Ok completed outcome**
+     * 絕不直接交付——leader 之拒絕／錯誤可能是針對 *它自己的* resolver/opt-in 評估
+     * （含 redirect 各跳）所為之決策，follower 自身之 hop-Y（乃至 hop-0）可能解析到
+     * 不同位址（allowed）；直接繼承＝錯誤歸因＋false denial（可得性隔離缺陷）。
+     * follower 一律視為 miss、不 join 該 deferred（`skipJoinForDeferred`）、以自己的
+     * opt-in／resolver／deadline 有界重選舉重評估全鏈（`bindingRestarts` ≤
+     * [MAX_STALE_RESTARTS]，超過即 fail-closed `Failed(TRANSPORT)`）。刻意取捨：一個
+     * 失敗的 leader 現對每個 follower 各多花一次有界重選舉，而非即時回 surface
+     * leader 之拒絕——以確保政策相依之失敗歸因於產生該失敗之評估者。例外 carve-outs
+     * （例外／逾時路徑、非 completed outcome，行為不變）：leader 被取消 → follower
+     * 映射 `Unavailable(CANCELLED)`；follower 自身 await 預算耗盡（leader 仍在跑）→
+     * `Failed(TIMEOUT)`。（leader 自身 deadline 耗盡而 complete 之 `Failed(TIMEOUT)`
+     * 屬 completed non-Ok outcome——follower 不繼承、走上述有界重選舉；非 carve-out。）
      * election 另有一個 follower 面例外：`skipJoinForDeferred === 該條目之 deferred` 時不 join 該
-     * in-flight 條目（先前之 Ok 未通過本 follower 之 chain-face 驗證），呼叫方就地
+     * in-flight 條目（先前之 Ok 未通過本 follower 之 chain-face 驗證，或先前之非 Ok
+     * completed outcome——該 leader 對本 follower 而言已不可信），呼叫方就地
      * 插入新世代條目並自己當 leader；與世代漂移之有界重試正交（後者另計
      * `staleRestarts`）。
      * follower Ok 交付前亦有一道 post-validation epoch re-check（鏡射 [verifiedCachedHit]）：
@@ -1046,9 +1101,9 @@ class WebExtractService(
         var epochAtEntry = cache.currentGeneration
         var staleRestarts = 0
         var bindingRestarts = 0
-        // A2：follower 驗證失敗／epoch-drift 後 skipJoin 之對象——election 見此 deferred
-        // 即不 join 該 in-flight 條目（僅 identity 相等時），改為就地插入新條目
-        //（自己當 leader）。以 deferred identity 為範圍而非 key，同 key 之後續 leader 不受誤傷。
+        // A2：follower 驗證失敗／epoch-drift／非 Ok completed outcome 後 skipJoin 之對象——
+        // election 見此 deferred 即不 join 該 in-flight 條目（僅 identity 相等時），改為就地
+        // 插入新條目（自己當 leader）。以 deferred identity 為範圍而非 key，同 key 之後續 leader 不受誤傷。
         var skipJoinForDeferred: CompletableDeferred<LeaderOutcome>? = null
         val hop0 = stripFragment(rawUrl.trim())
         while (true) {
@@ -1103,8 +1158,9 @@ class WebExtractService(
                         lateHit = null
                     }
                     if (lateHit == null) {
-                        // follower chain-face 驗證失敗後：skipJoinForDeferred === 該條目之 deferred
-                        // 表示該 leader（內容）已被本 caller 判定不可信——不得 join，
+                        // follower chain-face 驗證失敗／非 Ok completed outcome 後：
+                        // skipJoinForDeferred === 該條目之 deferred 表示該 leader（內容或其失敗決策）
+                        // 已被本 caller 判定為不可信——不得 join，
                         // 改為就地插入新世代條目，由本 caller 以自己的 binding 當 leader
                         //（其 fetch 將自行逐跳過閘，通過即交付自己的結果）。
                         val entry = inFlight[k]
@@ -1152,6 +1208,9 @@ class WebExtractService(
                     // 否則為 leader 取消：follower 映射 typed Unavailable(CANCELLED)
                     // 並返回，不再進入單飛迴圈（never cached，不得 out-fetch a
                     // cancelled leader）。
+                    // （本 arm 為例外路徑、非 completed outcome；behavior 不變。
+                    // completed 之非 Ok outcome 不走本 arm——見下方 `!is Ok` 分支，
+                    // 該路徑一律有界重選舉、絕不交付 leader 之 non-Ok。）
                     // 例外：若 leader 於取消前已完整產出 Ok（okForFollowers 路徑，
                     // complete(ok) 而非 completeExceptionally），follower 收到該 Ok
                     // 而非 CANCELLED——`await()` 會直接回傳已落定的結果（仍須通過下方
@@ -1168,7 +1227,21 @@ class WebExtractService(
                 } ?: return WebExtractOutcome.Failed(WebExtract.DETAIL_TIMEOUT)
                 // awaited 為 LeaderOutcome（經 deferred completion edge 同步之載體）。
                 if (awaited.outcome !is WebExtractOutcome.Ok) {
-                    return awaited.outcome
+                    // 不得跨 resolver／政策上下文共享 non-Ok：leader 之拒絕／錯誤可能是
+                    // 針對 *它自己的* resolver/opt-in 評估（含 redirect 各跳）之決策，
+                    // follower 自身的 hop-Y（乃至 hop-0）可能解析到不同位址（allowed）——
+                    // 直接繼承=錯誤歸因＋false denial（可得性隔離缺陷）。
+                    // miss 語義：不 join 該 deferred、改自當 leader，以自己的 opt-in／
+                    // resolver／deadline 重評估全鏈；沿用既有有界重選舉機制（MAX_STALE_RESTARTS）。
+                    // 成本/語義：一個失敗的 leader 現對每個 follower 各花一次有界重選舉，
+                    // 而非即時回 surface leader 之拒絕——這是刻意的 miss 語義取捨，
+                    // 以確保政策相依之失敗歸因於產生該失敗之評估者，而非跨上下文共享。
+                    bindingRestarts += 1
+                    if (bindingRestarts > WebExtract.MAX_STALE_RESTARTS) {
+                        return WebExtractOutcome.Failed(WebExtract.DETAIL_TRANSPORT)
+                    }
+                    skipJoinForDeferred = m
+                    continue
                 }
                 // Ok 之 chain-face 驗證：leader 記錄之 chain 須以 **follower 自己的**
                 // opt-in/resolver/deadline 逐跳重驗（規則與 fetch 相同：跨 origin opt-in
@@ -1263,13 +1336,16 @@ class WebExtractService(
                 // parse／gunzip 內部 deadline 耗盡逸出（本 commit 起由
                 // extractUncached 的 wrapper 先接為 Failed(TIMEOUT)，此 arm 為
                 // extract() 側 backstop）：m 必須 settle 為 Failed(TIMEOUT)，
-                // follower 映射同 detail；never Ok、never cached。
+                // never Ok、never cached；follower 不繼承該 non-Ok——視為 miss、
+                // 以自己的 binding 有界重選舉重評估全鏈（見 follower arm `!is Ok` 分支）。
                 val failed = WebExtractOutcome.Failed(WebExtract.DETAIL_TIMEOUT)
                 m.complete(LeaderOutcome(failed, emptyList()))
                 return failed
             } catch (_: Exception) {
                 // 剩餘例外（非 DeadlineExceededException）一律 fail-closed
-                // TRANSPORT（m 必須 settle；follower 不得 hang）。
+                // TRANSPORT（m 必須 settle；follower 不得 hang）；
+                // follower 不繼承該 non-Ok——視為 miss、以自己的 binding 有界重選舉
+                // 重評估全鏈（見 follower arm `!is Ok` 分支）。
                 try {
                     currentCoroutineContext().ensureActive()
                 } catch (ce: CancellationException) {
@@ -1916,8 +1992,16 @@ internal data class ParseResult(val content: WebExtractContent, val inputCapped:
  *   （true → 上層 `truncated=true`；若 model 預算未截，envelope 內嵌
  *   `[...TRUNCATED INPUT AT $PARSE_INPUT_CAP CHARS]` input sentinel）。
  *
- * `<script`／`<style`／`<title` 僅在緊接的字元為 ASCII 空白、`/`、`>` 或 EOF
- * 時才被視為標籤（tag-name 邊界）；如 `<scripture>`／`<titlex>` 不再誤判。
+ * `<script`／`<style`／`<title` 僅在緊接的字元為 WHATWG ASCII whitespace、`/`、`>` 或 EOF
+ * 時才被視為標籤（tag-name 邊界；接受集為 U+0009／U+000A／U+000C／U+0020，另保留 U+000D，
+ * **U+000B 不接受**）；如 `<scripture>`／`<titlex>` 不再誤判。
+ *
+ * 決策（round-5 Finding 1）：start-tag 邊與 end-tag 邊共用 [isTagNameBoundary]；
+ * `<script\u000B>` 之類（U+000B 於 tag name 之後）**不成 tag-open**，body 依 WHATWG
+ * tag-name state 之 error-recovery 呈現為可見文本（與瀏覽器一致），僅 end-tag 一側
+ * 維持 over-strip fail-closed。此一路徑非洩漏（可見內容仍為 envelope 內未信任文本、
+ * fence 不受影響；攻擊者原可把文本置於普通 `<div>`），刻意採 WHATWG 忠實行為並
+ * 釘為 fixture `scriptU000BStartTagBodyVisiblePerWHATWG`。
  */
 internal fun parseHtml(html: String, finalUrl: String, deadlineNs: Long = Long.MAX_VALUE, checking: () -> Unit = {}): ParseResult? {
     return try {
@@ -1993,11 +2077,20 @@ internal object HtmlExtract {
         }
     }
 
-    /** tag-name 邊界：緊接 needle 之 byte 必須為 ASCII 空白、`/`、`>` 或 EOF。 */
+    /**
+     * tag-name 邊界：緊接 needle 之 byte 必須為 WHATWG ASCII whitespace、`/`、`>` 或 EOF。
+     * 接受集（與 WHATWG script data end tag name／RAWTEXT end tag name 狀態之 delimiters
+     * 一致）為 U+0009 TAB／U+000A LF／U+000C FF／U+0020 SPACE，外加 `/`、`>`；
+     * U+000D CR 保留為必要接受項——**本實作 decode 直通 parseHtml，並無 CR→LF pre-normalization**，
+     * WHATWG 所定義之 CR→LF 正規化無法假定已發生（decode 不做，故 `</script\r>` 須照樣辨識為閉合）。
+     * **U+000B（vertical TAB）不在接受集**——WHATWG 不視其為 ASCII whitespace：`</script\v>`
+     * 之類形態不構成 end-tag 閉合，fail-closed
+     * （over-strip 為安全方向：內容損失，然無隱藏內容外洩為可見文本）。
+     */
     private fun isTagNameBoundary(lower: String, p: Int): Boolean {
         if (p >= lower.length) return true // EOF
         val c = lower[p]
-        return c == ' ' || c == '\t' || c == '\n' || c == '\u000B' ||
+        return c == ' ' || c == '\t' || c == '\n' ||
             c == '\u000C' || c == '\r' || c == '/' || c == '>'
     }
 
@@ -2127,7 +2220,8 @@ internal object HtmlExtract {
      * [findTagEnd]（引號感知）整體跳過）。無對應關閉標籤者，
      * 原則上自開始標籤剝至輸入結尾（`findTagEnd == -1` 之未閉合開始標籤**一律剝至輸入結尾，
      * 內嵌之 `</script …>`／`</style …>` 不構成停點，刻意 fail-closed；見候選分支註解）；
-     * end-tag 辨識容忍 tag-name 與 `>` 之間之 ASCII 空白及單一可選 `/`，見 [findEndTagClose]）。
+     * end-tag 辨識容忍 tag-name 與 `>` 之間之 WHATWG ASCII whitespace（U+0009／U+000A／
+     * U+000C／U+0020，另保留 U+000D；**U+000B 不接受**）及單一可選 `/`，見 [findEndTagClose]）。
      * comment 本身原樣保留在文本流中（含 `<!--`…EOF
      * 的未閉合 comment——其內容一併原樣保留至輸入結尾）。
      * 以 StringBuilder 分段拼接（純文字／comment／非候選 tag 為「待取段」，遇結構性
@@ -2141,7 +2235,8 @@ internal object HtmlExtract {
      * （[checking] 先、[deadlineNs] 後，同舊版）；純文字路徑以 512 code unit 節流雙閘，
      * 並於段落 flush 點（待取段落入 sb 之前）雙閘；子掃描（[findTagEnd]／[findEndTagClose]）同樣雙閘。
      * 內部 [findEndTagClose] 以 `"</tag"` 候選前進辨識 end-tag（tag-name 邊界＋
-     * ASCII 空白＋可選 `/`），各候選 indexOf 區間幾乎不相交、WS 跳掃各 run 不相交，
+     * WHATWG ASCII whitespace（U+0009／U+000A／U+000C／U+0020，另保留 U+000D；**U+000B 不接受**）
+     * ＋可選 `/`），各候選 indexOf 區間幾乎不相交、WS 跳掃各 run 不相交，
      * 故 one-pass 仍為線性（見 [findEndTagClose] KDoc）；`lower.indexOf("-->")` 為
      * 原生掃描、不可 weave（線性、受 input cap 約束）。
      */
@@ -2193,7 +2288,8 @@ internal object HtmlExtract {
                         // 時，strip 才停於該 end-tag 之後。
                         val openEnd = findTagEnd(lower, i, deadlineNs, checking)
                         val searchFrom = if (openEnd < 0) i else openEnd + 1
-                        // WHATWG 端標籤語義：容忍 tag-name 與 `>` 之間之 ASCII 空白及單一可選 `/`
+                        // WHATWG 端標籤語義：容忍 tag-name 與 `>` 之間之 WHATWG ASCII whitespace
+                        //（U+0009／U+000A／U+000C／U+0020，另保留 U+000D；**U+000B 不接受**）及單一可選 `/`
                         //（如 `</script >`、`</style\t/>`）；找不到／邊界不符回 -1 → 剝至輸入結尾。
                         val close = findEndTagClose(lower, tag, searchFrom, deadlineNs, checking)
                         i = if (openEnd < 0 || close < 0) n else close
@@ -2217,14 +2313,18 @@ internal object HtmlExtract {
 
     /**
      * 閉合 end-tag 辨識（WHATWG 端標籤語義）：`</`＋ASCII 大小寫不敏感 tag 名，其後可
-     * 含任意 ASCII 空白（[isAsciiWs]），再為單一可選 `/` 與任意 ASCII 空白，最後為 `>`。
+     * 含任意 WHATWG ASCII whitespace（[isAsciiWs]：U+0009 TAB／U+000A LF／U+000C FF／U+0020 SPACE，
+     * 另保留 U+000D CR；**U+000B（vertical TAB）不接受**——WHATWG 不視其為 ASCII whitespace，
+     * 該字元後之 end-tag 不構成閉合，fail-closed，over-strip 為安全方向：內容損失，
+     * 然無隱藏內容外洩為可見文本），再為單一可選 `/` 與任意 WHATWG ASCII whitespace，最後為 `>`。
      * 回傳 `>` 之後一位（整個閉合標籤之後）；找不到／邊界不符一律 -1（呼叫方剝至輸入結尾）。
      * 候選以 `lower.indexOf("</tag", i)` 單調前進：每次失敗僅前進 2；各候選之 indexOf 掃描
      * 區間幾乎不相交（累計 ≤ n），尾隨空白跳掃總量亦 ≤ n（各 run 不相交、受 input cap 約束）。
      * checking／deadline 雙閘：每個候選一次、WS 跳掃每 512 code units 一次。
      * 刻意偏離 WHATWG tokenizer 的 error-recovery：end-tag 上出現屬性（`</script x>`）或
      * 重複 `/`（`</script//>`）一律不視為閉合（over-strip＝內容損失、絕非洩漏；fail-closed）；
-     * 僅接受 WHATWG 語法層之 `WS*` `/`? `WS*` `>` 形。NBSP 等非 ASCII 空白不接受（WHATWG 限 ASCII）。
+     * 僅接受 WHATWG 語法層之 `WS*` `/`? `WS*` `>` 形（WS＝U+0009／U+000A／U+000C／U+0020，
+     * 另保留 U+000D；**U+000B 不接受**）。NBSP 等非 ASCII 空白不接受（WHATWG 限 ASCII）。
      * raw-text body 不做引號／comment 過濾：JS 字串內之 `</script …>` 即為閉合（WHATWG 忠實語義）。
      */
     private fun findEndTagClose(lower: String, tag: String, from: Int, deadlineNs: Long, checking: () -> Unit): Int {
@@ -2240,7 +2340,8 @@ internal object HtmlExtract {
                 i = p + 2
                 continue
             }
-            // 跳過 tag-name 與 `/`／`>` 之間任意數量之 ASCII 空白（每 512 code units 雙閘）。
+            // 跳過 tag-name 與 `/`／`>` 之間任意數量之 WHATWG ASCII whitespace（U+0009／U+000A／
+            // U+000C／U+0020，另保留 U+000D；**U+000B 不接受**；每 512 code units 雙閘）。
             var scanned = 0
             while (j < lower.length && isAsciiWs(lower[j])) {
                 if (++scanned and 511 == 0) {
@@ -2249,7 +2350,8 @@ internal object HtmlExtract {
                 }
                 j++
             }
-            // 單一可選 `/`（self-closing 形態之 end-tag，如 `</script/>`），其後可再含 ASCII 空白。
+            // 單一可選 `/`（self-closing 形態之 end-tag，如 `</script/>`），其後可再含
+            // WHATWG ASCII whitespace（U+0009／U+000A／U+000C／U+0020，另保留 U+000D；**U+000B 不接受**）。
             if (j < lower.length && lower[j] == '/') {
                 j++
                 var scanned2 = 0
@@ -2276,8 +2378,12 @@ internal object HtmlExtract {
         "dc.date",
     )
 
+    // WHATWG ASCII whitespace：U+0009 TAB／U+000A LF／U+000C FF／U+0020 SPACE；
+    // **本實作 decode 直通 parseHtml，並無 CR→LF pre-normalization**——U+000D CR 保留為必要接受項。
+    // **U+000B（vertical TAB）不接受**——WHATWG 不視其為 ASCII whitespace：end-tag 於此字元後
+    // 不構成閉合（fail-closed；over-strip 為安全方向：內容損失，然無隱藏內容外洩為可見文本）。
     private fun isAsciiWs(c: Char): Boolean =
-        c == ' ' || c == '\t' || c == '\n' || c == '\u000B' || c == '\u000C' || c == '\r'
+        c == ' ' || c == '\t' || c == '\n' || c == '\u000C' || c == '\r'
 
     private fun isNameChar(c: Char): Boolean =
         c in 'a'..'z' || c in 'A'..'Z' || c in '0'..'9' || c == '-' || c == '_' || c == ':'

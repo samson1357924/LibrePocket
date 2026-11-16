@@ -62,9 +62,12 @@ private fun safeLogW(tag: String, msg: String, e: Throwable? = null) {
  * `IllegalStateException(ShizukuRequestErrors.REQUEST_CODE_SPACE_EXHAUSTED)`（fail-closed）。
  * 呼叫方自選碼經 [request]／[requestWithCallback]／[onResult] 註冊或送出時照燒。
  * 殘餘邊界：行程重啟後碼空間自 1 重新開始（含呼叫方自選碼）——stale pending
- * dialog 在重啟後答覆，可把舊碼送達新行程的 listener；唯一緩解是 B3 落庫前的
- * final-commit fence（`ShizukuGrantStore.save()` 前即時持久重查），為 B3 啟用的
- * 不可通融硬性前置（見 docs/THREAT_MODEL.md 第 4 項）。
+ * dialog 在重啟後答覆，可把舊碼送達新行程的 listener；緩解有兩層（皆為 B3 啟用的
+ * 不可通融硬性前置，見 docs/THREAT_MODEL.md 第 4 項）：（一）跨行程重啟的 request
+ * identity 證明（上游 binder/PID／舊 OS result 投遞模型＋deterministic 重啟測試）；
+ * （二）落庫前的 final-commit fence（`ShizukuGrantStore.save()` 前即時持久重查）；
+ * `bridgeEffective` 雙 volatile 非單一原子閘，runner 必須 pre-spawn 重驗持久快照／
+ * activation／scope。
  *
  * attach 成功後才能請求：[request]/[requestWithCallback] 在未成功 attach
  * （含從未 attach、已 [detach]）時一律 fail-closed 回傳 false，不登記任何回呼；
@@ -408,8 +411,9 @@ class ShizukuPermissionRequests(
     /**
      * 僅供測試驅動 dispatch 路徑用；無 production caller；勿在產品碼呼叫。
      * 注意：emitResult 的 epoch 參數重查只能擋「作廢後的過期分發」，無法分辨 stale 與
-     * fresh 送達「當前」listener（同一 epoch 內兩者不可分辨）——落庫前的唯一兜底是
-     * B3 的 final-commit fence（`ShizukuGrantStore.save()` 前即時重查持久層）。
+     * fresh 送達「當前」listener（同一 epoch 內兩者不可分辨）——緩解有兩層：跨行程
+     * 重啟的 request identity 證明＋落庫前的 final-commit fence（`ShizukuGrantStore.save()`
+     * 前即時重查持久層；`bridgeEffective` 雙 volatile 非單一原子閘，須 pre-spawn 重驗）。
      */
     @VisibleForTesting(otherwise = VisibleForTesting.PRIVATE)
     internal fun emitResult(

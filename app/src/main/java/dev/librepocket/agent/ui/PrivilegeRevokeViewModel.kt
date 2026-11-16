@@ -1,10 +1,15 @@
 package dev.librepocket.agent.ui
 
 import android.app.Application
+import android.content.Context
+import android.content.ContextWrapper
+import androidx.activity.ComponentActivity
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.ui.platform.LocalContext
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
+import androidx.lifecycle.ViewModelStoreOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.lifecycle.viewModelScope
@@ -121,7 +126,9 @@ internal class PrivilegeRevokeViewModel(
 /**
  * [PrivilegeRevokeViewModel] 的 [ViewModelProvider.Factory]（與既有 factory 同風格：
  * 直接覆寫標準 `create(modelClass)`、只認本類別）。產品路徑經
- * `viewModel(factory = PrivilegeRevokeViewModelFactory(app))` 取得；接線測試注入假 executor。
+ * `viewModel(factory = PrivilegeRevokeViewModelFactory(app), viewModelStoreOwner = …)` 取得
+ * （owner 解析見 [PrivilegeRevokeWiring]／[findComponentActivity]，Re-review #9）；
+ * 接線測試注入假 executor。
  */
 internal class PrivilegeRevokeViewModelFactory(
     private val app: Application,
@@ -139,7 +146,24 @@ internal class PrivilegeRevokeViewModelFactory(
 }
 
 /**
- * 「一鍵收回」接線單一來源（Re-review #7 Finding 3）。
+ * 從 Compose 的 [LocalContext] 沿 [ContextWrapper] 鏈向上解析宿主 [ComponentActivity]。
+ *
+ * Re-review #9：`LocalViewModelStoreOwner.current`（或 `viewModel(...)` 的預設
+ * owner）會落在 composition 最近的 ViewModelStoreOwner——Settings destination 的
+ * NavBackStackEntry（production：`StartupGateHost` 的 NavHost { composable(SETTINGS) }），
+ * 不是 Activity。導航 pop 掉 SETTINGS 時該 entry 的 ViewModelStore 會被清空，revoke VM
+ * 連帶銷毀，而 revoke() 的 `withContext(NonCancellable)` 仍在跑——重進 Settings 只能
+ * 拿到全新（Idle）VM，在途狀態／失敗 banner 全失。此處刻意以 context 鏈解析 Activity
+ * owner，與 composition 深度（NavHost 目的地條目）無關。
+ *
+ * 非 Activity 終端（如 application context）回傳 null，呼叫方負責 fail-closed。
+ */
+internal tailrec fun Context.findComponentActivity(): ComponentActivity? =
+    this as? ComponentActivity
+        ?: (this as? ContextWrapper)?.baseContext?.findComponentActivity()
+
+/**
+ * 「一鍵收回」接線單一來源（Re-review #7 Finding 3；owner 解析見 Re-review #9）。
  *
  * `MainScreen` 與接線測試共用此 composable：`viewModel` 取得、`uiState` 收集
  * （`collectAsStateWithLifecycle`）、`(onRevokePrivilege, inFlight, error)` 三元
@@ -147,18 +171,39 @@ internal class PrivilegeRevokeViewModelFactory(
  * `content` 由呼叫方決定（生產傳 `SettingsScreen` 的三參接線；測試傳探針 UI），
  * SettingsScreen API 不變。
  *
- * viewModel owner 預設為 Activity（MainScreen 宿主 MainActivity）；若未來併入 NavBackStackEntry，
- * 生命週期改由 pop 控制、撤權狀態會隨 pop 消失——屆時需重新評估 scope（並見 #136-B3 前置）。
+ * viewModel owner 預設為宿主 [ComponentActivity]（[LocalContext] 經
+ * [findComponentActivity] 沿 context 鏈解析；Re-review #9 修復）——與 composition
+ * 深度無關：NavHost destination 的 [androidx.navigation.NavBackStackEntry]
+ * （如 SETTINGS 目的地）不是 owner，不會被諮詢。顯式傳入 [viewModelStoreOwner]
+ * 可覆寫（例如未來穩定的 root navigation-graph owner）。
+ *
+ * 保證（同一保證的兩個釘測面）：pop 掉 Settings（正常 CHAT→SETTINGS 使用者路徑中的
+ * 抽屜「新對話」導航）不會銷毀本 VM——owner 是 Activity 而非 SETTINGS 條目，撤權在途
+ * 狀態／失敗 banner 跨 pop 存活（與配置變更無關；範圍為 Activity／畫面生命週期）。
+ * 配置變更（重建）保留由 `PrivilegeRevokeWiringTest` 釘住，Settings-pop 保留由
+ * nav-pop 整合測試（`PrivilegeRevokeNavPopTest`）釘住。Re-review #9。
+ *
+ * 注意：owner 解析失敗（Compose context 無 Activity，例如非 MainActivity 宿主）會
+ * 直接 `error(...)` fail-closed，絕不退回 NavBackStackEntry。
  */
 @Composable
 internal fun PrivilegeRevokeWiring(
     app: Application,
     withdraw: suspend () -> Unit,
     executor: (suspend (PrivilegeBridgeState, PrivilegeBridgeStore) -> Boolean)? = null,
+    viewModelStoreOwner: ViewModelStoreOwner? = null,
     content: @Composable (onRevokePrivilege: () -> Unit, inFlight: Boolean, error: Boolean) -> Unit,
 ) {
+    val owner = viewModelStoreOwner
+        ?: LocalContext.current.findComponentActivity()
+        ?: error(
+            "PrivilegeRevokeWiring: no Activity available in Compose context " +
+                "(expected MainActivity-hosted MainScreen); refusing to bind the revoke " +
+                "ViewModel to the Settings NavBackStackEntry (Re-review #9)",
+        )
     val vm: PrivilegeRevokeViewModel = viewModel(
         factory = PrivilegeRevokeViewModelFactory(app, withdraw, executor),
+        viewModelStoreOwner = owner,
     )
     val uiState by vm.uiState.collectAsStateWithLifecycle()
     content(

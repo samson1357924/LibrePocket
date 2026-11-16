@@ -676,6 +676,12 @@ class FastRouter(
          * (b) [clauseProbeJoined] — Cf is REMOVED silently: `ap\u200Bprove` rejoins as
          *     `approve` (an intra-word split neither the raw text nor the spaced
          *     probe can match).
+         * Lo-category Hangul fillers (U+115F/U+1160/U+3164/U+FFA0) are silently
+         * removed in BOTH probes as well: NFKC folds U+3164/U+FFA0 into U+1160
+         * （Lo 類）, which would otherwise break a verb nucleus like `再ㅤ做`
+         * (`再` + filler + `做`) before the clause gate can match it — same
+         * treatment already applied by the negation gate and the interrogative-tail
+         * probe, extended here for the clause gate (stage-9.5, F1 residual close).
          * `_` (Pc) is KEEPED in both probes so identifiers like `after_approval`
          * stay one word and cannot collide with the `after … approval` clause.
          * Unlike [isNegated]'s three-text scheme this never feeds `\b`-less
@@ -684,11 +690,15 @@ class FastRouter(
          * regexes anchor on).
          */
         private fun clauseProbeSpaced(text: String): String =
-            Normalizer.normalize(text, Normalizer.Form.NFKC).replace(CLAUSE_FOLD, " ").trim()
+            Normalizer.normalize(text, Normalizer.Form.NFKC)
+                .replace(HANGUL_FILLER, "")
+                .replace(CLAUSE_FOLD, " ")
+                .trim()
 
         private fun clauseProbeJoined(text: String): String =
             Normalizer.normalize(text, Normalizer.Form.NFKC)
                 .replace(CLAUSE_Cf, "")
+                .replace(HANGUL_FILLER, "")
                 .replace(CLAUSE_FOLD, " ")
                 .trim()
 

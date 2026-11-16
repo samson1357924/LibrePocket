@@ -3507,6 +3507,7 @@ class FastDispatchTest {
             "查Foo符號等授權再做",
             // #19 B3 stage-9.1 新增 arm H/I 負向釘：
             "查Foo符號如果我同意",
+            "查Foo符號再ㅤ做",   // arm H with U+3164 Hangul filler inside the nucleus
             "查Foo符號明天再做",
             // stage-9.4（release-gate 鎳）：arm H 代表攻擊形（未列舉亦必否決）：
             "查Foo再做符號",

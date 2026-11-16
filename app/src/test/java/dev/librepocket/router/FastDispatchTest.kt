@@ -600,6 +600,9 @@ class FastDispatchTest {
             "查找Foo符號" to "Foo",
             "尋找Foo符號" to "Foo",
             "找尋Foo符號" to "Foo",
+            "搜寻Foo符號" to "Foo",
+            "寻找Foo符號" to "Foo",
+            "找寻Foo符號" to "Foo",
             // 帶空白複合動詞：`查詢 Foo 符號` 先前（stage-7.2 前）殘餘 `詢 Foo` 含空白 ⇒ 澄清；
             // 現 `查詢` 整體消費 ⇒ FAST `Foo`（clarify→FAST 翻轉，記錄並釘 FAST）：
             "查詢 Foo 符號" to "Foo",
@@ -614,6 +617,13 @@ class FastDispatchTest {
             "查詢一下Foo符號" to "Foo",
             // 單字＋空白（行為不變，釘住）：
             "找 Foo 符號" to "Foo",
+            // 記錄殘餘（stage-7.3 A3 複核裁決）：前綴為 cue 詞但有內容識別字 → verbatim 承認：
+            "查 符號Extra 符號" to "符號Extra", // 與 `符號表` 同語義——殘餘 verbatim
+            // 記錄殘餘（stage-2/F1 邊析裁決）：step D 邊緣類透明度——glued `。`＋cue 可整段剝：
+            "查 Foo 。符號" to "Foo",          // U+3002 邊緣類透明度（step D 剝 `。`）→ FAST Foo
+            // 記錄殘餘（stage-7.4A4 複核裁決）：suffix cue 分隔類吸收 U+FF0C（AlarmManager 為合法識別字）：
+            "查 AlarmManager，這個符號" to "AlarmManager",
+            // #19 stage-7.2 收尾：簡體複合與 disclaimer `質詢`（首字 `質`∉ opener）：
             // 保留：Implicit plain identifier still routes FAST.
             "查 Foo 符號" to "Foo",
             // 無空格形態：句首 lookup 動詞「查」仍是位置 cue（positional opener，
@@ -1459,6 +1469,9 @@ class FastDispatchTest {
             // 記錄的吸收類 pin 與提取 KDoc 的 stage-7.4 收尾 entry）：
             "symbols,Foo",
             "symbols，Foo",
+            // #19 B3 stage-7.2 收尾：`質詢Foo符號`——首字 `質`∉ opener ⇒ no-match DENIED
+            // （reasonCode null，§A2 記錄殘餘對應的「不收複合」邊界；見本 KDoc 第 III 點）
+            "質詢Foo符號",
         )) {
             // A2: 無 lookup marker ⇒ 模板不成立 ⇒ no-match DENIED（reasonCode null），
             // 不是澄清。
@@ -2867,6 +2880,26 @@ class FastDispatchTest {
             "查Foo符號批准‥再做", // U+2025 two-dot leader
             "查Foo符號批准…再做", // U+2026 horizontal ellipsis
             "查Foo符號等\u200B主管批准",
+            // arm D′：CJK 插入語蓋 verb 與 再|才 之間（含全形字母/助詞）：
+            "查Foo符號批准Ｄ再做",
+            "查Foo符號同意白拿了再做",
+            "查Foo符號批准主張再做",
+            "查Foo符號批准五再說",
+            "查Foo符號核准Ｔ別了再做",
+            "查Foo符號批准Ｄ_Ｄ再做",
+            "查Foo符號批准a-b再做",
+            "查Foo符號批准Ｄ;Ｄ再做",
+            "查Foo符號批准Ｄ,Ｄ再做",
+            "查Foo符號批准Ｄ.Ｄ再做",
+            "查Foo符號批准Ｄ/Ｄ再做",
+            "查Foo符號批准Ｄ#Ｄ再做",
+            "查Foo符號批准Ｄ\$Ｄ再做",
+            "查Foo符號批准Ｄ(Ｄ再做",
+            "查Foo符號批准Ｄ)Ｄ再做",
+            "查Foo符號批准Ｄ:Ｄ再做",
+            "查Foo符號核准_甲乙丙再做",
+            "查Foo符號同意甲-乙再做",
+            "查Foo符號許可_甲再做",
             // spaced backstop：possessor 兩端單空白落在框架兩個分隔槽內，
             // arm D 仍匹配 ⇒ decide() DENIED、reasonCode=null（no-match fallback，verified；
             // 絕不以 NEED_CLARIFICATION 過度斷言）——絕不執行（never FAST）。

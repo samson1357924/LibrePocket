@@ -102,7 +102,7 @@ import java.util.concurrent.atomic.AtomicLong
  *   首字為單字 opener（查找尋搜詢寻询）、次字為非 opener CJK 字元者（`詢問`/`查看`/
  *   `查閱`/`查驗`/`尋覓`/`尋思`/`搜羅`/`找遍`…無窮類）一律視為剩餘識別字原樣執行
  *   （如 `詢問Foo符號` ⇒ FAST query=`問Foo`）——READ-only；查詢不改寫 verbatim；
- *   记錄殘餘（pinned），非 no-match、不宣稱否決；`質詢`（首字 `質` ∉ opener）
+ *   記錄殘餘（pinned），非 no-match、不宣稱否決；`質詢`（首字 `質` ∉ opener）
  *   → no-match DENIED。字典無窮不可封閉枚舉，刻意不再嘗試。
  * - Cf/default-ignorable-split normalization 已納（本輪）：授權子句/教學標記在
  *   raw 文本與兩個正規化探針（NFKC + Cf 摺空白；NFKC + Cf 刪除）上取聯集測試；
@@ -126,9 +126,20 @@ import java.util.concurrent.atomic.AtomicLong
  *   只有/只許/只许/只允…才之有界缺口）；EN 開放詞彙不宣稱完備；`\bban\w*\b` 之類（如 `symbols Foo banana` → NEED_CLARIFICATION）、`特別找`
  *   之類普通詞仍收為否定系副作用（recorded, fail-safe）；裸名詞絕不單獨收錄（anchor-or-nothing）；EN 連接詞詞幹槽已納 CJK 許可詞幹
  *   （許可|许可|同意|核准|核準|批准|確認|确认|點頭|点头）——錨定於 EN 連接詞之後者否決；EN/CJK 交集其餘仍 open-world recorded。
+ * - arm D′（動詞＋ CJK/ASCII 字母數字＋助詞 `了過`＋識別字標點/空白插入 ≤16 個字元＋ 再|才）：`批准Ｄ再做`（全形 D NFKC 折回）／`批准五再說`／
+ *   `同意白拿了再做`／`批准主張再做`／`批准主張同意再做`／`批准Ｄ_Ｄ再做`／`批准a-b再做`／`批准Ｄ/Ｄ再做`／`批准Ｄ;Ｄ再做`／`批准Ｄ#Ｄ再做` 皆否決——
+ *   L/N/了過/識別字標點/半全形空白插入語全封；不取 ≥17 字（過長歧義為
+ *   識別字可能性上升、過度否決成本逆轉，{0,16} 為審裁下限）；帶空白 ⇒ whitespace 閘；全形英文撇號等
+ *   fullwidth 字母（NFKC 折回 ASCII）亦收，所字形不再被識別字規避。`批准然後再做`（然後＝2×\p{L}）已由本臂
+ *   否決（`然`/`後` 皆為 Lo）——舊「然後未列 linker」殘餘記錄自 D′ 起作廢。
+ *   （可接受的過度否決記錄：黏合 CJK 識別字 vs 同意子句無法僅憑語法分離——例如 `查批准的再生符號`
+ *   被 arm D′ 否決（span 到達 再）；fail-safe 方向，記錄）
  * - 已知殘餘（accepted, frame-local）：possessor 槽為 {0,64} 平坦 [\p{L}\p{N}] 類（不巢狀量化，線性時間），
  *   涵蓋現實組織名（含數字與中文）；possessor 超過 64 個 \p{L}/\p{N} 字元時框架不匹配 → fail-open
- *   （單 token 命令形 end-to-end；帶空白則不執行）；consent 動詞後接 再|才 則無論 possessor 長度皆否決；
+ *   （單 token 命令形 end-to-end；帶空白則不執行）；consent 動詞與 再|才 之間僅許分隔符/了過（arm A/B）
+ *   或 ≤16 個 CJK/ASCII 字母數字＋助詞 `了過`（arm D′）才否決——`批准Ｄ再做`（全形 D NFKC 折回）／`批准五再說`／
+ *   `同意白拿了再做`／`批准主張再做`／`批准然後再做`（然後＝2×\p{L}，已為 arm D′ 所收）皆否決；
+ *   仍殘餘者：possessor >64 之 `等…同意`（無再|才）——見下節，open-world 殘餘。
  *   {0,64} 槽與 consent 動詞集不巢狀量化，無災難性回溯。
  * - 已知殘餘（accepted, not fixed；separator hardening 現況）：consent 動詞與 後-family/再|才 之間夾
  *   半/全形分隔符（`\s` `,` `，` `.` `。` `;` `；` `:` `：` `、` `！` `？` `!` `?`、`．` U+FF0E `‥` U+2025 `…` U+2026、下劃線 `_`）與助詞 `了` `過`
@@ -136,8 +147,9 @@ import java.util.concurrent.atomic.AtomicLong
  *   `批准。再做`／`同意後，再查`／`批准，才做` 皆否決；possessor 兩端單空白落在框架兩個分隔槽內，
  *   arm D 仍然匹配（如 `等 安全審核委員會主席 批准` → clause gate 否決）；possessor 內部夾空白
  *   （如 `等安全 審核主席 批准`）clause 框架不匹配，帶空白殘餘落 whitespace 澄清／no-match——
- *   never FAST、never executes。殘餘：`批准然後再做`（未列 linker 然後）不匹配 → fail-open；
- *   possessor 超過 64 個 \p{L}/\p{N} 字元 → fail-open；`只有.{0,8}才` 之有界 {0,8} 不變；EN 開放詞彙 open-world 不變。
+ *   never FAST、never executes。殘餘：possessor 超過 64 個 \p{L}/\p{N} 字元 → fail-open；
+ *   `只有.{0,8}才` 之有界 {0,8} 不變；EN 開放詞彙 open-world 不變。
+ *   （`批准然後再做` 自 arm D′ 起 ¬ 殘餘——然後 2×\p{L}，必否決。）
  * - 已知殘餘（accepted, frame-local, not fixed；audit F7）：CJK 框架分隔符現涵蓋 \s，
  *   故 `同意 後再查`（consent 動詞與後-family 間僅一空白）已由 arm A 於 clause gate 否決（原
  *   「clause gate 放行、extraction whitespace 閘把關」之描述自分隔符類納入後不再成立）；
@@ -432,12 +444,12 @@ class FastRouter(
         //        ＋必填後-family＋可選分隔符 [\s，,.;；:：。、！？!?]*（同上，不含 `了` `過`）＋可選 再|才，
         //       `同意後`／`批准後`／`批准後再做`／`同意後，再查`／`批准。再做` 皆否決；
         //       B＝動詞＋可選分隔符（同上）＋必填再|才（無後-family），`批准再做`／`批准才做`／`批准,再做`／`批准，才做`／`批准了再做` 皆否決；
-        //        無 `再|才` 亦不匹配——`查 批准 符號` 保持 FAST）、
+        //        無 `再|才` 亦不匹配——`查 批准 符號` 保持 FAST；
+        //       D′＝動詞＋插入 arm（L/N/了過 ≤16 個字元）必填再|才：`批准Ｄ再做`／`同意白拿了再做` 皆否決；
         //       以及有界缺口 `只有.{0,8}才`／`只許.{0,8}才|只许.{0,8}才`／`只允.{0,8}才`（無裸名詞 CJK 匹配）；
-        //       已知殘餘（accepted, frame-local）：`等` 與 consent 動詞之間的 possessor 超過 64 個
-        //       L/N 字元不匹配 → fail-open；consent 動詞後接 再|才 則無論 possessor 長度皆否決（arm B）；
-        //       `批准然後再做`（未列 linker 然後）不匹配 → fail-open；`只有.{0,8}才` 之有界 {0,8} 不變；
-        //       （單 token 命令形 end-to-end FAST；帶空白則不執行）；
+        //       已知殘餘（accepted, frame-local）：`等` 與 consent 動詞之間的 possessor 超過 64 個 L/N 字元
+        //       不匹配 → fail-open（單 token 命令形 end-to-end FAST；帶空白則不執行）；
+        //       插入 ≤16 字 L/N/了過＋必填再|才（arm D′）——`批准Ｄ再做` 等亦否決；
         //       Cf-split 拆分（如 `等\u200B主管批准`）由 spaced/joined 探針還原覆蓋（兩探針與 raw 取聯集）。
         //    探針：NFKC → 剝 Cf/格式符 → 非字母/數字 run 摺成單一空白（`_` 保留——after_approval
         //    之類識別字不得被拆），以及 NFKC → Cf 直接刪除 → 同樣摺疊（`after I ap\u200Bprove` 這種
@@ -486,6 +498,7 @@ class FastRouter(
                 "|等[\\s，,]*(?:[\\p{L}\\p{N}]{0,64}[\\s，,]*)?(?:同意|核准|核準|批准|確認|确认|許可|许可|點頭|点头)" +
                 "|(?:同意|核准|核準|批准|確認|确认|許可|许可|點頭|点头)[\\s，,.;；:：。、！？!?．‥…了過_]*(?:之後|之后|以後|以后|後|后)(?:[\\s，,.;；:：。、！？!?．‥…_]*(?:再|才))?" +
                 "|(?:同意|核准|核準|批准|確認|确认|許可|许可|點頭|点头)[\\s，,.;；:：。、！？!?．‥…了過_]*(?:再|才)" +
+                "|(?:同意|核准|核準|批准|確認|确认|許可|许可|點頭|点头)[\\p{L}\\p{N}了過\\s，,.;；:：。、！？!?．‥…_$#@/():,;+=~-]{0,16}(?:再|才)" + // arm D′：CJK/ASCII/全形字母（NFKC 折）＋助詞＋識別字標點/空白插入於動詞與再|才之間（如 `批准Ｄ再做`/`同意白拿了再做`/`批准Ｄ_Ｄ再做`/`批准a-b再做`/`批准Ｄ/Ｄ再做`）——L/N/了過/標點/空白插入 ≤16 字、fail-safe 否決
                 "|只有.{0,8}才" +
                 "|只許.{0,8}才|只许.{0,8}才" +
                 "|只允.{0,8}才",

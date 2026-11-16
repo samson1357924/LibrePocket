@@ -137,8 +137,8 @@ internal class DeadlineExceededException : RuntimeException()
  *   follower await 回 Ok 後，**leader 記錄之 chain 須以 follower 自己的 opt-in／
  *   resolver／deadline 逐跳重驗**（規則與 fetch 相同：跨 origin opt-in 不可逆降級、
  *   https→http 連續對拒、per-hop policyGate＋sorted distinct token 相等；
- *   以 follower 剩餘預算為界，逾時視為驗證失敗；無 chain（pathological，should never
- *   happen）fail-closed）；
+ *   以 follower 剩餘預算為界，逾時視為驗證失敗；無 chain 或空 chain（pathological，should never
+ *   happen）皆 fail-closed）；
  *   驗證失敗即 miss 語義：follower 不取得該 Ok、不寫快取、不 purge 快取，
  *   以有界重選舉（`bindingRestarts` ≤ [MAX_STALE_RESTARTS]）以自己的 binding 重 fetch；
  *   leader 內容不得跨越不符之驗證邊界；
@@ -974,6 +974,9 @@ class WebExtractService(
      */
     private data class LeaderOutcome(val outcome: WebExtractOutcome, val chain: List<HopBinding>?)
 
+    // 載體語義：null＝follower 判定之 pathology（Ok 無 chain）→ follower 端 fail-closed（TRANSPORT）；
+    // 空 list＝非 Ok 載體，或 scaffold 語義（僅 internal put() 產生，本 arm 不交付）；follower Ok arm 兩者皆 fail-closed。
+
     private val mutex = Mutex()
     private val inFlight: MutableMap<String, InFlightEntry> = mutableMapOf()
 
@@ -1169,8 +1172,13 @@ class WebExtractService(
                 // 相等）。以 follower 之剩餘預算（waitMs 語義）為界；逾時＝驗證失敗。
                 // 驗證失敗絕不交付 leader 之 Ok；leader 內容不得跨越不符之驗證邊界。
                 val leaderChain = awaited.chain
-                    // Pathological：Ok 卻無 chain（should never happen）→ fail-closed。
+                    // Pathological：Ok 卻無 chain（或 leader 僅發布 scaffold 空 chain）→ fail-closed。
                     ?: return WebExtractOutcome.Failed(WebExtract.DETAIL_TRANSPORT)
+                // Follower Ok 之 chain 必須非空——real fetch 之 leader Ok 一律攜帶 ≥1 HopBinding；
+                // 空 chain 僅 internal scaffold `put()` 產生且本 arm 不得借路交付未驗證之內容。
+                if (leaderChain.isEmpty()) {
+                    return WebExtractOutcome.Failed(WebExtract.DETAIL_TRANSPORT)
+                }
                 val validateWaitMs = ((deadlineNs - System.nanoTime()) / 1_000_000).coerceAtLeast(1)
                 val validated = try {
                     withTimeoutOrNull(validateWaitMs) {

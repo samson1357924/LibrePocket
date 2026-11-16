@@ -2879,7 +2879,7 @@ class WebExtractD4Test {
                 probe = withTimeout(5_000) {
                     svc.extract("https://probe.example/", resolver = publicDns("probe.example"))
                 }
-                if (probe is WebExtractOutcome.Failed && probe!!.detail == WebExtract.DETAIL_TRANSPORT) break
+                if (probe is WebExtractOutcome.Failed && probe.detail == WebExtract.DETAIL_TRANSPORT) break
             }
             val out = probe
             assertTrue(

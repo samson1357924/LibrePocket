@@ -31,6 +31,10 @@ object VoiceStt {
     const val EXTRA_RESULTS = "android.speech.extra.RESULTS"
 
     const val DETAIL_NO_SERVICE = "NO_RECOGNITION_SERVICE"
+    // 辨識服務存在、但兩個回呼 slot 都被 never-callback 的 recognizer 佔用時的誠實話術：
+    // 與 DETAIL_NO_SERVICE（系統根本沒有辨識服務）語意區分——這裡是「有服務卻回不來」，
+    // 需使用者按「重設語音辨識」（in-place 硬重設，非系統重建 activity）後方可恢復。
+    const val DETAIL_RECOGNIZER_UNRESPONSIVE = "RECOGNIZER_UNRESPONSIVE"
     const val DETAIL_SWITCH_OFF = "SWITCH_OFF"
     const val DETAIL_EMPTY_RESULT = "EMPTY_RESULT"
 
@@ -41,9 +45,13 @@ object VoiceStt {
         return null
     }
 
-    /** 取辨識候選首條非空正文；無結果回 null（呼叫方留手動輸入）。 */
-    fun pickResult(results: List<String>?): String? =
-        results?.firstOrNull { it.isNotBlank() }
+    /** 取辨識候選首條非空正文；無結果回 null（呼叫方留手動輸入）。
+     * （註：production 投遞路徑已改為 AssistantVoice.resolveVoicePrefill 的有界 variant；本函式為 test-pinned 參考契約、production-dead，僅測試使用。）
+     */
+    fun pickResult(results: List<*>?): String? =
+        results?.asSequence()
+            ?.mapNotNull { it as? String }
+            ?.firstOrNull { it.isNotBlank() }
 
     /** 降級話術（CAPABILITY_MATRIX §5：原因碼原文引用）。 */
     fun fallbackMessage(reason: DenyReason, detail: String): String =

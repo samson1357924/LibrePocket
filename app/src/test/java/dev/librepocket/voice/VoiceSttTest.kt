@@ -16,7 +16,8 @@ import org.junit.Test
  *
  * 斷言 RecognizerIntent 委託參數（FREE_FORM / zh-TW / MAX 1）、
  * 無辨識服務降級原因碼（NO_PRIVILEGE / USER_DISABLED）、
- * manifest `<queries>` 動作為 RECOGNIZE_SPEECH 且探測帶 MATCH_DEFAULT_ONLY（B1），
+ * manifest `<queries>` 動作為 RECOGNIZE_SPEECH（B1）；探測（MATCH_DEFAULT_ONLY）行為由
+ * `ChatScreenVoiceLaunchTest.recognizerWithoutDefaultCategory_degradesToNoPrivilege_initialVoice` 覆蓋，
  * 以及 `voice.transcribe` 投影（READ，`voice_input` 預設開）。
  */
 class VoiceSttTest {
@@ -39,8 +40,20 @@ class VoiceSttTest {
 
     @Test fun emptyResults_stayManual() {
         assertNull(VoiceStt.pickResult(null))
-        assertNull(VoiceStt.pickResult(emptyList()))
+        assertNull(VoiceStt.pickResult(emptyList<Any?>()))
         assertNull(VoiceStt.pickResult(listOf("", "   ")))
+    }
+
+    @Test fun wrongElementTypes_areIgnoredWithoutException() {
+        assertNull(VoiceStt.pickResult(listOf(42)))
+        assertNull(VoiceStt.pickResult(listOf(Any())))
+    }
+
+    @Test fun mixedAndNullElements_pickFirstNonBlankString() {
+        assertEquals("ok", VoiceStt.pickResult(listOf(42, "", "  ", "ok")))
+        assertEquals("ok", VoiceStt.pickResult(listOf(null, "ok")))
+        assertNull(VoiceStt.pickResult(listOf<Any?>(null, null)))
+        assertNull(VoiceStt.pickResult(listOf<Any?>(null, 1, "", "  ")))
     }
 
     @Test fun switchOff_isUserDisabled() {
@@ -74,7 +87,7 @@ class VoiceSttTest {
         assertTrue(switchedOff.contains("USER_DISABLED"))
     }
 
-    // ---- B1：manifest <queries> + 探測旗標 ----
+    // ---- B1：manifest <queries>（MATCH_DEFAULT_ONLY 探測行為測試見 ChatScreenVoiceLaunchTest.recognizerWithoutDefaultCategory_degradesToNoPrivilege_initialVoice） ----
 
     /** 單測工作目錄（模組 dir）出發，向上走最多 5 層找原始碼/清單檔。 */
     private fun findSource(vararg relPaths: String): java.io.File {
@@ -101,15 +114,6 @@ class VoiceSttTest {
         )
         assertFalse(queries.contains("android.speech.RecognitionService"))
         assertEquals("android.speech.action.RECOGNIZE_SPEECH", VoiceStt.ACTION)
-    }
-
-    @Test fun sttProbe_usesMatchDefaultOnly() {
-        // B1：探測只認 DEFAULT 可處理的辨識服務（見 ChatScreen.launchSystemStt）。
-        val chatScreen = findSource(
-            "src/main/java/dev/librepocket/agent/ui/chat/ChatScreen.kt",
-            "app/src/main/java/dev/librepocket/agent/ui/chat/ChatScreen.kt",
-        ).readText()
-        assertTrue(chatScreen.contains("MATCH_DEFAULT_ONLY"))
     }
 
     // ---- voice.transcribe 投影（系統委託；B2 後 Azure 不再碰 STT） ----

@@ -1,7 +1,12 @@
 package dev.librepocket.agent.ui
 
+import android.content.Context
+import android.os.SystemClock
 import android.util.Log
 import kotlinx.coroutines.CancellationException
+import androidx.compose.material3.DrawerState
+import androidx.compose.material3.DrawerValue
+import androidx.compose.material3.rememberDrawerState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.SideEffect
@@ -16,6 +21,8 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
+import androidx.navigation.NavHostController
+import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
 import dev.librepocket.agent.R
 import dev.librepocket.agent.ui.chat.ChatScreen
@@ -32,6 +39,10 @@ import dev.librepocket.agent.ui.setup.PendingDelete
 import dev.librepocket.agent.ui.setup.SetupScreen
 import dev.librepocket.agent.ui.setup.SetupViewModel
 import dev.librepocket.agent.ui.setup.SetupViewModelFactory
+import dev.librepocket.agent.assistant.AssistantVoiceHandoff
+import dev.librepocket.agent.assistant.PendingVoiceRetrigger
+import dev.librepocket.agent.assistant.VoiceHandoffContract
+import dev.librepocket.agent.assistant.VoiceTaskIdentity
 import dev.librepocket.agent.assistant.rememberAssistantRole
 import dev.librepocket.chat.ChatStatus
 import dev.librepocket.entry.EntryDispatch
@@ -59,9 +70,17 @@ object Routes {
 private const val TAG = "MainScreen"
 
 @Composable
-fun MainScreen(
+internal fun MainScreen(
     sharedText: String? = null,
     onSharedConsumed: () -> Unit = {},
+    // C2 session 語音喚起（Issue #137）：MainActivity 的一次態 voice 請求；
+    // 轉交 ChatScreen 自動走既有 RecognizerIntent 委派（零新權限），
+    // 結果只 prefill 不自動送出。預設 false 保舊構造相容。
+    assistVoiceRequested: Boolean = false,
+    onAssistVoiceConsumed: () -> Unit = {},
+    // C2（Issue #137）：本 Activity 若為可信 voice session 的任務宿主，帶其任務身份；
+    // 否則 null——retrigger 投遞在此任務上不可能（normal task 搶不到一次態 STT retrigger）。
+    voiceTaskIdentity: VoiceTaskIdentity? = null,
 ) {
     val navController = rememberNavController()
     val scope = rememberCoroutineScope()
@@ -76,6 +95,10 @@ fun MainScreen(
     // 守衛／spinner／drawer 接線只在 StartupGateHost 實現（單一來源，接線測直
     // 接測該 host）；此處只收集狀態並傳入，不重算、不重抄。
     val startupReconcilePending by setupViewModel.startupReconcilePending.collectAsStateWithLifecycle()
+    val navLoading = startupEffectiveLoading(gate is EndpointGate.Loading, startupReconcilePending)
+    val drawerState = rememberDrawerState(initialValue = DrawerValue.Closed)
+    val backStack by navController.currentBackStackEntryAsState()
+    val currentRoute = backStack?.destination?.route
     // 登出失敗 Settings UI 可見（Re-review #7 Finding 2 階段2）：false 分支不導航
     // 不清空，只靠 form.errorCode（LOGOUT_*）驅動 Settings 失敗卡；簽名不改。
     val setupForm by setupViewModel.form.collectAsStateWithLifecycle()
@@ -181,6 +204,64 @@ fun MainScreen(
         }
     }
 
+    // C2 session 語音喚起路由與邊界守衛（單一來源見 AssistVoiceCoordinator / shouldDeliverVoiceToChat）。
+    // drawerState 由 coordinator 負責在投遞前收斂至完全關閉；delivery gate 另行要求 target/current 皆為 Closed。
+    AssistVoiceCoordinator(
+        assistVoiceRequested = assistVoiceRequested,
+        hasEndpoint = hasEndpoint,
+        navLoading = navLoading,
+        currentRoute = currentRoute,
+        navController = navController,
+        drawerState = drawerState,
+        viewedSessionId = viewedSessionId,
+        onClearViewedSession = { viewedSessionId = null },
+        onAssistVoiceConsumed = onAssistVoiceConsumed,
+    )
+
+    // Trusted cross-process retrigger handoff from active voice session (F1): deliver only when
+    // this activity's identity matches the pending entry's bound task/session AND under the same
+    // chat-safe boundary as initial voice delivery.
+    val pendingVoiceRetrigger by AssistantVoiceHandoff.pendingFlow().collectAsStateWithLifecycle(initialValue = null)
+    val voiceRetriggerToken = voiceRetriggerTokenFor(
+        pending = pendingVoiceRetrigger,
+        identity = voiceTaskIdentity,
+        currentRoute = currentRoute,
+        hasEndpoint = hasEndpoint,
+        navLoading = navLoading,
+        viewedSessionId = viewedSessionId,
+        drawerState = drawerState,
+    )
+
+    // C2 retrigger 收斂（F2/Stage B）：手勢發生於非 CHAT 路由／抽屜／唯讀覆蓋開啟中時，
+    // 與初始語音請求同策略收斂至 CHAT（關抽屜／清覆蓋）或無端點時丟棄 token；identity-gated。
+    AssistVoiceRetriggerCoordinator(
+        pending = pendingVoiceRetrigger,
+        identity = voiceTaskIdentity,
+        hasEndpoint = hasEndpoint,
+        navLoading = navLoading,
+        currentRoute = currentRoute,
+        navController = navController,
+        drawerState = drawerState,
+        viewedSessionId = viewedSessionId,
+        onClearViewedSession = { viewedSessionId = null },
+        context = app,
+    )
+
+    // C2 retrigger 過期/無法投遞收斂：token 超過 TTL 或端點落定後仍不可投遞 → 清除，避免日後 CHAT 進入時補彈 STT。
+    // Convergence twin (AssistVoiceRetriggerCoordinator) handles live, non-expired tokens; this
+    // stale-clear only drops expired/undeliverable entries.
+    // Stale/undeliverable retrigger convergence. Expiry is enforced at gate/consume/currentPending
+    // time and on the next state change — there is no background timer.
+    // 過期 entries converge regardless of identity (undeliverable by definition); live entries
+    // remain identity-gated — never cleared across instances. Fail-closed.
+    RetriggerStaleClearEffect(
+        pending = pendingVoiceRetrigger,
+        identity = voiceTaskIdentity,
+        navLoading = navLoading,
+        hasEndpoint = hasEndpoint,
+        context = app,
+    )
+
     // Edit-entry helper: prefill the form with the live endpoint (key stays
     // blank) so "edit" never shows another preset's defaults.
     fun goSetupForEdit() {
@@ -233,12 +314,30 @@ fun MainScreen(
         pendingTeardown = pendingTeardown,
         // Stage F：stale 抑制標籤同源傳入（四參派生；pure 只隱藏，真清卡靠 retry 終端）。
         logoutErrorSourceJournal = setupForm.logoutErrorSourceJournal,
+        drawerState = drawerState,
         chatContent = { padding ->
             ChatScreen(
                 padding = padding,
                 viewModel = chatViewModel,
                 onOpenSettings = { goSetupForEdit() },
                 onTurnFinished = { sessionListViewModel.refresh() },
+                // Safety net for coordinator key omissions/in-flight transitions: only deliver when CHAT,
+                // endpoint/nav are ready, no readonly transcript overlay (viewedSessionId excluded), and
+                // drawer is fully closed (current+target). Coordinator routes/clears; this gate blocks misdelivery.
+                voiceInputRequested = shouldDeliverVoiceToChat(
+                    assistVoiceRequested = assistVoiceRequested,
+                    currentRoute = currentRoute,
+                    hasEndpoint = hasEndpoint,
+                    navLoading = navLoading,
+                    viewedSessionId = viewedSessionId,
+                    drawerState = drawerState,
+                ),
+                onVoiceInputConsumed = onAssistVoiceConsumed,
+                voiceRetriggerToken = voiceRetriggerToken,
+                onVoiceRetriggerConsumed = { token ->
+                    consumeVoiceRetrigger(token, pendingVoiceRetrigger, voiceTaskIdentity, app)
+                },
+                voiceSwitchesLoaded = voiceEffectiveSnapshot.loaded || voiceEffectiveSnapshot.loadFailed,
                 userSwitches = voiceUiSwitches,
                 voiceSwitchLoadFailed = voiceEffectiveSnapshot.loadFailed,
                 ttsAcknowledged = ttsAcknowledged,
@@ -449,5 +548,264 @@ fun MainScreen(
     )
     viewedSessionId?.let { id ->
         TranscriptViewer(id, sessionListViewModel::readTranscriptPage) { viewedSessionId = null }
+    }
+}
+
+/**
+ * Production source of truth (not a test mirror). Stale/undeliverable retrigger convergence.
+ * Expiry is enforced at gate/consume/currentPending time and on the next state change — there is
+ * no background timer; an over-TTL entry simply stops being deliverable/consumable until this
+ * effect converges it on the next state change. Fail-closed.
+ * An expired entry is converged regardless of identity match: it is undeliverable anyway, so any
+ * composing instance may drop it (prevents an orphaned over-TTL entry staying resident for the
+ * process lifetime). Non-expired entries keep the identity gate.
+ */
+@Composable
+internal fun RetriggerStaleClearEffect(
+    pending: PendingVoiceRetrigger?,
+    identity: VoiceTaskIdentity?,
+    navLoading: Boolean,
+    hasEndpoint: Boolean,
+    context: Context,
+) {
+    LaunchedEffect(pending, navLoading, hasEndpoint, identity) {
+        val p = pending ?: return@LaunchedEffect
+        val stale = VoiceHandoffContract.isExpired(p.issuedElapsedRealtimeMs, SystemClock.elapsedRealtime())
+        if (stale) {
+            AssistantVoiceHandoff.clear(context = context, targetTaskId = p.targetTaskId, sessionInstanceId = p.sessionInstanceId, token = p.token)
+            return@LaunchedEffect
+        }
+        val id = identity
+        if (id == null || id.taskId != p.targetTaskId || id.sessionInstanceId != p.sessionInstanceId) {
+            return@LaunchedEffect
+        }
+        if (!navLoading && !hasEndpoint) {
+            AssistantVoiceHandoff.clear(context = context, targetTaskId = p.targetTaskId, sessionInstanceId = p.sessionInstanceId, token = p.token)
+        }
+    }
+}
+
+/**
+ * Production source of truth for the retrigger consume lambda used by MainScreen. Identity-gated
+ * and token-matched: only the owning (identity-matched) instance may consume its token.
+ */
+internal fun consumeVoiceRetrigger(
+    token: Long,
+    pending: PendingVoiceRetrigger?,
+    identity: VoiceTaskIdentity?,
+    context: Context,
+): Boolean {
+    val id = identity
+    val p = pending?.takeIf { it.token == token }
+    if (id == null || p == null) return false
+    return AssistantVoiceHandoff.consume(token = token, context = context, targetTaskId = id.taskId, sessionInstanceId = id.sessionInstanceId)
+}
+
+/**
+ * C2 聊天頁安全投遞邊界（單一來源；initial delivery 與 retrigger 共用）：
+ * 僅在 `Routes.CHAT`、有端點、啟動已落定、無唯讀覆蓋且抽屜已完全關閉。
+ */
+internal fun chatSafeBoundary(
+    currentRoute: String?,
+    hasEndpoint: Boolean,
+    navLoading: Boolean,
+    viewedSessionId: String?,
+    drawerState: DrawerState,
+): Boolean =
+    currentRoute == Routes.CHAT &&
+        hasEndpoint &&
+        !navLoading &&
+        viewedSessionId == null &&
+        drawerState.isClosed &&
+        drawerState.targetValue == DrawerValue.Closed
+
+/**
+ * C2 session 語音喚起投遞門禁（與 [AssistVoiceCoordinator] 同源）：
+ * 僅在已導至 `Routes.CHAT`、有端點、啟動已落定、無唯讀覆蓋且抽屜已完全關閉時才向
+ * [ChatScreen] 遞送一次態 `voiceInputRequested`；邊界判斷單一來源為 [chatSafeBoundary]。
+ */
+internal fun shouldDeliverVoiceToChat(
+    assistVoiceRequested: Boolean,
+    currentRoute: String?,
+    hasEndpoint: Boolean,
+    navLoading: Boolean,
+    viewedSessionId: String?,
+    drawerState: DrawerState,
+): Boolean =
+    assistVoiceRequested &&
+        chatSafeBoundary(currentRoute, hasEndpoint, navLoading, viewedSessionId, drawerState)
+
+/**
+ * C2 retrigger 投遞門禁：除 [chatSafeBoundary] 外，還要求此 Activity 的 [identity]
+ * （可信 voice task 宿主）與 [pending] entry 綁定的 task/session 完全一致，且 token
+ * 未超過 [VoiceHandoffContract.RETRIGGER_TTL_MS]（age ∈ [0, TTL]，見 [VoiceHandoffContract.isExpired]）。
+ * normal-task 實例（identity == null）恆不投遞。
+ */
+internal fun shouldDeliverVoiceRetrigger(
+    pending: PendingVoiceRetrigger?,
+    identity: VoiceTaskIdentity?,
+    currentRoute: String?,
+    hasEndpoint: Boolean,
+    navLoading: Boolean,
+    viewedSessionId: String?,
+    drawerState: DrawerState,
+    nowElapsedRealtimeMs: Long = SystemClock.elapsedRealtime(),
+): Boolean =
+    pending != null &&
+        identity != null &&
+        identity.taskId == pending.targetTaskId &&
+        identity.sessionInstanceId == pending.sessionInstanceId &&
+        !VoiceHandoffContract.isExpired(pending.issuedElapsedRealtimeMs, nowElapsedRealtimeMs) &&
+        chatSafeBoundary(currentRoute, hasEndpoint, navLoading, viewedSessionId, drawerState)
+
+/**
+ * C2 retrigger 投遞 token 推導（MainScreen 與接線測試共用單一來源）：
+ * 門禁通過時回傳 pending entry 的 token，否則回傳 0L（ChatScreen 視為無 retrigger）。
+ */
+internal fun voiceRetriggerTokenFor(
+    pending: PendingVoiceRetrigger?,
+    identity: VoiceTaskIdentity?,
+    currentRoute: String?,
+    hasEndpoint: Boolean,
+    navLoading: Boolean,
+    viewedSessionId: String?,
+    drawerState: DrawerState,
+): Long = if (
+    shouldDeliverVoiceRetrigger(
+        pending = pending,
+        identity = identity,
+        currentRoute = currentRoute,
+        hasEndpoint = hasEndpoint,
+        navLoading = navLoading,
+        viewedSessionId = viewedSessionId,
+        drawerState = drawerState,
+    )
+) {
+    pending?.token ?: 0L
+} else {
+    0L
+}
+
+/**
+ * C2 session 語音喚起路由與邊界守衛（MainScreen 與接線測試共用單一來源）：
+ * - 啟動落定前（`navLoading`）不啟動也不消費，等待 gate 與 reconcile 落定；
+ * - 落定後若無可用端點（`!hasEndpoint`），消費清除 stale flag，避免日後設定
+ *   完成回到 CHAT 時意外補彈 STT；
+ * - 有端點且已落定時，關閉唯讀檢視（`viewedSessionId`），若當前不在 CHAT
+ *   路由則先導回 CHAT，待 `currentRoute == Routes.CHAT` 後關閉抽屜並交由 ChatScreen 消費。
+ */
+@Composable
+internal fun AssistVoiceCoordinator(
+    assistVoiceRequested: Boolean,
+    hasEndpoint: Boolean,
+    navLoading: Boolean,
+    currentRoute: String?,
+    navController: NavHostController,
+    drawerState: DrawerState,
+    viewedSessionId: String?,
+    onClearViewedSession: () -> Unit,
+    onAssistVoiceConsumed: () -> Unit,
+) {
+    // 刻意不把 viewedSessionId 放進 LaunchedEffect key：若納入 key，下方
+    // onClearViewedSession() 將 viewedSessionId 設為 null 會立即重啟效應並取消
+    // 正在執行的 drawerState.close()；同時 shouldDeliverVoiceToChat 已要求
+    // viewedSessionId == null 才允許投遞，不會在唯讀覆蓋關閉前誤送。
+    LaunchedEffect(assistVoiceRequested, hasEndpoint, navLoading, currentRoute) {
+        if (!assistVoiceRequested) return@LaunchedEffect
+        if (navLoading) return@LaunchedEffect
+        if (!hasEndpoint) {
+            onAssistVoiceConsumed()
+            return@LaunchedEffect
+        }
+        if (viewedSessionId != null) {
+            onClearViewedSession()
+        }
+        if (currentRoute != null && currentRoute != Routes.CHAT) {
+            navController.navigate(Routes.CHAT) {
+                popUpTo(Routes.CHAT) { inclusive = false }
+                launchSingleTop = true
+            }
+            return@LaunchedEffect
+        }
+        if (!drawerState.isClosed || drawerState.targetValue != DrawerValue.Closed) {
+            drawerState.close()
+        }
+    }
+}
+
+/**
+ * Production source of truth (shared with AssistVoiceCoordinator semantics). Convergence twin of
+ * [AssistVoiceCoordinator] for the retrigger gesture: navigate to CHAT / clear the read-only
+ * overlay / close the drawer — or, when there is no endpoint, drop the token without navigating.
+ * Identity-gated with token-matched clears, mirroring the initial-voice policy. STT is still
+ * launched only by ChatScreen after token derivation; this effect never launches it and never
+ * touches `assistVoiceRequested`.
+ *
+ * - Identity gate first (same check as [shouldDeliverVoiceRetrigger]): a non-owning instance
+ *   observes the shared flow but does not converge, navigate, or clear.
+ * - TTL gate: an expired/future-dated entry is left alone here — [RetriggerStaleClearEffect]
+ *   drops it on this state change instead.
+ * - `navLoading`: hold until the gate and startup reconcile settle (nothing converges yet).
+ * - `!hasEndpoint`: token-matched clear only; deliberately no navigation — StartupGateHost
+ *   forces SETUP anyway.
+ * - `viewedSessionId != null`: clear the overlay and proceed in the same run; delivery itself
+ *   stays gated on `viewedSessionId == null` (see [chatSafeBoundary]).
+ * - `currentRoute != null` and not CHAT: navigate to CHAT (singleTop, popUpTo(CHAT) without
+ *   inclusive). Otherwise close the drawer if it is not fully closed.
+ *
+ * 刻意不把 viewedSessionId 放進 LaunchedEffect key：若納入 key，下方
+ * onClearViewedSession() 將 viewedSessionId 設為 null 會立即重啟效應並取消
+ * 正在執行的 drawerState.close()；同時 shouldDeliverVoiceRetrigger 已要求
+ * viewedSessionId == null 才允許投遞，不會在唯讀覆蓋關閉前誤送。
+ * drawerState 同樣不入 key（isClosed / targetValue 為可觀察狀態，入 key 會在
+ * close() 動畫途中重啟效應）。
+ */
+@Composable
+internal fun AssistVoiceRetriggerCoordinator(
+    pending: PendingVoiceRetrigger?,
+    identity: VoiceTaskIdentity?,
+    hasEndpoint: Boolean,
+    navLoading: Boolean,
+    currentRoute: String?,
+    navController: NavHostController,
+    drawerState: DrawerState,
+    viewedSessionId: String?,
+    onClearViewedSession: () -> Unit,
+    context: Context,
+) {
+    // NB: identity 不放入 LaunchedEffect key（同 AssistVoiceCoordinator 排除 viewedSessionId／
+    // drawerState 的原則：identity 值每個 activity 實例僅指派一次；且 effect 內不 mutate identity，
+    // 安全靠 pending/hasEndpoint/navLoading/currentRoute 重啟收斂）。
+    LaunchedEffect(pending, hasEndpoint, navLoading, currentRoute) {
+        val p = pending ?: return@LaunchedEffect
+        // Identity gate first: only the owning (identity-matched) instance may converge.
+        val id = identity
+        if (id == null || id.taskId != p.targetTaskId || id.sessionInstanceId != p.sessionInstanceId) {
+            return@LaunchedEffect
+        }
+        if (VoiceHandoffContract.isExpired(p.issuedElapsedRealtimeMs, SystemClock.elapsedRealtime())) {
+            // Expired/future-dated entry: RetriggerStaleClearEffect drops it on this state
+            // change; never navigate and never clear from here.
+            return@LaunchedEffect
+        }
+        if (navLoading) return@LaunchedEffect
+        if (!hasEndpoint) {
+            // Token-matched clear (not navigation): StartupGateHost forces SETUP anyway.
+            AssistantVoiceHandoff.clear(context = context, targetTaskId = p.targetTaskId, sessionInstanceId = p.sessionInstanceId, token = p.token)
+            return@LaunchedEffect
+        }
+        if (viewedSessionId != null) {
+            onClearViewedSession()
+        }
+        if (currentRoute != null && currentRoute != Routes.CHAT) {
+            navController.navigate(Routes.CHAT) {
+                popUpTo(Routes.CHAT) { inclusive = false }
+                launchSingleTop = true
+            }
+            return@LaunchedEffect
+        }
+        if (!drawerState.isClosed || drawerState.targetValue != DrawerValue.Closed) {
+            drawerState.close()
+        }
     }
 }

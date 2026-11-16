@@ -1,0 +1,236 @@
+package dev.librepocket.agent.assistant
+
+import android.content.Context
+import android.net.Uri
+import android.os.Bundle
+import android.os.SystemClock
+import android.util.Log
+import kotlinx.coroutines.flow.Flow
+
+/**
+ * Cross-process handoff facade for C2 voice retrigger (F1/F2, #137).
+ *
+ * Source of truth lives in [VoiceHandoffProvider] (main process). The trusted voice session runs
+ * in :voice process and publishes/clears via [android.content.ContentResolver.call]; main-process
+ * UI observes provider state and consumes tokens under delivery/identity gates.
+ *
+ * The remote `call()` is the only publish path — there is no local mirror. In-process/Robolectric
+ * observers should assert via the provider (Stage 2 registers the provider with
+ * ShadowContentResolver), since `requestRetrigger` returns a token and never writes provider state
+ * directly.
+ */
+internal object AssistantVoiceHandoff {
+
+    private const val TAG = "AssistantVoiceHandoff"
+
+    fun pendingFlow(): Flow<PendingVoiceRetrigger?> = VoiceHandoffProvider.pending
+
+    /** Test/無 UI 觀測輔助（production 經 pendingFlow 觀察）；不暴露為公開 API 表面。 */
+    fun peek(context: Context? = null): Long = currentPending(context)?.token ?: 0L
+
+    /** Test/無 UI 觀測輔助（production 經 pendingFlow 觀察）；不暴露為公開 API 表面。 */
+    fun currentPending(context: Context? = null): PendingVoiceRetrigger? {
+        val local = VoiceHandoffProvider.pending.value
+        val resolved = if (local != null || context == null) {
+            local
+        } else {
+            try {
+                val b = context.contentResolver.call(uri(context), VoiceHandoffContract.METHOD_PEEK, null, null)
+                b?.toPending()
+            } catch (e: Exception) {
+                Log.w(TAG, "voice retrigger peek failed; fail-closed", e)
+                null
+            }
+        }
+        // TTL filter: expired (or clock-skewed, negative-age) retriggers are treated as absent
+        // (callers clear; never delivered).
+        if (resolved != null &&
+            VoiceHandoffContract.isExpired(resolved.issuedElapsedRealtimeMs, SystemClock.elapsedRealtime())
+        ) {
+            return null
+        }
+        return resolved
+    }
+
+    /**
+     * Mints a one-shot retrigger token for the active voice task.
+     *
+     * Failure path clears only the token minted by this call: on either failure branch
+     * (exception, or no ack / rejected publish) this performs a token-matched best-effort
+     * [clear] so a stray remote publish (lost ack) is removed; a newer token published
+     * meanwhile survives because the clear is token-matched.
+     */
+    fun requestRetrigger(
+        context: Context,
+        targetTaskId: Int,
+        sessionInstanceId: Long,
+    ): Long {
+        val token = VoiceHandoffProvider.nextToken()
+        // NB: [issuedElapsedRealtimeMs] is advisory only — the provider stamps the stored entry
+        // with its own clock and never trusts the caller-supplied value.
+        val pending = PendingVoiceRetrigger(
+            token = token,
+            targetTaskId = targetTaskId,
+            sessionInstanceId = sessionInstanceId,
+            issuedElapsedRealtimeMs = SystemClock.elapsedRealtime(),
+        )
+        // Cross-process publish is authoritative (the provider's call() handler stores it).
+        // No local mirror: a failed IPC must never look like a successful handoff (the caller
+        // can retry the gesture), and same-process observers read the provider state directly.
+        val ack = try {
+            context.contentResolver.call(
+                uri(context),
+                VoiceHandoffContract.METHOD_PUBLISH,
+                null,
+                pending.toBundle(),
+            )
+        } catch (e: Exception) {
+            Log.w(TAG, "voice retrigger publish failed; gesture dropped (user may retry)", e)
+            // Best-effort token-matched cleanup of any stray remote publish (lost ack).
+            clear(context, targetTaskId = targetTaskId, sessionInstanceId = sessionInstanceId, token = token)
+            return 0L
+        }
+        if (ack == null) {
+            Log.w(TAG, "voice retrigger publish rejected (no ack); gesture dropped")
+            // Best-effort token-matched cleanup of any stray remote publish (lost ack).
+            clear(context, targetTaskId = targetTaskId, sessionInstanceId = sessionInstanceId, token = token)
+            return 0L
+        }
+        // Any non-null Bundle counts as ack.
+        return token
+    }
+
+    /**
+     * Consume [token]. Identity is REQUIRED (no wildcard default — the IPC boundary rejects
+     * wildcard identity anyway): pass the owning task's taskId/sessionInstanceId. Bare
+     * token-only consume remains possible via [VoiceHandoffProvider.consume] in-process only.
+     */
+    fun consume(
+        token: Long,
+        context: Context? = null,
+        targetTaskId: Int,
+        sessionInstanceId: Long,
+    ): Boolean {
+        if (token == 0L) return false
+        val local = VoiceHandoffProvider.consume(token, targetTaskId, sessionInstanceId)
+        if (local) {
+            // Local CAS already removed the entry; no extra IPC clear (it would ignore the token
+            // and could wipe a newer token from the same session cycle).
+            return true
+        }
+        // Cross-process consumer fallback.
+        if (context != null) {
+            return try {
+                val b = context.contentResolver.call(
+                    uri(context),
+                    VoiceHandoffContract.METHOD_CONSUME,
+                    null,
+                    identityBundle(targetTaskId, sessionInstanceId).apply {
+                        putLong(VoiceHandoffContract.KEY_TOKEN, token)
+                    },
+                )
+                b?.getBoolean(VoiceHandoffContract.KEY_OK, false) == true
+            } catch (e: Exception) {
+                Log.w(TAG, "voice retrigger consume failed; fail-closed", e)
+                false
+            }
+        }
+        return false
+    }
+
+    /**
+     * Clears the pending handoff entry.
+     *
+     * Bare no-argument call (no identity, no token) is same-process only: it clears the
+     * local provider slot and performs NO IPC — the provider rejects a bare/empty METHOD_CLEAR
+     * over IPC (there is no cross-process clear-all). Cross-process clearing requires a
+     * token and/or identity, which is what this method sends when either is present.
+     */
+    fun clear(
+        context: Context? = null,
+        targetTaskId: Int = VoiceHandoffContract.WILDCARD_TASK_ID,
+        sessionInstanceId: Long = VoiceHandoffContract.WILDCARD_SESSION_INSTANCE_ID,
+        token: Long = 0L,
+    ) {
+        val hasIdentity = targetTaskId != VoiceHandoffContract.WILDCARD_TASK_ID ||
+            sessionInstanceId != VoiceHandoffContract.WILDCARD_SESSION_INSTANCE_ID
+        if (hasIdentity) {
+            VoiceHandoffProvider.clearMatching(targetTaskId, sessionInstanceId, token)
+        } else if (token != 0L) {
+            VoiceHandoffProvider.clearIfToken(token)
+        } else {
+            VoiceHandoffProvider.clearAll()
+        }
+        // Bare wildcard (no identity, no token): local-only, no IPC — the provider has no
+        // cross-process clear-all path; the bare clear must not wipe a remote slot either.
+        if (context != null && (hasIdentity || token != 0L)) {
+            try {
+                context.contentResolver.call(
+                    uri(context),
+                    VoiceHandoffContract.METHOD_CLEAR,
+                    null,
+                    identityBundle(targetTaskId, sessionInstanceId).apply {
+                        if (token != 0L) putLong(VoiceHandoffContract.KEY_TOKEN, token)
+                    },
+                )
+            } catch (e: Exception) {
+                Log.w(TAG, "voice retrigger clear failed; fail-closed", e)
+            }
+        }
+    }
+
+    /**
+     * Expired-only convergence for a fresh session cycle: clears the local pending entry
+     * iff it is expired-or-skewed (see [VoiceHandoffContract.isExpired]) and sends a best-effort
+     * METHOD_CLEAR_EXPIRED over IPC (no extras) so the main-process slot converges too.
+     * An unexpired entry published milliseconds ago by another session instance for a
+     * surviving voice task is PRESERVED — the TTL is the discriminator, not the caller's
+     * freshness guess. IPC failures are logged at warn and swallowed (fail-closed; local
+     * clear still applies).
+     */
+    fun clearExpired(context: Context? = null) {
+        VoiceHandoffProvider.clearExpired()
+        context?.let {
+            try {
+                it.contentResolver.call(
+                    uri(it),
+                    VoiceHandoffContract.METHOD_CLEAR_EXPIRED,
+                    null,
+                    null,
+                )
+            } catch (e: Exception) {
+                Log.w(TAG, "voice retrigger clearExpired failed; fail-closed", e)
+            }
+        }
+    }
+
+    private fun uri(context: Context): Uri =
+        Uri.parse("content://${VoiceHandoffContract.authority(context.packageName)}")
+
+    private fun PendingVoiceRetrigger.toBundle(): Bundle = Bundle().apply {
+        putLong(VoiceHandoffContract.KEY_TOKEN, token)
+        putInt(VoiceHandoffContract.KEY_TARGET_TASK_ID, targetTaskId)
+        putLong(VoiceHandoffContract.KEY_SESSION_INSTANCE_ID, sessionInstanceId)
+        putLong(VoiceHandoffContract.KEY_ISSUED_ELAPSED_REALTIME_MS, issuedElapsedRealtimeMs)
+    }
+
+    private fun Bundle.toPending(): PendingVoiceRetrigger? {
+        val token = getLong(VoiceHandoffContract.KEY_TOKEN, 0L)
+        if (token == 0L) return null
+        return PendingVoiceRetrigger(
+            token = token,
+            targetTaskId = getInt(VoiceHandoffContract.KEY_TARGET_TASK_ID, -1),
+            sessionInstanceId = getLong(VoiceHandoffContract.KEY_SESSION_INSTANCE_ID, 0L),
+            issuedElapsedRealtimeMs = getLong(VoiceHandoffContract.KEY_ISSUED_ELAPSED_REALTIME_MS, 0L),
+        )
+    }
+
+    private fun identityBundle(targetTaskId: Int, sessionInstanceId: Long): Bundle = Bundle().apply {
+        if (targetTaskId != VoiceHandoffContract.WILDCARD_TASK_ID) {
+            putInt(VoiceHandoffContract.KEY_TARGET_TASK_ID, targetTaskId)
+        }
+        if (sessionInstanceId != VoiceHandoffContract.WILDCARD_SESSION_INSTANCE_ID) {
+            putLong(VoiceHandoffContract.KEY_SESSION_INSTANCE_ID, sessionInstanceId)
+        }
+    }
+}

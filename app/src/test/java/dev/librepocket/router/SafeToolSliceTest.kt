@@ -167,8 +167,9 @@ class SafeToolSliceTest {
         clock = fixedClock,
     )
 
-    @Test fun registryCountsPin42_1_41() {
-        assertEquals(42, ToolRegistry.ALL.size)
+    @Test fun registryCountsPin43_1_42() {
+        // D4 web.extract 新增後為 43/1/42（仍恰一 ready）。
+        assertEquals(43, ToolRegistry.ALL.size)
         assertEquals(1, ToolRegistry.ALL.count { it.executionReady })
         assertEquals("lsp.symbols", ToolRegistry.ALL.single { it.executionReady }.name)
         assertTrue(ToolRegistry.ALL.filter { it.name != "lsp.symbols" }.all { !it.executionReady })

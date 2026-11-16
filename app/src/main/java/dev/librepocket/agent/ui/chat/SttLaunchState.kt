@@ -142,7 +142,9 @@ internal val SttLaunchStateSaver = listSaver(
 )
 
 /**
- * `resetEpoch` 的 fail-closed saver：負數還原為 0、單調值原樣通過 — 對 crafted Bundle 的縱深防禦。
+ * `resetEpoch` 的 fail-closed saver：負數還原為 0、非負值原樣通過 — 對 crafted Bundle 的縱深防禦。
+ * 僅此而已：完全自洽的 crafted Bundle 在此框架下不可被此 saver 排除（saved state 屬 framework
+ * 信任域）；它並非 replay 防禦邊界，僅防止負數鍵名污染（仍唯一、不衝突）。
  */
 internal val ResetEpochSaver = Saver<MutableIntState, Int>(
     save = { it.intValue },

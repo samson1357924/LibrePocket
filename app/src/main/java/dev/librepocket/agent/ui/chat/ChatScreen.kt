@@ -365,8 +365,9 @@ fun ChatScreen(
     //（"stt-slotN-<epoch>"）：重設後，重設前的 launch（與其 rc→key 綁定）永遠不可達——其晚到
     // 結果在 registry 邊界永不投遞（late result 停靠 pendingResults，鍵不再註冊），無法冒充
     // 重設後的 launch；slot/gen 表僅為第二層縱深防禦。
-    // rememberSaveable：跨 activity 重建還原（epoch>0 時 outstanding launch 重建後仍可歸屬）。
-    // Int 單調遞增；若 wrap 到負值亦各自唯一、不衝突（無需驗證，僅此註記）。
+    // wrap 為負唯一且不衝突；跨重建的負數還原經 ResetEpochSaver 夾為 0（與 epoch-0 鍵名相同但
+    //  fail-closed 丟棄，無 misattribution）。rememberSaveable：跨 activity 重建還原（epoch>0 時
+    //  outstanding launch 重建後仍可歸屬）。
     var resetEpoch by rememberSaveable(saver = ResetEpochSaver) { mutableIntStateOf(0) }
     // 每枚進行中 launch 各自佔一個回呼 slot（共 2 枚）：slotBusy 標記佔用、slotGen 記錄該 slot 對應的
     // admit generation（launch 時自 currentGeneration 讀取，即剛承認的那一枚 arm 的 generation）。
@@ -485,7 +486,7 @@ fun ChatScreen(
     }
     val sttRegistry = LocalActivityResultRegistryOwner.current?.activityResultRegistry
         ?: error("No ActivityResultRegistryOwner was provided via LocalActivityResultRegistryOwner")
-    // androidx.activity.compose 1.13.0 rememberLauncherForActivityResult 的手工等價物，差異：
+    // androidx.activity.compose（libs.versions.toml 聲明 1.10.1，atomic-group 衝突解析實際採用 1.13.0；bytecode 已驗證）的 rememberLauncherForActivityResult 的手工等價物，差異：
     // (1) key 由 resetEpoch 推導（非隨機 UUID）——重設後重設前 launch 立即與 registry 斷鏈；
     // (2) callbacks 經 rememberUpdatedState 委派當代 handleSttResult（與 androidx 相同）。
     val latestHandleSttResult by rememberUpdatedState { slot: Int, result: ActivityResult -> handleSttResult(slot, result) }

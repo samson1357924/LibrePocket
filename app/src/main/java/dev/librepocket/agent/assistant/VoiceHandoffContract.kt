@@ -63,14 +63,14 @@ internal object VoiceHandoffContract {
  * used to bind retrigger delivery/consume to the trusted voice task (not the
  * normal-task MainActivity instance that also collects the same state flow).
  */
-data class VoiceTaskIdentity(val taskId: Int, val sessionInstanceId: Long)
+internal data class VoiceTaskIdentity(val taskId: Int, val sessionInstanceId: Long)
 
 /**
  * One-shot retrigger token for a trusted voice task. [issuedElapsedRealtimeMs] is stamped by the
  * provider (main process) with [android.os.SystemClock.elapsedRealtime] at store time — the
  * caller-supplied value is ignored — and drives every TTL gate across processes.
  */
-data class PendingVoiceRetrigger(
+internal data class PendingVoiceRetrigger(
     val token: Long,
     val targetTaskId: Int,
     val sessionInstanceId: Long,

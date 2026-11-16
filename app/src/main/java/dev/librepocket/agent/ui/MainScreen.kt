@@ -70,7 +70,7 @@ object Routes {
 private const val TAG = "MainScreen"
 
 @Composable
-fun MainScreen(
+internal fun MainScreen(
     sharedText: String? = null,
     onSharedConsumed: () -> Unit = {},
     // C2 session 語音喚起（Issue #137）：MainActivity 的一次態 voice 請求；
@@ -554,6 +554,9 @@ fun MainScreen(
  * Expiry is enforced at gate/consume/currentPending time and on the next state change — there is
  * no background timer; an over-TTL entry simply stops being deliverable/consumable until this
  * effect converges it on the next state change. Fail-closed.
+ * An expired entry is converged regardless of identity match: it is undeliverable anyway, so any
+ * composing instance may drop it (prevents an orphaned over-TTL entry staying resident for the
+ * process lifetime). Non-expired entries keep the identity gate.
  */
 @Composable
 internal fun RetriggerStaleClearEffect(
@@ -565,12 +568,16 @@ internal fun RetriggerStaleClearEffect(
 ) {
     LaunchedEffect(pending, navLoading, hasEndpoint, identity) {
         val p = pending ?: return@LaunchedEffect
+        val stale = VoiceHandoffContract.isExpired(p.issuedElapsedRealtimeMs, SystemClock.elapsedRealtime())
+        if (stale) {
+            AssistantVoiceHandoff.clear(context = context, targetTaskId = p.targetTaskId, sessionInstanceId = p.sessionInstanceId, token = p.token)
+            return@LaunchedEffect
+        }
         val id = identity
         if (id == null || id.taskId != p.targetTaskId || id.sessionInstanceId != p.sessionInstanceId) {
             return@LaunchedEffect
         }
-        val stale = VoiceHandoffContract.isExpired(p.issuedElapsedRealtimeMs, SystemClock.elapsedRealtime())
-        if (stale || (!navLoading && !hasEndpoint)) {
+        if (!navLoading && !hasEndpoint) {
             AssistantVoiceHandoff.clear(context = context, targetTaskId = p.targetTaskId, sessionInstanceId = p.sessionInstanceId, token = p.token)
         }
     }

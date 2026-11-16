@@ -150,8 +150,7 @@ fun ChatScreen(
     ttsAcknowledged: Boolean = false,
     onTtsAcknowledged: suspend () -> Boolean = { true },
     // C2 session 語音喚起（Issue #137）：MainActivity 經 MainScreen 傳入的
-    // 一次態 voice 請求（MainScreen 已守衛 hasEndpoint && !navLoading &&
-    // currentRoute == Routes.CHAT）；true 且開關快照已落定（voiceSwitchesLoaded）
+    // 一次態 voice 請求（MainScreen 已守衛 `chatSafeBoundary` 單一來源；true 且開關快照已落定（voiceSwitchesLoaded）
     // 即自動走下方既有 launchSystemStt()（RecognizerIntent 委派，零新權限），
     // 先消費再啟動（防重組重放）。
     // 結果經 AssistantVoice.resolveVoicePrefill 截斷至上限並只 prefill 不自動送出；
@@ -366,8 +365,10 @@ fun ChatScreen(
     // screenId＋此世代推導（"stt-<screenId>-slotN-<epoch>"）：重設後，重設前的 launch（與其 rc→key 綁定）永遠不可達——其晚到
     // 結果在 registry 邊界永不投遞（late result 停靠 pendingResults，鍵不再註冊），無法冒充
     // 重設後的 launch；slot/gen 表僅為第二層縱深防禦。
-    // wrap 為負唯一且不衝突；跨重建的負數還原經 ResetEpochSaver 夾為 0（與 epoch-0 鍵名相同但
-    //  fail-closed 丟棄，無 misattribution）。rememberSaveable：跨 activity 重建還原（epoch>0 時
+    // in-process 的負世代鍵名仍然唯一；與 epoch-0 同鍵名僅可能經跨重建還原夾為 0 的路徑出現
+    // （須搭配 process death，且 outstanding launch 的 gate 由 gen==0L fail-closed 丟棄）；
+    // ResetEpochSaver 維持 fail-closed 夾取（save 側原值寫入、restore 側負值夾為 0）。
+    // 世代唯一性由 monotonic 遞增保證，wrap 僅於 ~2^31 次重設後出現（Int 世代遞增）。rememberSaveable：跨 activity 重建還原（epoch>0 時
     //  outstanding launch 重建後仍可歸屬）。
     var resetEpoch by rememberSaveable(saver = ResetEpochSaver) { mutableIntStateOf(0) }
     // Entry-scoped identity：entry-scoped rememberSaveable＋ScreenIdSaver（restore 驗證

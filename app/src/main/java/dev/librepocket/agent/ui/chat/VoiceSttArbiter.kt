@@ -126,7 +126,8 @@ internal class VoiceSttArbiter(
 
     /**
      * Drop the in-flight marker without touching anything else.
-     * Test/lifecycle hook; not used in production.
+     * @VisibleForTesting 僅測試用；production 不呼叫（恢復路徑由 ChatScreen 的「重設語音辨識」
+     * 走 [hardReset]／resetEpoch 世代承擔）。
      * Also resets [currentGeneration] to 0.
      */
     @VisibleForTesting

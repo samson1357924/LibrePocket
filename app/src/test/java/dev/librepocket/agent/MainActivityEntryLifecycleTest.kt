@@ -484,7 +484,7 @@ open class FakeDispatchMainActivity : MainActivity() {
     private lateinit var onVoiceInputConsumed: () -> Unit
     val deliveries = mutableListOf<String>()
     var trustedVoiceSession: Boolean = true
-    var capturedVoiceIdentity: VoiceTaskIdentity? = null
+    internal var capturedVoiceIdentity: VoiceTaskIdentity? = null
 
     override fun isTrustedVoiceSession(): Boolean = trustedVoiceSession
 

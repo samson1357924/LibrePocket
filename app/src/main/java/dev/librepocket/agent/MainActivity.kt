@@ -81,7 +81,7 @@ open class MainActivity : ComponentActivity() {
     }
 
     /** Installs the production screen; overridable so lifecycle tests can fake dispatch. */
-    protected open fun installMainScreenContent(
+    internal open fun installMainScreenContent(
         sharedText: () -> String?,
         onSharedConsumed: () -> Unit,
         voiceInputRequested: () -> Boolean = { false },

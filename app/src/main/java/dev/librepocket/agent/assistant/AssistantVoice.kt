@@ -2,7 +2,6 @@ package dev.librepocket.agent.assistant
 
 import android.content.Intent
 import dev.librepocket.entry.EntryNormalize
-import dev.librepocket.voice.VoiceStt
 
 /**
  * C2 session 喚起→STT 文字回填契約（Issue #137 C2，三 flavor 共用）。
@@ -30,7 +29,7 @@ import dev.librepocket.voice.VoiceStt
  *   結果經 [resolveVoicePrefill] 截斷至 [EntryNormalize.MAX_TEXT_LENGTH]（4000 字）後
  *   只 prefill、不自動送出（見 [AUTO_SEND_AFTER_VOICE]），無能力增益。
  */
-object AssistantVoice {
+internal object AssistantVoice {
     /** ASSIST intent 附帶 voice 請求的 extra key（字面值穩定，Robolectric 鎖定）。 */
     const val EXTRA_VOICE_INPUT = "dev.librepocket.extra.ASSIST_VOICE_INPUT"
 
@@ -70,12 +69,30 @@ object AssistantVoice {
      * [EntryNormalize.MAX_TEXT_LENGTH]（4000 字）；
      * 無結果回 null（呼叫方留手動輸入，不報錯不自動送出）。
      *
-     * trim/empty 檢查為防禦性邊界：涵蓋 [VoiceStt.pickResult] 契約與未修剪／純空白候選，
+     * trim/empty 檢查為防禦性邊界：涵蓋 `VoiceStt.pickResult` 契約與未修剪／純空白候選，
      * 長度上限則維持 prefill-only 邊界（不自動送出，亦不接受超長回填）。
+     * `VoiceStt.pickResult` 保留作為測試鎖定的參考契約，production-dead（production 使用本檔的 bounded variant）。
+     * 首個非空白字元定位後，body ≤ cap 時 trimEnd（≡ 原 trim 的後綴側），body > cap 時取前 cap 字元（≡ 原 trim 後 take(cap) 的前綴）——逐位元組等價於舊 pipeline（trim→take(4000)），且兩分支皆 bounded copy；空候選→null。
+     * 實作經單次反向掃描定位 end（跳過尾綴空白）後計算 take = min(end−start, cap)，為舊 pipeline 的逐位元組等價且 bounded copy；尾端空白超界情境由 AssistantVoiceTest 釘住。
      */
-    fun resolveVoicePrefill(results: List<*>?): String? =
-        VoiceStt.pickResult(results)
-            ?.trim()
-            ?.take(EntryNormalize.MAX_TEXT_LENGTH)
-            ?.takeIf { it.isNotEmpty() }
+    fun resolveVoicePrefill(results: List<*>?): String? {
+        results ?: return null
+        for (element in results) {
+            val candidate = element as? String ?: continue
+            // 首個非空白字元 start（O(n) 掃描，零配置）與尾綴空白跑終點 end（反向有界掃描，零配置）：
+            //  take = min(end - start, MAX_TEXT_LENGTH)；substring bounded copy。
+            // 逐位元組等價於舊 pipeline（trim → take(4000) → 非空即採納），且無無界複製。
+            val start = candidate.indexOfFirst { !it.isWhitespace() }
+            val trimmed = if (start == -1) {
+                null
+            } else {
+                var end = candidate.length
+                while (end > start && candidate[end - 1].isWhitespace()) end--
+                candidate.substring(start, start + minOf(end - start, EntryNormalize.MAX_TEXT_LENGTH))
+                    .takeIf { it.isNotEmpty() }
+            }
+            if (trimmed != null) return trimmed
+        }
+        return null
+    }
 }

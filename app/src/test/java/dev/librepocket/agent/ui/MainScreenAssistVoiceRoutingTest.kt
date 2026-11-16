@@ -364,8 +364,8 @@ class MainScreenAssistVoiceRoutingTest {
                 context = appContext,
             )
 
-            // Production stale-clear effect (single source of truth): identity-gated + token-matched;
-            // only the owning instance converges its own token.
+            // Production stale-clear effect (single source of truth): expired entries converge
+            // regardless of identity; non-expired entries stay identity-gated + token-matched.
             RetriggerStaleClearEffect(
                 pending = pendingRetrigger,
                 identity = voiceTaskIdentity,
@@ -1431,8 +1431,10 @@ class MainScreenAssistVoiceRoutingTest {
         render(h)
         awaitRoute(h, Routes.CHAT)
 
-        // Stale entry is not delivered, and the owning instance's stale-clear effect converges
-        // (drops) it — the non-owner instance could not do this.
+        // Stale entry is not delivered, and the stale-clear effect converges
+        // (drops) it — the non-owner path converges ONLY over-TTL entries (by design);
+        // this entry is age-11s (over-TTL), so identity is not what gates the clear here —
+        // the identity gate holds only for age-0 (non-expired) entries.
         composeRule.runOnIdle {
             h.publishRetrigger(
                 targetTaskId = 10,
@@ -1475,22 +1477,23 @@ class MainScreenAssistVoiceRoutingTest {
     }
 
     @Test
-    fun retrigger_staleToken_notCleared_byNonOwningInstance() {
+    fun retrigger_staleToken_cleared_byNonOwningInstance() {
         val provider = RoutingFakeProvider()
         val h = Harness(newChatViewModel(provider))
         h.gate.value = EndpointGate.Ready(sampleEndpoint())
         h.voiceSwitchesLoaded.value = true
         h.userSwitches.value = mapOf(VoiceTools.SWITCH_INPUT to true)
-        // Normal-task instance: no voice-task identity, so the stale-clear effect must not fire
-        // here (this instance does not own the token).
+        // Normal-task instance: no voice-task identity. Expired entries are converged regardless
+        // of identity match (an over-TTL entry is undeliverable anyway), so the stale-clear
+        // effect drops it here too. Non-expired entries keep the identity gate (see
+        // retrigger_nonOwningInstance_noEndpoint_tokenUntouched).
         h.voiceTaskIdentity = null
 
         render(h)
         awaitRoute(h, Routes.CHAT)
 
-        var publishedToken = 0L
         composeRule.runOnIdle {
-            publishedToken = h.publishRetrigger(
+            h.publishRetrigger(
                 targetTaskId = 10,
                 sessionInstanceId = 7L,
                 issuedElapsedRealtimeMs = SystemClock.elapsedRealtime() - 11_000L,
@@ -1500,7 +1503,36 @@ class MainScreenAssistVoiceRoutingTest {
 
         assertEquals(0, h.retriggerConsumedCount)
         assertTrue(h.registry.launchedIntents.isEmpty())
-        assertEquals("non-owning instance must not clear a token it does not own", publishedToken, h.providerPending()?.token)
+        assertNull("expired entry is converged regardless of identity match", h.providerPending())
+    }
+
+    @Test
+    fun retrigger_staleToken_cleared_evenWithIdentityMismatch() {
+        val provider = RoutingFakeProvider()
+        val h = Harness(newChatViewModel(provider))
+        h.gate.value = EndpointGate.Ready(sampleEndpoint())
+        h.voiceSwitchesLoaded.value = true
+        h.userSwitches.value = mapOf(VoiceTools.SWITCH_INPUT to true)
+        // Identity present but mismatched (different task and session instance): the stale-clear
+        // effect must still converge an expired entry — an over-TTL entry is undeliverable
+        // anyway, so no orphaned over-TTL entry stays resident for the process lifetime.
+        h.voiceTaskIdentity = VoiceTaskIdentity(taskId = 99, sessionInstanceId = 999L)
+
+        render(h)
+        awaitRoute(h, Routes.CHAT)
+
+        composeRule.runOnIdle {
+            h.publishRetrigger(
+                targetTaskId = 10,
+                sessionInstanceId = 7L,
+                issuedElapsedRealtimeMs = SystemClock.elapsedRealtime() - 11_000L,
+            )
+        }
+        composeRule.waitForIdle()
+
+        assertEquals(0, h.retriggerConsumedCount)
+        assertTrue(h.registry.launchedIntents.isEmpty())
+        assertNull("expired entry is cleared even with identity mismatch", h.providerPending())
     }
 
     @Test

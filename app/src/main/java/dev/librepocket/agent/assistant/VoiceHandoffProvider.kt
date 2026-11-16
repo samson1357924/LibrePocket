@@ -201,7 +201,7 @@ class VoiceHandoffProvider : ContentProvider() {
         private const val TAG = "VoiceHandoffProvider"
 
         private val _pending = MutableStateFlow<PendingVoiceRetrigger?>(null)
-        val pending: StateFlow<PendingVoiceRetrigger?> = _pending.asStateFlow()
+        internal val pending: StateFlow<PendingVoiceRetrigger?> = _pending.asStateFlow()
         // Seeded from monotonic elapsed realtime so tokens stay monotonic across :voice-process restarts
         // (a fresh process must not re-issue token 1 and collide with/impersonate a live token).
         // (elapsed realtime shl 12) keeps bounded headroom below Long overflow and starts odd; any residual
@@ -209,7 +209,7 @@ class VoiceHandoffProvider : ContentProvider() {
         private val seq = AtomicLong((SystemClock.elapsedRealtime() shl 12) or 1L)
 
         /** For session-side token generation in any process (IDs are still owned by session). */
-        fun nextToken(): Long = seq.incrementAndGet()
+        internal fun nextToken(): Long = seq.incrementAndGet()
 
         /** @return true when stored; false when rejected (token <= 0, not persisted). */
         @Synchronized

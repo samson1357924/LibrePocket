@@ -4,6 +4,8 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.provider.Settings
+import android.speech.RecognitionService
+import android.speech.SpeechRecognizer
 import androidx.test.core.app.ApplicationProvider
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
@@ -196,6 +198,112 @@ class AssistantRoleRobolectricTest {
             "openFallback 必須以 queryIntentActivities 全枚舉候選",
             ui.contains("queryIntentActivities"),
         )
+    }
+
+    /**
+     * LibreRecognitionService stub 誠實性（fail-closed）釘住（誠實無能力、非待實作佔位）：
+     * - [LibreRecognitionService.onStartListening] → listener 恰收到一次
+     *   [SpeechRecognizer.ERROR_CLIENT]，其餘任何回呼（含 partial results）皆不得發生；
+     * - [LibreRecognitionService.onCheckRecognitionSupport]（雙參與三參兩種 overload）→
+     *   回報空語言清單（零支援），不偽造能力；error path 不得觸發；
+     * - onCancel / onStopListening 為無狀態 no-op（不拋例外）。
+     *
+     * 說明：`RecognitionService.Callback` 與 `SupportCallback` 的建構子在 compile-time
+     * stub android.jar 皆為 package-private，`object : Callback()` 無法編譯；故以
+     * reflection 在 Robolectric sandbox 內以 private ctor 建立（instrumented 版提供
+     * `(RecognitionService, IRecognitionListener, AttributionSource)` 私有 ctor；
+     * `SupportCallback(IRecognitionSupportCallback)` 私有 ctor），並以 dynamic proxy
+     * 實作 IRecognitionListener / IRecognitionSupportCallback 記錄呼叫；SDK 33 釘住
+     * （與本類其他測試一致）。service 的 protected 覆寫方法經 reflection invoke。
+     */
+    @Test
+    fun recognitionServiceStub_isHonestFailClosed() {
+        val service = LibreRecognitionService()
+        val loader = RecognitionService::class.java.classLoader!!
+        val callbackClass = Class.forName("android.speech.RecognitionService${'$'}Callback", true, loader)
+        val listenerInterface = Class.forName("android.speech.IRecognitionListener", true, loader)
+        val supportCallbackClass = Class.forName("android.speech.RecognitionService${'$'}SupportCallback", true, loader)
+        val supportInterface = Class.forName("android.speech.IRecognitionSupportCallback", true, loader)
+
+        // --- onStartListening：listener 恰收到一次 ERROR_CLIENT，無 partial results ---
+        val listenerCalls = mutableListOf<Pair<String, Int?>>()
+        val listenerProxy = java.lang.reflect.Proxy.newProxyInstance(loader, arrayOf(listenerInterface)) { _, method, args ->
+            listenerCalls += method.name to (args?.getOrNull(0) as? Int)
+            proxyDefault(method.returnType)
+        }
+        val callbackCtor = callbackClass
+            .getDeclaredConstructor(RecognitionService::class.java, listenerInterface, android.content.AttributionSource::class.java)
+            .also { it.isAccessible = true }
+        val listenerCallback = callbackCtor.newInstance(service, listenerProxy, null) as RecognitionService.Callback
+        invokeStub(service, "onStartListening", Intent(), listenerCallback)
+        assertEquals(
+            listOf("onError" to SpeechRecognizer.ERROR_CLIENT),
+            listenerCalls,
+        )
+
+        // --- onCheckRecognitionSupport：空語言清單（零支援），雙參與三參皆然 ---
+        val supportCalls = mutableListOf<Pair<String, Any?>>()
+        val supportProxy = java.lang.reflect.Proxy.newProxyInstance(loader, arrayOf(supportInterface)) { _, method, args ->
+            supportCalls += method.name to args?.getOrNull(0)
+            proxyDefault(method.returnType)
+        }
+        val supportCtor = supportCallbackClass
+            .getDeclaredConstructor(supportInterface)
+            .also { it.isAccessible = true }
+        val supportCallback = supportCtor.newInstance(supportProxy)
+
+        supportCalls.clear()
+        invokeStub(service, "onCheckRecognitionSupport", Intent(), supportCallback)
+        assertZeroSupport(supportCalls)
+
+        supportCalls.clear()
+        invokeStub(
+            service,
+            "onCheckRecognitionSupport",
+            Intent(),
+            android.content.AttributionSource.Builder(android.os.Process.myUid()).setPackageName("dev.librepocket.test").build(),
+            supportCallback,
+        )
+        assertZeroSupport(supportCalls)
+
+        // --- onCancel / onStopListening：無狀態 no-op（不拋例外，listener 零回呼） ---
+        listenerCalls.clear() // onStartListening 已斷言過其單次 onError；此處歸零後驗證兩個 no-op 零回呼
+        invokeStub(service, "onCancel", listenerCallback)
+        invokeStub(service, "onStopListening", listenerCallback)
+        assertTrue(listenerCalls.isEmpty())
+    }
+
+    /** 記錄型 SupportCallback 的零支援斷言：恰收到一次 onSupportResult、空語言清單、無 onError。 */
+    private fun assertZeroSupport(supportCalls: List<Pair<String, Any?>>) {
+        assertTrue("must report zero support, not an error: $supportCalls", supportCalls.none { it.first == "onError" })
+        val call = supportCalls.singleOrNull { it.first == "onSupportResult" }
+            ?: throw AssertionError("onCheckRecognitionSupport must invoke onSupportResult exactly once; calls=$supportCalls")
+        val support = call.second as android.speech.RecognitionSupport
+        assertEquals(emptyList<String>(), support.getInstalledOnDeviceLanguages())
+        assertEquals(emptyList<String>(), support.getSupportedOnDeviceLanguages())
+        assertEquals(emptyList<String>(), support.getPendingOnDeviceLanguages())
+        assertEquals(emptyList<String>(), support.getOnlineLanguages())
+    }
+
+    /** proxy 回傳預設值（IRecognitionListener / IRecognitionSupportCallback 方法皆 void；其餘回傳 null/0）。 */
+    private fun proxyDefault(returnType: Class<*>): Any? = when (returnType) {
+        java.lang.Boolean.TYPE -> false
+        java.lang.Integer.TYPE -> 0
+        java.lang.Long.TYPE -> 0L
+        java.lang.Float.TYPE -> 0f
+        java.lang.Double.TYPE -> 0.0
+        java.lang.Short.TYPE -> 0.toShort()
+        java.lang.Byte.TYPE -> 0.toByte()
+        java.lang.Character.TYPE -> '\u0000'
+        else -> null
+    }
+
+    /** 以 reflection invoke LibreRecognitionService 的 protected 覆寫方法（compile-time 不可直接存取）。 */
+    private fun invokeStub(service: LibreRecognitionService, name: String, vararg args: Any?) {
+        val params = args.map { requireNotNull(it) { "invokeStub args must be non-null" }::class.java }.toTypedArray()
+        val m = LibreRecognitionService::class.java.getDeclaredMethod(name, *params)
+        m.isAccessible = true
+        m.invoke(service, *args)
     }
 
     /** 單測工作目錄（模組 dir）出發，向上走最多 5 層找原始碼/清單檔（同 VoiceSttTest 模式）。 */

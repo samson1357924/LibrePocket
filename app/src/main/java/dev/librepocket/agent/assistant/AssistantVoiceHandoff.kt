@@ -19,14 +19,16 @@ import kotlinx.coroutines.flow.Flow
  * ShadowContentResolver), since `requestRetrigger` returns a token and never writes provider state
  * directly.
  */
-object AssistantVoiceHandoff {
+internal object AssistantVoiceHandoff {
 
     private const val TAG = "AssistantVoiceHandoff"
 
     fun pendingFlow(): Flow<PendingVoiceRetrigger?> = VoiceHandoffProvider.pending
 
+    /** Test/無 UI 觀測輔助（production 經 pendingFlow 觀察）；不暴露為公開 API 表面。 */
     fun peek(context: Context? = null): Long = currentPending(context)?.token ?: 0L
 
+    /** Test/無 UI 觀測輔助（production 經 pendingFlow 觀察）；不暴露為公開 API 表面。 */
     fun currentPending(context: Context? = null): PendingVoiceRetrigger? {
         val local = VoiceHandoffProvider.pending.value
         val resolved = if (local != null || context == null) {

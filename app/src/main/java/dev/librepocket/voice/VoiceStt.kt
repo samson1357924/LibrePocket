@@ -45,7 +45,9 @@ object VoiceStt {
         return null
     }
 
-    /** 取辨識候選首條非空正文；無結果回 null（呼叫方留手動輸入）。 */
+    /** 取辨識候選首條非空正文；無結果回 null（呼叫方留手動輸入）。
+     * （註：production 投遞路徑已改為 AssistantVoice.resolveVoicePrefill 的有界 variant；本函式為 test-pinned 參考契約、production-dead，僅測試使用。）
+     */
     fun pickResult(results: List<*>?): String? =
         results?.asSequence()
             ?.mapNotNull { it as? String }

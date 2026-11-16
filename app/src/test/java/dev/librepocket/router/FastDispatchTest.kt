@@ -588,6 +588,30 @@ class FastDispatchTest {
             "查 函式 符號" to "函式",
             // Single-letter-token shapes stand (was: CJK filler delete):
             "查 是 符號" to "是",
+            // #19 B3 stage-7.2 (A2)：CJK 複合查詢動詞 longest-match-first——
+            // SYMBOL_CJK_COMMAND_TOKEN 整體消費複合動詞，不再把第二字形
+            // （詢/尋/索/找…）誤留為識別字前綴：
+            "查詢Foo符號" to "Foo", // 查（U+67E5）詢（U+8A62）複合動詞
+            "搜尋Foo符號" to "Foo",
+            "搜索Foo符號" to "Foo",
+            "查询Foo符号" to "Foo",
+            "查找Foo符號" to "Foo",
+            "尋找Foo符號" to "Foo",
+            "找尋Foo符號" to "Foo",
+            // 帶空白複合動詞：`查詢 Foo 符號` 先前（stage-7.2 前）殘餘 `詢 Foo` 含空白 ⇒ 澄清；
+            // 現 `查詢` 整體消費 ⇒ FAST `Foo`（clarify→FAST 翻轉，記錄並釘 FAST）：
+            "查詢 Foo 符號" to "Foo",
+            // 單字開頭＋空白：複合不成立，`查` 為位置 cue ⇒ `詢Foo` 為合法識別字，原樣保留：
+            "查 詢Foo 符號" to "詢Foo",
+            // 記錄殘餘（Re-review #7 複核）：首字為單字 opener 的兩字動詞視為剩餘原樣識別字（READ-only）：
+            "詢問Foo符號" to "問Foo", // 首字「詢」∈ opener
+            "查看Foo符號" to "看Foo", // 首字「查」∈ opener
+            // 禮貌前綴＋複合動詞：
+            "請查詢Foo符號" to "Foo",
+            // 複合動詞＋一下：
+            "查詢一下Foo符號" to "Foo",
+            // 單字＋空白（行為不變，釘住）：
+            "找 Foo 符號" to "Foo",
             // 保留：Implicit plain identifier still routes FAST.
             "查 Foo 符號" to "Foo",
             // 無空格形態：句首 lookup 動詞「查」仍是位置 cue（positional opener，
@@ -598,6 +622,11 @@ class FastDispatchTest {
             assertEquals(text, RouteKind.FAST, d.route)
             assertNotNull(text, d.toolCall)
             assertEquals(text, "lsp.symbols", d.toolCall?.toolName)
+            assertEquals(
+                text,
+                """{"query": "$expectedQuery", "limit": ${LspTools.DEFAULT_LIMIT}}""",
+                d.toolCall!!.argumentsJson,
+            )
             val obj = Json.parseToJsonElement(d.toolCall!!.argumentsJson).jsonObject
             assertEquals(text, expectedQuery, obj["query"]!!.jsonPrimitive.content)
             assertEquals(text, LspTools.DEFAULT_LIMIT, obj["limit"]!!.jsonPrimitive.content.toInt())
@@ -803,6 +832,9 @@ class FastDispatchTest {
             "傳簡訊給媽媽說我晚點到",
             "查符號",
             "查一下符號",
+            // #19 B3 stage-7.2（A2）：複合動詞整體消費後無有意義殘餘
+            // （先前會以 `詢` 為 query 執行——identifier-less / verb-second-glyph 錯流）：
+            "查詢符號",
         )) {
             val d = decide(text)
             assertEquals(text, RouteKind.DENIED, d.route)
@@ -1320,6 +1352,11 @@ class FastDispatchTest {
             "符號的意思",
             "什麼是符號",
             "為什麼要用符號",
+            // #19 B3 stage-7.2（A2）：`查詢的` 是陳述句殘餘——無 symbol hint（符號/符号/
+            // symbols? 皆缺）⇒ symbol 前閘不成立、RULES 無命中 ⇒ no-match DENIED
+            // （reasonCode null，**不是** NEED_CLARIFICATION）——DENIED + toolCall null、
+            // 絕不執行；此為 check-outcome 後如實釘錄（見 PR #171 stage-7.2）。
+            "查詢的",
         )) {
             // A2: 無 lookup marker ⇒ 模板不成立 ⇒ no-match DENIED（reasonCode null），
             // 不是澄清。
@@ -1349,6 +1386,7 @@ class FastDispatchTest {
         }
         // Dispatch sanity for at least one case: clarification never reaches the backend.
         skippedOf(dispatcher.dispatch(decide("符號的意思"), lspOn), "符號的意思")
+        skippedOf(dispatcher.dispatch(decide("查詢的"), lspOn), "查詢的")
         assertEquals(0, backend.invocations.get())
     }
 
@@ -2533,7 +2571,9 @@ class FastDispatchTest {
     // ---- #19 B3 stage-1：symbol 前閘僅收命令式肯定語句（affirmative-command admission）----
     // symbol 前閘僅准許**命令式肯定語句**（explicit lookup command）：句首（可選 EN
     // `please`／CJK 請|麻煩|帮我|幫我|给我|給我|请 前綴）必須是查詢動詞
-    // （find/search/lookup/locate，或 CJK 查/找/尋/搜/詢/寻/询）或
+    // （find/search/lookup/locate，或 CJK 命令式查詢動詞符元
+    // 查詢|查询|搜尋|搜寻|搜索|查找|尋找|寻找|找尋|找寻 複合 longest-match-first 排前、
+    // 單字 查/找/尋/搜/詢/寻/询 殿後）或
     // `symbol(s) <name>` 命令形；句中出現授權/條件授權子句（命令式 opener + 結構性
     // 授權/條件子句否決：only after/when/if/until/once/before/with/upon …、
     // after|until|unless|once|when|while|if|before|since|whenever|as|because|
@@ -2703,6 +2743,10 @@ class FastDispatchTest {
             // 原 `positionalCueGrammarPins` 之 FAST pins 翻轉為 DENIED：
             "查Foo符號等123456789批准",
             "查Foo符號批准,再做",
+            // #19 B3 stage-7.2（A2）×stage-7.1：複合符元整體消費 `查詢` 後，
+            // arm B（`批准,再做`）於同一 raw 文本上命中 ⇒ 准入否決（對 raw/spaced/joined
+            // 三探針聯集測試）：
+            "查詢Foo符號批准,再做",
             // 新增 pins：
             "查Foo符號等123456789012批准",
             "查Foo符號等安全審核委員會主席批准",

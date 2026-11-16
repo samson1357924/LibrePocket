@@ -59,7 +59,9 @@ import java.util.concurrent.atomic.AtomicLong
  * ONLY an **explicit lookup command** under the affirmative-command
  * admission model ([isAffirmativeSymbolCommand], #19 B3 stage-1):
  * 句首（可選 EN `please`／CJK 請|麻煩|帮我|幫我|给我|給我|请 前綴）必須是查詢動詞
- * （find/search/lookup/locate，或 CJK 查/找/尋/搜/詢/寻/询）或
+ * （find/search/lookup/locate，或 CJK 命令式查詢動詞符元 SYMBOL_CJK_COMMAND_TOKEN：
+ * 複合 查詢|查询|搜尋|搜寻|搜索|查找|尋找|寻找|找尋|找寻 longest-match-first 排前、
+ * 單字 查/找/尋/搜/詢/寻/询 殿後；Java 交替同位置有序首中 ⇒ 複合先＝最長匹配）或
  * `symbol(s) <name>` 命令形；句中出現授權/條件授權子句（命令式 opener +
  * 結構性授權/條件子句否決：only after/when/if/until/once/before/with/upon …、
  * after|until|unless|once|when|while|if|before|since|whenever|as|because|
@@ -96,6 +98,12 @@ import java.util.concurrent.atomic.AtomicLong
  *   （DENIED、reasonCode null），不宣稱 EN 否定或 EN 語序的封閉表完整性。
  * - 過度澄清為受控 fail-safe：帶教學標記的命令式語句（如 `查 Foo 符號的方法是`）
  *   一律不成立前閘——寧可 no-match/澄清，絕不把非查詢命令綁到 lsp.symbols 執行。
+ * - 殘餘（accepted, by design；Re-review #7 複核修訂）：CJK 無窮盡的兩字動詞形——
+ *   首字為單字 opener（查找尋搜詢寻询）、次字為非 opener CJK 字元者（`詢問`/`查看`/
+ *   `查閱`/`查驗`/`尋覓`/`尋思`/`搜羅`/`找遍`…無窮類）一律視為剩餘識別字原樣執行
+ *   （如 `詢問Foo符號` ⇒ FAST query=`問Foo`）——READ-only；查詢不改寫 verbatim；
+ *   记錄殘餘（pinned），非 no-match、不宣稱否決；`質詢`（首字 `質` ∉ opener）
+ *   → no-match DENIED。字典無窮不可封閉枚舉，刻意不再嘗試。
  * - Cf/default-ignorable-split normalization 已納（本輪）：授權子句/教學標記在
  *   raw 文本與兩個正規化探針（NFKC + Cf 摺空白；NFKC + Cf 刪除）上取聯集測試；
  *   CJK 條件框架（等…possessor…consent 動詞）亦同樣以三文本取聯集測試——
@@ -153,7 +161,9 @@ import java.util.concurrent.atomic.AtomicLong
  *    #4（B3 re-review）/stage-1：問句/知識/教學（how-to）語句與含授權/條件授權
  *    子句或教學/說明標記的語句一律不滿足 symbol 前閘——
  *    但句首（可選 EN please／CJK 請|麻煩|帮我|幫我|给我|給我|请 前綴）必須是查詢動詞
- *    （find/search/lookup/locate，或 CJK 查/找/尋/搜/詢/寻/询）或 `symbol(s) <name>`
+ *    （find/search/lookup/locate，或 CJK 命令式查詢動詞符元 SYMBOL_CJK_COMMAND_TOKEN：
+ *    複合 查詢|查询|搜尋|搜寻|搜索|查找|尋找|寻找|找尋|找寻 longest-match-first 排前、
+ *    單字 查/找/尋/搜/詢/寻/询 殿後；Java 交替同位置有序首中 ⇒ 複合先＝最長匹配）或 `symbol(s) <name>`
  *    命令形；句中出現授權/條件授權子句（only after/until i…approve、
  *    after|until|unless|once|when|while|if|before|since|whenever|as|because|
  *    provided|upon|following|pending|with|subject to|prior to|given|on 後接可選受詞/限定詞（0–3 個）再接詞幹、
@@ -386,9 +396,15 @@ class FastRouter(
         // 1. 句首（start-anchored，IGNORE_CASE）必須是以下之一：
         //    - EN：`^(?:please[\s,]+)?(?:find|search|lookup|locate)\b`（可選 please 前綴）
         //    - EN 單詞命令形：`^symbol(s)?\s+\S`（如 `symbols Foo`，原樣保留）
-        //    - CJK：`^(?:(?:請|麻煩|帮我|幫我|给我|給我|请)[\s，,]*)?(?:查|找|尋|搜|詢|寻|询)`
-        //      （可選禮貌前綴 請|麻煩|帮我|幫我|给我|給我|请 後接查詢動詞
-        //       查|找|尋|搜|詢|寻|询；`請先說明…` 不匹配——請後接 先 而非動詞，正確）
+        //    - CJK：`^(?:(?:請|麻煩|帮我|幫我|给我|給我|请)[\s，,]*)?SYMBOL_CJK_COMMAND_TOKEN`
+        //      （可選禮貌前綴 請|麻煩|帮我|幫我|给我|給我|请 後接
+        //       查詢動詞符元 SYMBOL_CJK_COMMAND_TOKEN =
+        //       `(?:查詢|查询|搜尋|搜寻|搜索|查找|尋找|寻找|找尋|找寻|查|找|尋|搜|詢|寻|询)`
+        //       ——複合 longest-match-first 排前、單字殿後（Java 交替同位置有序首中，
+        //       複合先＝最長匹配；`查詢Foo符號` 整體消費 `查詢`）；
+        //       `請先說明…` 不匹配——請後接 先 而非動詞，正確；
+        //       CJK 兩字動詞首字為單字 opener 者一律視為剩餘 verbatim 識別字（如 `詢問Foo符號` ⇒ FAST query=`問Foo`；
+        //        READ-only；記錄殘餘；`質詢` 因首字 ∉ opener → no-match；字典無窮不可封閉枚舉）
         // 2. 任意位置不得出現授權/條件授權子句（對 raw text 與下方兩個正規化探針測——
         //    「任意位置」＝三個文本之一命中即否決；IGNORE_CASE；結構性錨定，絕不裸名詞）：
         //    A. `\bonly\s+(?:after|when|if|until|once|before|with|upon)\b` 變體（approval|consent|permission 收尾）、
@@ -447,8 +463,17 @@ class FastRouter(
         private val AFFIRMATIVE_OPENER_EN =
             Regex("^(?:please[\\s,]+)?(?:find|search|lookup|locate)\\b", RegexOption.IGNORE_CASE)
         private val AFFIRMATIVE_OPENER_EN_COMMAND = Regex("^symbols?\\s+\\S", RegexOption.IGNORE_CASE)
+        // #19 B3 stage-7.2（A2）：CJK 查詢動詞符元——AFFIRMATIVE_OPENER_CJK 與
+        // SYMBOL_OPENER_CJK 共用的單一事實來源（single source；兩正則不可能再各自
+        // 漂移）。複合形 longest-match-first 排前（Java 交替在同位置為有序首中 ⇒
+        // 複合先＝最長匹配），單字殿後：`查詢Foo符號` 整體消費 `查詢`，語義修正
+        // （否則殘餘 `詢Foo` 會被當識別字前綴執行）。單字開頭仍保留合法識別字形態
+        // （`查 詢Foo 符號` → query=`詢Foo`）。CJK 兩字動詞首字為單字 opener 者
+        // （`詢問Foo符號` ⇒ FAST query=`問Foo` 等無窮類）視為剩餘 verbatim 識別字
+        // 原樣執行（READ-only；記錄殘餘；`質詢` 因首字 ∉ opener → no-match）。
+        private const val SYMBOL_CJK_COMMAND_TOKEN = "(?:查詢|查询|搜尋|搜寻|搜索|查找|尋找|寻找|找尋|找寻|查|找|尋|搜|詢|寻|询)"
         private val AFFIRMATIVE_OPENER_CJK =
-            Regex("^(?:(?:請|麻煩|帮我|幫我|给我|給我|请)[\\s，,]*)?(?:查|找|尋|搜|詢|寻|询)")
+            Regex("^(?:(?:請|麻煩|帮我|幫我|给我|給我|请)[\\s，,]*)?" + SYMBOL_CJK_COMMAND_TOKEN)
         private val PERMISSION_CONDITIONAL_CLAUSE = Regex(
             "\\bonly\\s+(?:after|when|if|until|once|before|with|upon)\\s+[a-z\\s]*?(?:approval|consent|permission)\\b" +
                 "|\\b(?:after|until|unless|once|when|while|if|before|since|whenever|as|because|provided|upon|following|pending|with|subject\\s+to|prior\\s+to|given|on)[\\s,]+" +
@@ -528,7 +553,12 @@ class FastRouter(
          * (optionally after a leading `please`), the EN single-word command
          * form (`symbol(s) <name>`), or a CJK lookup verb (optionally after a
          * politeness prefix 請|麻煩|帮我|幫我|给我|給我|请 directly followed by
-         * 查|找|尋|搜|詢|寻|询）; it contains NO permission/conditional/consent
+         * [SYMBOL_CJK_COMMAND_TOKEN] = longest-match-first
+         * `查詢|查询|搜尋|搜寻|搜索|查找|尋找|寻找|找尋|找寻|查|找|尋|搜|詢|寻|询`
+         * （複合排前、單字殿後；Java 交替同位置有序首中 ⇒ 複合先＝最長匹配；
+         * CJK 兩字動詞首字為單字 opener 者一律視為剩餘 verbatim 識別字——如
+         * `詢問Foo符號` ⇒ FAST query=`問Foo`；READ-only；記錄殘餘；`質詢` 因首字
+         * ∉ opener → no-match；不宣稱否決））; it contains NO permission/conditional/consent
          * clause anywhere (checked against the raw text AND the two normalized
          * probes, see [clauseProbeSpaced]/[clauseProbeJoined]); it contains NO
          * teaching/description marker anywhere (same three texts); and its
@@ -967,8 +997,13 @@ class FastRouter(
          *       `(?:for\s+|the\s+|a\s+|an\s+)?` — the verb plus ONE optional
          *       post-verb connective (`find a symbol Foo` → `symbol Foo`);
          *   CJK: `^(?:(?:請|麻煩|帮我|幫我|给我|給我|请)[\s，,]*)?`
-         *       `(?:查|找|尋|搜|詢|寻|询)[\s，,]*(?:一下)?[\s，,]*` — optional
-         *       politeness prefix + lookup verb + optional 一下;
+         *       + `SYMBOL_CJK_COMMAND_TOKEN` + `[\s，,]*(?:一下)?[\s，,]*` — optional
+         *       politeness prefix + CJK command token
+         *       （複合 查詢|查询|搜尋|搜寻|搜索|查找|尋找|寻找|找尋|找寻 longest-match-first
+         *       排前、單字 查/找/尋/搜/詢/寻/询 殿後——Java 交替同位置有序首中 ⇒
+         *       複合先＝最長匹配；首字為單字 opener 的兩字動詞視為剩餘識別字原樣執行
+         *       （如 `詢問Foo符號` ⇒ FAST query=`問Foo`；記錄殘餘；字典無窮不可封閉枚舉）
+         *       + optional 一下;
          *   command form A: `^symbols?\b[\s]*` — `symbols Foo` → `Foo`.
          *   Applied sequentially (CJK → EN → command), so `查 find 符號` still
          *   reduces to empty and clarifies.
@@ -1113,7 +1148,7 @@ class FastRouter(
          * [missingQuestionFor] ("請問要查哪個符號？").
          */
         private val SYMBOL_OPENER_CJK = Regex(
-            "^(?:(?:請|麻煩|帮我|幫我|给我|給我|请)[\\s，,]*)?(?:查|找|尋|搜|詢|寻|询)[\\s，,]*(?:一下)?[\\s，,]*",
+            "^(?:(?:請|麻煩|帮我|幫我|给我|給我|请)[\\s，,]*)?" + SYMBOL_CJK_COMMAND_TOKEN + "[\\s，,]*(?:一下)?[\\s，,]*",
         )
         private val SYMBOL_OPENER_EN = Regex(
             "^(?:please[\\s,]+)?(?:find|search|lookup|locate)\\b[\\s,]*(?:for\\s+|the\\s+|a\\s+|an\\s+)?",

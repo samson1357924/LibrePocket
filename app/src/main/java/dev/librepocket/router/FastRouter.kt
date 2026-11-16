@@ -1221,7 +1221,7 @@ class FastRouter(
          *   `查 symbols Foo符號`（混合 opener）→ FAST `Foo符號`；
          *   `symbols Foo符號。` → Step D 剝 `。` → FAST `Foo符號`；
          *   「verbatim」＝零 cue 處理（Step C／兩道守衛），不排除共用的 Step D 前緣剝離
-         *   （`symbols Foo::` → FAST `Foo`、`symbols Foo符號。` → FAST `Foo符號`，同類共用）。
+         *   （`symbols Foo::` → FAST `Foo::`（stage-9.3 起 verbatim）、`symbols Foo符號。` → FAST `Foo符號`，同類共用）。
          *   `symbols Foo符號 extra`／`symbols Foo 符號`／`symbols 符號 符號`
          *   → 空白 ⇒ Step E 澄清。CJK 分支逐位元不變（`查 Foo符號 符號`
          *   澄清、`查 符號` 澄清、`查 Foo 符號` → FAST `Foo`）。
@@ -1270,18 +1270,29 @@ class FastRouter(
          * Step D — edge trim ONLY: runs of
          *   LEADING `[\s，。、？?「」『』“”"'（）]`（stage-8.4：前導類不再含
          *   `:`（U+003A）／`：`（U+FF1A））and TRAILING
-         *   `[\s，。、？?：:「」『』“”"'（）]`（stage-8.2 possessive `++$`，不動）
+         *   `[\s，。、？?「」『』“”"'（）]`（stage-9.3：尾端類亦不再含
+         *   `:`／`：`；stage-8.2 possessive `++$` 保留無誤）
          *   stripped repeatedly. Nothing
          *   intra-token is ever removed by this step.
          *   Stage-8.4（Re-review #8 A3）：前導 colon 不再剝離——C++
          *   global-namespace 前綴 `::Foo` 與 `Foo` 為不同 scope，一律原樣保留
-         *   verbatim（leading colons 一律不剝/不改寫（trailing edge class 維持不變））；單冒號 `:Foo`
+         *   verbatim（leading colons 一律不剝/不改寫）；單冒號 `:Foo`
          *   （U+003A）亦原樣保留（`查 :Foo 符號` → FAST `:Foo`，記錄，READ-only）；
          *   全形 `：`（U+FF1A）同樣不被前導類剝除，但 Step E 是 ASCII-punct-only
          *   ⇒ `查 ：Foo 符號` 拒絕 ⇒ NEED_CLARIFICATION（fail-closed，絕不
-         *   rewrite 成 `Foo`）；尾端 colon 類不變（`查 Foo: 符號` → FAST `Foo`，
-         *   前後不對稱為記錄行為）；`查 ::符號 符號` 之歧義守衛照舊澄清
-         *   （belt-and-suspenders，pinned）。
+         *   rewrite 成 `Foo`）。
+         *   Stage-9.3（Re-review #9 A3, [P2]）：尾端 colon 類亦不再剝除——C++
+         *   scoped qualified identifier 之尾端 `::` 為合法 token（`Foo::` 與 `Foo`
+         *   為不同 scope 語義），與 stage-8.3/8.4 verbatim-preservation 一致——一律原樣
+         *   保留 verbatim：`symbols Foo::`／`查 Foo:: 符號`（Step C 剝尾綴 `符號` ⇒
+         *   `Foo::`，純 CJK 分支）／`查 symbols Foo::`（EN-delimited）→ FAST `Foo::`；
+         *   `查 ::std::vector:: 符號` → FAST `::std::vector::`（COI token `::Foo` 兩分支對齊：
+         *   前導 stage-8.4 verbatim、尾端 stage-9.3 verbatim）；`查 Foo: 符號` 現在 verbatim
+         *   `Foo:`（stage-8.2/8.4 時釘為 `Foo`——stage-9.3 翻轉，記錄）；尾端全形 `：`（U+FF1A）
+         *   不再剝除 ⇒ Step E 拒絕 U+FF1A ⇒ NEED_CLARIFICATION（fail-closed，與 FF1A
+         *   reject 對稱；`查 Foo： 符號`／`symbols Foo：`，≥ stage-8.2 pin 改釘澄清）；
+         *   `查 Foo。 符號` → FAST `Foo`（`。` 尾仍剝，不受影響）；`查 ::符號 符號`
+         *   之歧義守衛照舊澄清（belt-and-suspenders，pinned）。
          *   NOTE: halfwidth `!` and
          *   the halfwidth parens are deliberately NOT in the edge class —
          *   `查 ! Foo`-class inputs must clarify, and `get(id)` must survive
@@ -1302,8 +1313,10 @@ class FastRouter(
          *   (ii) ANY remaining whitespace fails;
          *   (iii) a remainder ending in `.` `,` `;` fails
          *   (sentence-final natural-punctuation hazard; a trailing `:` is
-         *   already eaten by step D's edge class, so no `:` check is kept
-         *   here; `Foo.bar` / `3,14` / `std::vector` / `get(id)` / `-main`
+         *   NO LONGER eaten by step D's edge class (stage-9.3) — it is kept
+         *   verbatim instead and is allow-list-legal here, so no `:` check
+         *   is kept; a fullwidth `：` (U+FF1A) is rejected by (iv) instead;
+         *   `Foo.bar` / `3,14` / `std::vector` / `get(id)` / `-main`
          *   keep verbatim because they do
          *   not end there and pass the anchor check); (iv) every code point
          *   must be Unicode letter (L*) or number (N*), or one of
@@ -1322,6 +1335,8 @@ class FastRouter(
          * `查 Foo::symbol 符號` / `查 std::vector 符號` → `::` preserved,
          * `查 ::Foo 符號` / `查 ::std::vector 符號` → `::Foo` / `::std::vector`
          * （stage-8.4：前導 `::` 原樣保留 verbatim；前導冒號非剝離類）,
+         * `查 Foo:: 符號` / `查 ::std::vector:: 符號` → `Foo::` / `::std::vector::`
+         * （stage-9.3：尾端 `::` 亦原樣保留 verbatim；尾端冒號非剝離類）,
          * `查 Foo.symbols 符號` → `Foo.symbols` (intra-`symbols` survives),
          * `查 get(id) 符號` → `get(id)`, `查 3.14 符號` → `3.14`,
          * `查 3,14 符號` → `3,14`, `查 中文變數 符號` → `中文變數`.
@@ -1368,13 +1383,18 @@ class FastRouter(
          *   the old strip-to-empty → clarify behavior is retired, pinned).
          * - `查 符號表 符號` → FAST `符號表`; `查 使用者 符號` → FAST `使用者`
          *   (stage-6.3; filler-substrings no longer deleted, pinned).
-         * - Halfwidth `:` IS in the edge class's TRAILING branch only (step D,
-         *   stage-8.4: the LEADING branch dropped `:`／`：`): `查 Foo: 符號` edge-
-         *   trims to FAST `Foo` (unchanged stage-2 semantics); the leading
+         * - Halfwidth `:` is no longer in the edge class's TRAILING branch either
+         *   (stage-9.3, Re-review #9 A3 — the LEADING branch dropped `:`／`：` at
+         *   stage-8.4, the TRAILING branch now too): `查 Foo: 符號` → FAST `Foo:`
+         *   (stage-8.2/8.4 時釘為 `Foo`，stage-9.3 翻轉 — C++ scoped qualified identifier
+         *   尾端 `::` 為合法 token，verbatim 保留); `查 Foo:: 符號` → FAST `Foo::`;
+         *   `symbols Foo::` / `查 symbols Foo::` → FAST `Foo::`; the leading
          *   `::Foo` shape is preserved verbatim (stage-8.4, Re-review #8 A3 —
          *   C++ global-namespace prefix, never rewritten to `Foo`); `查 :Foo
          *   符號` → FAST `:Foo`（記錄，READ-only）；`查 ：Foo 符號`（全形
-         *   U+FF1A）Step E 拒絕 ⇒ NEED_CLARIFICATION（fail-closed）。
+         *   U+FF1A）Step E 拒絕 ⇒ NEED_CLARIFICATION（fail-closed）；尾端 `：`（U+FF1A）
+         *   同樣不再剝除 ⇒ `查 Foo： 符號`／`symbols Foo：` ⇒ Step E 拒絕 ⇒
+         *   NEED_CLARIFICATION（fail-closed，與 FF1A reject 對稱）。
          *   `.` `;` are
          *   NOT in the edge class (`查 Foo. 符號` / `查 Foo; 符號` fail
          *   step E). A halfwidth comma glued to an identifier at cue
@@ -1524,14 +1544,24 @@ class FastRouter(
         // 逐字相同）；失敗路徑一次掃掠定局。
         // #19 B3 stage-8.4 — 前導分支移除 `:`（U+003A）／`：`（U+FF1A）：C++
         // global-namespace 前綴 `::Foo` 為不同 scope，原樣保留 verbatim——前導 colon
-        // 一律不剝（leading colons 一律不剝/不改寫（trailing edge class 不變）；Re-review #8 A3）。全形 `：`
+        // 一律不剝（leading colons 一律不剝/不改寫；Re-review #8 A3）。全形 `：`
         // 亦不再被前導類剝除，但 Step E 是 ASCII-punct-only ⇒ `查 ：Foo 符號`
         // 拒絕 ⇒ NEED_CLARIFICATION（fail-closed，絕不 rewrite 成 `Foo`）。
-        // 尾端分支（含 possessive `++$` 與 `：:` 兩字元）不動；`查 Foo: 符號`
-        // 尾端 `:` 仍剝 ⇒ FAST `Foo`（前後不對稱為記錄行為）。
         // possessive 變更實測無效能收益（no-op；start-position × trailing-run 掃描仍為超線性——僅消除單次 attempt 內的 give-back 回溯，已量測 ~246/275 ms 修前後不變）；保留為安全/正典形態。
+        // #19 B3 stage-9.3（Re-review #9 A3, [P2]）—— 尾端分支移除 `:`（U+003A）／`：`（U+FF1A）：
+        // C++ scoped qualified identifier 之尾端 `::` 原樣保留 verbatim（`Foo::` 為 C++
+        // scoped 語意之合法 token，與 stage-8.3/8.4 verbatim-preservation 一致）：
+        // `symbols Foo::` ⇒ FAST `Foo::`／`查 Foo:: 符號` ⇒ FAST `Foo::`／
+        // `查 symbols Foo::` ⇒ FAST `Foo::`（EN-delimited verbatim）／
+        // `查 Foo: 符號` ⇒ FAST `Foo:`（stage-8.2/8.4 時釘為 `Foo`，stage-9.3 翻轉）；
+        // `查 Foo。 符號` ⇒ FAST `Foo`（`。` 尾仍剝，`。` 不變）；
+        // `查 ::std::vector:: 符號` ⇒ FAST `::std::vector::`（COI token `::Foo` 兩分支對齊：
+        // 前導 by stage-8.4、尾端 by stage-9.3）。尾端 `：`（U+FF1A）不再剝除 ⇒
+        // `查 Foo： 符號`／`symbols Foo：` ⇒ Step E 拒絕 U+FF1A ⇒ NEED_CLARIFICATION
+        // （fail-closed，與 FF1A leading reject 對稱；≥ stage-8.2 pin 改釘澄清）。
+        // possessive `++$` 保留無誤（stage-8.2）；前導分支不動（stage-8.4 已移除 colons）。
         private val SYMBOL_EDGE = Regex(
-            "^[\\s，。、？?「」『』“”\"'（）]+|[\\s，。、？?：:「」『』“”\"'（）]++$",
+            "^[\\s，。、？?「」『』“”\"'（）]+|[\\s，。、？?「」『』“”\"'（）]++$",
         )
         private const val SYMBOL_ALLOWED_PUNCT = "._-${'$'}#@/():,;+=~"
 
@@ -1701,8 +1731,9 @@ class FastRouter(
             // Step E — immutable remainder validation. After steps A–D the
             // remainder is NEVER rewritten; it is only admitted or rejected:
             // empty ⇒ fail; ANY remaining whitespace ⇒ fail; sentence-final
-            // `. , ;` ⇒ fail (natural-punctuation hazard; a trailing `:` is
-            // unreachable — step D's edge class already strips it, so no
+            // `. , ;` ⇒ fail (natural-punctuation hazard; a trailing `:` (stage-9.3)
+            // is no longer stripped by step D — it is allow-list-legal here, and a
+            // fullwidth `：` (U+FF1A) fails the allow-list below, so no
             // `:` disjunct is kept, defense-in-depth noted); any code point
             // outside {Unicode L*, N*} ∪ `. _ - $ # @ / ( ) : , ; + = ~` ⇒
             // fail (incl. Format/control); at least one L/N anchor required.

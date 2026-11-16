@@ -3348,10 +3348,17 @@ class FastDispatchTest {
     // #19 B3 stage-8.4（Re-review #8 A3）：C++ global-namespace 前綴 `::Foo` 是
     // 不同 scope——SYMBOL_EDGE 前導分支不再剝 `:`（U+003A）／`：`（U+FF1A），
     // leading colon 原樣保留 verbatim（leading colons 一律不剝/不改寫）；
-    // 尾端分支（stage-8.2 possessive `++$`）不動。`:Foo`（單冒號）為記錄之 verbatim
+    // `:Foo`（單冒號）為記錄之 verbatim
     // 殘餘（READ-only）；全形 `：`（U+FF1A）Step E 是 ASCII-punct-only ⇒
-    // NEED_CLARIFICATION（fail-closed，絕不 rewrite 成 `Foo`）；`查 Foo: 符號`
-    // 尾端 `:` 仍剝（前後不對稱，記錄）；`查 ::符號 符號` 歧義守衛照舊澄清。
+    // NEED_CLARIFICATION（fail-closed，絕不 rewrite 成 `Foo`）；
+    // #19 B3 stage-9.3（Re-review #9 A3, [P2]）：尾端分支亦不再剝 `:`（U+003A）／`：`（U+FF1A）——
+    // C++ scoped qualified identifier 之尾端 `::` 為合法 token，原樣保留 verbatim（`Foo::` ≠ `Foo`；
+    // 與 stage-8.3/8.4 verbatim-preservation 一致；COI token `::Foo` 兩分支對齊：前導 stage-8.4／尾端 stage-9.3）；
+    // `查 Foo: 符號` ⇒ verbatim `Foo:`（stage-8.2/8.4 時釘為 `Foo`——stage-9.3 翻轉）；
+    // `查 ::std::vector:: 符號` ⇒ FAST `::std::vector::`；`查 Foo。 符號` ⇒ FAST `Foo`（`。` 尾仍剝）；
+    // 尾端全形 `：`（U+FF1A）不再剝除 ⇒ Step E 拒絕 ⇒ NEED_CLARIFICATION（fail-closed，
+    // 與 FF1A leading reject 對稱）；`查 ::符號 符號` 歧義守衛照舊澄清。
+    // possessive `++$`（stage-8.2）保留無誤。
     // （argumentsJson parseToJsonElement 風格，與 enCommandDelimitedIdentifiersAreVerbatim 一致）
     @Test fun leadingColonPrefixesPreserved() = runBlocking {
         val backend = CountingBackend()
@@ -3360,7 +3367,12 @@ class FastDispatchTest {
             "查 ::Foo 符號" to "::Foo",
             "查 ::std::vector 符號" to "::std::vector",
             "查 :Foo 符號" to ":Foo",
-            "查 Foo: 符號" to "Foo",
+            "查 Foo: 符號" to "Foo:",
+            // stage-9.3：尾端 `::` verbatim 保留——C++ scoped qualified identifier 合法 token：
+            "查 Foo:: 符號" to "Foo::",
+            "查 ::std::vector:: 符號" to "::std::vector::",
+            // stage-9.3：`。` 尾仍剝（`。` 不變）：
+            "查 Foo。 符號" to "Foo",
             // Leading-colon token-body residual（記錄已接受殘餘：冒號開頭入 Step E）：
             "查 ::,Foo 符號" to "::,Foo",
             "查 :;Foo 符號" to ":;Foo",
@@ -3385,10 +3397,14 @@ class FastDispatchTest {
                 executed.result.resultJson.contains("\"name\":\"$expectedQuery:example\""),
             )
         }
-        // 澄清 pins：全形 `：`（U+FF1A）Step E 拒絕（fail-closed）；
+        // 澄清 pins：全形 `：`（U+FF1A）Step E 拒絕（fail-closed）——包括尾端 `：`
+        // （stage-9.3：尾端分支不再剝 `：`，Step E 拒絕 U+FF1A ⇒ NEED_CLARIFICATION，
+        // 與 FF1A leading reject 對稱；≥ stage-8.2 pin 改釘澄清）；
         // `::符號 符號` 歧義守衛照舊澄清（pre-Step-B′ 守衛先行；post-Step-D 守衛為後備）。
         for (text in listOf(
             "查 ：Foo 符號",
+            "查 Foo： 符號",
+            "symbols Foo：",
             "查 ::符號 符號",
         )) {
             val d = decide(text)
@@ -3425,12 +3441,14 @@ class FastDispatchTest {
         // 非否決依據（無 `再|才`＋動作動詞核、無 如果|假如|倘若|要是|的話）。
         // stage-8.7 之 FAST pins `查 Foo符號等審批再做`／`查Foo符號等授權再做` 自 stage-9.1 起 flip 為 DENIED
         // （arm H：`再做`——deferred action；見下方 DENIED 交互 pins）。
+        // stage-9.3 之 FAST pins `symbols Foo::`／`查 symbols Foo::` 自「Foo」flip 為 `Foo::`
+        // （Re-review #9 A3, [P2]：尾端 `::` 為 C++ scoped qualified identifier 之合法 token，verbatim 保留）。
         for ((text, expectedQuery) in listOf(
             "symbols ::Foo" to "::Foo",
             "find symbol ::Foo" to "::Foo",
             "查 symbols ::Foo" to "::Foo",
-            "symbols Foo::" to "Foo",
-            "查 symbols Foo::" to "Foo",
+            "symbols Foo::" to "Foo::",
+            "查 symbols Foo::" to "Foo::",
             "symbols 同意" to "同意",
             "symbols 批准" to "批准",
         )) {

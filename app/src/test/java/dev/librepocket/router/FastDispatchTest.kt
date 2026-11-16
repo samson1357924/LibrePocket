@@ -563,20 +563,12 @@ class FastDispatchTest {
             // Simplified 这个 suffix cue (stage-6.3 suffix-cue table fix,
             // canonical U+8FD9 U+4E2A):
             "查 AlarmManager 这个符號" to "AlarmManager",
-            // Two trailing suffix cues are all stripped — the cue run is
-            // end-anchored and repeated (recorded residual):
-            "查 Foo 符号 符號" to "Foo",
             // Stage-6.3 reviewer pins (F6): a halfwidth/fullwidth `,` glued to
             // the identifier at cue position is absorbed by the step-C suffix
             // cue (the edge class has no halfwidth comma; see KDoc):
             "查 Foo, 符號" to "Foo",
             "查 Foo， 符號" to "Foo",
             "查 Foo，符號" to "Foo",
-            // Glued simplified keyword-cue consumption (F6, recorded residual):
-            // the trailing `符號` cue strips first, then the residual `符号`
-            // is consumed as a second suffix cue — cue-absorbed, recorded,
-            // not fixed (READ-only):
-            "查 Foo符号 符號" to "Foo",
             // EN keyword-inline comma (F7, recorded residual — documented-
             // residual route): step A's command-form opener (`^symbols?\b[\s]*`)
             // eats the keyword but not the inline comma, so `,Foo` stands as
@@ -584,6 +576,9 @@ class FastDispatchTest {
             "find symbol,Foo" to ",Foo",
             // Unspaced 這個符號 glued to the identifier (recorded residual):
             "查 AlarmManager這個符號" to "AlarmManager",
+            // #19 B3 stage-7.3 (A3)：CJK 識別字以 `符號` 結尾、無空白黏合的單一 cue
+            // ——尾綴單 cue 消費，殘餘不再匹配尾綴 cue ⇒ FAST（僅雙 cue 黏合形態澄清）：
+            "查 使用者符號" to "使用者",
             // `函式`/`函数` are identifiers, never strip words:
             "查 函式 符號" to "函式",
             // Single-letter-token shapes stand (was: CJK filler delete):
@@ -662,6 +657,66 @@ class FastDispatchTest {
         assertEquals(0, backend.invocations.get())
     }
 
+    @Test fun ambiguousTrailingCueClarifiesAndNeverExecutes() = runBlocking {
+        // #19 B3 stage-7.3 (A3)：尾綴 CJK cue 至多剝一次；剝完殘餘仍以 cue 結尾
+        // （或就是 cue 本身）⇒ 雙 cue 形態結構性歧義 ⇒ NEED_CLARIFICATION（絕不執行）。
+        // 舊（stage-6.3）注記：`查 Foo符号 符號`／`查 Foo 符号 符號` 等因尾綴 cue
+        // 循環剝離而誤判 FAST（`Foo`）——已退役殘餘。
+        val backend = CountingBackend()
+        val dispatcher = lspDispatcher(backend)
+        for (text in listOf(
+            // 雙 cue 黏合／空白分隔（繁／簡混用）：單一步驟-C 剝離後殘餘仍尾綴 cue。
+            "查 Foo符號 符號",
+            "查 Foo符号 符號",
+            "查 Foo 符号 符號",
+            "查 Foo 符號 符號",
+            "查 Foo符号符號",
+            // 殘餘恰為 cue 本身：`符號 符號` 剝一個後剩 `符號`，歧義守衛拒絕。
+            "查 符號 符號",
+            // 句末終止符包住單一 cue：step C/D 剝離曝露後恰為 cue ⇒ 守衛拒絕（審計 F1）。
+            "查 符號。",
+            "查 符號：",
+            "查 符號。符號",
+            "查 「符號」",
+            "查 「符號」符號",
+            "查 （符號）",
+            "查 符號。 符號",
+            // 單 cue 即全殘餘：剝完為空 ⇒ step E 拒絕。
+            "查 符號",
+            "查 符号。",
+            "查 Fog符号符號",
+            "查 Foo 符號Extra 符號",
+            "查 符號符號",
+            "查 Foo符號　符號",
+            "查 (這個符號)",   // 包夾黏著複合 cue 的全匹配守衛（審計 F4 收斂）
+            "查 .符號.",
+            "查 ( 符號 )",
+            // 包夾於識別字標點的單一 cue（全匹配守衛；審計 B1）——與全形 `（符號）` 對稱：
+            "查 (符號)",
+            "查 (符号)",
+            "查 -符號-",
+            "查 符號+",
+            "查 _符號_",
+            "查 #符號#",
+            "查 \$符號\$",
+            "查 ~符號~",
+            "查 =符號=",
+            "查 符號/",
+            "查 符號-",
+            "查 符號)",
+            "查 符號(",
+            // 句末終止符＋ cue₂ 前的單 cue（fail-closed flip，使翻轉刻意化）：
+            "查 Foo 符號。",
+        )) {
+            val d = decide(text)
+            assertEquals(text, RouteKind.DENIED, d.route)
+            assertEquals(text, DenyReason.NEED_CLARIFICATION, d.reasonCode)
+            assertNull(text, d.toolCall)
+            skippedOf(dispatcher.dispatch(d, lspOn), text)
+        }
+        assertEquals(0, backend.invocations.get())
+    }
+
     @Test fun dispatchQualifiedDottedNameExecutesVerbatim() = runBlocking {
         // #19 B3 stage-6.3：dispatch-level pin — `查 Foo.symbol.bar 符號`
         // executes exactly once and the executor receives exactly
@@ -685,6 +740,29 @@ class FastDispatchTest {
         )
     }
 
+    @Test fun dispatchGluedSingleCueExecutesVerbatim() = runBlocking {
+        // #19 B3 stage-7.3 (A3)：dispatch-level pin — `查 AlarmManager這個符號`
+        // (glued single cue) executes exactly once and the executor receives exactly
+        // `AlarmManager` as the query (surfaced via the fake backend's
+        // `${query}:example` symbol name).
+        val backend = CountingBackend()
+        val r = lspDispatcher(backend).decideAndDispatch(
+            "查 AlarmManager這個符號", lspOn, sessionId = "s-glued", turnIndex = 6,
+        )
+        assertEquals(RouteKind.FAST, r.decision.route)
+        assertEquals(1, backend.invocations.get())
+        assertEquals(
+            """{"query": "AlarmManager", "limit": ${LspTools.DEFAULT_LIMIT}}""",
+            r.decision.toolCall!!.argumentsJson,
+        )
+        val executed = r.outcome as? FastDispatchOutcome.Executed
+        assertNotNull("AlarmManager must execute: ${r.outcome}", executed)
+        assertTrue(
+            "executor must receive the exact glued-cue query: ${executed!!.result.resultJson}",
+            executed.result.resultJson.contains("AlarmManager:example"),
+        )
+    }
+
     @Test fun singleLetterIdentifiersQueryable() {
         // #19 stage-2（A3 修復）：EN connectives/單字母識別字不再被誤剝——
         // `查 a 符號`/`查 to 符號`/`查 for 符號` 都是合法 FAST 查詢（`find symbol a`
@@ -692,6 +770,9 @@ class FastDispatchTest {
         // → NEED_CLARIFICATION（或誤改寫）。
         for ((text, expectedQuery) in listOf(
             "查 a 符號" to "a",
+            // 審計 B1 的正向邊界：cue 兩側皆有識別字內容 ⇒ verbatim FAST（全匹配錨）：
+            "查 get(符號)" to "get(符號)",
+            "查 使用者(符號)" to "使用者(符號)",
             "查 to 符號" to "to",
             "查 for 符號" to "for",
             "find symbol a" to "a",

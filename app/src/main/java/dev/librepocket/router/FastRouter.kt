@@ -1014,13 +1014,32 @@ class FastRouter(
          *   semantics for "symbol named X". Nothing later in the remainder
          *   is touched (never a global `\bsymbols?\b` delete —
          *   `查 Foo.symbols 符號` keeps `Foo.symbols` verbatim).
-         * Step C — trailing CJK keyword-SUFFIX cue run, END-anchored, one
-         *   occurrence per iteration (repeated): each iteration removes ONE
-         *   suffix of the form `[\s，,]*(?:這個|这个|一下)?[\s，,]*(?:符號|符号)[\s，,]*$`
-         *   — e.g. ` 這個符號`, ` 这个符號`, `一下符號`, ` 符號` suffixes:
+         * Step C — peel at most ONE trailing CJK keyword-SUFFIX cue,
+         *   END-anchored, then apply the ambiguity guard (stage-7.3, A3):
+         *   a single match of
+         *   `[\s，,]*(?:這個|这个|一下)?[\s，,]*(?:符號|符号)[\s，,]*$` is
+         *   removed — e.g. ` 這個符號`, ` 这个符號`, `一下符號`, ` 符號`
+         *   suffixes:
+         *   `查 AlarmManager這個符號` → `AlarmManager` (glued single cue),
          *   `查 AlarmManager 這個符號` → `AlarmManager`,
          *   `查 AlarmManager 这个符號` → `AlarmManager`,
          *   `查 使用者 符號` → `使用者`, `查 符號表 符號` → `符號表`.
+         *   Ambiguity guard (stage-7.3, A3): after the ONE peel, if the
+         *   remainder STILL matches the suffix cue at its end — or is exactly
+         *   that cue — the double-cue shape is structurally ambiguous
+         *   (`Foo符號 符號`, `Foo符号符號`, `Foo符号 符號`, `Foo 符號 符號`,
+         *   `符號 符號`) ⇒ extraction FAILS ⇒ NEED_CLARIFICATION (never a
+         *   rewritten query):
+         *   `查 Foo符號 符號` → NEED_CLARIFICATION,
+         *   `查 Foo符号符號` → NEED_CLARIFICATION,
+         *   `查 符號 符號` → NEED_CLARIFICATION.
+         *   CJK identifiers ending in `符號` queried as a bare glued
+         *   `查 X符號` DO execute with X — the single trailing cue is
+         *   consumed: `查 使用者符號` → FAST `使用者`. Identifiers that
+         *   END in `符號` are NOT queryable in any form (the glued cue is
+         *   consumed from every input shape, including the EN
+         *   `symbols X符號` command form) — record this as an accepted
+         *   product limitation; only use an identifier not ending in the cue.
          *   `函式|函数` are NO LONGER strip words (neither globally nor as
          *   suffix cues): `查 函式 符號` → `函式` (intended FAST),
          *   `查 Foo 函式 符號` → multi-token ⇒ NEED_CLARIFICATION.
@@ -1126,11 +1145,27 @@ class FastRouter(
          *   FAST `Foo`; `查 Foo， 符號` / `查 Foo，符號` → FAST `Foo`), so
          *   step E's `endsWith(',')` is reachable only for cue-less
          *   remainders (e.g. `search symbol Foo,` — clarifies, pinned).
-         * - Glued simplified keyword-cue consumption (stage-6.3 pin):
-         *   `查 Foo符号 符號` → FAST `Foo` — the trailing `符號` cue strips
-         *   first, then the residual `符号` is consumed as a SECOND step-C
-         *   suffix cue (simplified `符号` is in the suffix-cue table).
-         *   Cue-absorbed, recorded, not fixed; the tool is READ-only.
+         * - Double-cue glued shapes are now NEED_CLARIFICATION (stage-7.3,
+         *   A3 — ambiguity, not a rewritten query): after the ONE step-C
+         *   peel, a remainder still ending in a suffix cue (or exactly that
+         *   cue) is structurally ambiguous and extraction FAILS —
+         *   `查 Foo符號 符號` → NEED_CLARIFICATION,
+         *   `查 Foo符号 符號` → NEED_CLARIFICATION,
+         *   `查 Foo符号符號` → NEED_CLARIFICATION,
+         *   `查 Foo 符號 符號` → NEED_CLARIFICATION,
+         *   `查 符號 符號` → NEED_CLARIFICATION,
+         *   `查 符號` → NEED_CLARIFICATION.
+         *   (stage-6.3 recorded `查 Foo符号 符號` → FAST `Foo` as a
+         *   second-step-C-peel residual — retired; glued double cues are
+         *   clarifications now.)
+         *   CJK identifiers ending in `符號` queried as a bare glued
+         *   `查 X符號` DO execute with X (the single trailing cue is
+         *   consumed): `查 使用者符號` → FAST `使用者` — a single glued cue is
+         *   unambiguous. Identifiers that END in `符號` are NOT queryable in
+         *   ANY form （the glued cue is consumed from every input shape,
+         *   including the EN `symbols X符號` command form — the cue is
+         *   CJK, not opener-bound); record as accepted product limitation.
+         *   Only DOUBLE-cue-glued shapes (`X符號符號` / `X符號 符號`) clarify.
          *   (A chimera `这個符號` — simplified 这 U+8FD9 + traditional
          *   個 U+500B — matches NEITHER `這個` nor `这个` suffix alternative,
          *   so the remainder stays multi-token and clarifies:
@@ -1160,14 +1195,24 @@ class FastRouter(
         // (e.g. `symbols Foo` → `Foo`, `Symbol Foo.` → `Foo.`); it never
         // touches anything later in the remainder.
         private val SYMBOL_LEADING_SYMBOLS = Regex("^symbols?\\b[\\s,]*", RegexOption.IGNORE_CASE)
-        // #19 B3 stage-6.3 — Step C: trailing CJK keyword-suffix cue,
-        // END-anchored, ONE occurrence per iteration (`這個符號`、`这个符號`、
-        // `一下符號`、`符號` suffixes). `函式|函数` are deliberately NOT suffix
-        // cues here: they are identifier content, never strip words —
+        // #19 B3 stage-7.3 (A3) — Step C: trailing CJK keyword-suffix cue,
+        // END-anchored. ONE suffix cue is peeled; if the remainder STILL ends with a
+        // suffix cue (or is exactly that cue), the double-cue shape is structurally
+        // ambiguous (`Foo符號 符號`、`Foo符号 符號`、`符號`) and extraction FAILS ⇒
+        // NEED_CLARIFICATION. `這個符號`、`这个符號`、`一下符號`、`符號` suffixes.
+        // `函式|函数` are deliberately NOT suffix cues here: they are identifier
+        // content, never strip words —
         // `查 函式 符號` routes FAST with query `函式`, and
         // `查 Foo 函式 符號` clarifies (multi-token).
         private val SYMBOL_CJK_KEYWORD_SUFFIX = Regex(
             "[\\s，,]*(?:這個|这个|一下)?[\\s，,]*(?:符號|符号)[\\s，,]*$",
+        )
+        // #19 B3 stage-7.3 (A3/F1c)：全匹配守衛——殘餘恰好是被識別字標點
+        // （SYMBOL_ALLOWED_PUNCT 子集，含成對包裹）包夾的單一 cue（可選 這個/一下
+        // 黏在 cue 上）⇒ 拒絕（澄清）。`get(符號)`／`使用者(符號)` 不匹配（有識別字
+        // 內容於包裹之外）⇒ 保留 verbatim FAST；`(符號)`／`-符號-`／`_符號_` 澄清。
+        private val BARE_SYMBOL_CUE_WRAP = Regex(
+            "^[\\s，,._\$#@/():,;+=~-]*(?:這個|这个|一下)?(?:符號|符号)[\\s，,._\$#@/():,;+=~-]*$",
         )
         private val SYMBOL_LEADING_CONNECTIVE = Regex(
             "^(?:for|the|a|an|named|called|of|to)\\s+(?=\\S)",
@@ -1201,19 +1246,22 @@ class FastRouter(
             // Step B — ONE leading EN `symbol(s)` cue (word-anchored, at most
             // once). No other part of the remainder is touched here.
             s = SYMBOL_LEADING_SYMBOLS.replaceFirst(s, "").trim()
-            // Step C — trailing CJK keyword-suffix cue run, end-anchored:
-            // each iteration strips ONE occurrence (e.g. ` 這個符號`,
-            // ` 这个符號`, `一下符號`, ` 符號`); nothing intra-remainder is
-            // ever removed.
-            while (true) {
-                val m = SYMBOL_CJK_KEYWORD_SUFFIX.find(s) ?: break
-                val kept = s.substring(0, m.range.first).trimEnd()
-                if (kept.length == s.length) break
-                s = kept
+            // Step C — peel at most ONE trailing CJK keyword suffix (end-anchored).
+            s = SYMBOL_CJK_KEYWORD_SUFFIX.replaceFirst(s, "").trim()
+            // Ambiguity guard (stage-7.3, A3): after the ONE peel, if the remainder
+            // STILL matches the suffix cue at its end — or is exactly that cue — the
+            // double-cue shape is structurally ambiguous (`Foo符號 符號`,
+            // `Foo符号 符號`, `符號`) ⇒ extraction FAILS ⇒ NEED_CLARIFICATION.
+            // Identifier content is never rewritten — a verbatim remainder may only be
+            // admitted when it parses unambiguously.
+            if (s.isNotEmpty() &&
+                (SYMBOL_CJK_KEYWORD_SUFFIX.containsMatchIn(s) || BARE_SYMBOL_CUE_WRAP.containsMatchIn(s))
+            ) {
+                return ""
             }
             // Step B′ — leading EN connectives, repeatedly, only when another
             // token remains after the connective. Applied AFTER the trailing
-            // suffix cue run so `查 a 符號` keeps its single-letter identifier:
+            // suffix cue peel so `查 a 符號` keeps its single-letter identifier:
             // the suffix strip leaves `a` with nothing after it, and a bare
             // connective at the end of the remainder is NOT stripped.
             while (true) {
@@ -1234,6 +1282,19 @@ class FastRouter(
                     break
                 }
                 s = u
+            }
+            // Ambiguity guard, re-applied AFTER the edge trim (stage-7.3, A3):
+            // Step D can expose a hidden cue (`查 符號。` → step D strips `。`,
+            // leaving exactly `符號`) ⇒ extraction FAILS ⇒ NEED_CLARIFICATION.
+            // The full-match clause additionally rejects a cue wrapped ONLY in
+            // identifier punctuation (`查 (符號)` / `查 -符號-` / `查 _符號_`)
+            // — symmetric with the fullwidth `（符號）` case; verbatim Fast
+            // admission only for識別字 with real content on both sides of the
+            // cue (e.g. `get(符號)` / `使用者(符號)`).
+            if (s.isNotEmpty() &&
+                (SYMBOL_CJK_KEYWORD_SUFFIX.containsMatchIn(s) || BARE_SYMBOL_CUE_WRAP.containsMatchIn(s))
+            ) {
+                return ""
             }
             // Particles rule (stage-6.1, unchanged) — CJK interrogative
             // particles （嗎|吗|呢） anywhere in the remainder ⇒ extraction

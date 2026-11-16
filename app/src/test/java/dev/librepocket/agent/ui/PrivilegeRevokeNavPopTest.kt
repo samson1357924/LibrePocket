@@ -119,10 +119,12 @@ class PrivilegeRevokeNavPopTest {
         // 重進 Settings：VM 必須存活（owner 是 Activity，不是 SETTINGS 條目）。
         composeRule.runOnIdle { h.nav.navigate(Routes.SETTINGS) }
         awaitRoute(h, Routes.SETTINGS)
+        composeRule.waitForIdle()
         // 關鍵斷言：INFLIGHT 跨 pop 存活（bug 下此處為全新 VM ⇒ IDLE ⇒ 紅）。
         composeRule.onNodeWithText("revokeState=INFLIGHT").assertIsDisplayed()
         // 再點一次：VM 級 InFlight 守衛對新 composition 依然生效，executor 不重入。
         composeRule.onNodeWithTag("revokeProbe").performClick()
+        // 註：in-flight 期間重複點擊於 VM 級互斥（同步先落值），本行為 pin 的診斷訊息優先於 async 精讀時序
         assertEquals("重進 Settings 後的重複點擊不得重入 executor", 1, h.executorCalls.get())
 
         // 放行 executor（失敗）→ ERROR banner 對新 composition 可見。
@@ -132,7 +134,7 @@ class PrivilegeRevokeNavPopTest {
             composeRule.onAllNodesWithText("revokeState=ERROR").fetchSemanticsNodes().isNotEmpty()
         }
         composeRule.onNodeWithText("revokeState=ERROR").assertIsDisplayed()
-        assertEquals(1, h.executorCalls.get())
+        assertEquals("撤權在途期間 executor 恰執行一次", 1, h.executorCalls.get())
 
         // 重試：第二次 executor 立即回傳（failure=false）→ IDLE。
         h.failure.set(false)
@@ -140,7 +142,7 @@ class PrivilegeRevokeNavPopTest {
         composeRule.waitUntil(timeoutMillis = 10_000) {
             composeRule.onAllNodesWithText("revokeState=IDLE").fetchSemanticsNodes().isNotEmpty()
         }
-        assertEquals(2, h.executorCalls.get())
+        assertEquals("重試後 executor 恰執行兩次", 2, h.executorCalls.get())
     }
 
     @Test
@@ -163,12 +165,14 @@ class PrivilegeRevokeNavPopTest {
         composeRule.waitForIdle()
         composeRule.onNodeWithText("新對話").performClick()
         awaitRoute(h, Routes.CHAT)
-        assertEquals(1, h.executorCalls.get())
+        assertEquals("SETTINGS 被 pop 後 executor 不得重入", 1, h.executorCalls.get())
 
         composeRule.runOnIdle { h.nav.navigate(Routes.SETTINGS) }
         awaitRoute(h, Routes.SETTINGS)
+        composeRule.waitForIdle()
         composeRule.onNodeWithText("revokeState=INFLIGHT").assertIsDisplayed()
         composeRule.onNodeWithTag("revokeProbe").performClick()
+        // 註：in-flight 期間重複點擊於 VM 級互斥（同步先落值），本行為 pin 的診斷訊息優先於 async 精讀時序
         assertEquals("重進 Settings 後的重複點擊仍不得重入 executor", 1, h.executorCalls.get())
 
         h.latch.countDown()
@@ -180,7 +184,7 @@ class PrivilegeRevokeNavPopTest {
             "成功不得出現失敗 banner",
             composeRule.onAllNodesWithText("revokeState=ERROR").fetchSemanticsNodes().isEmpty(),
         )
-        assertEquals(1, h.executorCalls.get())
+        assertEquals("撤權在途期間 executor 恰執行一次", 1, h.executorCalls.get())
     }
 
     private fun render(h: Harness) {

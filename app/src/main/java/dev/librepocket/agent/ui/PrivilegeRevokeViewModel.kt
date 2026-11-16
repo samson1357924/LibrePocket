@@ -157,10 +157,15 @@ internal class PrivilegeRevokeViewModelFactory(
  * owner，與 composition 深度（NavHost 目的地條目）無關。
  *
  * 非 Activity 終端（如 application context）回傳 null，呼叫方負責 fail-closed。
+ *
+ * 框架建立的 baseContext 鏈為無環（Compose preview/測試皆然）；經遞迴深度上限 16 保底，循環 wrapper 不會造成死循環，僅回傳 null → 呼叫端 fail-loud。
  */
-internal tailrec fun Context.findComponentActivity(): ComponentActivity? =
-    this as? ComponentActivity
-        ?: (this as? ContextWrapper)?.baseContext?.findComponentActivity()
+internal tailrec fun Context.findComponentActivity(depth: Int = 0): ComponentActivity? = when {
+    depth > 16 -> null
+    this is ComponentActivity -> this
+    this is ContextWrapper -> baseContext?.findComponentActivity(depth + 1)
+    else -> null
+}
 
 /**
  * 「一鍵收回」接線單一來源（Re-review #7 Finding 3；owner 解析見 Re-review #9）。
@@ -173,9 +178,8 @@ internal tailrec fun Context.findComponentActivity(): ComponentActivity? =
  *
  * viewModel owner 預設為宿主 [ComponentActivity]（[LocalContext] 經
  * [findComponentActivity] 沿 context 鏈解析；Re-review #9 修復）——與 composition
- * 深度無關：NavHost destination 的 [androidx.navigation.NavBackStackEntry]
- * （如 SETTINGS 目的地）不是 owner，不會被諮詢。顯式傳入 [viewModelStoreOwner]
- * 可覆寫（例如未來穩定的 root navigation-graph owner）。
+ * 深度無關：預設路徑不諮詢 NavBackStackEntry；顯式傳入的 [viewModelStoreOwner]
+ * 由呼叫方決定（若傳入 dest-scoped owner 則行為等同前輪錯誤語義）。
  *
  * 保證（同一保證的兩個釘測面）：pop 掉 Settings（正常 CHAT→SETTINGS 使用者路徑中的
  * 抽屜「新對話」導航）不會銷毀本 VM——owner 是 Activity 而非 SETTINGS 條目，撤權在途

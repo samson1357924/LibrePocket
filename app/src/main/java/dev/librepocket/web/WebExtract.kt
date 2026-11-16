@@ -176,8 +176,14 @@ internal class DeadlineExceededException : RuntimeException()
  * 模型見到截斷 HTML 誤判）。
  *
  * D3 追蹤項（production 接線前必解／必評估，#138/D3，否則不得 wiring）：
- * 1. cache key＝URL（去 fragment 後之修剪字串，**非正規化**：default port／
- *    case／percent-encoding 差異會產生重複 key——只是浪費，非正確性問題）
+ * 1. cache key＝URL（**service 路徑**：`stripFragment()`＝OkHttp parse＋rebuild，
+ *    於建 key **之前**先正規化 host case（小寫）／default port（依 scheme 去除）／
+ *    fragment——fragment **一律去除**（至於 key）；percent-encoding 差異**不**正規化，
+ *    仍會產生重複 key——只是浪費，非正確性問題。
+ *    **public [WebExtractCache.key] helper**：trim 後照原樣（raw string as given），
+ *    **不**正規化、**不**去 fragment——注入方責任提供已正規化 URL（例如經 [stripFragment]；
+ *    見 [WebExtractCache.key] KDoc）；
+ *    equivalent-URL 測試補強見 Phase C（host case／default port／fragment 三組 fixture））
  *    ＋`maxBytes`＋`maxModelChars`＋`policy`＋`configRevision`
  *    ＋**hop-0 已核准位址集合**（[sortedDistinctAddressTokens]：位元組去重＋
  *    （位元組數, `contentToString()`）排序＋`hostAddress` join；length-prefix 附於 key 尾端；
@@ -596,8 +602,13 @@ internal fun sortedDistinctAddressTokens(addresses: List<InetAddress>): List<Str
 /**
  * D4 抽取快取（TTL 60min；純 JVM）。
  *
- * - key＝去 fragment 之修剪字串（刻意**不做** URL 正規化，見 [stripFragment]
- *  與 header「D3 追蹤項」#1）＋`maxBytes`
+ * - key＝service 路徑之 URL（`stripFragment()`＝OkHttp parse＋rebuild，於建 key 前
+ *  已正規化 host case（小寫）／default port（依 scheme 去除）／fragment——fragment
+ *  **一律去除**（至於 key）；percent-encoding 差異**不**正規化，仍會產生重複 key——
+ *  只是浪費，非正確性問題）；**public [key] helper 語義不同**：trim 後照原樣
+ *  （raw string as given），**不**正規化、**不**去 fragment——注入方責任提供已正規化
+ *  URL（例如經 [stripFragment]；見 [key] KDoc 與 header「D3 追蹤項」#1））
+ *  ＋`maxBytes`
  *  ＋`maxModelChars`＋policy identity（[EndpointNetworkOptIn.policy]＋
  *  [EndpointNetworkOptIn.configRevision]）
  *  ＋**hop-0 經當次重驗解析並授權之位址集合**（[addressToken]：先以位元組
@@ -696,6 +707,15 @@ class WebExtractCache(
     private fun addressToken(addresses: List<InetAddress>): String =
         sortedDistinctAddressTokens(addresses).joinToString(",")
 
+    /**
+     * cache key 組裝：URL 僅 trim、其餘照原樣（raw string as given）——**不**正規化、
+     * **不**去 fragment；host case／default port／fragment 等等價差異會產生重複 key
+     * （只是浪費，非正確性問題）。注入方責任提供已正規化 URL：service 路徑經
+     * [stripFragment]（OkHttp parse＋rebuild）先正規化 host case（小寫）／default port
+     * （依 scheme 去除）／去 fragment，再呼叫本函式——**fragment 一律去除**（至於 key）；
+     * percent-encoding 差異**不**正規化；equivalent-URL 測試補強見 Phase C
+     * （host case／default port／fragment 三組 fixture）。
+     */
     fun key(
         url: String,
         maxBytes: Int,
@@ -887,7 +907,8 @@ class WebExtractService(
      *   (iii) single-flight follower 之 chain-face 驗證：[validateChain] 與其後之 post-validation
      *   epoch re-check 皆已通過、revocation 於該 re-check 與交付 caller 之間之窗口內完成之
      *   post-revoke Ok（follower 交付路徑之同一窗口類，見上方 `InFlightEntry` KDoc／D3 追蹤項 #1；
-     *   follower Ok 交付窗口自 await 返回起含 L×(DNS+policy) 重驗時段，非 suspension-free）。
+     *   驗證時段含 L×(DNS+policy)，期間完成之撤權由該 re-check 攔截為 miss；僅 re-check→delivery
+     *   為無懸掛點窗口）。
      *   三者皆發生於交付呼叫端之前的無懸掛點窗口，不經 cache 寫回、不再導致二次落地。
      *   in-flight 路徑依 detached 語義處理：已 join 之 follower 於 drain 前
      *   收到 leader 已完成之 Ok（leader 自身 caller 同理）；drain 時仍 pending
@@ -1285,8 +1306,8 @@ class WebExtractService(
      * 3. 每跳 [validateChainStep]（policyGate 必須 allowed＋token 相等）。
      * 任一跳不符／失敗 → false；全數通過 → true。空 chain → true（無從驗證，沿用
      * 舊命中語義）。重驗本身不寫快取、不 purge 快取。
-     * binding-restart 輪次會重付 L×(DNS+policy) 之重驗成本（round-robin DNS 變更可使重驗合法通過，
-     * 故不消除；以 bindingRestarts 上界兜底）。
+     * binding-restart 輪次會重付 L×(DNS+policy) 之重驗成本（相同位址集合——含答案順序位移——經
+     * 排序去重 token 恆等（gate 仍 allowed 前提下）恆通過；集合變更才重驗失敗，故不消除；以 bindingRestarts 上界兜底）。
      */
     private suspend fun validateChain(
         chain: List<HopBinding>,

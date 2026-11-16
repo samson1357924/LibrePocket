@@ -92,8 +92,15 @@ arbitrary authority cannot pass as invisible; heuristic-detected providers
 exactly ``{merged-package}.shizuku`` (the Shizuku binder channel). In github
 mode ``--expect-provider required`` upgrades the ShizukuProvider check to a
 fail-closed existence contract (the merged manifest must declare exactly one
-compliant provider); the default ``optional`` only verifies provider
-attributes when a provider is present. When a ShizukuProvider is present, the
+compliant provider; two detected provider blocks resolving to the same
+canonical component name - any alias spelling - fail closed, and every
+detected provider's canonical class must be DEFINED in a root DEX shard
+(class_defs, not type_ids mentions)); the default ``optional`` only verifies
+provider attributes when a provider is present. That existence contract is
+github-only: the new defined-class backing and canonical duplicate identity
+are enforced inside ``_github_required_provider_total``, which only the
+github ``--expect-provider required`` path calls - no foss/play behavior is
+changed by these additions. When a ShizukuProvider is present, the
 upstream ``attachInfo()`` hard contract is pinned regardless of mode:
 ``exported`` must be the exact boolean true and ``multiprocess`` absent or
 the exact boolean false.
@@ -2457,6 +2464,26 @@ def _dex_shizuku_provider_java_names(parsed_dexes: list[ParsedDex]) -> set[str]:
     return names
 
 
+def _defined_java_names(parsed_dexes: list[ParsedDex]) -> set[str]:
+    """Java names of every class DEFINED in any root DEX shard.
+
+    Union of each parsed shard's ``defined_classes`` (the class_defs
+    table, never the type_ids mentions): a descriptor shaped ``L…;`` has its
+    ``L``/``;`` framing dropped and ``/`` mapped to ``.`` (e.g.
+    ``Lrikka/shizuku/ShizukuProvider;`` -> ``rikka.shizuku.ShizukuProvider``).
+    Descriptors that are not object-type shaped are skipped (the parser
+    already rejects non-object class_def descriptors, so this is defense in
+    depth). An empty set is a valid result.
+    """
+    names: set[str] = set()
+    for dex in parsed_dexes:
+        for descriptor in dex.defined_classes:
+            if not (descriptor.startswith("L") and descriptor.endswith(";")):
+                continue
+            names.add(descriptor[1:-1].replace("/", "."))
+    return names
+
+
 # Package-name shape for the FINAL merged-manifest package value: at
 # least one dot, letter/underscore-led identifier segments. The artifact
 # gate refuses a package it cannot attribute as a component-name base.
@@ -2757,6 +2784,7 @@ def _github_required_provider_total(
     xmltree: str,
     dex_java_names: set[str],
     package: str,
+    defined_java_names: set[str],
 ) -> int:
     """Distinct ShizukuProvider surfaces for ``--expect-provider required``.
 
@@ -2764,9 +2792,27 @@ def _github_required_provider_total(
     manifest ``<provider>`` blocks - identity is the positional index in the
     parsed provider list - matched by ``_is_shizuku_provider``. The
     merged-manifest provider identity is expected to be unique: BEFORE
-    counting anything, two detected blocks sharing the same
-    ``android:name`` fail closed as a PolicyError, so merger accidents and
+    counting anything, two detected blocks resolving to the same canonical
+    component name fail closed as a PolicyError, so merger accidents and
     name-padding attacks go red instead of silently deduping to one.
+    Canonical identity is the pin: identical class, duplicate declaration,
+    whatever the spelling - ``.Bridge`` and ``Bridge``, or ``.Bridge`` and
+    the full ``{package}.Bridge`` FQN, both resolve to the same FQN, and
+    the attribute contract cannot keep two canonical-equal blocks apart.
+    An evidenced class must never be consumed twice.
+
+    AFTER the duplicate-identity guard, BEFORE the counting math: every
+    detected block's canonical FQN must correspond to a class actually
+    DEFINED in a root DEX shard (``defined_java_names``, the DEX class_defs
+    union), otherwise PolicyError naming the canonical FQN. A type_ids
+    mention is not a class definition and never satisfies this check.
+    Evidenced subclass java names are themselves DEX-defined, so membership
+    covers them; the official FQN must be genuinely defined too. With zero
+    detected blocks this check does not fire (the found-0 red semantics
+    stay at the counting layer). This existence contract fires only in the
+    github ``--expect-provider required`` path - the only caller of this
+    helper - so foss/play and the default ``optional`` contract are
+    untouched.
 
     A canonical component-name match against an evidenced java name consumes
     (one) detected block; a provider that is both manifest-detected and
@@ -2799,27 +2845,32 @@ def _github_required_provider_total(
         )
         if _is_shizuku_provider(attrs.get("name", ""), attrs.get("authorities", ""))
     ]
-    counts_by_name: dict[str, int] = {}
-    # Design decision (intentional, reviewed): duplicate detection keys on the
-    # RAW android:name string, not the canonical java_name. Two plausible
-    # spellings of the same renamed subclass (`.Bridge` / `Bridge` / mixed-case
-    # class tail) therefore do NOT trip this guard — both blocks still must
-    # carry the full attribute contract (`_check_github_shizuku_provider` en-
-    # forces it on every detected provider), and both consume the same DEX-
-    # evidenced class, so `total` still charges exactly one surface per
-    # evidenced java name. Keeping the raw key preserves the reject
-    # "identical android:name" semantic (duplicate blocks of the official
-    # FQN), which is the realistic bypass shape; canonical-collision handling
-    # is left to the attribute contract on purpose (failing it there carries
-    # the same fail-closed outcome with a clearer error).
+    counts_by_canonical: dict[str, int] = {}
+    # Duplicate identity is the CANONICAL component name, not the raw
+    # android:name string. Alias spellings of the same class (``.Bridge``
+    # and ``Bridge``, or ``.Bridge`` and the full ``{package}.Bridge`` FQN)
+    # resolve to one FQN; keying on the raw name would let both blocks
+    # through this guard and consume the same DEX-evidenced class twice,
+    # making two declarations count as one surface. Identical classes
+    # declared twice are one duplicate declaration however they are
+    # spelled: an evidenced class must never be consumed twice, and the
+    # attribute contract cannot keep two canonical-equal blocks apart.
     for _index, name in detected_blocks:
-        counts_by_name[name] = counts_by_name.get(name, 0) + 1
-    for name in sorted(counts_by_name):
-        count = counts_by_name[name]
+        canonical = _canonicalize_component_name(name, package)
+        counts_by_canonical[canonical] = counts_by_canonical.get(canonical, 0) + 1
+    for canonical in sorted(counts_by_canonical):
+        count = counts_by_canonical[canonical]
         if count > 1:
             raise PolicyError(
                 f"github merged manifest declares {count} ShizukuProvider "
-                f"blocks with identical android:name: {name}"
+                f"blocks with the same canonical component name: {canonical}"
+            )
+    for _index, name in detected_blocks:
+        canonical = _canonicalize_component_name(name, package)
+        if canonical not in defined_java_names:
+            raise PolicyError(
+                f"github merged manifest declares ShizukuProvider {canonical!r} "
+                "but no root DEX shard defines that class"
             )
     consumed: set[int] = set()
     for java_name in dex_java_names:
@@ -2944,8 +2995,9 @@ def inspect_apk(apk: Path, mode: str, aapt: str, dexdump: str, expect_provider: 
             xmltree, parsed_dexes, merged_package
         )
         if expect_provider == "required":
+            defined_java_names = _defined_java_names(parsed_dexes)
             total = _github_required_provider_total(
-                xmltree, dex_java_names, merged_package
+                xmltree, dex_java_names, merged_package, defined_java_names
             )
             if total != 1:
                 raise PolicyError(
@@ -2990,9 +3042,11 @@ def main(argv: list[str] | None = None) -> int:
         help=(
             "github mode: 'required' demands exactly one ShizukuProvider "
             "surface (manifest-detected or DEX-evidenced; block-identity "
-            "multiset counting - duplicate android:name among detected "
-            "blocks fails closed; suffix matches never consume; canonical "
-            "exact-FQN consumption); 'optional' (default) checks provider attributes "
+            "multiset counting - two detected blocks resolving to the same "
+            "canonical component name fail closed; suffix matches never "
+            "consume; canonical exact-FQN consumption; every detected "
+            "provider's canonical class must be DEX class_def-defined); "
+            "'optional' (default) checks provider attributes "
             "only when a ShizukuProvider is present (including "
             "DEX-evidenced renamed subclasses)"
         ),

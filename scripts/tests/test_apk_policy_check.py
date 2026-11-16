@@ -1127,10 +1127,30 @@ class ApkPolicyHarness(unittest.TestCase):
             "            '      A: android:exported(0x01010010)=(type 0x12)0xffffffff' \\\n"
             "            '      A: android:multiprocess(0x01010013)=(type 0x12)0x0' \\\n"
             "            '      A: android:authorities(0x01010018)=\"dev.librepocket.agent.github.shizuku\" (Raw: \"dev.librepocket.agent.github.shizuku\")' ;;\n"
+            "        shizuku-arbitrary-fqn)\n"
+            "          # Arbitrary, non-official FQN detected via the name\n"
+            "          # heuristic only (ShizukuProvider token in\n"
+            "          # android:name); the authority carries no Shizuku\n"
+            "          # token. Minimal application: just the one provider,\n"
+            "          # FULL permission/enabled/exported/multiprocess bindings.\n"
+            "          printf '%s\\n' 'E: manifest' \\\n"
+            "            '  A: package=\"dev.librepocket.agent.github\"' \\\n"
+            "            '  A: android:versionCode(0x0101021b)=(type 0x10)0x1' \\\n"
+            "            '  E: application' \\\n"
+            "            '    A: android:fullBackupContent(0x010104eb)=@0x7f010000' \\\n"
+            "            '    A: android:dataExtractionRules(0x0101063e)=@0x7f010001' \\\n"
+            "            '    A: android:networkSecurityConfig(0x01010527)=@0x7f010002' \\\n"
+            "            '    E: provider (line=1)' \\\n"
+            "            '      A: android:name(0x01010003)=\"dev.librepocket.agent.github.GhostShizukuProvider\" (Raw: \"dev.librepocket.agent.github.GhostShizukuProvider\")' \\\n"
+            "            '      A: android:permission(0x01010006)=\"android.permission.INTERACT_ACROSS_USERS_FULL\" (Raw: \"android.permission.INTERACT_ACROSS_USERS_FULL\")' \\\n"
+            "            '      A: android:enabled(0x0101000e)=(type 0x12)0xffffffff' \\\n"
+            "            '      A: android:exported(0x01010010)=(type 0x12)0xffffffff' \\\n"
+            "            '      A: android:multiprocess(0x01010013)=(type 0x12)0x0' \\\n"
+            "            '      A: android:authorities(0x01010018)=\"dev.librepocket.agent.github.ghost\" (Raw: \"dev.librepocket.agent.github.ghost\")' ;;\n"
             "        shizuku-ok-two)\n"
             "          # Like shizuku-ok but with TWO ShizukuProvider elements\n"
-            "          # (name-deduped accounting: both names must be distinct\n"
-            "          # Shizuku-matching spellings); --expect-provider required must\n"
+            "          # (two distinct canonical names, both detected as\n"
+            "          # ShizukuProviders); --expect-provider required must\n"
             "          # fail closed with the found-count message.\n"
             "          printf '%s\\n' 'E: manifest' \\\n"
             "            '  A: android:versionCode(0x0101021b)=(type 0x10)0x1' \\\n"
@@ -1467,10 +1487,10 @@ class ApkPolicyHarness(unittest.TestCase):
             "            '      A: android:authorities(0x01010018)=\"dev.librepocket.agent.github.bridge\" (Raw: \"dev.librepocket.agent.github.bridge\")' ;;\n"
             "        shizuku-duplicate-same-name)\n"
             "          # #166 FIX 2 pin: TWO detected ShizukuProvider blocks\n"
-            "          # carrying the SAME android:name (both compliant).\n"
-            "          # Merger accidents / name padding must fail closed as\n"
-            "          # a PolicyError instead of silently deduping to one -\n"
-            "          # regardless of DEX evidence.\n"
+            "          # resolving to the SAME canonical component name (identical\n"
+            "          # android:name, both compliant). Merger accidents / name\n"
+            "          # padding must fail closed as a PolicyError instead of\n"
+            "          # silently deduping to one - regardless of DEX evidence.\n"
             "          printf '%s\\n' 'E: manifest' \\\n"
             "            '  A: android:versionCode(0x0101021b)=(type 0x10)0x1' \\\n"
             "            '  E: application' \\\n"
@@ -1491,6 +1511,61 @@ class ApkPolicyHarness(unittest.TestCase):
             "            '      A: android:exported(0x01010010)=(type 0x12)0xffffffff' \\\n"
             "            '      A: android:multiprocess(0x01010013)=(type 0x12)0x0' \\\n"
             "            '      A: android:authorities(0x01010018)=\"dev.librepocket.agent.github.shizuku-dup\" (Raw: \"dev.librepocket.agent.github.shizuku-dup\")' ;;\n"
+            "        shizuku-alias-dot-and-dotfree)\n"
+            "          # Re-review #11 Finding 2 pin: TWO detected ShizukuProvider\n"
+            "          # blocks spelled '.Bridge' and 'Bridge' (alias spellings of\n"
+            "          # the SAME class), both carrying the full attribute contract\n"
+            "          # (INTERACT_ACROSS_USERS_FULL base permission, enabled/exported\n"
+            "          # exactly true, multiprocess absent|false, authorities exactly\n"
+            "          # dev.librepocket.agent.github.shizuku). Under canonical\n"
+            "          # component-name resolution both resolve to\n"
+            "          # dev.librepocket.agent.github.Bridge, so the duplicate-identity\n"
+            "          # guard in the required-provider total must fail closed with the\n"
+            "          # canonical FQN - the attribute contract cannot keep the two\n"
+            "          # canonical-equal blocks apart.\n"
+            "          printf '%s\\n' 'E: manifest' \\\n"
+            "            '  E: application' \\\n"
+            "            '    A: android:fullBackupContent(0x010104eb)=@0x7f010000' \\\n"
+            "            '    A: android:dataExtractionRules(0x0101063e)=@0x7f010001' \\\n"
+            "            '    A: android:networkSecurityConfig(0x01010527)=@0x7f010002' \\\n"
+            "            '    E: provider (line=3)' \\\n"
+            "            '      A: android:name(0x01010003)=\".Bridge\" (Raw: \".Bridge\")' \\\n"
+            "            '      A: android:permission(0x01010006)=\"android.permission.INTERACT_ACROSS_USERS_FULL\" (Raw: \"android.permission.INTERACT_ACROSS_USERS_FULL\")' \\\n"
+            "            '      A: android:enabled(0x0101000e)=(type 0x12)0xffffffff' \\\n"
+            "            '      A: android:exported(0x01010010)=(type 0x12)0xffffffff' \\\n"
+            "            '      A: android:multiprocess(0x01010013)=(type 0x12)0x0' \\\n"
+            "            '      A: android:authorities(0x01010018)=\"dev.librepocket.agent.github.shizuku\" (Raw: \"dev.librepocket.agent.github.shizuku\")' \\\n"
+            "            '    E: provider (line=4)' \\\n"
+            "            '      A: android:name(0x01010003)=\"Bridge\" (Raw: \"Bridge\")' \\\n"
+            "            '      A: android:permission(0x01010006)=\"android.permission.INTERACT_ACROSS_USERS_FULL\" (Raw: \"android.permission.INTERACT_ACROSS_USERS_FULL\")' \\\n"
+            "            '      A: android:enabled(0x0101000e)=(type 0x12)0xffffffff' \\\n"
+            "            '      A: android:exported(0x01010010)=(type 0x12)0xffffffff' \\\n"
+            "            '      A: android:multiprocess(0x01010013)=(type 0x12)0x0' \\\n"
+            "            '      A: android:authorities(0x01010018)=\"dev.librepocket.agent.github.shizuku\" (Raw: \"dev.librepocket.agent.github.shizuku\")' ;;\n"
+            "        shizuku-alias-dot-and-fqn)\n"
+            "          # Re-review #11 Finding 2 pin, second alias pair: '.Bridge' and\n"
+            "          # the full 'dev.librepocket.agent.github.Bridge' FQN - again\n"
+            "          # two spellings of the SAME canonical class, both compliant;\n"
+            "          # the canonical duplicate-identity guard must fail closed.\n"
+            "          printf '%s\\n' 'E: manifest' \\\n"
+            "            '  E: application' \\\n"
+            "            '    A: android:fullBackupContent(0x010104eb)=@0x7f010000' \\\n"
+            "            '    A: android:dataExtractionRules(0x0101063e)=@0x7f010001' \\\n"
+            "            '    A: android:networkSecurityConfig(0x01010527)=@0x7f010002' \\\n"
+            "            '    E: provider (line=3)' \\\n"
+            "            '      A: android:name(0x01010003)=\".Bridge\" (Raw: \".Bridge\")' \\\n"
+            "            '      A: android:permission(0x01010006)=\"android.permission.INTERACT_ACROSS_USERS_FULL\" (Raw: \"android.permission.INTERACT_ACROSS_USERS_FULL\")' \\\n"
+            "            '      A: android:enabled(0x0101000e)=(type 0x12)0xffffffff' \\\n"
+            "            '      A: android:exported(0x01010010)=(type 0x12)0xffffffff' \\\n"
+            "            '      A: android:multiprocess(0x01010013)=(type 0x12)0x0' \\\n"
+            "            '      A: android:authorities(0x01010018)=\"dev.librepocket.agent.github.shizuku\" (Raw: \"dev.librepocket.agent.github.shizuku\")' \\\n"
+            "            '    E: provider (line=4)' \\\n"
+            "            '      A: android:name(0x01010003)=\"dev.librepocket.agent.github.Bridge\" (Raw: \"dev.librepocket.agent.github.Bridge\")' \\\n"
+            "            '      A: android:permission(0x01010006)=\"android.permission.INTERACT_ACROSS_USERS_FULL\" (Raw: \"android.permission.INTERACT_ACROSS_USERS_FULL\")' \\\n"
+            "            '      A: android:enabled(0x0101000e)=(type 0x12)0xffffffff' \\\n"
+            "            '      A: android:exported(0x01010010)=(type 0x12)0xffffffff' \\\n"
+            "            '      A: android:multiprocess(0x01010013)=(type 0x12)0x0' \\\n"
+            "            '      A: android:authorities(0x01010018)=\"dev.librepocket.agent.github.shizuku\" (Raw: \"dev.librepocket.agent.github.shizuku\")' ;;\n"
             "        shizuku-weak-perm)\n"
             "          printf '%s\\n' 'E: manifest' '  E: application' \\\n"
             "            '    A: android:fullBackupContent(0x010104eb)=@0x7f010000' \\\n"
@@ -3770,9 +3845,19 @@ class ApkPolicyHarness(unittest.TestCase):
         self.assertIn("grantUriPermissions", result.stderr)
 
     def test_github_expect_provider_required_fail_closed(self) -> None:
+        # class_definitions carry the official provider class (and the
+        # second heuristic-detected surface's class): the github
+        # required-provider gate now demands every detected provider's
+        # canonical class be DEX class_def-defined, so the green cases
+        # below must ship a DEX that actually defines those classes.
         apk = complete_apk(
             self.tmp / "github-expect-provider.apk",
-            minimal_dex(type_descriptors=("Ljava/lang/Object;",)),
+            minimal_dex(
+                class_definitions=(
+                    ("Lrikka/shizuku/ShizukuProvider;", None),
+                    ("Ldev/librepocket/internal/ShizukuProvider;", None),
+                )
+            ),
         )
         # required + merged manifest with NO ShizukuProvider => exit 1.
         result = self._run_scanner_cli(
@@ -3784,6 +3869,8 @@ class ApkPolicyHarness(unittest.TestCase):
         # required + TWO ShizukuProviders (both are detected as
         # ShizukuProviders - one by authority suffix, one by the name heuristic)
         # => exit 1 with the found-count message (first-match must never win).
+        # Both canonical classes are DEX class_def-defined above so the
+        # required-provider gate reaches the counting layer.
         result = self._run_scanner_cli(
             apk, "github", xmltree_mode="shizuku-ok-two", expect_provider="required"
         )
@@ -3804,6 +3891,128 @@ class ApkPolicyHarness(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
 
+    def test_github_required_provider_must_have_dex_class_def(self) -> None:
+        # Re-review #11 Finding 1: the github required-provider gate must
+        # demand the declared provider's canonical class be DEX
+        # class_def-defined - a type_ids mention is NOT a class definition.
+        # (a) type_ids mentions the descriptor but it is never defined.
+        mention_apk = complete_apk(
+            self.tmp / "github-mention-not-defined.apk",
+            minimal_dex(type_descriptors=("Lrikka/shizuku/ShizukuProvider;",)),
+        )
+        result = self._run_scanner_cli(
+            mention_apk,
+            "github",
+            xmltree_mode="shizuku-ok",
+            expect_provider="required",
+        )
+        self.assertNotEqual(result.returncode, 0, result.stderr + result.stdout)
+        self.assertIn(
+            "but no root DEX shard defines that class", result.stderr
+        )
+        self.assertIn("rikka.shizuku.ShizukuProvider", result.stderr)
+
+        # (b) Empty DEX (no such type at all): same failure shape.
+        empty_apk = complete_apk(
+            self.tmp / "github-empty-dex-provider.apk",
+            minimal_dex(type_descriptors=("Ljava/lang/Object;",)),
+        )
+        result = self._run_scanner_cli(
+            empty_apk,
+            "github",
+            xmltree_mode="shizuku-ok",
+            expect_provider="required",
+        )
+        self.assertNotEqual(result.returncode, 0, result.stderr + result.stdout)
+        self.assertIn(
+            "but no root DEX shard defines that class", result.stderr
+        )
+        self.assertIn("rikka.shizuku.ShizukuProvider", result.stderr)
+
+        # (c) Positive control: the DEX really class_def-defines the official
+        # provider class (class_definitions carries the official class here).
+        defined_apk = complete_apk(
+            self.tmp / "github-defined-provider.apk",
+            minimal_dex(
+                class_definitions=(("Lrikka/shizuku/ShizukuProvider;", None),)
+            ),
+        )
+        result = self._run_scanner_cli(
+            defined_apk,
+            "github",
+            xmltree_mode="shizuku-ok",
+            expect_provider="required",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+
+        # (d) Arbitrary, non-official FQN detected via the name heuristic
+        # (ShizukuProvider token in android:name); the authority carries no
+        # Shizuku token. The DEX defines nothing, so the class-def gate
+        # must fire for detected non-official names too.
+        with self.subTest(case="d"):
+            ghost_apk = complete_apk(
+                self.tmp / "github-arbitrary-fqn.apk",
+                minimal_dex(type_descriptors=("Ljava/lang/Object;",)),
+            )
+            result = self._run_scanner_cli(
+                ghost_apk,
+                "github",
+                xmltree_mode="shizuku-arbitrary-fqn",
+                expect_provider="required",
+            )
+            self.assertNotEqual(
+                result.returncode, 0, result.stderr + result.stdout
+            )
+            self.assertIn(
+                "but no root DEX shard defines that class", result.stderr
+            )
+            self.assertIn(
+                "dev.librepocket.agent.github.GhostShizukuProvider",
+                result.stderr,
+            )
+
+    def test_github_canonical_alias_duplicate_provider_rejected(self) -> None:
+        # Re-review #11 Finding 2: alias spellings of the SAME provider class
+        # under Android's canonical component-name resolution ('.Bridge' and
+        # dot-free 'Bridge', or '.Bridge' and the full
+        # '{package}.Bridge' FQN) resolve to one canonical FQN. Two detected
+        # blocks with the same canonical name must fail closed - a
+        # DEX-evidenced class must never be consumed twice. The fixture
+        # blocks are otherwise fully contract-compliant (INTERACT_ACROSS_
+        # USERS_FULL, enabled/exported exactly true, multiprocess false,
+        # authorities exactly dev.librepocket.agent.github.shizuku), so the
+        # canonical duplicate-identity guard is the first gate that raises
+        # on these fixtures (both attribute contracts pass; the heuristic
+        # contract would run after the total).
+        bridge_dex = minimal_dex(
+            class_definitions=(
+                (
+                    "Ldev/librepocket/agent/github/Bridge;",
+                    "Lrikka/shizuku/ShizukuProvider;",
+                ),
+            )
+        )
+        for mode in ("shizuku-alias-dot-and-dotfree", "shizuku-alias-dot-and-fqn"):
+            with self.subTest(xmltree_mode=mode):
+                apk = complete_apk(
+                    self.tmp / f"github-alias-{mode}.apk", bridge_dex
+                )
+                result = self._run_scanner_cli(
+                    apk,
+                    "github",
+                    xmltree_mode=mode,
+                    expect_provider="required",
+                )
+                self.assertNotEqual(
+                    result.returncode, 0, result.stderr + result.stdout
+                )
+                self.assertIn(
+                    "github merged manifest declares 2 ShizukuProvider blocks "
+                    "with the same canonical component name: "
+                    "dev.librepocket.agent.github.Bridge",
+                    result.stderr,
+                )
+
     def test_github_dex_evidenced_renamed_shizuku_subclass(self) -> None:
         # #166-D-WARN repro: com.librepocket.internal.Bridge extends
         # rikka.shizuku.ShizukuProvider but carries an arbitrary (non-.shizuku)
@@ -3812,11 +4021,19 @@ class ApkPolicyHarness(unittest.TestCase):
         # manifest must declare it AND it must carry the full attribute
         # contract. DEX: Lcom/librepocket/internal/Bridge; superclass
         # Lrikka/shizuku/ShizukuProvider; (reuses the minimal_dex builder).
+        # The official provider class is class_def-defined too: the
+        # required-provider gate demands every heuristic-detected provider's
+        # canonical class be DEX-defined, and the "found 2" counting case
+        # below declares the official provider.
         bridge_dex = minimal_dex(
             class_definitions=(
                 (
                     "Lcom/librepocket/internal/Bridge;",
                     "Lrikka/shizuku/ShizukuProvider;",
+                ),
+                (
+                    "Lrikka/shizuku/ShizukuProvider;",
+                    None,
                 ),
             )
         )
@@ -3891,7 +4108,12 @@ class ApkPolicyHarness(unittest.TestCase):
                 )
 
         # (5) Positive control unchanged: official declared properly => green.
-        official_dex = minimal_dex(type_descriptors=("Ljava/lang/Object;",))
+        # class_definitions carry the official provider class: the
+        # required-provider gate demands the declared provider's canonical
+        # class be DEX class_def-defined.
+        official_dex = minimal_dex(
+            class_definitions=(("Lrikka/shizuku/ShizukuProvider;", None),)
+        )
         official_apk = complete_apk(self.tmp / "github-official-control.apk", official_dex)
         result = self._run_scanner_cli(
             official_apk, "github", xmltree_mode="shizuku-ok",
@@ -3985,9 +4207,14 @@ class ApkPolicyHarness(unittest.TestCase):
         self.assertIn("is not declared in the merged manifest", result.stderr)
 
         # (9) #166-D duplicate-name fail: TWO detected ShizukuProvider
-        # blocks carrying the same android:name must go RED with the named
-        # PolicyError BEFORE any DEX evidence is consulted - regardless of
-        # whether the DEX carries evidence (here: none).
+        # blocks resolving to the same CANONICAL component name must go RED
+        # with the named PolicyError. DEX evidence is consulted earlier
+        # (the DEX-evidenced attribute contract runs before the total) but
+        # yields no match here; the canonical duplicate guard fires before
+        # the class-def backing check and the counting math - regardless of
+        # whether the DEX carries evidence (here: none). The same-canonical
+        # failure is the owner even though this DEX defines no classes at
+        # all.
         dup_apk = complete_apk(
             self.tmp / "github-duplicate-same-name.apk",
             minimal_dex(type_descriptors=("Ljava/lang/Object;",)),
@@ -3999,7 +4226,7 @@ class ApkPolicyHarness(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0, result.stderr + result.stdout)
         self.assertIn(
             "github merged manifest declares 2 ShizukuProvider blocks with "
-            "identical android:name: rikka.shizuku.ShizukuProvider",
+            "the same canonical component name: rikka.shizuku.ShizukuProvider",
             result.stderr,
         )
 

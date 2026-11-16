@@ -29,7 +29,7 @@ private val Context.shizukuGrantDataStore: DataStore<Preferences> by preferences
     corruptionHandler = ReplaceFileCorruptionHandler { emptyPreferences() },
 )
 
-const val SHIZUKU_PENDING_REVOKE_FILE_NAME = "librepocket_shizuku_revoke.pending"
+internal const val SHIZUKU_PENDING_REVOKE_FILE_NAME = "librepocket_shizuku_revoke.pending"
 
 internal val SHIZUKU_GRANT_PROVIDER_ID = stringPreferencesKey("shizuku_grant_provider_id_v1")
 internal val SHIZUKU_GRANT_CONFIG_REVISION = longPreferencesKey("shizuku_grant_config_revision_v1")

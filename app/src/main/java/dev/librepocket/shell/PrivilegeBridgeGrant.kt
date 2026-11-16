@@ -23,7 +23,7 @@ private val Context.privilegeBridgeDataStore: DataStore<Preferences> by preferen
     corruptionHandler = ReplaceFileCorruptionHandler { emptyPreferences() },
 )
 
-const val PRIVILEGE_PENDING_REVOKE_FILE_NAME = "librepocket_privilege_revoke.pending"
+internal const val PRIVILEGE_PENDING_REVOKE_FILE_NAME = "librepocket_privilege_revoke.pending"
 
 internal val PRIVILEGE_GRANT_PROVIDER_ID = stringPreferencesKey("privilege_grant_provider_id_v1")
 internal val PRIVILEGE_GRANT_CONFIG_REVISION = longPreferencesKey("privilege_grant_config_revision_v1")

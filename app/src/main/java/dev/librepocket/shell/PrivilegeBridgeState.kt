@@ -439,7 +439,7 @@ class PrivilegeBridgeState @VisibleForTesting internal constructor(
     }
 
     /**
-     * 一鍵收回（持久版）：清審計表 → 關開關 → 撤橋接授權（記憶體旗標先落
+     * 一鍵收回（持久版）：記憶體旗標先落 false（關開關＋撤橋接授權，fail-closed）→ 清審計表 →
      * false，fail-closed）→ 有界清持久授權 → 鎖外有界執行可選跨域
      * `withdrawScope`（如 github 側 Shizuku 授權 Store 的 `clear()`，
      * 由 #136-B3 產品接線傳入，本檔不跨源集引用）。
@@ -562,6 +562,9 @@ class PrivilegeBridgeState @VisibleForTesting internal constructor(
                     }
                 } catch (t: Throwable) {
                     // 正常 scope 拋錯：保留現有 primaryFailure/addSuppressed 合併邏輯。
+                    // 注意：此路徑的 suppressed 保留原始 scope 拋出的 CE（略過 best-effort 分支
+                    // 「CE 一律包 ISE」的約束——primary 已存在時，CE-first 已無判別空間，
+                    // 合併方向以既有 primary 為主；#136-B3 以測試釘此語義（見 TESTING/B3 前置）。
                     val existingScope = primaryFailure
                     if (existingScope != null) {
                         existingScope.addSuppressed(t)

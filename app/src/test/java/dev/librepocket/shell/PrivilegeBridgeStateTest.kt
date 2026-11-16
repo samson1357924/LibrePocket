@@ -273,7 +273,7 @@ class PrivilegeBridgeStateTest {
         )
     }
 
-    @Test fun grantRevokedWhileQueuedOnMutexFailsClosed() = runBlocking {
+    @Test(timeout = 30_000L) fun grantRevokedWhileQueuedOnMutexFailsClosed() = runBlocking {
         val store = store()
         val state = PrivilegeBridgeState(bridgeSwitchOn = true)
         val slowStore = PreferenceDataStoreFactory.create(scope = scope) { File(dir, "slow.preferences_pb") }
@@ -529,7 +529,7 @@ class PrivilegeBridgeStateTest {
         grantJob.cancelAndJoin()
     }
 
-    @Test fun revokeWithStuckMutex_bestEffortClearPersists() = runBlocking {
+    @Test(timeout = 30_000L) fun revokeWithStuckMutex_bestEffortClearPersists() = runBlocking {
         // grant 落庫以 latch 持 opMutex（lockHoldRelease，grant 卡在 updateData 至 revoke 逾時）；revokeOpTimeoutMs=100
         // → opMutex 等待逾時 → PRIVILEGE_REVOKE_TIMEOUT；revoke 的鎖外 best-effort clear
         // 因 DataStore actor 被 grant 佔用以 critical section 被佔 >100ms，故逾時
@@ -587,7 +587,7 @@ class PrivilegeBridgeStateTest {
         assertNull("持久擦除由 grant epilogue compensation 有界完成（鎖外 best-effort clear 逾時），持久授權必已撤銷", store.load())
     }
 
-    @Test fun revokeMutexTimeout_bestEffortClearFailsFast_suppressedClearFailed() = runBlocking {
+    @Test(timeout = 30_000L) fun revokeMutexTimeout_bestEffortClearFailsFast_suppressedClearFailed() = runBlocking {
         // grant 落庫以 latch 持 opMutex（lockHoldRelease，grant 卡在 updateData 至 revoke 逾時）；clear()（含臨界區內
         // 與 best-effort）路徑的 updateData 直接拋 IOException（不 hang）。
         // → opMutex 等待逾時 → PRIVILEGE_REVOKE_TIMEOUT；鎖外 best-effort clear 因
@@ -1121,7 +1121,7 @@ class PrivilegeBridgeStateTest {
         assertTrue(seqIds.last() == "priv-${PrivilegeAuditLog.MAX_RECORDS + 10}")
     }
 
-    @Test fun refreshAfterFailedRevoke_withStaleValidGrantOnDisk_staysFailClosed() = runBlocking {
+    @Test(timeout = 30_000L) fun refreshAfterFailedRevoke_withStaleValidGrantOnDisk_staysFailClosed() = runBlocking {
         // stuck grant 持 opMutex → revoke 有界等待 opMutex 逾時 → REVOKE_TIMEOUT；
         // 鎖外 best-effort clear 因 IOException 快速失敗（suppressed）；
         // 落盤 fresh grant saved by the grant that then threw 保留在 backing → seal 封存壓住，refresh 一律 Invalid。
@@ -1240,7 +1240,7 @@ class PrivilegeBridgeStateTest {
         assertEquals(0, state.auditCount())
     }
 
-    @Test fun refreshRevokedWhileQueuedOnMutexFailsClosed() = runBlocking {
+    @Test(timeout = 30_000L) fun refreshRevokedWhileQueuedOnMutexFailsClosed() = runBlocking {
         // 鏡像 grantRevokedWhileQueuedOnMutexFailsClosed 的 idiom：
         // blocker 持有 opMutex（DataStore stuck），refresh 以 Unconfined 排隊，
         // 佇列中插入 revokeInMemoryForTest() → 排隊中的 refresh 必 fail-closed。
@@ -1293,7 +1293,7 @@ class PrivilegeBridgeStateTest {
         assertFalse(state.bridgeGranted)
     }
 
-    @Test fun grantDuringRevokeInFlight_failsFast() = runBlocking {
+    @Test(timeout = 30_000L) fun grantDuringRevokeInFlight_failsFast() = runBlocking {
         // revoke 卡在 store.clear() 的 hang 假件上（inFlight 於入口設置；opMutex 已取得、
         // clear 掛起等待測試放開）：期間 grant() 必 fail-fast 拋 REVOKE_IN_PROGRESS，
         // seal 維持封存（refresh 一律 Invalid）、旗標 false。
@@ -1516,7 +1516,7 @@ class PrivilegeBridgeStateTest {
         assertFalse(state.bridgeSwitchOn)
     }
 
-    @Test fun revokeTimeoutPath_reassertsSwitchAndFlag() = runBlocking {
+    @Test(timeout = 30_000L) fun revokeTimeoutPath_reassertsSwitchAndFlag() = runBlocking {
         // grant 卡住 opMutex（lockHold latch，不再靠 delay 猜排程）→ revoke 開始
         //（入口關旗、封存 seal）→ revoke 等待 opMutex 逾時後進入鎖外 best-effort clear
         //（掛起於 hangClear）→ 假件「於 clear 路徑、revoke inFlight 窗口內、revoke 尚未
@@ -1685,7 +1685,7 @@ class PrivilegeBridgeStateTest {
         assertFalse("賦值→回讀間 seal 置位 ⇒ second-read 必壓回 false", state.bridgeGranted)
     }
 
-    @Test fun grantEpilogueCompensationClearHangs_grantDoesNotHang() = runBlocking {
+    @Test(timeout = 30_000L) fun grantEpilogueCompensationClearHangs_grantDoesNotHang() = runBlocking {
         // 補償清庫有界 pin（revokeOpTimeoutMs）：grant commit 窗口插入並發撤銷
         //（grantCommitHookForTest 內 revokeInMemoryForTest() 推進 epoch＋置 seal；
         // 不寫 Store、不重入 revoke）。commit RMW 見 epoch 不符 ⇒

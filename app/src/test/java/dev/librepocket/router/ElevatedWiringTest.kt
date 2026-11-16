@@ -62,16 +62,61 @@ class ElevatedWiringTest {
     //  為刻意保留、非提權面的非 synthetic 公開成員，以具名允許清單固定；除此之外
     //  一律要求 synthetic（ElevatedDispatch 零外部 API）。）
 
-    /** 方法簽名（宣告類名＋方法名＋參數簡名），供失敗訊息精確點名。 */
+    /**
+     * 方法簽名（宣告類名＋方法名＋參數簡名），供失敗訊息精確點名。
+     * F5：此 exact-set 斷言釘住 Kotlin $app／$default bridge 名稱——
+     * Kotlin 工具鏈升級會改變 accessor/bridge 生成形狀（合法行為）；
+     * 若升級後本測試失敗，原因是橋形狀改變，不是回歸——需依新命名重新校準此 expectedNames。
+     */
     private fun publicMethodSignature(method: java.lang.reflect.Method): String =
         "${method.declaringClass.simpleName}.${method.name}(" +
             method.parameterTypes.joinToString(",") { it.simpleName } + ")"
 
+    /**
+     * 遞迴收集類別與所有嵌套（companion／nested object）布告的公開方法——
+     * 防止未來在 ElevatedDispatch/ShellExecTool 內新增 companion/nested 類別的公開 API
+     * 逃逸出本 pin。宣告成員＝直系 declaredMethods + 遞迴 declaredClasses 的成員。
+     */
+    private fun publicMethodsRecursive(type: Class<*>): List<java.lang.reflect.Method> {
+        val own = type.declaredMethods.filter { java.lang.reflect.Modifier.isPublic(it.modifiers) }
+        // 嵌套類別的成員對宣告類遞迴計入（companion object 的方法即 gate API 面）。
+        return own + type.declaredClasses
+            .filter { java.lang.reflect.Modifier.isPublic(it.modifiers) || it.simpleName.isNotEmpty() }
+            .flatMap { publicMethodsRecursive(it) }
+    }
+
+    /**
+     * 非 constant 的公開欄位（@JvmField val、var 等）——任何公開欄位都會破壞
+     * Java 來源隔離語義（Java 可直讀/寫常數面）。具有 ConstantValue 屬性的 static final
+     * 視為常數面（Java 編譯期常量 inline，允許）；Kotlin `const val` 皆如此編譯。
+     */
+    private fun publicNonConstantFields(type: Class<*>): List<String> =
+        type.declaredFields
+            .filter { java.lang.reflect.Modifier.isPublic(it.modifiers) }
+            .filterNot {
+                // JVM 編譯期常量 inline 形：static final 且為 primitive／String 型別
+                // （Kotlin const val 皆此形；TOOL_NAME/POLICY_ACTION 屬此面）。
+                java.lang.reflect.Modifier.isStatic(it.modifiers) &&
+                    java.lang.reflect.Modifier.isFinal(it.modifiers) &&
+                    (it.type.isPrimitive || it.type == java.lang.String::class.java)
+            }
+            .map { "${type.simpleName}.${it.name}" } +
+            type.declaredClasses.flatMap { publicNonConstantFields(it) }
+
     @Test fun internalGateMembersAreJvmSynthetic() {
-        val dispatch = dev.librepocket.router.ElevatedDispatch::class.java.declaredMethods
-            .filter { java.lang.reflect.Modifier.isPublic(it.modifiers) }
-        val execTool = dev.librepocket.shell.ShellExecTool::class.java.declaredMethods
-            .filter { java.lang.reflect.Modifier.isPublic(it.modifiers) }
+        val dispatch = publicMethodsRecursive(dev.librepocket.router.ElevatedDispatch::class.java)
+        val execTool = publicMethodsRecursive(dev.librepocket.shell.ShellExecTool::class.java)
+        // 零公開非 const 欄位：任何公開欄位（含 nested 類別 grapth）都不得逃出 pin。
+        // Kotlin object 的固有 INSTANCE 欄位（interface 無 → Kotlin object）：javap 必現；
+        // 非 const（非 primitive/String）；僅這兩個宣告類別的 `INSTANCE` 允許，其他公開非 const 欄位一律 fail。
+        val allowedObjectInstances = setOf("ElevatedDispatch.INSTANCE", "ShellExecTool.INSTANCE")
+        val escapedFields = (publicNonConstantFields(dev.librepocket.router.ElevatedDispatch::class.java) +
+            publicNonConstantFields(dev.librepocket.shell.ShellExecTool::class.java))
+            .filterNot { it in allowedObjectInstances }
+        assertTrue(
+            "public non-constant fields must not exist in gate classes: $escapedFields",
+            escapedFields.isEmpty(),
+        )
         // shell.exec 的既有公開 API（刻意保留、非提權面）：非 synthetic；其餘一律須 synthetic。
         val allowedNonSynthetic = setOf(
             "ShellExecTool.execute",   // shell.exec 受限執行入口（公開 API）
@@ -1296,7 +1341,7 @@ class ElevatedWiringTest {
         }
     }
 
-    @Test fun cancelledCallerDuringPoolSaturationThrowsCancellationNotDenial() = runBlocking {
+    @Test fun preCancelledCallerDuringPoolSaturationThrowsCancellationNotDenial() = runBlocking {
         // 池飽和＋已取消 caller 的確定性 pin：兩個 parked supplier 佔滿有界池（同 supplierPoolSaturationFailsClosedFast 骨架），
         // 第三個 caller 於 execute() 內即確認 context 已取消（入口 ensureActive 重拋 CE，不是 Denied、零審計、零 spawn）。
         // 誠實盤點（為何是這個 pin 而非虛構交錯）：boundedSupplierCall 進池是非掛起的原子 trySubmit

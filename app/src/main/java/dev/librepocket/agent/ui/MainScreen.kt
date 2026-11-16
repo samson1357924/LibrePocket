@@ -7,11 +7,11 @@ import kotlinx.coroutines.CancellationException
 import androidx.compose.material3.DrawerState
 import androidx.compose.material3.DrawerValue
 import androidx.compose.material3.rememberDrawerState
+import kotlinx.coroutines.isActive
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -383,19 +383,25 @@ internal fun MainScreen(
                     }
                 },
                 onRevokePrivilege = {
+                    // 同步先落 inFlight（composition 主執行緒），消除同幅雙擊窗口：
+                    // 兩次點擊在 launch 實際執行前都會看到 inFlight == true。
+                    // consumer-side pin: SettingsScreenTest.privilegeRevoke_inFlightStateDisablesButtonAndShowsProgress（同步落位消除同幅雙擊窗口）
                     if (!privilegeRevokeInFlight) {
+                        privilegeRevokeInFlight = true
+                        privilegeRevokeError = false
                         scope.launch {
-                            privilegeRevokeInFlight = true
-                            privilegeRevokeError = false
                             try {
-                                privilegeState.revoke(privilegeStore) {
-                                    FlavorPrivilegeScope.withdraw(app)
-                                }
+                                privilegeRevokeError = executePrivilegeRevoke(
+                                    privilegeState = privilegeState,
+                                    privilegeStore = privilegeStore,
+                                    withdraw = { FlavorPrivilegeScope.withdraw(app) },
+                                    isScopeActive = { scope.isActive },
+                                )
                             } catch (t: Throwable) {
-                                if (t is CancellationException || t is VirtualMachineError) throw t
-                                Log.w(TAG, "privilege revoke failed", t)
                                 privilegeRevokeError = true
+                                throw t
                             } finally {
+                                // WARN-1：即使存活的 UI Job 在此刻已消亡，也要先把 banner 置位再同一路線上拋
                                 privilegeRevokeInFlight = false
                             }
                         }

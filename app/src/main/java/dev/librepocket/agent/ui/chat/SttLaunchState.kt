@@ -1,21 +1,22 @@
 package dev.librepocket.agent.ui.chat
 
-import androidx.compose.runtime.MutableIntState
-import androidx.compose.runtime.MutableState
-import androidx.compose.runtime.mutableIntStateOf
-import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.staticCompositionLocalOf
-import androidx.compose.runtime.saveable.Saver
 import androidx.compose.runtime.saveable.listSaver
 import java.util.UUID
 
 /**
  * Activity 重建（recreation）時，ChatScreen 登記於 ActivityResultRegistry 的 launched key
- * （"stt-<screenId>-slotN-<resetEpoch>"，screenId 為 entry-scoped rememberSaveable、resetEpoch 亦為 rememberSaveable）與 pending result 由 registry
+ * （"stt-<screenId>-slotN-<resetEpoch>"，screenId／resetEpoch 自複合快照 [SttLaunchState] 內推導）與 pending result 由 registry
  * 存在 saved bundle 中、重建後重新投遞給新組合的 callback——因此「重建前 launch 的 recognizer，其
  * 結果可能在重建後的 composition 回來」是合法路徑，而不是錯誤。此時 slot/arbiter 的記憶體狀態（`remember{}`）會是全新的，無法僅憑
- * 新值判斷結果歸屬；本檔將每個 slot 的 launch 身分（slotBusy/slotGen）與 arbiter 的
- * generation 水位釘進 `rememberSaveable`，重建後還原，使重建前 launch 的結果仍能被精確歸屬。
+ * 新值判斷結果歸屬；本檔將每個 slot 的 launch 身分（slotBusy/slotGen）、arbiter 的
+ * generation 水位與 per-entry identity（screenId/resetEpoch）釘進同一枚 `rememberSaveable`
+ * 複合快照，重建後還原，使重建前 launch 的結果仍能被精確歸屬。
+ *
+ * 複合快照還原 fail-closed（atomic）：任何欄位驗證失敗一律整枚回退為新的 fresh composite
+ * （含**新 UUID**、slots 全閒、水位 0、epoch 0）——slot 身分與 launcher registry key identity
+ * 是同一枚 entry，不可能一半還原成功、一半回退；重建前 outstanding 結果在 registry 邊界
+ * 永不可投遞，也不會以半信半疑的狀態重建，更不會 NPE（見 [SttLaunchStateSaver] KDoc）。
  *
  * 所有類別維持 `internal`；不暴露為 public API。
  *
@@ -34,6 +35,13 @@ import java.util.UUID
  * - [inFlightName] / [admittedAtNanos]：in-flight arm（[VoiceSttArmKind] 名稱）與其 admit 時間
  *   （與 [admitGeneration] 同一枚 admit 的配對值；clock 來源由 `LocalVoiceSttArbiterClock` 提供，
  *   production 為 elapsedRealtimeNanos，monotonic 含 deep sleep、跨 process 一致）。
+ * - [screenId]：per-entry 隨機 UUID（launcher registry key 推導："stt-<screenId>-slotN-<resetEpoch>"）；
+ *   同一 entry recreation 還原同一 UUID，新 entry 必得新 UUID。
+ * - [resetEpoch]：使用者硬重設的世代（單調遞增；重設後重設前 launcher 於重組時同步 unregister，
+ *   其晚到結果在 registry 邊界永不可投遞）。
+ *
+ * [screenId]／[resetEpoch] 與 slot/watermark 同屬一枚複合快照：任何欄位驗證失敗一律整枚
+ * fresh（新 UUID），金鑰不可匹配任何既有 outstanding rc→key 綁定（atomic fail-closed）。
  */
 internal data class SttLaunchState(
     val slotBusy: List<Boolean>,
@@ -41,16 +49,23 @@ internal data class SttLaunchState(
     val admitGeneration: Long,
     val inFlightName: String?,
     val admittedAtNanos: Long,
+    val screenId: String,
+    val resetEpoch: Int,
 ) {
     internal companion object {
-        /** 全新（無 launch 紀錄）的快照：slot 全閒、generation 水位 0、無 in-flight。 */
-        internal fun fresh(): SttLaunchState =
+        /** 全新（無 launch 紀錄）的快照：slot 全閒、generation 水位 0、無 in-flight、新 UUID、epoch 0。 */
+        internal fun fresh(
+            screenId: String = UUID.randomUUID().toString(),
+            resetEpoch: Int = 0,
+        ): SttLaunchState =
             SttLaunchState(
                 slotBusy = listOf(false, false),
                 slotGen = listOf(0L, 0L),
                 admitGeneration = 0L,
                 inFlightName = null,
                 admittedAtNanos = 0L,
+                screenId = screenId,
+                resetEpoch = resetEpoch,
             )
     }
 }
@@ -66,12 +81,15 @@ internal fun saveSttLaunchState(state: SttLaunchState): List<Any?> =
         state.admitGeneration,
         state.inFlightName,
         state.admittedAtNanos,
+        state.screenId,
+        state.resetEpoch,
     )
 
 /**
  * bundle 欄位 → snapshot 的還原邏輯；fail-closed 驗證（見 [SttLaunchStateSaver] KDoc）。
  * slotBusy size==2 且全為 Boolean、slotGen size==2 且全為 Long、admitGeneration/admittedAtNanos
- * 皆 >= 0、inFlightName == null 或為 [VoiceSttArmKind] 的列舉名；跨欄位語意不合一律回傳 null：
+ * 皆 >= 0、inFlightName == null 或為 [VoiceSttArmKind] 的列舉名、screenId 為 36 字元且可
+ * `UUID.fromString` 解析的 String、resetEpoch 為非負 Int；跨欄位語意不合一律回傳 null：
  *
  * 1. [slotBusy][i] == true 但 slotGen[i] == 0L（楔住的 slot 永遠無法歸屬）；
  * 2. [slotBusy][i] == false 但 slotGen[i] != 0L（production 一律在 release 時把 gen 歸零）；
@@ -80,10 +98,13 @@ internal fun saveSttLaunchState(state: SttLaunchState): List<Any?> =
  * 5. admitGeneration >= Long.MAX_VALUE（下一枚 admit 會 wrap 成負世代，污染水位單調性）；
  * 6. slotGen[i] > admitGeneration（水位不可能低於任何已發出的世代）。
  *
- * 任何不合一律回傳 null（使 `rememberSaveable` 退回初始值）。
+ * 頂部尺寸須為 7（舊 5 元素 bundle → null，由 [SttLaunchStateSaver] 外層攔截回 fresh composite）；
+ * identity 軸：saved[5] 必須是 36 字元且可 `UUID.fromString` 解析的 String；saved[6] 必須是非負
+ * Int。任何不合一律回傳 null（使 [SttLaunchStateSaver] 外層回 fresh composite；pure function
+ * 本身回 null，JVM 單元測試直接釘住此 fail-closed 形狀）。
  */
 internal fun restoreSttLaunchState(saved: List<Any?>): SttLaunchState? {
-    if (saved.size != 5) return null
+    if (saved.size != 7) return null
     val busy = saved[0] as? List<*> ?: return null
     if (busy.size != 2 || busy.any { it !is Boolean }) return null
     val gens = saved[1] as? List<*> ?: return null
@@ -119,62 +140,44 @@ internal fun restoreSttLaunchState(saved: List<Any?>): SttLaunchState? {
     if (generation >= Long.MAX_VALUE) return null
     // 水位不可能低於任何已發出的世代。
     if (genList.any { it > generation }) return null
+    // 複合快照的 identity 軸（fail-closed；任一軸不合一律整枚退回 null）。
+    val screenId = saved[5] as? String ?: return null
+    if (screenId.length != 36 || runCatching { UUID.fromString(screenId) }.isFailure) return null
+    val resetEpoch = saved[6] as? Int ?: return null
+    if (resetEpoch < 0) return null
     return SttLaunchState(
         slotBusy = busyList,
         slotGen = genList,
         admitGeneration = generation,
         inFlightName = name as String?,
         admittedAtNanos = admitted,
+        screenId = screenId,
+        resetEpoch = resetEpoch,
     )
 }
 
 /**
  * [SttLaunchState] 的 `rememberSaveable` saver。
  *
- * 還原（restore）採 fail-closed 驗證：任何形狀不合預期的 bundle 內容（size 不符、型別不符、
- * generation／timestamp 為負、`inFlightName` 不是 `VoiceSttArmKind` 的列舉名、跨欄位語意不變量
- * 違反——見 `restoreSttLaunchState` KDoc）一律回傳 `null`，
- * 使 `rememberSaveable` 退回初始值（`SttLaunchState.fresh()`），而不是帶著半信半疑的狀態重建。
- * 注意：bundle 內的數值經 Bundle 往返後型別必為 Boolean／Long／String／List，型別檢查依此進行。
+ * 複合快照契約（atomic fail-closed）：slotBusy/slotGen/admitGeneration/inFlightName/
+ * admittedAtNanos/screenId/resetEpoch 是**同一枚** entry（ChatScreen 的 `sttLaunchSnapshot`），
+ * 任何欄位驗證失敗（見 `restoreSttLaunchState` KDoc）一律**整枚**回退為新的
+ * [SttLaunchState.fresh]（新 UUID、slots 全閒、水位 0、epoch 0），而不是帶著半信半疑的狀態
+ * 重建、也不是沿用舊 identity 發新 slots——因此重建前 outstanding launch 的 rc→key 綁定在
+ * 新 composition 永遠不可匹配，結果在 registry 邊界不可投遞（gen==0L fail-closed 亦丟棄），
+ * 重建不會 NPE。
+ * 完全自洽的 crafted bundle（全部欄位驗證皆通過）仍按原樣還原——saved-state 屬 framework 信任域，本 saver 不是 anti-tamper／replay 邊界；其安全性建立在「違規即整枚 fresh」而非「通過即可信」上。
+ *
+ * `restore` 永不回傳 null：`rememberSaveable` 的 `restored ?: init()` 只在「沒有保存值」時
+ * 執行 init；若 saver 回傳 null，`mutableStateSaver` 外層仍會提供一個非 null 的
+ * `MutableState<SttLaunchState?>`、內容卻是 null，重建當下的首讀即 NPE。bundle 內的數值經
+ * Bundle 往返後型別必為 Boolean／Long／Int／String／List，型別檢查依此進行。
  * Saved-state 的存活範圍 ⊆ 單次 boot（rememberSaveable／Bundle 不跨 reboot 存活），`elapsedRealtimeNanos`
  * 之所以能跨還原被比較，也正因為此存活範圍限制。
  */
 internal val SttLaunchStateSaver = listSaver(
     save = { state -> saveSttLaunchState(state) },
-    restore = { saved -> restoreSttLaunchState(saved) },
-)
-
-/**
- * `resetEpoch` 的 fail-closed saver：負數還原為 0、非負值原樣通過 — 對 crafted Bundle 的縱深防禦。
- * 僅此而已：完全自洽的 crafted Bundle 在此框架下不可被此 saver 排除（saved state 屬 framework
- * 信任域）；它並非 replay 防禦邊界，僅防止負數鍵名污染（仍唯一、不衝突）。
- */
-internal val ResetEpochSaver = Saver<MutableIntState, Int>(
-    save = { it.intValue },
-    restore = { if (it >= 0) mutableIntStateOf(it) else mutableIntStateOf(0) },
-)
-
-/**
- * [ScreenIdSaver] 的還原邏輯（抽成 internal top-level 供 JVM 單元測試直接驗證）。
- * 僅接受 36 字元且可 `UUID.fromString` 解析的字串；其餘（型別不符／腐化 bundle）一律發
- * fresh random UUID——永不 crash，腐化 bundle 產生的 key 不可匹配任何既有 outstanding
- * rc→key 綁定。
- */
-internal fun restoreScreenId(saved: Any?): MutableState<String> {
-    val valid = (saved as? String)?.takeIf { s ->
-        s.length == 36 && runCatching { UUID.fromString(s) }.isSuccess
-    }
-    return mutableStateOf(valid ?: UUID.randomUUID().toString())
-}
-
-/**
- * Per-entry `screenId` 的 fail-closed saver（entry-scoped identity；rememberSaveable 保存隨機
- * UUID）。還原時驗證為 36 字元且可 `UUID.fromString` 解析的字串，否則發 fresh random UUID——
- * 永不 crash；腐化／型別不符的 bundle 使 key 不可匹配任何既有 outstanding rc→key 綁定。
- */
-internal val ScreenIdSaver = Saver<MutableState<String>, Any>(
-    save = { it.value },
-    restore = { saved -> restoreScreenId(saved) },
+    restore = { saved -> restoreSttLaunchState(saved) ?: SttLaunchState.fresh() },
 )
 
 /**

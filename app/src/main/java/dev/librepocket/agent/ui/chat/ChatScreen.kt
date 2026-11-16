@@ -58,7 +58,6 @@ import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableLongStateOf
-import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -90,7 +89,6 @@ import dev.librepocket.voice.shouldApplyUiEvent
 import dev.librepocket.voice.VoiceTts
 import dev.librepocket.voice.VoiceTtsConfirmState
 import dev.librepocket.voice.TtsConfirmDecision
-import java.util.UUID
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -337,12 +335,13 @@ fun ChatScreen(
     //（閘忙時按住佇列一次，settle 後續行）。
     // 活動重建（recreation）後，ActivityResultRegistry 可能把重建前 launch 的結果重新投遞給
     // 重建後的 composition；此時 remembered 記憶體狀態是全新的，必須先還原 launch 歸屬快照
-    // （slot 身分 + arbiter generation 水位），重建前的 in-flight launch 才能被精確歸屬。
-    // SttLaunchStateSaver 還原時 fail-closed 驗證，bundle 形狀不合一律退回 fresh()。
+    // （slot 身分＋ arbiter generation 水位＋ screenId／resetEpoch 複合 identity），重建前的 in-flight launch 才能被精確歸屬。
+    // SttLaunchStateSaver 還原時 fail-closed 驗證，bundle 形狀不合一律退回 fresh composite（atomic：slots＋watermark＋identity 整枚 fresh＋新 UUID）。
     // arbiter 時鐘來源為 elapsedRealtimeNanos（monotonic、含 deep sleep、跨 process 一致、
     // 可跨 recreation 還原；wall-clock 會隨牆鐘跳變、nanoTime 無法跨 recreation 比較）。
     val arbiterClock = LocalVoiceSttArbiterClock.current
     val sttLaunchBootstrap = LocalSttLaunchStateBootstrap.current
+    // restore non-null（saver fresh fallback）；init lambda 僅於「無保存 bundle」時執行。
     var sttLaunchSnapshot by rememberSaveable(stateSaver = SttLaunchStateSaver) {
         mutableStateOf(sttLaunchBootstrap ?: SttLaunchState.fresh())
     }
@@ -361,21 +360,20 @@ fun ChatScreen(
     // （如兩 slot 楔住時未消費的 INITIAL）會擱淺到下一次無關的狀態翻轉；以此旗標作為決策
     // 效應的 key，讓 settle 確定性地喚起一次重裁決。
     var sttSettleSeq by remember { mutableStateOf(0) }
-    // 使用者硬重設世代（reset）：「重設語音辨識」+1。launcher 的 registry key 由 per-entry
-    // screenId＋此世代推導（"stt-<screenId>-slotN-<epoch>"）：重設後，重設前的 launch（與其 rc→key 綁定）永遠不可達——其晚到
+    // 複合快照的 per-entry identity＋重設世代（與 slot/watermark 同一枚 rememberSaveable、同一枚
+    // 複合快照 [SttLaunchState]）：launcher registry key 由兩個欄位推導
+    // （"stt-<screenId>-slotN-<resetEpoch>"）：重設後，重設前的 launch（與其 rc→key 綁定）永遠不可達——其晚到
     // 結果在 registry 邊界永不投遞（late result 停靠 pendingResults，鍵不再註冊），無法冒充
     // 重設後的 launch；slot/gen 表僅為第二層縱深防禦。
-    // in-process 的負世代鍵名仍然唯一；與 epoch-0 同鍵名僅可能經跨重建還原夾為 0 的路徑出現
-    // （須搭配 process death，且 outstanding launch 的 gate 由 gen==0L fail-closed 丟棄）；
-    // ResetEpochSaver 維持 fail-closed 夾取（save 側原值寫入、restore 側負值夾為 0）。
-    // 世代唯一性由 monotonic 遞增保證，wrap 僅於 ~2^31 次重設後出現（Int 世代遞增）。rememberSaveable：跨 activity 重建還原（epoch>0 時
-    //  outstanding launch 重建後仍可歸屬）。
-    var resetEpoch by rememberSaveable(saver = ResetEpochSaver) { mutableIntStateOf(0) }
-    // Entry-scoped identity：entry-scoped rememberSaveable＋ScreenIdSaver（restore 驗證
-    // 36-char UUID 或 fresh random；never crashes；corruption ⇒ keys unmatchable）；同一 entry
-    // recreation 還原同一 UUID，新 entry 必得新 UUID。前提：CHAT back-stack entry 永不以
-    // restoreState=true 還原（目前全倉皆無此用法）；未來若引入，須重新驗證跨 entry 歸屬。
-    var screenId by rememberSaveable(saver = ScreenIdSaver) { mutableStateOf(UUID.randomUUID().toString()) }
+    // 複合快照還原 fail-closed（atomic）：任何欄位驗證失敗一律整枚 fresh（新 UUID、epoch 0），
+    // 重建前 outstanding 的 launcher key 永不重新註冊、結果不可投遞；與單獨的 rememberSaveable
+    // 拆分還原不同——identity 與 slot/gen 不可能一半還原成功、一半回退。使用者硬重設於複合快照內
+    // 以 `snapshot.copy(resetEpoch = ...)` 原子遞增（見 resetVoiceSttCluster），再與之後的 persist
+    // 合為一枚原子提交。epoch 為 Int 遞增，wrap 僅於 ~2^31 次重設後出現。
+    // Entry-scoped identity 前提：CHAT back-stack entry 永不以 restoreState=true 還原（目前全倉皆無
+    // 此用法）；未來若引入，須重新驗證跨 entry 歸屬。
+    val screenId = sttLaunchSnapshot.screenId
+    val resetEpoch = sttLaunchSnapshot.resetEpoch
     // 每枚進行中 launch 各自佔一個回呼 slot（共 2 枚）：slotBusy 標記佔用、slotGen 記錄該 slot 對應的
     // admit generation（launch 時自 currentGeneration 讀取，即剛承認的那一枚 arm 的 generation）。
     // result callback 以 slot 歸屬配對——每枚 pending launch 各自佔 slot、歸屬精確，不受回傳順序影響
@@ -391,8 +389,9 @@ fun ChatScreen(
     fun hasFreeSttSlot(): Boolean = !slotBusy[0] || !slotBusy[1]
     // 狀態快照寫入 rememberSaveable：admit／降級／settle／watchdog 釋放後皆更新，
     // 使 activity 重建時能還原 slot 歸屬與閘的 in-flight／generation 水位。
+    // identity（screenId/resetEpoch）由 copy() 沿用，與 slot/gen/watermark 永遠同一枚複合快照。
     fun persistLaunchState() {
-        sttLaunchSnapshot = SttLaunchState(
+        sttLaunchSnapshot = sttLaunchSnapshot.copy(
             slotBusy = slotBusy.toList(),
             slotGen = slotGen.toList(),
             admitGeneration = sttArbiter.currentGeneration,
@@ -419,7 +418,9 @@ fun ChatScreen(
         sttArbiterState = null
         userVoiceArmed = false
         sttSettleSeq += 1
-        resetEpoch += 1
+        // 複合快照內的 resetEpoch 原子遞增（copy），與下方 persistLaunchState 的身分提交合為
+        // 同一枚複合快照；重設後的 launcher 以新世代 key（"stt-<screenId>-slotN-<epoch>"）於重組時同步註冊。
+        sttLaunchSnapshot = sttLaunchSnapshot.copy(resetEpoch = sttLaunchSnapshot.resetEpoch + 1)
         persistLaunchState()
         voiceErrors.clearSttError()
         showVoiceReset = false
@@ -458,7 +459,7 @@ fun ChatScreen(
         // （late result 停靠 pendingResults，鍵不再註冊；pre-reset launcher unregister 後 callback 移除），根本不會進入本函式；gen == 0L 的
         // 頂端 fail-closed 僅為第二層縱深防禦。跨 entry 的晚到結果同理在 registry 邊界終結：
         // key 內嵌 per-entry screenId，已 popUpTo 銷毀 entry 的 outstanding result 永遠不會投遞進
-        // 新 entry 的 callback，根本不會進入本函式。（前提：CHAT entry 永不以 restoreState=true 還原；見 screenId KDoc／docs）
+        // 新 entry 的 callback，根本不會進入本函式。（前提：CHAT entry 永不以 restoreState=true 還原；見複合快照 KDoc／docs）
         // STALE-SPECIMENS: stale-result 案例（S3-style watchdog 驅逐、successor 超越、gen==0L fail-closed drop）
         // 釘在 VoiceSttArbiterTest／isStaleVoiceResult 純述詞層／SttLaunchStateTest；Compose 層 stale 模擬亦可經
         // LocalVoiceSttArbiterClock 注入假時鐘（見 ChatScreenVoiceLaunchTest）。
@@ -982,7 +983,7 @@ fun ChatScreen(
             voiceErrors.sttError?.let {
                 if (showVoiceReset) {
                     // 無 slot 可派（兩 slot 皆被懸掛 recognizer 佔用）時附重設鈕：使用者觸發的
-                    // 硬重設——清空 slot 表與閘、保留 generation 水位、遞增 resetEpoch（重設前
+                    // 硬重設——清空 slot 表與閘、保留 generation 水位、遞增複合快照內的 resetEpoch（原子 copy，重設前
                     // launcher 於重組時同步 unregister，其晚到結果在 registry 邊界永不投遞）。語義是
                     // 「放棄未返回的辨識結果（晚到者在 registry 邊界永不投遞，slot/gen 表為第二層
                     // 縱深防禦，見 resetVoiceSttCluster 註解）」，不是「修好卡住的辨識器」。

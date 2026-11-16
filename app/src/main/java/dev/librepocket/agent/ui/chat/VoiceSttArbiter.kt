@@ -127,7 +127,7 @@ internal class VoiceSttArbiter(
     /**
      * Drop the in-flight marker without touching anything else.
      * @VisibleForTesting 僅測試用；production 不呼叫（恢復路徑由 ChatScreen 的「重設語音辨識」
-     * 走 [hardReset]／resetEpoch 世代承擔）。
+     * 走 [hardReset]／複合快照世代承擔）。
      * Also resets [currentGeneration] to 0.
      */
     @VisibleForTesting
@@ -149,18 +149,20 @@ internal class VoiceSttArbiter(
      * the same entry, and the registry parks the late result undeliverable under the dead key.
      * Cross-entry late results terminate at the registry boundary (keys embed the per-entry
      * screenId, so a NEW ChatScreen entry never re-registers the destroyed entry's key; precondition:
-     * CHAT back-stack entries are never restored with restoreState=true — see screenId KDoc / docs). The
+     * CHAT back-stack entries are never restored with restoreState=true — see composite snapshot KDoc / docs). The
      * remaining framework-level path is the same-entry re-registration and re-dispatch of a
      * pending result across process death (androidx contract, not simulated here): it enters the
-     * handler; attribution is preserved when the SttLaunchState snapshot restores (delivery is
-     * the designed outcome, pinned by the recreation tests), and gen==0L fail-closed drops only
-     * when the snapshot failed to restore. Post-reset the pre-reset key never re-registers in
+     * handler; attribution is preserved when the SttLaunchState composite snapshot (slots/watermark/
+     * screenId/epoch atomic) restores (delivery is the designed outcome, pinned by the recreation tests),
+     * and gen==0L fail-closed drops only when the snapshot failed to restore. Post-reset the pre-reset key never re-registers in
      * any restore whose parcel carries the post-reset (or later) saved state — the normal case
      * for configuration change and process death. If process death occurs before the first
      * post-reset onSaveInstanceState, the parcel predates the reset: epoch and screenId restore
      * as-pre-reset, the key re-registers identically, and the parked result re-enters under the
      * pre-reset identity — residual (a) (delivery with restored attribution, prefill only; or
-     * gen==0L fail-closed drop). Never cross-entry misattribution. See
+     * gen==0L fail-closed drop; an invalid saved parcel now also closes via fresh identity — the
+     * composite saver rejects it wholesale with a fresh composite + new UUID, so outstanding keys
+     * never re-register). Never cross-entry misattribution. See
      * CAPABILITY_MATRIX and THREAT_MODEL residual (a). The slot/generation
      * pairing (slot tables read 0L → fail-closed drop) is only the second layer — defense in
      * depth. Documented in CAPABILITY_MATRIX/THREAT_MODEL.

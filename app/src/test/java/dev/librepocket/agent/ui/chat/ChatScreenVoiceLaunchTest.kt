@@ -15,9 +15,13 @@ import androidx.activity.result.ActivityResultRegistryOwner
 import androidx.activity.result.contract.ActivityResultContract
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.MutableState
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.saveable.LocalSaveableStateRegistry
+import androidx.compose.runtime.saveable.SaveableStateRegistry
 import androidx.compose.ui.test.ExperimentalTestApi
 import androidx.compose.ui.test.junit4.StateRestorationTester
 import androidx.compose.ui.test.assertCountEquals
@@ -2094,6 +2098,8 @@ class ChatScreenVoiceLaunchTest {
             admitGeneration = 3L,
             inFlightName = "INITIAL",
             admittedAtNanos = 1_000L,
+            screenId = "123e4567-e89b-42d3-a456-426655440000",
+            resetEpoch = 0,
         )
 
         composeRule.setContent {
@@ -2173,6 +2179,8 @@ class ChatScreenVoiceLaunchTest {
             admitGeneration = 4L,
             inFlightName = "INITIAL",
             admittedAtNanos = 1_000L,
+            screenId = "123e4567-e89b-42d3-a456-426655440000",
+            resetEpoch = 0,
         )
 
         composeRule.setContent {
@@ -2410,6 +2418,181 @@ class ChatScreenVoiceLaunchTest {
         composeRule.onNodeWithText("重設語音辨識").assertIsDisplayed()
         assertEquals("", vm.input.value)
         assertEquals(0, provider.streamCalls)
+    }
+
+    // ── 複合快照 malformed-restore 回歸：保存的 SttLaunchState bundle 被污染時，重建不得 NPE、
+    // 也不得把重建前 A 的晚到結果誤歸屬給新 composition 的 C。────────────────
+    // 相位 1：在注入的 in-memory SaveableStateRegistry 下組合 → tap mic（A 起、gen1 slot0、懸掛）。
+    // 相位 2：與 StateRestorationTester 相同的 shouldEmitChildren 機制（先丟棄 children、再以
+    // 污染後的 seed 重建；避免 key() 改變 composite key hash 而使還原路徑失效）→ 斷言不崩潰、
+    // A 的晚到結果不 prefill、C 的結果正常 prefill、永不 auto-send。
+    private class SwitchableSaveableStateRegistry(
+        initialDelegate: SaveableStateRegistry,
+    ) : SaveableStateRegistry {
+        var delegate: SaveableStateRegistry = initialDelegate
+            private set
+
+        fun swapTo(newDelegate: SaveableStateRegistry) {
+            delegate = newDelegate
+        }
+
+        override fun canBeSaved(value: Any): Boolean = delegate.canBeSaved(value)
+        override fun consumeRestored(key: String): Any? = delegate.consumeRestored(key)
+        override fun performSave(): Map<String, List<Any?>> = delegate.performSave()
+        override fun registerProvider(
+            key: String,
+            valueProvider: () -> Any?,
+        ): SaveableStateRegistry.Entry = delegate.registerProvider(key, valueProvider)
+    }
+
+    // saved map 的結構：rememberSaveable 以 (composite group key) → 該 group 內所有
+    // provider 的 save 輸出串接後的 List。SttLaunchStateSaver 的輸出被 mutableStateSaver
+    // 包成 MutableState<List<Any?>>，是 key1 串接 List 內的一枚元素（含 wasActive=MS(false)、
+    // sttLaunchSnapshot=MS(compositeBundle)——內含 slot/gen/watermark/screenId/resetEpoch
+    // 的單枚複合 bundle）。因此以
+    // 「MutableState<List<*>> 且 value[0] 為 size 2 的 List<Boolean>」的形狀定位該元素。
+    private fun isSttLaunchStateBundleSaverValue(value: Any?): Boolean =
+        value is List<*> && value.isNotEmpty() &&
+            value[0] is List<*> &&
+            (value[0] as List<*>).size == 2 &&
+            (value[0] as List<*>).all { it is Boolean }
+
+    private fun findSttLaunchStateBundle(
+        saved: Map<String, List<Any?>>,
+    ): Triple<String, Int, MutableState<*>> {
+        val candidates = saved.flatMap { (key, providers) ->
+            providers.mapIndexedNotNull { index, element ->
+                if (element is MutableState<*> && isSttLaunchStateBundleSaverValue(element.value)) {
+                    Triple(key, index, element)
+                } else {
+                    null
+                }
+            }
+        }
+        assertEquals("exactly one SttLaunchState bundle element expected", 1, candidates.size)
+        return candidates.single()
+    }
+
+    private fun composeVoiceLaunchProbe(
+        vm: ChatViewModel,
+        registry: RecordingRegistry,
+        owner: ActivityResultRegistryOwner,
+        saveRegistry: SwitchableSaveableStateRegistry,
+        shouldEmit: MutableState<Boolean>,
+        now: Long,
+    ) {
+        composeRule.setContent {
+            val emit by shouldEmit
+            CompositionLocalProvider(
+                LocalActivityResultRegistryOwner provides owner,
+                LocalVoiceSttArbiterClock provides { now },
+                LocalSaveableStateRegistry provides saveRegistry,
+            ) {
+                // 與 StateRestorationTester 相同的 shouldEmitChildren 機制：if 分支進／出
+                // 會丟棄並重建 children group，但 group 的來源位置（composite key hash）不變——
+                // rememberSaveable 才會在重建後讀到 seeded registry 裡的還原值。
+                if (emit) {
+                    ChatScreen(
+                        padding = PaddingValues(0.dp),
+                        viewModel = vm,
+                        userSwitches = mapOf(VoiceTools.SWITCH_INPUT to true),
+                        voiceSwitchesLoaded = true,
+                    )
+                }
+            }
+        }
+    }
+
+    private fun malformedRestoreRecreationProbe(
+        corrupt: (MutableList<Any?>) -> Unit,
+    ) {
+        registerRecognitionService()
+        val provider = VoiceLaunchFakeProvider()
+        val vm = newVm(provider)
+        val registry = RecordingRegistry()
+        val owner = object : ActivityResultRegistryOwner {
+            override val activityResultRegistry: ActivityResultRegistry = registry
+        }
+        val now = 1_000_000_000L
+        val saveRegistry = SwitchableSaveableStateRegistry(SaveableStateRegistry(emptyMap()) { true })
+        val shouldEmit = mutableStateOf(true)
+
+        // 相位 1：組合、mic tap → A 起（gen1、slot0）、懸掛；然後讀取保存的 bundle。
+        composeVoiceLaunchProbe(vm, registry, owner, saveRegistry, shouldEmit, now)
+        composeRule.waitForIdle()
+        composeRule.onNodeWithContentDescription("語音輸入").performClick()
+        composeRule.waitForIdle()
+        assertEquals(1, registry.launchedIntents.size) // A USER gen1 slot0, hangs
+        val rcA = registry.launchedRequestCodes[0]
+
+        // 相位 1 結束即讀取保存的 bundle（children 丟棄後 registry 已清空，必須先讀）。
+        val saved = saveRegistry.performSave()
+        val (key, index, element) = findSttLaunchStateBundle(saved)
+
+        // 相位 2 步驟 1：丟棄 children（與 activity recreation 的 dispose 同路徑——DisposableEffect
+        // onDispose 同步 unregister launchers；key 間的 composite key hash 保持不變）。
+        shouldEmit.value = false
+        composeRule.waitForIdle()
+
+        // 相位 2 步驟 2：以污染後的 seed 重建（同一 RecordingRegistry 實例；重建的 composition
+        // 從 seeded registry 還原——而非從相位 1 的 live 狀態）。
+        @Suppress("UNCHECKED_CAST")
+        val inner = (element.value as List<Any?>).toMutableList().also(corrupt)
+        val seededElement = mutableStateOf(inner as List<Any?>)
+        val seededList = saved.getValue(key).toMutableList().also { it[index] = seededElement }
+        val reseed = saved.toMutableMap().apply { put(key, seededList) }
+        saveRegistry.swapTo(SaveableStateRegistry(reseed) { true })
+        shouldEmit.value = true
+        composeRule.waitForIdle()
+
+        // 不崩潰、不自動 launch、草稿不變。
+        assertEquals(1, registry.launchedIntents.size)
+        assertEquals("", vm.input.value)
+
+        // 再按 mic → C 起（新 fresh 世代 gen1、新 slot0），rcC != rcA。
+        composeRule.onNodeWithContentDescription("語音輸入").performClick()
+        composeRule.waitForIdle()
+        assertEquals(2, registry.launchedIntents.size)
+        val rcC = registry.launchedRequestCodes[1]
+        assertTrue(rcC != rcA)
+        assertEquals("", vm.input.value)
+
+        // A 的晚到結果：相位 2 為 fresh composite（新 UUID）⇒ A 的 key 永不重新註冊，
+        // 結果在 registry 邊界不可投遞 → 草稿保持空白，也不結算 C 的閘。
+        val staleResult = Intent().putStringArrayListExtra(
+            RecognizerIntent.EXTRA_RESULTS,
+            arrayListOf("old transcript"),
+        )
+        composeRule.runOnIdle {
+            registry.dispatchResult(rcA, ActivityResult(Activity.RESULT_OK, staleResult))
+        }
+        composeRule.waitForIdle()
+        assertEquals("", vm.input.value)
+
+        // C 自己的結果：新鮮、正常 prefill；永不 auto-send。
+        val freshResult = Intent().putStringArrayListExtra(
+            RecognizerIntent.EXTRA_RESULTS,
+            arrayListOf("new transcript"),
+        )
+        composeRule.runOnIdle {
+            registry.dispatchResult(rcC, ActivityResult(Activity.RESULT_OK, freshResult))
+        }
+        composeRule.waitForIdle()
+        assertEquals("new transcript", vm.input.value)
+        assertEquals(0, provider.streamCalls)
+    }
+
+    @Test
+    fun malformedRestore_corruptSlotBusySize_recreationFailsClosedWithoutCrash() {
+        // 污染 (a)：slotBusy size==1 → inner restore 回 null → 複合 saver 回 fresh composite（不 NPE）。
+        malformedRestoreRecreationProbe { it[0] = listOf(true) }
+    }
+
+    @Test
+    fun malformedRestore_invariantViolation_recreationFailsClosedWithoutCrash() {
+        // 污染 (b)：busy slot0 但 slotGen 全 0（跨欄位不變量 1 違反）；保留
+        // admitGeneration=1／inFlightName="USER"／admittedAtNanos>0。
+        malformedRestoreRecreationProbe { it[1] = listOf(0L, 0L) }
     }
 
     // ── resetEpoch（「重設語音辨識」世代）：重設後，重設前 launch 的 rc 永遠不可達 ─────────────
@@ -3036,7 +3219,7 @@ class ChatScreenVoiceLaunchTest {
     // registry）後，全新 CHAT entry 一律從 epoch 0 起算、以相同 key 重新註冊（"stt-slot0-0"），
     // 依 androidx registerKey 早退重用同一 requestCode——使舊辨識的晚到 RESULT_OK 被投遞進新
     // entry 的 callback，prefill 舊逐字稿覆寫新草稿並提早結算新閘。此節的鑰匙是 entry-scoped
-    // screenId（per-entry 隨機 UUID，rememberSaveable），key 推導為 "stt-<screenId>-slotN-<epoch>"：
+    // screenId（複合 SttLaunchState 快照欄位，重建還原同一 entry），key 推導為 "stt-<screenId>-slotN-<epoch>"：
     // 同一 entry 的 recreation 沿用原 key 可收回有效結果；新 entry 絕不重用已銷毀 entry 的
     // outstanding rc→key；重設仍以 epoch 斷開舊 callback。
 

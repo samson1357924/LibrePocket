@@ -1,8 +1,5 @@
 package dev.librepocket.agent.ui.chat
 
-import androidx.compose.runtime.mutableIntStateOf
-import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.saveable.SaverScope
 import java.util.UUID
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -16,8 +13,10 @@ import org.junit.Test
  * (pure JVM, no Android).
  *
  * The saver restores the per-slot launch identity + arbiter watermark snapshot across
- * Activity recreation. Restore is fail-closed: any malformed bundle content must yield null
- * (so `rememberSaveable` falls back to [SttLaunchState.fresh]), never a half-trusted snapshot.
+ * Activity recreation. [restoreSttLaunchState] is fail-closed: any malformed bundle content
+ * must yield null; [SttLaunchStateSaver] wraps it and mints a fresh composite (new UUID)
+ * instead of returning null — never a half-trusted snapshot, never a null-valued
+ * MutableState at the `rememberSaveable` boundary.
  */
 class SttLaunchStateTest {
 
@@ -28,12 +27,16 @@ class SttLaunchStateTest {
         return restoreSttLaunchState(saved as List<Any?>)
     }
 
+    private val TEST_SCREEN_ID = "123e4567-e89b-42d3-a456-426655440000"
+
     private val populated = SttLaunchState(
         slotBusy = listOf(true, false),
         slotGen = listOf(3L, 0L),
         admitGeneration = 3L,
         inFlightName = "INITIAL",
         admittedAtNanos = 123_456L,
+        screenId = TEST_SCREEN_ID,
+        resetEpoch = 3,
     )
 
     @Test
@@ -44,18 +47,26 @@ class SttLaunchStateTest {
         assertEquals(0L, fresh.admitGeneration)
         assertNull(fresh.inFlightName)
         assertEquals(0L, fresh.admittedAtNanos)
+        assertEquals(0, fresh.resetEpoch)
+        assertEquals(36, fresh.screenId.length)
+        assertTrue(runCatching { UUID.fromString(fresh.screenId) }.isSuccess)
     }
 
     @Test
     fun `saver round trip preserves all fields`() {
-        val restored = restore(save(populated))
+        val saved = save(populated)
+        assertEquals(7, saved.size)
+        assertEquals(TEST_SCREEN_ID, saved[5])
+        assertEquals(3, saved[6])
+        val restored = restore(saved)
         assertEquals(populated, restored)
     }
 
     @Test
     fun `saver round trip preserves fresh state`() {
-        val restored = restore(save(SttLaunchState.fresh()))
-        assertEquals(SttLaunchState.fresh(), restored)
+        val fresh = SttLaunchState.fresh()
+        val restored = restore(save(fresh))
+        assertEquals(fresh, restored)
     }
 
     @Test
@@ -66,6 +77,8 @@ class SttLaunchStateTest {
             admitGeneration = 7L,
             inFlightName = null,
             admittedAtNanos = 0L,
+            screenId = TEST_SCREEN_ID,
+            resetEpoch = 2,
         )
         val restored = restore(save(paused))
         assertEquals(paused, restored)
@@ -139,9 +152,45 @@ class SttLaunchStateTest {
     }
 
     @Test
+    fun `restore returns null on malformed screenId`() {
+        val base = save(populated)
+        // Wrong type.
+        assertNull(restore(base.toMutableList().also { it[5] = 42 }))
+        assertNull(restore(base.toMutableList().also { it[5] = null }))
+        // Not 36 chars.
+        assertNull(restore(base.toMutableList().also { it[5] = "" }))
+        assertNull(restore(base.toMutableList().also { it[5] = "123e4567-e89b-42d3-a456-42665544000" }))
+        assertNull(restore(base.toMutableList().also { it[5] = "123e4567-e89b-42d3-a456-4266554400000" }))
+        // 36 chars but not a UUID (hex validation fails).
+        assertNull(restore(base.toMutableList().also { it[5] = "zzzzzzzz-zzzz-zzzz-zzzz-zzzzzzzzzzzz" }))
+    }
+
+    @Test
+    fun `restore returns null on malformed resetEpoch`() {
+        val base = save(populated)
+        assertNull(restore(base.toMutableList().also { it[6] = -1 }))
+        assertNull(restore(base.toMutableList().also { it[6] = 3L })) // Long, not Int
+        assertNull(restore(base.toMutableList().also { it[6] = "3" }))
+        assertNull(restore(base.toMutableList().also { it[6] = null }))
+    }
+
+    @Test
     fun `restore accepts zero generation and zero admittedAtNanos`() {
-        val restored = restore(listOf(listOf(false, false), listOf(0L, 0L), 0L, null, 0L))
-        assertEquals(SttLaunchState.fresh(), restored)
+        val restored = restore(
+            listOf(listOf(false, false), listOf(0L, 0L), 0L, null, 0L, TEST_SCREEN_ID, 0),
+        )
+        assertEquals(
+            SttLaunchState(
+                slotBusy = listOf(false, false),
+                slotGen = listOf(0L, 0L),
+                admitGeneration = 0L,
+                inFlightName = null,
+                admittedAtNanos = 0L,
+                screenId = TEST_SCREEN_ID,
+                resetEpoch = 0,
+            ),
+            restored,
+        )
     }
 
     @Test
@@ -155,6 +204,8 @@ class SttLaunchStateTest {
             admitGeneration = 3L,
             inFlightName = "INITIAL",
             admittedAtNanos = 123_456L,
+            screenId = TEST_SCREEN_ID,
+            resetEpoch = 4,
         )
         assertEquals(consistent, restore(save(consistent)))
         // Also consistent: slot0 holds gen 3 from an earlier admit, slot1 holds gen 5, watermark 5.
@@ -164,6 +215,8 @@ class SttLaunchStateTest {
             admitGeneration = 5L,
             inFlightName = "USER",
             admittedAtNanos = 999_000L,
+            screenId = TEST_SCREEN_ID,
+            resetEpoch = 5,
         )
         assertEquals(twoAdmits, restore(save(twoAdmits)))
     }
@@ -192,7 +245,7 @@ class SttLaunchStateTest {
     fun `restore returns null when inFlightName is set with zero watermark`() {
         // Isolate this rule: a fresh-shaped snapshot (all slots free) so the watermark>=gen
         // rule cannot mask it — only the inFlight-without-generation rule can fire.
-        assertNull(restore(listOf(listOf(false, false), listOf(0L, 0L), 0L, "INITIAL", 5L)))
+        assertNull(restore(listOf(listOf(false, false), listOf(0L, 0L), 0L, "INITIAL", 5L, TEST_SCREEN_ID, 0)))
     }
 
     @Test
@@ -223,48 +276,50 @@ class SttLaunchStateTest {
     @Test
     fun `restore returns null when inFlightName is set but all slots are free`() {
         // Production invariant: a named in-flight arm must hold at least one reserved slot.
-        assertNull(restore(listOf(listOf(false, false), listOf(0L, 0L), 4L, "INITIAL", 5L)))
+        assertNull(restore(listOf(listOf(false, false), listOf(0L, 0L), 4L, "INITIAL", 5L, TEST_SCREEN_ID, 0)))
         // At least one busy slot satisfies the invariant.
-        assertNotNull(restore(listOf(listOf(true, false), listOf(3L, 0L), 4L, "INITIAL", 5L)))
-    }
-
-    private val testSaverScope = object : SaverScope {
-        override fun canBeSaved(value: Any): Boolean = true
+        assertNotNull(restore(listOf(listOf(true, false), listOf(3L, 0L), 4L, "INITIAL", 5L, TEST_SCREEN_ID, 0)))
     }
 
     @Test
-    fun `ResetEpochSaver restore negative resets to zero, positive passes through, save round-trips`() {
-        assertEquals(0, ResetEpochSaver.restore(-1)?.intValue)
-        assertEquals(5, ResetEpochSaver.restore(5)?.intValue)
-        val saved = with(ResetEpochSaver) { testSaverScope.save(mutableIntStateOf(7)) }
-        assertEquals(7, saved)
+    fun `saver fallback is non-null and fresh`() {
+        // 腐化快照：slotBusy size==1 → inner restore 回 null → Saver 必須 fail-closed 回 fresh
+        // composite（永不回 null；rememberSaveable 首讀即 NPE 的回歸釘住）。
+        val corrupt = save(populated).toMutableList().also { it[0] = listOf(true) }
+        val restored = SttLaunchStateSaver.restore(corrupt)
+        assertNotNull("saver restore must fail closed to a fresh composite, never null", restored)
+        assertEquals(listOf(false, false), restored!!.slotBusy)
+        assertEquals(listOf(0L, 0L), restored.slotGen)
+        assertEquals(0L, restored.admitGeneration)
+        assertNull(restored.inFlightName)
+        assertEquals(0L, restored.admittedAtNanos)
+        assertEquals(0, restored.resetEpoch)
+        assertEquals(36, restored.screenId.length)
+        assertTrue(runCatching { UUID.fromString(restored.screenId) }.isSuccess)
+        assertTrue(restored.screenId != populated.screenId)
     }
 
     @Test
-    fun screenIdSaver_roundTrip_validUuidRestored() {
-        val uuid = "123e4567-e89b-42d3-a456-426655440000"
-        val saved = with(ScreenIdSaver) { testSaverScope.save(mutableStateOf(uuid)) }
-        assertEquals(uuid, saved)
-        val restored = ScreenIdSaver.restore(saved!!) ?: error("restored must not be null")
-        assertEquals(uuid, restored.value)
+    fun `legacy 5-element bundle falls back to fresh`() {
+        // 舊 5 元素 bundle（issue 前格式）：inner restore 回 null → Saver 回 fresh composite。
+        val legacy = listOf(listOf(true, false), listOf(3L, 0L), 3L, "INITIAL", 123_456L)
+        val restored = SttLaunchStateSaver.restore(legacy)
+        assertNotNull("saver restore must fail closed to a fresh composite, never null", restored)
+        assertEquals(listOf(false, false), restored!!.slotBusy)
+        assertEquals(listOf(0L, 0L), restored.slotGen)
+        assertEquals(0L, restored.admitGeneration)
+        assertNull(restored.inFlightName)
+        assertEquals(0L, restored.admittedAtNanos)
+        assertEquals(0, restored.resetEpoch)
+        assertEquals(36, restored.screenId.length)
+        assertTrue(runCatching { UUID.fromString(restored.screenId) }.isSuccess)
+        assertTrue(restored.screenId != populated.screenId)
     }
 
     @Test
-    fun screenIdSaver_corruptRestore_yieldsFreshUnmatchableUuid() {
-        listOf("garbage", 123, null).forEach { corrupt ->
-            val restored = restoreScreenId(corrupt)
-            assertEquals(36, restored.value.length)
-            assertTrue(runCatching { UUID.fromString(restored.value) }.isSuccess)
-            assertTrue(restored.value != "garbage")
-        }
-        // 同一顆腐化值經 saver 本身的 restore 入口也 fail-closed（非空值；null 沒入口但同走 restoreScreenId）。
-        assertEquals(36, (ScreenIdSaver.restore(123) ?: error("restored must not be null")).value.length)
-        // 36 字元但非合法 UUID 的字串同樣 fail-closed 發 fresh UUID。
-        val invalid36 = "zzzzzzzz-zzzz-zzzz-zzzz-zzzzzzzzzzzz"
-        assertEquals(36, invalid36.length)
-        val restored = restoreScreenId(invalid36)
-        assertTrue(runCatching { UUID.fromString(restored.value) }.isSuccess)
-        assertTrue(restored.value != invalid36)
+    fun `valid restore preserves identity`() {
+        // GUARD：合法 snapshot 經 saver 還原仍原樣（composite atomicity 不改變合法路徑）。
+        assertEquals(populated, SttLaunchStateSaver.restore(save(populated)))
     }
 
     @Test

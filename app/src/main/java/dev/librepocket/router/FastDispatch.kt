@@ -122,8 +122,10 @@ import kotlin.coroutines.coroutineContext
  * Device E2E: PENDING — no device in this environment; coverage is JVM-only
  * (`FastDispatchTest` with fake backends). The wired/verified flips wait for
  * the E2E PR.
+ *
+ * INTERNAL / UNWIRED EXECUTION PATH — not reachable from production composition; wiring requires the tool.exec ALLOW-only policy + immutable confirmation snapshots + Room audit + device E2E (see docs/CAPABILITY_MATRIX.md §啟用前置). Do not add callers outside this file without a separate security review.
  */
-class FastDispatcher(
+internal class FastDispatcher(
     executors: Map<String, FastToolExecutor> = emptyMap(),
     private val lookup: (String) -> ToolDef? = { ToolRegistry.find(it) },
 ) {
@@ -306,7 +308,9 @@ class FastDispatcher(
 
     /**
      * One-call fast lane: route the intent text, then dispatch the decision.
-     * Convenience for tests and future callers; carries no extra semantics
+     * Convenience for tests and WIRED-WHEN-READY callers only; records-only
+     * builds must not call it in production paths; wiring PR = security
+     * review. Carries no extra semantics
      * beyond [FastRouter.decide] + [dispatch] with the same [ctx].
      *
      * The SAME [ctx] snapshot is passed to both decide and dispatch, so the
@@ -351,7 +355,7 @@ class FastDispatcher(
 }
 
 /** One fast-lane attempt: the routing decision plus its dispatch outcome. */
-data class FastLaneResult(
+internal data class FastLaneResult(
     val decision: RouteDecision,
     val outcome: FastDispatchOutcome,
 )
@@ -367,7 +371,7 @@ data class FastLaneResult(
  * never rides [FastDispatchOutcome.Executed].
  * Executed carries bounded callId and NO executor denyCode.
  */
-data class FastExecResult(
+internal data class FastExecResult(
     val toolName: String,
     val callId: String,
     val resultJson: String,
@@ -379,7 +383,7 @@ data class FastExecResult(
  * Dispatch outcome: executed exactly once, or skipped. A skip is NOT
  * necessarily effect-free — see [FastDispatchOutcome.Skipped.attempted].
  */
-sealed interface FastDispatchOutcome {
+internal sealed interface FastDispatchOutcome {
     /**
      * Executed exactly once. The carried [FastExecResult.callId] is the
      * SAME bounded form used by the receipt channel (redact → ≤cap
@@ -431,7 +435,7 @@ sealed interface FastDispatchOutcome {
  * [FastDispatcher] — a caller-side [CancellationException] propagates; a
  * `withTimeout` expiry maps to a `TIMEOUT` skip, not a cancel.
  */
-interface FastToolExecutor {
+internal interface FastToolExecutor {
     val toolName: String
     suspend fun execute(call: ToolCall, ctx: ProjectionContext): FastExecResult
 }
@@ -512,7 +516,7 @@ interface FastToolExecutor {
  * (modulo the slice's extra `clockMillis`, the tool echo rule, and key
  * order) by `SymbolReceiptParityTest` — do not fork the shared helpers.
  */
-class LspSymbolsExecutor(
+internal class LspSymbolsExecutor(
     private val backend: LspTools.Backend = LspTools.StubBackend,
 ) : FastToolExecutor {
     override val toolName: String = LspTools.SYMBOLS_NAME

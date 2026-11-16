@@ -33,6 +33,7 @@
 | B9 | 骨幹測試門禁 | P1–P3 測試策略 | `ProviderAdapterTest / TranscriptRedactorTest / CapabilityProjectionTest / ChatBudgetTest / FastRouterDecisionTest / SystemIntentMappingTest / PrivilegeGateTest / SlowBudgetTest / ArbitrationTest / SteeringSemanticsTest / PauseResumeTest` 全綠；AndroidWorld `smoke_chat_stop.py` + `slow_checkout_demo.py`（2 基準 App，含暫停恢復 + steering + 超限轉指引）通過 |
 
 > 註：上表 `ARCH §5/§6/§8/§9` 等編號指歷史 ARCH 草案章節（`ca5a666` 重寫前），現行 `docs/ARCHITECTURE.md` 已改為非編號 `Current/Target/Proposed` 節；對應目標語義以現行 `Target` 節與 `docs/specs/P1_SPEC.md` 為準。
+> 啟用前置：before any non-test FastDispatcher caller: fresh ctxSupplier + fresh tool.exec ALLOW-only policy + immutable confirmation snapshot + Room audit + device E2E。
 
 ### 1.2 骨幹非目標（明確不做）
 

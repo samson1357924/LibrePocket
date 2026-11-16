@@ -921,7 +921,11 @@ class WebExtractD4Test {
         assertEquals(2, http.calls.get())
     }
 
-    @Test fun leaderIoFailurePropagatesFailedToFollowersAndBypassesCache() = runBlocking {
+    @Test fun leaderIoFailureFollowerReElectsGetsOwnFailedAndBypassesCache() = runBlocking {
+        // （Round-5 P2#2 語義更新：non-Ok 一律不跨上下文共享——follower 不再
+        // 經單飛 await() 繼承 leader 的 Failed，而是 skipJoinForDeferred＋有界
+        // 重選舉、以自己的 binding 重 fetch 出自己的 Failed(TRANSPORT)。
+        // Failed 仍不寫快取：final assert 的 next 呼叫重打 upstream，calls==3。）
         val dns = publicDns("example.com")
         val http = FakeExtract {
             delay(100)
@@ -936,16 +940,17 @@ class WebExtractD4Test {
         delay(150)
         val leaderOut = withTimeout(5_000) { leader.await() }
         val followerOut = withTimeout(5_000) { follower.await() }
-        // handler IOException → FetchOut.Fail(TRANSPORT)：leader 正常完成 Failed，
-        // follower 經單飛 await() 收到同一 Failed（而非 CANCELLED）。
+        // handler IOException → FetchOut.Fail(TRANSPORT)：leader 正常完成 Failed；
+        // follower 不繼承 non-Ok（Round-5）→ 有界重選舉後自行 fetch 出同值 Failed
+        // （TRANSPORT），而非 CANCELLED、亦非 leader 的結果物件。
         for ((label, out) in listOf("leader" to leaderOut, "follower" to followerOut)) {
             assertTrue("$label expected Failed, got $out", out is WebExtractOutcome.Failed)
             assertEquals(WebExtract.DETAIL_TRANSPORT, (out as WebExtractOutcome.Failed).detail)
         }
-        // Failed 不寫快取：下一輪必重打 upstream
+        // Failed 不寫快取：下一輪必重打 upstream（leader＋follower＋next＝3 次上游）
         val next = withTimeout(5_000) { svc.extract("https://example.com/ioerr", resolver = dns) }
         assertTrue(next is WebExtractOutcome.Failed)
-        assertEquals(2, http.calls.get())
+        assertEquals(3, http.calls.get())
     }
 
     @Test fun preflightTimeoutMapsToFailedTimeoutNoUpstream() = runBlocking {
@@ -2646,10 +2651,9 @@ class WebExtractD4Test {
                 parsed.content.snippet.contains("var x=1"),
             )
         }
-        // ---- 恰閉合之 style end-tag（含 VT／FF 等 ASCII 空白）→ CSS 本體絕不得出現 ----
+        // ---- 恰閉合之 style end-tag（含 FF 等 ASCII 空白）→ CSS 本體絕不得出現 ----
         val acceptedStyleEndTags = listOf(
             "</style \n\r >",
-            "</style\u000B>", // VT（vertical tab）：ASCII 空白 → 恰閉合
             "</style\u000C>", // FF（form feed）：ASCII 空白 → 恰閉合
             "</STYLE \t >", // 大小寫混合
         )
@@ -2694,6 +2698,38 @@ class WebExtractD4Test {
                 parsed.content.snippet.contains("AFTER"),
             )
         }
+        // ---- VT（U+000B）非 WHATWG ASCII 空白：`</script\u000B>`／`</style\u000B>` 不視為閉合 → 剝至 EOF（fail-closed）----
+        // （reviewer round-5 P2#1；此斷言為「修復」——先前此測試釘選 VT 為合法閉合，與 WHATWG 衝突。）
+        val vtRejected = listOf(
+            "</script\u000B>" to "var VTSECRET=1;",
+            "</style\u000B>" to ".a{color:red}/*VT_CSS_SECRET*/",
+            // Round-5 Finding 3（security gate hardening）：VT 後接 `/` 或 whitespace，
+            // 兩者皆必拒絕（剝至 EOF）——boundary 檢查線於 WS-skip 與單一可選 `/` 之前。
+            "</script\u000B/>" to "var VTSECRET=1;",
+            "</style\u000B\t>" to ".a{color:red}/*VT_CSS_SECRET*/",
+        )
+        for ((endTag, body) in vtRejected) {
+            val isStyle = endTag.startsWith("</style")
+            val doc = if (isStyle)
+                "<p>BEFORE</p><style>$body$endTag<p>AFTER</p>"
+            else
+                "<p>BEFORE</p><script>$body$endTag<p>AFTER</p>"
+            val parsed = parseHtml(doc, "https://example.com/")
+            assertTrue("parseHtml 應成功，got null（endTag=[$endTag]）", parsed != null)
+            assertEquals(
+                "endTag=[$endTag] 不視為閉合 → 剝至 EOF，snippet 應僅剩『BEFORE』",
+                "BEFORE",
+                parsed!!.content.snippet,
+            )
+            assertFalse(
+                "payload 絕不得出現（endTag=[$endTag]），got ${parsed.content.snippet}",
+                parsed.content.snippet.contains(body),
+            )
+            assertFalse(
+                "AFTER 絕不得出現（endTag=[$endTag]），got ${parsed.content.snippet}",
+                parsed.content.snippet.contains("AFTER"),
+            )
+        }
         // ---- 殘缺 end-tag 於輸入結尾（無 `>`）→ 不構成閉合 → 剝至 EOF ----
         val truncatedEndTags = listOf(
             "</script   ", // 尾隨空白後即 EOF（無 `>`）
@@ -2713,6 +2749,75 @@ class WebExtractD4Test {
                 parsed.content.snippet.contains("var x=1"),
             )
         }
+    }
+
+    // WHATWG counterexample（reviewer round-5 P2#1）：U+000B 非 ASCII 空白 →
+    // `</script\u000B>` 非閉合；HIDDEN_B 留在 script 元素內直到真正的 `</script>`。
+    @Test fun scriptStyleU000BTwoCloseHiddenContentNotExposed() = runBlocking {
+        val scriptDoc =
+            "<p>BEFORE</p><script type=\"application/json\">HIDDEN_A</script\u000B>HIDDEN_B</script><p>AFTER</p>"
+        val parsed = parseHtml(scriptDoc, "https://example.com/")
+        assertTrue("parseHtml 應成功，got null", parsed != null)
+        assertEquals("BEFORE AFTER", parsed!!.content.snippet)
+        assertFalse(
+            "HIDDEN_A 絕不得出現，got ${parsed.content.snippet}",
+            parsed.content.snippet.contains("HIDDEN_A"),
+        )
+        assertFalse(
+            "HIDDEN_B 絕不得出現，got ${parsed.content.snippet}",
+            parsed.content.snippet.contains("HIDDEN_B"),
+        )
+        val styleDoc =
+            "<p>BEFORE</p><style>CSS_HIDDEN_A</style\u000B>CSS_HIDDEN_B</style><p>AFTER</p>"
+        val parsedStyle = parseHtml(styleDoc, "https://example.com/")
+        assertTrue("parseHtml 應成功，got null", parsedStyle != null)
+        assertEquals("BEFORE AFTER", parsedStyle!!.content.snippet)
+        assertFalse(
+            "CSS_HIDDEN_A 絕不得出現，got ${parsedStyle.content.snippet}",
+            parsedStyle.content.snippet.contains("CSS_HIDDEN_A"),
+        )
+        assertFalse(
+            "CSS_HIDDEN_B 絕不得出現，got ${parsedStyle.content.snippet}",
+            parsedStyle.content.snippet.contains("CSS_HIDDEN_B"),
+        )
+        // 服務級：envelope 亦不得攜 HIDDEN 標記（snippet 之外的結構不得帶入）。
+        val http = FakeExtract(
+            handler = { _ -> okResp(scriptDoc) },
+        )
+        val svc = WebExtractService(http)
+        val ok = svc.extract("https://example.com/d4-vt", resolver = publicDns("example.com"))
+        assertTrue("extract 應 Ok，got $ok", ok is WebExtractOutcome.Ok)
+        val envelope = (ok as WebExtractOutcome.Ok).envelope
+        assertFalse(
+            "HIDDEN_A 絕不得進入 envelope",
+            envelope.contains("HIDDEN_A"),
+        )
+        assertFalse(
+            "HIDDEN_B 絕不得進入 envelope",
+            envelope.contains("HIDDEN_B"),
+        )
+        assertTrue(
+            "AFTER 可見（envelope）",
+            envelope.contains("AFTER"),
+        )
+    }
+
+    // Round-5 Finding 1（決策：WHATWG 忠實；見 parseHtml KDoc）：`<script\u000B>` 於
+    // tag name 之後接 U+000B → 非 tag-open → body 依 WHATWG tag-name state
+    // error-recovery 保留為可見文本（hidden 仍在 envelope 內未信任文本中，fence 不變）。
+    // （end-tag 一側仍 over-strip fail-closed；此決策不適用 end-tag。）
+    @Test fun scriptU000BStartTagBodyVisiblePerWHATWG() = runBlocking {
+        val doc = "<p>BEFORE</p><script\u000B>HIDDEN</script><p>AFTER</p>"
+        val parsed = parseHtml(doc, "https://example.com/")
+        assertTrue("parseHtml 應成功，got null", parsed != null)
+        assertTrue(
+            "<script\\u000B> 非 tag-open → HIDDEN 依 WHATWG 可見，got ${parsed!!.content.snippet}",
+            parsed.content.snippet.contains("HIDDEN"),
+        )
+        assertFalse(
+            "cleanField 須剝除 Cc（\u000B），snippet 斷不應含原始 VT",
+            parsed.content.snippet.contains('\u000B'),
+        )
     }
 
     // B4 — unterminated 開始標籤內嵌之 `</script …>` 絕不構成停點（Phase A fail-closed 決定）：
@@ -3454,6 +3559,103 @@ class WebExtractD4Test {
         assertEquals(NetworkDenyCode.METADATA_ADDRESS_BLOCKED, u.denyCode)
         assertEquals("METADATA_ADDRESS_BLOCKED", u.detail)
         assertEquals("leader(2: x 302＋hop-Y .41)＋follower x refetch(1)＝3 次上游（B hop-Y 於 upstream 前被拒）", 3, http.calls.get())
+    }
+
+    // Round-5 P2#2：leader 於 hop-Y 政策閘被拒（metadata）→ follower 不得繼承該拒絕；
+    // follower 以自己的 resolver（y→203.0.113.42，allowed）重選舉後應取得自己的 Ok TENANT_B。
+    @Test fun leaderDeniedFollowerAllowedRedirectHopY() = runBlocking {
+        val dnsA = fakeDns(
+            "x.example.com" to listOf("10.0.0.30"),
+            "y.example.net" to listOf("169.254.169.254"),
+        )
+        val dnsB = fakeDns(
+            "x.example.com" to listOf("10.0.0.30"),
+            "y.example.net" to listOf("203.0.113.42"),
+        )
+        val release = CompletableDeferred<Unit>()
+        val http = FakeExtract(
+            pinnedHandler = { url, pinned ->
+                when {
+                    url == "https://x.example.com/start" ->
+                        release.await().let { WebExtractRawResponse(302, ByteArray(0), mapOf("Location" to "https://y.example.net/secret")) }
+                    pinned.any { it.hostAddress == "203.0.113.42" } -> okResp(html(body = "TENANT_B data"))
+                    else -> okResp(html(body = "UNEXPECTED_MARKER"))
+                }
+            },
+            handler = { okResp(html(body = "UNREACHABLE_MARKER")) },
+        )
+        val svc = WebExtractService(http)
+        val optIn = EndpointNetworkOptIn(NetworkEgressPolicy.ALLOW_PRIVATE_DNS)
+        val url = "https://x.example.com/start"
+        val leader = async { svc.extract(url, optIn = optIn, resolver = dnsA) }
+        withTimeout(5_000) { while (http.calls.get() < 1) delay(1) }
+        val follower = async { svc.extract(url, optIn = optIn, resolver = dnsB) }
+        // Q5(b) best-effort barrier：follower 須於 leader 完成前登記為 joiner；hop-Y 閘為同步前置
+        // （DNS 為 blocking）無可注入 suspension point——兩種交錯（先 join 再重選舉／自主重選舉）
+        // 皆收斂至相同斷言（follower 自取 TENANT_B、calls==3），故斷言不依賴 barrier 精確度。
+        delay(150)
+        release.complete(Unit)
+        val leaderOut = withTimeout(5_000) { leader.await() }
+        val followerOut = withTimeout(5_000) { follower.await() }
+        // Leader：hop-0 fetched（302）→ hop-Y 閘（dnsA y→169.254.169.254）於 HTTP 之前 fail-closed。
+        val u = leaderOut as WebExtractOutcome.Unavailable
+        assertEquals(NetworkDenyCode.METADATA_ADDRESS_BLOCKED, u.denyCode)
+        assertEquals("METADATA_ADDRESS_BLOCKED", u.detail)
+        // Follower：以自己的 resolver 重選舉 → hop-Y allowed → 取得自己的 Ok TENANT_B；
+        // 絕不繼承 leader 的 METADATA 拒絕。
+        val f = followerOut as WebExtractOutcome.Ok
+        assertTrue(
+            "follower 必須取得自己的 TENANT_B，不得繼承 leader 拒絕，got ${f.content.snippet}",
+            f.content.snippet.contains("TENANT_B"),
+        )
+        assertFalse(
+            "follower 絕不得見 TENANT_A/UNEXPECTED_MARKER，got ${f.content.snippet}",
+            f.content.snippet.contains("UNEXPECTED_MARKER"),
+        )
+        // leader hop-0(1)＋follower hop-0(2)＋follower hop-Y(3)＝3
+        assertEquals(3, http.calls.get())
+    }
+
+    // Round-5 P2#2 控制組：兩 resolver 皆把 y 指向受阻 metadata → follower 以自己的
+    // 評估得到相同拒絕碼（拒絕歸因於評估者自身，非繼承 leader 的物件；不生 UNREACHABLE）。
+    @Test fun leaderDeniedFollowerSameBindingDeniedIdentically() = runBlocking {
+        val dnsA = fakeDns(
+            "x.example.com" to listOf("10.0.0.30"),
+            "y.example.net" to listOf("169.254.169.254"),
+        )
+        val dnsB = fakeDns(
+            "x.example.com" to listOf("10.0.0.30"),
+            "y.example.net" to listOf("169.254.169.254"),
+        )
+        val release = CompletableDeferred<Unit>()
+        val http = FakeExtract(
+            pinnedHandler = { url, pinned ->
+                when {
+                    url == "https://x.example.com/start" ->
+                        release.await().let { WebExtractRawResponse(302, ByteArray(0), mapOf("Location" to "https://y.example.net/secret")) }
+                    else -> okResp(html(body = "UNEXPECTED_MARKER"))
+                }
+            },
+            handler = { okResp(html(body = "UNREACHABLE_MARKER")) },
+        )
+        val svc = WebExtractService(http)
+        val optIn = EndpointNetworkOptIn(NetworkEgressPolicy.ALLOW_PRIVATE_DNS)
+        val url = "https://x.example.com/start"
+        val leader = async { svc.extract(url, optIn = optIn, resolver = dnsA) }
+        withTimeout(5_000) { while (http.calls.get() < 1) delay(1) }
+        val follower = async { svc.extract(url, optIn = optIn, resolver = dnsB) }
+        // 控制組註解：判別點為下方 calls==2（follower 於 hop-Y 閘前被各自擋下、
+        // 各自走完自己的評估），非 denyCode（兩案皆 METADATA_ADDRESS_BLOCKED，
+        // 僅憑碼值無法區分「自評估之拒」與「繼承物件」；coding-change 前亦會拿到同碼）。
+        delay(150)
+        release.complete(Unit)
+        val leaderOut = withTimeout(5_000) { leader.await() }
+        val followerOut = withTimeout(5_000) { follower.await() }
+        val uA = leaderOut as WebExtractOutcome.Unavailable
+        val uB = followerOut as WebExtractOutcome.Unavailable
+        assertEquals(NetworkDenyCode.METADATA_ADDRESS_BLOCKED, uA.denyCode)
+        assertEquals(NetworkDenyCode.METADATA_ADDRESS_BLOCKED, uB.denyCode)
+        assertEquals("leader hop-0＋follower hop-0＝2 次上游（雙方皆於 hop-Y 閘前拒）", 2, http.calls.get())
     }
 
     // P2#3（exact-output fixtures）：comment／引號屬性／裸 `<` 之 parseHtml snippet 精確輸出。

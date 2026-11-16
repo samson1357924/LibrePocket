@@ -856,10 +856,11 @@ class FastRouter(
          *   `什麼是符號`、`為什麼要用符號`、`符號是什麼`、`符號的意思`、
          *   `符號有哪些種類`、bare `symbols`、`What is a symbol?`、`Explain symbols`
          *   （無命令式准入 ⇒ 不進 symbol 模板；否定閘不介入）。
-         * - `查 find 符號`/`查 search 符號` 等：EN lookup 動詞在 cue 位置
-         *   （Step A，句首錨定）為剝離詞；Stage-8.3 起殘餘 `符號` 為 EN-delimited
-         *   verbatim identifier（Step C carve-out）⇒ FAST `符號`，不再 clarify
-         *   （原 clarify pin 翻轉，見 extraction KDoc Step C carve-out）；
+         * - `查 find 符號`/`查 search 符號` 等（stage-9.2 起）：CJK-leading 語句先讀
+         *   CJK 語法——尾綴 cue 剝去後 `find`/`search` 為合法 verbatim 識別字
+         *   ⇒ FAST `find`／`search`（stage-8.3 的 EN-delimited `符號` verbatim 解讀
+         *   已被 CJK-preferred 兩階段取代——三支 stage-8.3 pin 翻轉，見 extraction
+         *   KDoc 與 FastDispatchTest pins）；
          *   非 cue 位置的動詞不再剝離（見 extraction KDoc）。
          */
         private val NEGATION_HINTS = listOf(
@@ -1125,7 +1126,8 @@ class FastRouter(
         }
 
         /**
-         * B3 symbol-query extraction (#19 stage-6.3, positional cue grammar):
+         * B3 symbol-query extraction (#19 stage-6.3, positional cue grammar;
+         * #19 B3 stage-9.2 兩階段 CJK-preferred-fallback):
          * remainder extraction for the symbol template. The pipeline is
          * **cue-position only** — it strips exactly what is anchored at
          * position 0 (openers, one leading EN keyword cue, the leading-EN
@@ -1134,7 +1136,34 @@ class FastRouter(
          * is ever rewritten: a remainder that does not reduce to a single,
          * allow-listed, L/N-anchored token is REJECTED (extraction fails ⇒
          * NEED_CLARIFICATION) — never silently rewritten into a different
-         * query and executed. Steps, in application (code) order:
+         * query and executed.
+         *
+         * Two-phase extraction (stage-9.2, Re-review #9 A2): when a CJK opener
+         * （SYMBOL_OPENER_CJK）actually leads the utterance, the post-opener
+         * remainder is FIRST parsed by the CJK branch alone (suffix-cue peel +
+         * both ambiguity guards + Step-B′ EN connectives + Step D edge trim —
+         * NO EN cue machine) via the shared
+         * [finishSymbolQueryExtraction] helper. A non-empty result returns
+         * immediately; an empty CJK pass (or no CJK opener at all) falls through
+         * to the EN pipeline below, whose own identical guards reproduce any
+         * CJK-branch rejection. Both phases share [finishSymbolQueryExtraction],
+         * so the CJK and EN post-opener paths cannot drift on Steps C–E.
+         * CJK-opener consumption sets neither enDelimited nor the
+         * `symbols?`-cue budget; EN cue/verb/CMD consumption sets both.
+         * Cue budget (stage-9.2): a `symbols?` cue consumed by Step A CMD is
+         * counted, and Step B — the other cue consumer — RUNS AT MOST ONCE
+         * TOTAL per utterance (skipped entirely once CMD spent the budget);
+         * Step A CMD itself still consumes at most once. Without the budget a
+         * legal `Symbol(s)` identifier was destroyed (`find symbol symbol` /
+         * `symbols symbols` mapped to 空 ⇒ 澄清 — stage-9.2, Re-review #9 A2).
+         * `查 Symbol 符號` → FAST `Symbol`、`查 symbols 符號` → FAST
+         * `symbols`、`查 find 符號` → FAST `find`（三支 stage-8.3 pin 翻轉，
+         * EN 動詞/ cue 形字詞被 CJK 語境繫結為識別字 verbatim——READ-only 查詢、
+         * 不改寫；CJK-leading 語句一律先讀 CJK 語法）；`find symbol symbol` ⇒
+         * FAST `symbol`、`symbols symbols` ⇒ FAST `symbols`、
+         * `find symbol Foo` ⇒ FAST `Foo`、`查 Symbol Foo` ⇒ FAST `Foo`、
+         * `查 Foo符號 符號` 仍澄清（兩分支皆先守衛 fail-closed）。
+         * Steps, in application (code) order:
          *
          * Step A — anchored openers (each at most once, start-anchored):
          *   EN: `^(?:please[\s,]+)?(?:find|search|lookup|locate)\b[\s,]*`
@@ -1150,15 +1179,25 @@ class FastRouter(
          *       + optional 一下;
          *   command form A: `^symbols?\b[\s]*` — `symbols Foo` → `Foo`.
          *   Applied sequentially (CJK → EN → command), so `查 find 符號`
-         *   reduces to `符號` (EN-delimited — executes verbatim, stage-8.3;
-         *   see the Step C carve-out below).
+         *   reduces to `find 符號` and the CJK-preferred phase (stage-9.2)
+         *   peels the suffix cue ⇒ FAST `find` (see the two-phase note above;
+         *   EN 動詞形字詞於 CJK 語境為識別字 verbatim).
+         *   #19 B3 stage-9.2 — EN-started utterances bind the verb/cue shape
+         *   as the identifier the same way when no CJK opener leads:
+         *   `find symbol symbol` / `symbols symbols` ⇒ FAST `symbol` /
+         *   `symbols`（cue budget 1：Step A CMD 已耗，Step B 跳過）。
          * Step B — ONE leading EN `symbol(s)` cue (`^symbols?\b[\s,]*`,
          *   IGNORE_CASE, word-anchored), stripped at most once:
          *   `symbols Foo` → `Foo`, `Symbol Foo.` → `Foo.`,
-         *   `find symbol named Foo` → `named Foo`. Carries the EN keyword
+         *   (stage-9.2：Step A CMD 已耗 cue budget ⇒ Step B 跳過，殘餘
+         *   `named Foo` 由 Step B′ 剝 `named ` ⇒ FAST `Foo`；修前 Step B 本就
+         *   不匹配 `named …`，B′ 同樣剝離——行為逐位元不變). Carries the EN keyword
          *   semantics for "symbol named X". Nothing later in the remainder
          *   is touched (never a global `\bsymbols?\b` delete —
          *   `查 Foo.symbols 符號` keeps `Foo.symbols` verbatim).
+         *   #19 B3 stage-9.2 — Step B RUNS AT MOST ONCE TOTAL per utterance:
+         *   when Step A CMD consumed a `symbols?` cue, Step B is skipped
+         *   outright (cue budget of 1 already spent by `symbols?`).
          * Step C — peel at most ONE trailing CJK keyword-SUFFIX cue,
          *   END-anchored, then apply the ambiguity guard (stage-7.3, A3;
          *   EN-delimited 殘餘不進本步驟——見下方 carve-out):
@@ -1170,9 +1209,13 @@ class FastRouter(
          *   守衛（pre-Step-B′／post-Step-D）不適用；僅限單一 token
          *   （空白 ⇒ Step E 澄清）。CJK 純分支（enDelimited=false，無任何 EN
          *   消費——`查 Foo符號 符號` 等）逐位元不變（維持雙 cue 澄清）；
-         *   混合 opener（CJK 消費後 EN 消費，如 `查 symbols 符號符號`）援用
-         *   本 verbatim 規則 ⇒ FAST `符號符號`。CJK「有尾綴 cue 明確資料」敘述
-         *   僅適用於未經 EN 消費之 CJK 殘餘。
+         *   #19 B3 stage-9.2 — 兩階段改寫後，「CJK opener 後接 EN 消費」的
+         *   混合形態改走 CJK-preferred 優先：CJK 階段先解析（剝尾綴 cue、雙守衛），
+         *   失敗（空白/守衛拒絕，如 `查 symbols 符號符號` → 守衛拒 ⇒ 空）才落到
+         *   EN pipeline；此時 EN 消費（SYMBOL_OPENER_CMD `symbols `）即設
+         *   enDelimited + cue budget（Step B 跳過），Step C 不剝離 ⇒ FAST `符號符號`。
+         *   CJK「有尾綴 cue 明確資料」敘述僅適用於未經 EN 消費之 CJK 殘餘；
+         *   EN 消費發生於 CJK 階段失敗後的 EN fallback，而非 CJK 階段本身。
          *   例：`symbols Foo符號`／`find symbol Foo符號`／`search symbols Foo符號`
          *   → FAST `Foo符號`；`symbols 符號`（目標名「符號」）→ FAST `符號`；
          *   `查 symbols Foo符號`（混合 opener）→ FAST `Foo符號`；
@@ -1381,8 +1424,9 @@ class FastRouter(
          *   劃定之 identifier——glued cue 原樣保留為查詢字串 `符號符號`；
          *   歧義守衛不適用、不剝離）。Accepted verbatim-preservation rule,
          *   READ-only、有界單 token LSP query。「verbatim」適用於所有 enDelimited=true 形態
-         *   （含 CJK opener 後接 EN 消費之混合 opener——`查 symbols 符號符號`
-         *   ⇒ FAST `符號符號`）；enDelimited=false 之 CJK 分支不援用本規則。
+         *   （stage-9.2 起：含 CJK opener 後 CJK 階段失敗、於 EN fallback 消費 EN
+         *   command form 之混合 opener——`查 symbols 符號符號` ⇒ FAST `符號符號`）；
+         *   enDelimited=false 之 CJK 分支不援用本規則。
          *   前緣剝離殘餘：`symbols ？符號` → Step D 剝 `？` → FAST `符號`
          *   （en-delimited，歧義守衛不適用；L/N 錨點仍由 Step E 把關）。
          *   前導 colon 之互動（stage-8.4）：leading `::` 一律原樣保留 verbatim，
@@ -1429,6 +1473,10 @@ class FastRouter(
         // leading EN `symbol(s)` cue, word-anchored, stripped at most once
         // (e.g. `symbols Foo` → `Foo`, `Symbol Foo.` → `Foo.`); it never
         // touches anything later in the remainder.
+        // #19 B3 stage-9.2 (Re-review #9 A2) — Step B runs AT MOST ONCE TOTAL
+        // per utterance: skipped entirely when Step A CMD already consumed a
+        // `symbols?` cue (cue budget of 1 spent). Step A CMD consumes at most
+        // once as well.
         private val SYMBOL_LEADING_SYMBOLS = Regex("^symbols?\\b[\\s,]*", RegexOption.IGNORE_CASE)
         // #19 B3 stage-7.3 (A3) — Step C: trailing CJK keyword-suffix cue,
         // END-anchored. ONE suffix cue is peeled; if the remainder STILL ends with a
@@ -1500,8 +1548,43 @@ class FastRouter(
             return cp <= 0x7E && SYMBOL_ALLOWED_PUNCT.indexOf(cp.toChar()) >= 0
         }
 
+        /**
+         * #19 B3 stage-9.2 (Re-review #9 A2, [P2]) — two-phase extraction,
+         * CJK-preferred with EN fallback. A CJK opener
+         * （SYMBOL_OPENER_CJK）leading the utterance means the utterance is CJK
+         * grammar: the post-opener remainder is first parsed by the CJK branch
+         * ONLY (suffix-cue peel + both ambiguity guards + Step-B′ EN connectives
+         * + Step D edge trim — NO EN cue machine). If that yields a non-empty
+         * query it is returned; only an empty CJK pass (or no CJK opener at
+         * all) falls through to the EN pipeline below.
+         *
+         * CJK-pass examples: `查 Symbol 符號` → peel → FAST `Symbol`；
+         * `查 symbols 符號` → peel → FAST `symbols`；`查 find 符號` → peel →
+         * FAST `find`；`查 Foo符號` → FAST `Foo`；`查 Symbol Foo` → 無尾綴 cue
+         * ⇒ 不剝（Step E 拒絕空白）⇒ CJK pass 空 ⇒ EN pipeline：
+         * SYMBOL_OPENER_CMD 消費 `Symbol `（cue 記帳）⇒ Step B 跳過 ⇒ FAST `Foo`。
+         * `查 Foo符號 符號` — CJK ambiguity guard（peel 後殘餘仍匹配尾綴 cue）
+         * FAILS ⇒ CJK pass 回傳 "" ⇒ EN pipeline：CJK 消費後 EN 各步無消費、
+         * enDelimited=false ⇒ 同一守衛再度 FAIL ⇒ NEED_CLARIFICATION（絕不執行）。
+         */
         private fun extractSymbolQuery(text: String): String {
-            var s = text.trim()
+            val trimmed = text.trim()
+            // #19 B3 stage-9.2 — Phase 1: CJK-preferred pass (only when a CJK
+            // opener actually leads). CJK-opener consumption does NOT set
+            // enDelimited and does NOT consume an EN `symbols?` cue — the CJK
+            // branch bypasses the whole Step A-EN/CMD/Step-B machine.
+            val cjkMatch = SYMBOL_OPENER_CJK.find(trimmed)
+            if (cjkMatch != null && cjkMatch.range.first == 0) {
+                val cjkRemainder = trimmed.substring(cjkMatch.range.last + 1).trim()
+                val cjkQuery = finishSymbolQueryExtraction(cjkRemainder, enDelimited = false)
+                if (cjkQuery.isNotEmpty()) return cjkQuery
+                // Empty CJK pass (whitespace-bearing remainder, an ambiguity
+                // guard rejection, …) ⇒ fall through to the EN pipeline, which
+                // re-consumes the same CJK opener and runs the full A/B machine.
+                // The EN path's own guards reproduce any CJK-branch rejection —
+                // never silently trading the CJK result for an execution.
+            }
+            var s = trimmed
             // #19 B3 stage-8.3 — EN-delimited 殘餘旗標：EN opener（SYMBOL_OPENER_EN）、
             // command-form EN opener（SYMBOL_OPENER_CMD）或前導 EN `symbol(s)` cue
             // （SYMBOL_LEADING_SYMBOLS）任一**實際改動字串** ⇒ enDelimited = true。
@@ -1510,22 +1593,53 @@ class FastRouter(
             // 為 EN grammar 劃定之 verbatim identifier（僅單一 token；空白 ⇒ Step E 澄清）。
             var enDelimited = false
             // Step A — anchored openers (each applied at most once a position;
-            // sequential so `查 find 符號` reduces to `符號`).
+            // sequential; with a CJK opener leading, the stage-9.2 CJK-preferred
+            // pass above already had first claim on the remainder).
             s = SYMBOL_OPENER_CJK.replaceFirst(s, "").trim()
             var afterEn = SYMBOL_OPENER_EN.replaceFirst(s, "")
             if (afterEn != s) enDelimited = true
             s = afterEn.trim()
             var afterCmd = SYMBOL_OPENER_CMD.replaceFirst(s, "")
-            if (afterCmd != s) enDelimited = true
+            // #19 B3 stage-9.2 (Re-review #9 A2) — cue budget: a `symbols?` cue
+            // consumed by Step A CMD is counted here. Step B (the OTHER cue
+            // consumer) RUNS AT MOST ONCE TOTAL per utterance — it is skipped
+            // entirely when Step A CMD already consumed a cue. Step A CMD itself
+            // still consumes at most once. This stops `extractSymbolQuery`
+            // eating the cue twice (`find symbol symbol` → `symbol symbol` →
+            // `symbol`（CMD）⇒ B 跳過 ⇒ `symbol`，而非空 ⇒ 澄清).
+            var symbolCueConsumed = false
+            if (afterCmd != s) {
+                enDelimited = true
+                symbolCueConsumed = true
+            }
             s = afterCmd.trim()
             // Step B — ONE leading EN `symbol(s)` cue (word-anchored, at most
             // once). No other part of the remainder is touched here.
-            var afterLead = SYMBOL_LEADING_SYMBOLS.replaceFirst(s, "")
-            if (afterLead != s) enDelimited = true
+            // #19 B3 stage-9.2 — skipped when Step A CMD consumed the cue
+            // (cue budget of 1 per utterance spent).
+            val afterLead = if (symbolCueConsumed) s else {
+                val lead = SYMBOL_LEADING_SYMBOLS.replaceFirst(s, "")
+                if (lead != s) enDelimited = true
+                lead
+            }
             s = afterLead.trim()
-            // Step C — peel at most ONE trailing CJK keyword suffix (end-anchored).
-            // EN-delimited 殘餘（enDelimited == true）一律跳過：EN grammar 劃定之
-            // identifier 原樣保留——不剝離、不守衛（stage-8.3 carve-out）。
+            return finishSymbolQueryExtraction(s, enDelimited)
+        }
+
+        /**
+         * Steps C–E shared verbatim by BOTH extraction phases (#19 B3 stage-9.2):
+         * the CJK-preferred pass and the EN pipeline tail. Sharing this helper is
+         * the INTENTIONAL alignment mechanism between the two branches — the two
+         * paths cannot drift here without both reviewers' attention. Do not
+         * loosen the guards per branch; the enDelimited flag is the ONLY
+         * branch-switch, exactly as in the pre-9.2 single pipeline.
+         *
+         * Step C — peel at most ONE trailing CJK keyword suffix (end-anchored).
+         * EN-delimited 殘餘（enDelimited == true）一律跳過：EN grammar 劃定之
+         * identifier 原樣保留——不剝離、不守衛（stage-8.3 carve-out）。
+         */
+        private fun finishSymbolQueryExtraction(s0: String, enDelimited: Boolean): String {
+            var s = s0
             if (!enDelimited) {
                 s = SYMBOL_CJK_KEYWORD_SUFFIX.replaceFirst(s, "").trim()
                 // Ambiguity guard (stage-7.3, A3): after the ONE peel, if the remainder

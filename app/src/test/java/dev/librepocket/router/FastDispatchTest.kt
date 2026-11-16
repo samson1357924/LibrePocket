@@ -444,11 +444,14 @@ class FastDispatchTest {
         }
         // 單複數 `find symbols` 剝空 ⇒ 澄清（且不會 Fast）。
         // #19 B3 stage-8.3（Re-review #8 A2）：`查 find 符號` 的 EN-delimited 殘餘
-        // `符號` 原樣保留 ⇒ FAST `符號`（原 NEED_CLARIFICATION pin 翻轉——
-        // Step A SYMBOL_OPENER_EN 消費即設 enDelimited；見 enCommandDelimitedIdentifiersAreVerbatim）。
+        // `符號` 原樣保留 ⇒ FAST `符號`（原 NEED_CLARIFICATION pin 翻轉）。
+        // #19 B3 stage-9.2（Re-review #9 A2, [P2]）：兩階段 CJK-preferred-fallback 後，
+        // CJK-leading 語句先讀 CJK 語法——尾綴 cue 剝去後 `find` 為合法 verbatim
+        // 識別字 ⇒ FAST `find`（stage-8.3 pin 再度翻轉；EN-started 之 `find symbol symbol`
+        // ⇒ FAST `symbol` 見 enCueBudgetAndCjkPreferredExtractionPinned）。
         val bareSymbol = decide("查 find 符號")
         assertEquals(RouteKind.FAST, bareSymbol.route)
-        assertEquals("符號", Json.parseToJsonElement(bareSymbol.toolCall!!.argumentsJson).jsonObject["query"]!!.jsonPrimitive.content)
+        assertEquals("find", Json.parseToJsonElement(bareSymbol.toolCall!!.argumentsJson).jsonObject["query"]!!.jsonPrimitive.content)
         val bare = decide("find symbols")
         assertEquals(RouteKind.DENIED, bare.route)
         assertEquals(DenyReason.NEED_CLARIFICATION, bare.reasonCode)
@@ -1562,9 +1565,13 @@ class FastDispatchTest {
             // 見 positionalCueGrammarPins。「查 要 用 符號」殘餘 `要 用` 含空白 ⇒ 澄清。
             "查 要 用 符號",
             // #19 B3 stage-8.3（Re-review #8 A2）：`查 Symbol 符號`／`查 symbols 符號`
-            // 的 EN command-form 消費（SYMBOL_OPENER_CMD）即設 enDelimited ⇒ Step C 不剝離，
-            // EN-delimited 殘餘 `符號` 原樣保留 ⇒ FAST `符號`（原 NEED_CLARIFICATION pin 翻轉）；
-            // 不再在此釘為澄清——見 enCommandDelimitedIdentifiersAreVerbatim 的翻轉 pin。
+            // 曾翻轉為 FAST `符號`（EN command-form 劃定 verbatim 殘餘）；
+            // #19 B3 stage-9.2（Re-review #9 A2, [P2]）兩階段 CJK-preferred-fallback 後——
+            // CJK-leading 語句先讀 CJK 語法，尾綴 cue 剝去後 `Symbol`/`symbols` 為合法
+            // verbatim 識別字 ⇒ FAST `Symbol`／FAST `symbols`／`find`/`lookup`/`locate`
+            // （五支 stage-8.3 pin 再度翻轉——三支規格明列、lookup/locate 為同族同根機制，
+            // 見 enCueBudgetAndCjkPreferredExtractionPinned；皆為 READ-only 有界 token）。
+            // 不再在此釘為澄清——亦不再同樣釘於 enCommandDelimitedIdentifiersAreVerbatim。
             // astral-only remainder：hasSymbolQuery 以 BMP char 錨定，𠮷 的兩個
             // surrogate units 皆非 letter/digit ⇒ 澄清（fail-safe，已記錄；
             // hasSymbolQuery 保持 BMP-based，不改動該 predicate）。
@@ -3210,13 +3217,15 @@ class FastDispatchTest {
             // Step D（CJK/EN 共用之邊緣類）剝離尾端 `。`；en-delimited 分支同樣適用。
             "symbols Foo符號。" to "Foo符號",
             // #19 B3 stage-8.3 翻轉 pins（原 NEED_CLARIFICATION——EN 劃定語意校正）：
-            // EN-delimited 殘餘 `符號` 原樣保留 ⇒ FAST `符號`。
-            "查 find 符號" to "符號",
-            "查 Symbol 符號" to "符號",
-            "查 symbols 符號" to "符號",
-            // 對稱翻轉 pins（與 find/Symbol 同族）：
-            "查 lookup 符號" to "符號",
-            "查 locate 符號" to "符號",
+            // #19 B3 stage-9.2（Re-review #9 A2, [P2]）再度翻轉——CJK-leading 語句先讀
+            // CJK 語法：尾綴 cue 剝去後 `find`/`Symbol`/`symbols`/`lookup`/`locate` 皆為
+            // 合法 verbatim 識別字（READ-only 查詢、不改寫；CJK-leading 一律先讀 CJK 語法）。
+            "查 find 符號" to "find",
+            "查 Symbol 符號" to "Symbol",
+            "查 symbols 符號" to "symbols",
+            // 對稱翻轉 pins（與 find/Symbol 同族——stage-9.2 同一根機制）：
+            "查 lookup 符號" to "lookup",
+            "查 locate 符號" to "locate",
             // 前緣剝離殘餘（記錄已接受殘餘：Step D 去全形 `？` ⇒ verbatim `符號`）：
             "symbols ？符號" to "符號",
         )) {
@@ -3260,6 +3269,80 @@ class FastDispatchTest {
             assertFalse(text, result.outcome is FastDispatchOutcome.Executed)
             assertEquals(text, before, backend.invocations.get())
         }
+    }
+
+    // #19 B3 stage-9.2（Re-review #9 A2, [P2]）：EN `symbols?` cue 的兩次消費疊加導致
+    // 合法 `Symbol(s)` 識別字被摧毀（`find symbol symbol` → 空 ⇒ 澄清、`symbols symbols`
+    // → 空 ⇒ 澄清）。stage-9.2 修復：(a) cue budget——Step A CMD 消費一個 `symbols?`
+    // cue 即記帳，Step B（另一 cue 消費者）同一 utterance 最多執行一次（CMD 耗 budget
+    // ⇒ Step B 整體跳過；CMD 自身仍只消費一次）；(b) 兩階段 CJK-preferred-fallback——
+    // CJK opener 引領的語句先由 CJK 分支解析（尾綴 cue 剝離＋兩道歧義守衛＋Step-B′
+    // EN connectives＋Step D 邊緣剝離，無 EN cue machine），非空結果即返回；CJK 階段
+    // 失敗（空白/守衛拒絕）才落入 EN pipeline。CJK opener 消費本身不設 enDelimited、
+    // 不耗 cue budget；EN cue/verb/CMD 消費才設。CJK 階段與 EN pipeline 共用 Steps C–E
+    // （finishSymbolQueryExtraction），兩分支不可能漂移。
+    // 驗證期望（decide() 端到端，與 enCommandDelimitedIdentifiersAreVerbatim 同一
+    // double-assert 風格——decide FAST + toolName + query 精確等值 + decideAndDispatch
+    // 執行且 invocations +1、receipt body 回顯 `"name":"$query:example"`）：
+    //   `find symbol symbol` → FAST `symbol`（CMD 耗 budget，Step B 跳過）；
+    //   `symbols symbols`    → FAST `symbols`（同上）；
+    //   `find symbol Foo`    → FAST `Foo`；
+    //   `查 Foo符號`         → FAST `Foo`（CJK-preferred 尾綴 cue 剝離，不變保證）；
+    //   `查 Symbol Foo`      → FAST `Foo`（CJK 階段 Step E 拒空白 ⇒ EN fallback：
+    //                           CMD `Symbol ` 耗 budget ⇒ Step B 跳過 ⇒ `Foo`）。
+    // CJK 雙 cue 仍澄清（fail-closed）：`查 Foo符號 符號` — CJK ambiguity guard
+    //   （peel 後殘餘仍匹配尾綴 cue）拒絕 ⇒ CJK 階段空 ⇒ EN pipeline 同守衛再度拒絕
+    //   ⇒ NEED_CLARIFICATION（絕不執行）。
+    @Test fun enCueBudgetAndCjkPreferredExtractionPinned() = runBlocking {
+        val backend = CountingBackend()
+        val dispatcher = lspDispatcher(backend)
+        for ((text, expectedQuery) in listOf(
+            "find symbol symbol" to "symbol",
+            "symbols symbols" to "symbols",
+            "find symbol Foo" to "Foo",
+            // stage-9.2 不變保證 pin：CJK-preferred 分支 peel 尾綴 cue ⇒ `Foo`。
+            "查 Foo符號" to "Foo",
+            // CJK 階段失敗 ⇒ EN fallback 路徑 ⇒ `Foo`（記錄已接受殘餘：
+            // `Symbol` 與 `Foo` 間空白被 EN grammar 劃定）。
+            "查 Symbol Foo" to "Foo",
+        )) {
+            val d = decide(text)
+            assertEquals(text, RouteKind.FAST, d.route)
+            assertEquals(text, "lsp.symbols", d.toolCall?.toolName)
+            assertNotNull(text, d.toolCall)
+            assertEquals(
+                text,
+                expectedQuery,
+                Json.parseToJsonElement(d.toolCall!!.argumentsJson).jsonObject["query"]!!.jsonPrimitive.content,
+            )
+            val before = backend.invocations.get()
+            val result = dispatcher.decideAndDispatch(text, lspOn, sessionId = "s1", turnIndex = 1)
+            assertEquals(text, RouteKind.FAST, result.decision.route)
+            val executed = result.outcome as? FastDispatchOutcome.Executed
+            assertNotNull("$text must execute against the fake backend (got ${result.outcome})", executed)
+            assertEquals(text, before + 1, backend.invocations.get())
+            assertTrue(
+                "executed body must echo the identifier verbatim: ${executed!!.result.resultJson}",
+                executed.result.resultJson.contains("\"name\":\"$expectedQuery:example\""),
+            )
+        }
+        // CJK 雙 cue 仍澄清（fail-closed，絕不執行）：CJK ambiguity guard 先拒，
+        // EN pipeline 同守衛再度拒 ⇒ NEED_CLARIFICATION。
+        for (text in listOf(
+            "查 Foo符號 符號",
+        )) {
+            val d = decide(text)
+            assertEquals(text, RouteKind.DENIED, d.route)
+            assertEquals(text, DenyReason.NEED_CLARIFICATION, d.reasonCode)
+            assertNull(text, d.toolCall)
+            val before = backend.invocations.get()
+            val result = dispatcher.decideAndDispatch(text, lspOn, sessionId = "s1", turnIndex = 1)
+            assertEquals(text, RouteKind.DENIED, result.decision.route)
+            assertNull(text, result.decision.toolCall)
+            assertFalse(text, result.outcome is FastDispatchOutcome.Executed)
+            assertEquals(text, before, backend.invocations.get())
+        }
+        assertEquals(5, backend.invocations.get())
     }
 
     // #19 B3 stage-8.4（Re-review #8 A3）：C++ global-namespace 前綴 `::Foo` 是

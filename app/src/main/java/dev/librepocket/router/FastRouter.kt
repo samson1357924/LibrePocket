@@ -69,8 +69,12 @@ import java.util.concurrent.atomic.AtomicLong
  * approve/agree/consent/confirm/say/allow/release/permit/ok/ready/permission/
  * review 等詞幹（gerund 與過去式一併涵蓋）、wait for/until/till、hold on/off、
  * not yet、CJK 結構性條件句（等…（有界 possessor）同意、（後）再/才、只有…才等有界框架、
- * 以及 stage-9.1 arm H deferred-action nucleus `再|才`＋動作動詞核（做查跑說寫讀處理執行更新重啟處辦辦理）、
- * arm I conditional-framing nucleus 如果|假如|倘若|要是|的話，皆任意位置、不依賴 consent 動詞識別）等），
+ * 以及 stage-9.1 arm H deferred-action nucleus `再|才`＋動作動詞核（做查跑說寫讀處理執行更新重啟處辦辦理，
+ * stage-10.1 擴充 通知|告訴|通報|報告|匯報|彙報|回信|提醒，共 20 個）、
+ * arm I conditional-framing nucleus 如果|假如|倘若|要是|的話、
+ * 以及 stage-10.1 arm J wait/until＋completion nucleus 等|待|直到|直至…放行|結束|完成|完畢|通過|核准|批准|確認|同意|回覆|通知，
+ * 與 arm K bare temporal nucleus 明早|明晚|明天|明日|後天|后天|大後天|大后天|下週|下星期|下周|下下週|下下周|下個月|下个月|月底|年底|日後|日后|幾天後|几天后|過幾天|过几天|稍後|稍后|晚點|晚点|等下|待會|待会|待會兒|待会儿|回頭|回头，
+ * 皆任意位置、不依賴 consent 動詞識別）等），
  * 或任意教學/說明標記（命令式 opener + 教學標記否決：explain|teach|tutorial|
  * how-to|howto|mean|describe|demonstrate 等屈折形式，或 CJK 說明|説明|講解|
  * 讲解|介紹|介绍|討論|讨论|教程|方法（是）?|意思|名稱|名称|如何|怎麼|怎么|
@@ -131,6 +135,7 @@ import java.util.concurrent.atomic.AtomicLong
  *   動詞內 >16 插入仍為已知殘餘（見下節「未列示 consent 動詞」與「動詞內 >16 插入」，
  *   皆 READ-only／未接線）；stage-9.1 起 arm H/I 顆粒（`再|才`＋動作動詞核／如果|假如|倘若|要是|的話）
  *   於任意位置出現即否決，不受此框架形狀所限（deferred-action／conditional-framing 形態）；
+ *   stage-10.1 起 arm J/K 顆粒（wait/until＋completion-endpoint／裸時間顆粒）同樣任意位置即否決；
  *   未列 possessor 亦皆收（`等主管批准`／`等老闆同意`／`等經理核准`／
  *   `等董事會點頭`／`等董老闆批准`／長組織名如 `等安全審核委員會主席批准`／`等國家安全委員會批准`／
  *   9/12 位數字 `等123456789批准`／`等123456789012批准` 皆否決；`等我們同意`／`等你點頭` 仍匹配））＋ consent 動詞集
@@ -168,24 +173,50 @@ import java.util.concurrent.atomic.AtomicLong
  *   （如 `等資安/法務批准`／`等CISO/CEO同意`／`等資安 / 法務批准`／`等主管-法務批准`／`等資安_法務批准`）
  *   新帶來的否決即為 A1 修正目標形態本身；任何超出該形態的黏合識別字過度否決一律接受——
  *   方向固定為 fail-safe（從不執行），不得以「收回」此類輸入為名放寬 possessor 槽。
- * - arm H（deferred-action nucleus；stage-9.1；Re-review #9 A1 [P1]；任意位置，CJK）：`(?:再|才)(?:做|查|跑|說|寫|讀|處理|執行|更新|重啟|處辦|辦理)`
- *   ——文中任意位置出現 `再|才` ＋ 有界動作動詞核（12 個 Lo 動詞：做查跑說寫讀處理執行更新重啟處辦辦理）即否決；
+ * - arm H（deferred-action nucleus；stage-9.1；Re-review #9 A1 [P1]；任意位置，CJK）：`(?:再|才)(?:做|查|跑|說|寫|讀|處理|執行|更新|重啟|處辦|辦理|通知|告訴|通報|報告|匯報|彙報|回信|提醒)`
+ *   ——文中任意位置出現 `再|才` ＋ 有界動作動詞核（20 個 Lo 動詞：做查跑說寫讀處理執行更新重啟處辦辦理，
+ *   stage-10.1 新增 通知|告訴|通報（通知/告訴 系）與 報告|匯報|彙報（報告 系）、回信（回覆系）、提醒（提示系）八個延後動作動詞）即否決；
  *   不依賴 consent 動詞識別 ⇒ 未列示 consent 動詞亦無法繞過；`查Foo符號等審批再做`／`查Foo符號等授權再做`／
- *   `查Foo符號明天再做`／`查Foo符號等審批後再做` 皆否決（deny-by-admission；READ-only 亦從不執行）。
- *   動詞核為 common CJK action verbs 之有界集——不封閉宣稱：核外動詞（未列入此 12 個者）仍不匹配
+ *   `查Foo符號明天再做`／`查Foo符號等審批後再做`／`查Foo符號明天再通知我` 皆否決（deny-by-admission；READ-only 亦從不執行）。
+ *   動詞核為 common CJK action verbs 之有界集——不封閉宣稱：核外動詞（未列入此 20 個者）仍不匹配
  *   ⇒ fail-OPEN（open-world 殘餘，如實記錄，不宣稱封閉；見下節「未列示 consent 動詞」）。
  * - arm I（conditional-framing nucleus；stage-9.1；Re-review #9 A1 [P1]；任意位置，CJK）：`(?:如果|假如|倘若|要是|的話)`
  *   ——文中任意位置出現條件框架顆粒即否決；`查Foo符號如果我同意` 否決。`的話` over-deny 黏合識別字
  *   為 accepted fail-safe（記錄，不得「收回」）；arm I 同樣不依賴 consent 動詞識別。
- *   arm H/I 於准入檢查（[isAffirmativeSymbolCommand] 之 PERMISSION_CONDITIONAL_CLAUSE gate，raw/spaced/joined
+ * - arm J（wait/until + completion nucleus；stage-10.1；Re-review #10 A1 [P1]；任意位置，CJK）：`(?:等|待|直到|直至).{0,16}?(?:放行|結束|完成|完畢|通過|核准|批准|確認|同意|回覆|通知)`
+ *   ——文中任意位置出現 等|待|直到|直至 ＋ 有界 {0,16} 平坦缺口（`.` 單一有界量化、無巢狀量化、無災難性回溯）
+ *   ＋ 有名 completion-endpoint 集（放行|結束|完成|完畢|通過|核准|批准|確認|同意|回覆|通知，11 個）即否決；
+ *   `查Foo符號等我放行`／`查Foo符號等審核結束`／`查Foo符號直到審核結束`／`查Foo符號等我回覆` 皆否決
+ *   （deny-by-admission；READ-only 亦從不執行）；不依賴 consent 動詞識別。
+ *   過度否決記錄（accepted fail-safe, do not "fix"）：識別字本身含 等|待|直到|直至 × completion-endpoint
+ *   （如 `查 等就結束 符號`）一律 DENIED——黏合 CJK 識別字 vs 等待完成句無法僅憑語法分離
+ *   （與 arm H/I 同一接受類；識別字若不可查，使用者可改寫查詢）。
+ * - arm K（bare temporal nucleus；stage-10.1；Re-review #10 A1 [P1]；任意位置，CJK）：`(?:明早|明晚|明天|明日|後天|后天|大後天|大后天|下週|下星期|下周|下下週|下下周|下個月|下个月|月底|年底|日後|日后|幾天後|几天后|過幾天|过几天|稍後|稍后|晚點|晚点|等下|待會|待会|待會兒|待会儿|回頭|回头)`
+ *   ——文中任意位置出現裸時間顆粒（明早|明晚|明天|明日|後天|后天|大後天|大后天|下週|下星期|下周|下下週|下下周|下個月|下个月|月底|年底|日後|日后|幾天後|几天后|過幾天|过几天|稍後|稍后|晚點|晚点|等下|待會|待会|待會兒|待会儿|回頭|回头，34 個）即否決；
+ *   `查Foo符號明天再通知我`（同時命中臂 H `再通知`）／`查Foo符號稍後通知`／`查Foo符號明天再通ㅤ知我`
+ *   （U+3164 於 通/知 之間；stage-9.5 於子句探針先剝除 ⇒ 臂 H `再通知` 亦命中）皆否決
+ *   （deny-by-admission；READ-only 亦從不執行）。
+ *   過度否決記錄（accepted fail-safe, do not "fix"）：識別字本身含裸時間顆粒（如 `查 明日報表 符號`／`查 年底 符號`）一律 DENIED——
+ *   時間顆粒 vs 識別字無法僅憑語法分離（與 arm H/I/J 同一接受類；識別字若不可查，使用者可改寫查詢）。
+ *   EN 側（tomorrow／later 等）刻意不動、如實記錄（不宣稱 EN 封閉表）。
+ *   arm H/I/J/K 於准入檢查（[isAffirmativeSymbolCommand] 之 PERMISSION_CONDITIONAL_CLAUSE gate，raw/spaced/joined
  *   三探針聯集）落地，與其他 arm 同一 clause gate、同閘否決——非於 extraction。
- * - 已知殘餘（accepted, open-world fail-OPEN；Re-review #8 安全審計 M3；stage-9.1 收窄）：未列示 consent 動詞
+ * - 已知殘餘（accepted, open-world fail-OPEN；Re-review #8 安全審計 M3；stage-9.1 收窄；stage-10.1 再收窄）：未列示 consent 動詞
  *   （`審批`／`應允`／`承諾`／`認可`／`允許`／`授權`／`首肯`／`放行` 等近義詞族——列舉不盡，封閉清單不可能完備）
- *   且不含 arm H/I 顆粒（無 `再|才`＋有界動作動詞核、無 如果|假如|倘若|要是|的話）者，
+ *   且不含 arm H/I/J/K 顆粒（無 `再|才`＋有界動作動詞核、無 如果|假如|倘若|要是|的話、
+ *   無 等|待|直到|直至 × completion-endpoint、無裸時間顆粒）者，
  *   一律不匹配條件句框架 ⇒ 不成立 clause-gate 否決 ⇒ 落其餘閘；是 FAST 即執行（fail-OPEN——與
  *   前閘「過度否決 fail-safe」前提相反，如實記錄之方向）。stage-9.1 起，`查Foo符號等審批再做`／
  *   `查Foo符號等授權再做` 等形因 arm H（`再|才`＋動作動詞核）於准入檢查否決，不再 fail-OPEN；
- *   核外動詞殘餘（動作動詞之無窮類 ∉ 12 個核內動詞）仍 fail-OPEN，如實記錄、不宣稱封閉。目前唯一 executionReady 工具為 lsp.symbols，
+ *   stage-10.1 起，`查Foo符號等我放行`／`查Foo符號等審核結束`／`查Foo符號明天再通知我` 等形因
+ *   arm J/K（wait/until＋completion-endpoint／裸時間顆粒）於准入檢查否決，亦不再 fail-OPEN；
+ *   核外動詞/核外端點殘餘（動作動詞之無窮類 ∉ 20 個核內動詞；completion-endpoint 之無窮類 ∉ 11 個端點集，
+ *   如 `撤銷`／`掛起` 等核外端點）仍 fail-OPEN；核內有界缺口之超出亦然——
+ *   `等|待|直到|直至`＋>16 個單位缺口＋completion-endpoint（尤其 `放行`／`結束`／`完成`／`完畢`／`通過`／`通知`）
+ *   不匹配臂 J ⇒ fail-OPEN（記錄，不宣稱封閉；缺口上限 ≤16 為 mandated 形狀，見臂 J 註解）。
+ *   臂內顆粒對 M/Cf 類插入不敏感（如 `明\u0301天` 夾 combining mark ⇒ arm K 不命中 ⇒ fail-OPEN；
+ *   arm J 之 `.{0,16}?` 缺口為 M/Cf-tolerant，其餘臂 H/I/K 顆粒非）——fail-open 方向，對稱記錄、不宣稱封閉。
+ *   以上皆如實記錄、不宣稱封閉。目前唯一 executionReady 工具為 lsp.symbols，
  *   READ-only、未接線——以本 lane 現況（唯一 executionReady 為 READ-only、未接線）之實害為零；含 consent 動詞內 >16 插入者亦同（FLEX 上限 16，對稱 arm D′）。
  *   若本 lane 未來接線非 READ 工具，封閉 consent 動詞清單必須先重新審視——已規劃的補救方向為
  *   對 `等…` 框架加超集 deny-guard（open-world deny-by-default 之一致化），非逐一枚舉動詞。
@@ -522,13 +553,20 @@ class FastRouter(
         //       （INS＝`[\p{L}\p{N}._-$#@/():,;+=~]`）——`批A准再做`／`批_准`／`核1準` 等
         //       動詞內 1 插入字元亦否決（fail-safe）；插入 >16 字仍為殘餘（fail-OPEN，見 M3 節）；
         //       以及有界缺口 `只有.{0,8}才`／`只許.{0,8}才|只许.{0,8}才`／`只允.{0,8}才`（無裸名詞 CJK 匹配）；
-        //       H＝deferred-action nucleus（stage-9.1；Re-review #9 A1 [P1]；任意位置，CJK）：`(?:再|才)(?:做|查|跑|說|寫|讀|處理|執行|更新|重啟|處辦|辦理)`
-        //        ——文中任意位置出現 `再|才` ＋ 有界動作動詞核（12 個 Lo 動詞）即否決；不依賴 consent 動詞識別；
-        //       `查Foo符號等審批再做`／`查Foo符號等授權再做`／`查Foo符號明天再做`／`查Foo符號等審批後再做` 皆否決；
+        //       H＝deferred-action nucleus（stage-9.1；Re-review #9 A1 [P1]；任意位置，CJK）：`(?:再|才)(?:做|查|跑|說|寫|讀|處理|執行|更新|重啟|處辦|辦理|通知|告訴|通報|報告|匯報|彙報|回信|提醒)`
+        //        ——文中任意位置出現 `再|才` ＋ 有界動作動詞核（20 個 Lo 動詞：十二個 stage-9.1 核＋ stage-10.1 擴充 通知|告訴|通報|報告|匯報|彙報|回信|提醒）即否決；不依賴 consent 動詞識別；
+        //       `查Foo符號等審批再做`／`查Foo符號等授權再做`／`查Foo符號明天再做`／`查Foo符號等審批後再做`／`查Foo符號明天再通知我` 皆否決；
         //        動詞核為 common CJK action verbs 之有界集——不封閉宣稱：核外動詞仍 fail-OPEN（open-world 殘餘，如實記錄，見 M3 節）；
         //       I＝conditional-framing nucleus（stage-9.1；Re-review #9 A1 [P1]；任意位置，CJK）：`(?:如果|假如|倘若|要是|的話)`
         //        ——文中任意位置出現條件框架顆粒即否決；`查Foo符號如果我同意` 否決；`的話` over-deny 為接受之 fail-safe；
-        //        arm H/I 於准入檢查（isAffirmativeSymbolCommand 之 clause gate，raw/spaced/joined 三探針聯集）落地，非於 extraction；
+        //       J＝wait/until + completion nucleus（stage-10.1；Re-review #10 A1 [P1]；任意位置，CJK）：`(?:等|待|直到|直至).{0,16}?(?:放行|結束|完成|完畢|通過|核准|批准|確認|同意|回覆|通知)`
+        //        ——文中任意位置出現 等|待|直到|直至 ＋ 有界 {0,16} 平坦缺口（`.` 單一有界量化）＋ completion-endpoint 集（11 個：放行|結束|完成|完畢|通過|核准|批准|確認|同意|回覆|通知）即否決；
+        //       `查Foo符號等我放行`／`查Foo符號等審核結束`／`查Foo符號直到審核結束`／`查Foo符號等我回覆` 皆否決；
+        //        `.` 平坦 {0,16} 有界、無巢狀量化、無災難性回溯；over-deny（如 `查 等就結束 符號`）為接受之 fail-safe（記錄，不得「收回」）；
+        //       K＝bare temporal nucleus（stage-10.1；Re-review #10 A1 [P1]；任意位置，CJK）：`(?:明早|明晚|明天|明日|後天|后天|大後天|大后天|下週|下星期|下周|下下週|下下周|下個月|下个月|月底|年底|日後|日后|幾天後|几天后|過幾天|过几天|稍後|稍后|晚點|晚点|等下|待會|待会|待會兒|待会儿|回頭|回头)`
+        //        ——文中任意位置出現裸時間顆粒（34 個）即否決；`查Foo符號明天再通知我`／`查Foo符號稍後通知`／`查 明日報表 符號` 皆否決；
+        //        over-deny 為接受之 fail-safe（記錄，不得「收回」）；EN 側（tomorrow 等）刻意不動、如實記錄；
+        //        arm H/I/J/K 於准入檢查（isAffirmativeSymbolCommand 之 clause gate，raw/spaced/joined 三探針聯集）落地，非於 extraction；
         //       已知殘餘（accepted, frame-local）：`等` 與 consent 動詞之間的 possessor 超過 64 個單位
         //       不匹配 → fail-open（單 token 命令形 end-to-end FAST；帶空白則不執行）；
         //       插入 ≤16 字 L/N/了過＋必填再|才（arm D′）——`批准Ｄ再做` 等亦否決；
@@ -617,20 +655,37 @@ class FastRouter(
                 "|" + CONSENT_VERBS_CJK_FLEX + "[\\s，,.;；:：。、！？!?．‥…了過_]*(?:再|才)" +
                 "|" + CONSENT_VERBS_CJK_FLEX + "[\\p{L}\\p{N}了過\\s，,.;；:：。、！？!?．‥…_$#@/():,;+=~／＿-]{0,16}(?:再|才)" + // arm D′：FLEX 動詞＋CJK/ASCII/全形字母（NFKC 折）＋助詞＋識別字標點/空白（含 `／` U+FF0F／`＿` U+FF3F）插入於動詞與再|才之間（如 `批准Ｄ再做`/`同意白拿了再做`/`批准Ｄ_Ｄ再做`/`批准a-b再做`/`批准Ｄ/Ｄ再做`/`批准Ｄ／Ｄ再做`）——L/N/了過/標點/空白插入 ≤16 字、fail-safe 否決
                 // #19 B3 stage-9.1（Re-review #9 A1，[P1]）：arm H——deferred-action nucleus（任意位置，CJK）。
-                // 文中任意位置出現 `再|才` ＋ 有界動作動詞核（12 個 Lo 動詞：做查跑說寫讀處理執行更新重啟處辦辦理）
+                // 文中任意位置出現 `再|才` ＋ 有界動作動詞核（20 個 Lo 動詞：做查跑說寫讀處理執行更新重啟處辦辦理，
+                // ＋ stage-10.1 擴充 通知|告訴|通報|報告|匯報|彙報|回信|提醒——通知/告訴 系、報告 系、回信、提醒 四批延後動作動詞）
                 // 即否決（clause gate at admission）。`查Foo符號等審批再做`／`查Foo符號等授權再做`／`查Foo符號明天再做`／
-                // `查Foo符號等審批後再做` 皆否決（fail-safe direction；deny-by-admission，never FAST）。
+                // `查Foo符號等審批後再做`／`查Foo符號明天再通知我` 皆否決（fail-safe direction；deny-by-admission，never FAST）。
                 // 動詞核為 common CJK action verbs 之有界集——不封閉宣稱（非 open-world closure）：
-                // 核外動詞（未列入此 12 個者）仍不匹配 ⇒ fail-OPEN（open-world 殘餘，如實記錄；見 KDoc「未列示 consent 動詞」節）。
+                // 核外動詞（未列入此 20 個者）仍不匹配 ⇒ fail-OPEN（open-world 殘餘，如實記錄；見 KDoc「未列示 consent 動詞」節）。
                 // 【接受之 fail-safe 過度否決（記錄，不得「收回」）】：識別字本身含 再|才×動作動詞核（如 `查 再做 符號`／
-                // `查 再做一次 符號`／`查 才做 符號`／`查 再查 符號`／`查 授權再做 符號`）一律 DENIED——黏合 CJK 識別字 vs
+                // `查 再做一次 符號`／`查 才做 符號`／`查 再查 符號`／`查 授權再做 符號`／`查 再通知 符號`）一律 DENIED——黏合 CJK 識別字 vs
                 // 延後條件句無法僅憑語法分離（與 arm I `的話` 同一接受類；識別字若不可查，使用者可改寫查詢）。
-                "|(?:再|才)(?:做|查|跑|說|寫|讀|處理|執行|更新|重啟|處辦|辦理)" + // arm H：deferred-action nucleus（stage-9.1）——任意位置 CJK 再|才＋有界動作動詞核 ⇒ clause gate 否決（識別字含核者一律 DENIED，accepted fail-safe）
+                "|(?:再|才)(?:做|查|跑|說|寫|讀|處理|執行|更新|重啟|處辦|辦理|通知|告訴|通報|報告|匯報|彙報|回信|提醒)" + // arm H：deferred-action nucleus（stage-9.1；stage-10.1 動詞核擴充至 20 個 Lo 動詞）——任意位置 CJK 再|才＋有界動作動詞核 ⇒ clause gate 否決（識別字含核者一律 DENIED，accepted fail-safe）
                 // #19 B3 stage-9.1（Re-review #9 A1，[P1]）：arm I——conditional-framing nucleus（任意位置，CJK）。
                 // 文中任意位置出現條件框架顆粒（如果|假如|倘若|要是|的話）即否決（clause gate at admission）。
                 // `查Foo符號如果我同意` 否決。`的話` over-deny 黏合識別字為 accepted fail-safe（記錄，不得「收回」）。
-                // arm H/I 不依賴 consent 動詞識別，未列示 consent 動詞亦無法繞過。
+                // arm H/I/J/K 不依賴 consent 動詞識別，未列示 consent 動詞亦無法繞過。
                 "|(?:如果|假如|倘若|要是|的話)" + // arm I：conditional-framing nucleus（stage-9.1）——任意位置 CJK 條件框架顆粒 ⇒ clause gate 否決（`的話` over-deny 為接受之 fail-safe）
+                // #19 B3 stage-10.1（Re-review #10 A1，[P1]）：arm J——wait/until + completion nucleus（任意位置，CJK）。
+                // 文中任意位置出現 等|待|直到|直至 ＋ 有界 {0,16} 平坦缺口（`.` 單一有界量化、無巢狀量化、無災難性回溯）
+                // ＋ 有名 completion-endpoint 集（放行|結束|完成|完畢|通過|核准|批准|確認|同意|回覆|通知，11 個）即否決（clause gate at admission）。
+                // `查Foo符號等我放行`／`查Foo符號等審核結束`／`查Foo符號直到審核結束`／`查Foo符號等我回覆` 皆否決（deny-by-admission；READ-only 亦從不執行）。
+                // arm J 不依賴 consent 動詞識別，未列示 consent 動詞亦無法繞過。
+                // 【接受之 fail-safe 過度否決（記錄，不得「收回」）】：識別字本身含 等|待|直到|直至 × completion-endpoint（如 `查 等就結束 符號`）一律 DENIED——
+                // 黏合 CJK 識別字 vs 等待完成句無法僅憑語法分離（與 arm H/I 同一接受類；識別字若不可查，使用者可改寫查詢）。
+                "|(?:等|待|直到|直至).{0,16}?(?:放行|結束|完成|完畢|通過|核准|批准|確認|同意|回覆|通知)" + // arm J：wait/until + completion nucleus（stage-10.1；Re-review #10 A1 [P1]）——任意位置 CJK 等|待|直到|直至＋有界 {0,16} 缺口＋completion-endpoint ⇒ clause gate 否決（識別字含核者一律 DENIED，accepted fail-safe）
+                // #19 B3 stage-10.1（Re-review #10 A1，[P1]）：arm K——bare temporal nucleus（任意位置，CJK）。
+                // 文中任意位置出現裸時間顆粒（明早|明晚|明天|明日|後天|后天|大後天|大后天|下週|下星期|下周|下下週|下下周|下個月|下个月|月底|年底|日後|日后|幾天後|几天后|過幾天|过几天|稍後|稍后|晚點|晚点|等下|待會|待会|待會兒|待会儿|回頭|回头，34 個）即否決（clause gate at admission）。
+                // `查Foo符號明天再通知我`／`查Foo符號稍後通知`／`查 明日報表 符號` 皆否決（deny-by-admission；READ-only 亦從不執行）。
+                // （`查Foo符號明天再通知我` 同時命中 arm H `再通知`；`查Foo符號明天再通ㅤ知我`（U+3164 於 通/知 之間）由 stage-9.5 探針剝除 filler 後 arm H 亦命中——雙臂交集，fail-safe 方向不變。）
+                // 【接受之 fail-safe 過度否決（記錄，不得「收回」）】：識別字本身含裸時間顆粒（如 `查 明日報表 符號`／`查 年底 符號`）一律 DENIED——
+                // 時間顆粒 vs 識別字無法僅憑語法分離（與 arm H/I/J 同一接受類；識別字若不可查，使用者可改寫查詢）。
+                // EN 側（tomorrow／later 等）刻意不動、如實記錄（不宣稱 EN 封閉表）。arm K 不依賴 consent 動詞識別。
+                "|(?:明早|明晚|明天|明日|後天|后天|大後天|大后天|下週|下星期|下周|下下週|下下周|下個月|下个月|月底|年底|日後|日后|幾天後|几天后|過幾天|过几天|稍後|稍后|晚點|晚点|等下|待會|待会|待會兒|待会儿|回頭|回头)" + // arm K：bare temporal nucleus（stage-10.1；Re-review #10 A1 [P1]）——任意位置 CJK 裸時間顆粒 ⇒ clause gate 否決（識別字含核者一律 DENIED，accepted fail-safe）
                 "|只有.{0,8}才" +
                 "|只許.{0,8}才|只许.{0,8}才" +
                 "|只允.{0,8}才",

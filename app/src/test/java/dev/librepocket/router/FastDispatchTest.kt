@@ -3436,7 +3436,7 @@ class FastDispatchTest {
     }
 
     @Test fun enDelimitedClauseAndColonInteractionsArePinned() = runBlocking {
-        // #19 B3 stage-8.6（交互 pins；Re-review #8 release-gate required）＋stage-9.1（Re-review #9 A1 [P1]）：
+        // #19 B3 stage-8.6（交互 pins；Re-review #8 release-gate required）＋stage-9.1（Re-review #9 A1 [P1]）＋stage-10.1（Re-review #10 A1 [P1]）：
         // 釘住 EN-delimited verbatim carve-out（stage-8.3）× 尾綴/前導條件子句閘（stage-8.1）
         // × leading colon（stage-8.4）× SLOW 後備（stage-8.5）的跨階段交互——皆已實測無誤，
         // 僅缺 pin。准入判定在 raw 文本上跑 ⇒ enDelimited 不救 `…批准再做` 形態的子句 veto；
@@ -3446,13 +3446,16 @@ class FastDispatchTest {
         // （conditional-framing nucleus 如果|假如|倘若|要是|的話）於准入檢查（同一 PERMISSION_CONDITIONAL_CLAUSE
         // clause gate，raw/spaced/joined 三探針聯集）落地、任意位置即否決——不依賴 consent 動詞識別；
         // 未列示 consent 動詞（`審批`／`授權`…）不再是 fail-OPEN 捷徑（`…審批再做` 等已 flip 為 DENIED）。
-        // EN 側（`after i approve` 等）不變、not 觸動——本 stage 僅 CJK arm H/I。
+        // EN 側（`after i approve` 等）不變、not 觸動——本 stage 僅 CJK arm H/I；stage-10.1 僅 CJK arm J/K 與 arm H 動詞核擴充。
+        // stage-10.1（Re-review #10 A1 [P1]）：arm J（wait/until＋completion nucleus 等|待|直到|直至×放行|結束|完成|完畢|通過|核准|批准|確認|同意|回覆|通知）／
+        // arm K（bare temporal nucleus 明早|明晚|明天|明日|後天|后天|大後天|大后天|下週|下星期|下周|下下週|下下周|下個月|下个月|月底|年底|日後|日后|幾天後|几天后|過幾天|过几天|稍後|稍后|晚點|晚点|等下|待會|待会|待會兒|待会儿|回頭|回头，34 顆粒）／
+        // arm H 動詞核擴充至 20 個 Lo 動詞（＋通知|告訴|通報|報告|匯報|彙報|回信|提醒），皆任意位置、同一 PERMISSION_CONDITIONAL_CLAUSE clause gate。
         val backend = CountingBackend()
         val dispatcher = lspDispatcher(backend)
         // FAST 交互 pins（EN-delimited × 前導冒號；及識別字含 consent/授權 相鄰詞之既 FAST pins）：
         // EN 消費（opener 或 `symbols?` cue）⇒ verbatim（Step A/C/B 發生順序與 raw 一致）；
         // 識別字含 consent 顆粒者（如 `symbols 同意`／`symbols 批准`）仍 FAST——consent 顆粒本身
-        // 非否決依據（無 `再|才`＋動作動詞核、無 如果|假如|倘若|要是|的話）。
+        // 非否決依據（無 `再|才`＋動作動詞核、無 如果|假如|倘若|要是|的話、無 等|待|直到|直至×completion-endpoint、無裸時間顆粒）。
         // stage-8.7 之 FAST pins `查 Foo符號等審批再做`／`查Foo符號等授權再做` 自 stage-9.1 起 flip 為 DENIED
         // （arm H：`再做`——deferred action；見下方 DENIED 交互 pins）。
         // stage-9.3 之 FAST pins `symbols Foo::`／`查 symbols Foo::` 自「Foo」flip 為 `Foo::`
@@ -3465,6 +3468,10 @@ class FastDispatchTest {
             "查 symbols Foo::" to "Foo::",
             "symbols 同意" to "同意",
             "symbols 批准" to "批准",
+            // #19 B3 stage-10.1（Re-review #10 A1 [P1]）正向控制：識別字僅「長得像」延後/通知顆粒者仍 FAST——
+            // 無 再|才＋動作動詞核、無 等|待|直到|直至×completion-endpoint、無裸時間顆粒：
+            "查 通知 符號" to "通知",
+            "查 報告 符號" to "報告",
         )) {
             val d = decide(text)
             assertEquals(text, RouteKind.FAST, d.route)
@@ -3486,7 +3493,7 @@ class FastDispatchTest {
                 executed.result.resultJson.contains("\"name\":\"$expectedQuery:example\""),
             )
         }
-        // DENIED 交互 pins：raw text 命中條件子句閘（arm A/B/等/D′/H/I）⇒ 准入否決
+        // DENIED 交互 pins：raw text 命中條件子句閘（arm A/B/等/D′/H/I/J/K）⇒ 准入否決
         // （no-match DENIED；enDelimited/verbatim carve-out 救不了子句 veto）。
         // stage-9.1 翻轉釘（Re-review #9 A1 [P1]，fail-open 修復）：`查 Foo符號等審批再做`／
         // `查Foo符號等授權再做` 自 stage-8.7 FAST 移至 DENIED（arm H：`再|才`＋動作動詞核
@@ -3513,6 +3520,15 @@ class FastDispatchTest {
             "查Foo再做符號",
             "symbols 再佔再做",
             "查Foo符號等審批後再做",
+            // #19 B3 stage-10.1 新增 arm J/K 負向釘（Re-review #10 A1 [P1]，deny-by-admission）：
+            // arm J（wait/until＋completion-endpoint）／arm K（bare temporal nucleus）／arm H 動詞核擴充至 20 個：
+            "查Foo符號等我放行",
+            "查Foo符號等審核結束",
+            "查Foo符號明天再通知我",
+            "查Foo符號直到審核結束",
+            "查Foo符號等我回覆",
+            "查Foo符號稍後通知",
+            "查Foo符號明天再通ㅤ知我",   // arm H with U+3164 Hangul filler inside the nucleus（stage-9.5 探針剝除 filler 後 `再通知` 命中；亦命中 arm K `明天`）
         )) {
             val d = decide(text)
             assertEquals(text, RouteKind.DENIED, d.route)
@@ -3524,7 +3540,7 @@ class FastDispatchTest {
             assertFalse(text, result.outcome is FastDispatchOutcome.Executed)
             assertEquals(text, before, backend.invocations.get())
         }
-        assertEquals(7, backend.invocations.get())
+        assertEquals(9, backend.invocations.get())
     }
 }
 

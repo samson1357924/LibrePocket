@@ -2022,9 +2022,10 @@ class ChatScreenVoiceLaunchTest {
         ).assertCountEquals(0)
 
         // A late, pre-reset recognizer result on slot0 (gen1) is unattributable after the reset:
-        // it must not prefill the draft. (The re-occupied residual — slot reused post-reset before
-        // the old recognizer reports — is documented as accepted in resetVoiceSttCluster; it cannot
-        // be pinned here without production instrumentation.)
+        // it must not prefill the draft. (Pre-reset rc dispatch reaches an unregistered callback —
+        // the reset advances resetEpoch, which re-keys the launchers and disposes/unregisters the
+        // pre-reset ones, so the registry boundary discards the result before handleSttResult ever
+        // runs. Re-occupancy is pinned by resetEpoch_slotReoccupiedByNewLaunch_oldResultNeverPrefillsOrSettlesIt.)
         val lateResult = Intent().putStringArrayListExtra(
             RecognizerIntent.EXTRA_RESULTS,
             arrayListOf("pre-reset stale transcript"),
@@ -2407,6 +2408,621 @@ class ChatScreenVoiceLaunchTest {
         ).assertIsDisplayed()
         composeRule.onNodeWithText("重設語音辨識").assertIsDisplayed()
         assertEquals("", vm.input.value)
+        assertEquals(0, provider.streamCalls)
+    }
+
+    // ── resetEpoch（「重設語音辨識」世代）：重設後，重設前 launch 的 rc 永遠不可達 ─────────────
+    // 三段式 prologue（與 unresponsiveWedge_resetButton_... 相同）：voiceInputRequested=true 的
+    // INITIAL gen1 懸掛 slot0 → watchdog → mic B gen2 懸掛 slot1 → watchdog → mic（兩 slot 全忙）
+    // → unresponsive 橫幅 → 使用者 tap「重設語音辨識」→ mic → C gen3 slot0。
+    // 重設前的 launcher 於重組時被 DisposableEffect(slotKey) 的 onDispose 同步 unregister；其 rc→key
+    // 綁定雖保留（in-flight unregister 語義），callback 已移除——重設前 rc 的晚到結果在 registry 邊界
+    // 永不投遞（late result 停靠 pendingResults，鍵不再註冊），無法冒充重設後的 launch。
+
+    @Test
+    fun resetEpoch_slotReoccupiedByNewLaunch_oldResultNeverPrefillsOrSettlesIt() {
+        registerRecognitionService()
+        val provider = VoiceLaunchFakeProvider()
+        val vm = newVm(provider)
+        val registry = RecordingRegistry()
+        val owner = object : ActivityResultRegistryOwner {
+            override val activityResultRegistry: ActivityResultRegistry = registry
+        }
+        var now = 1_000_000_000L
+        val voiceRequested = MutableStateFlow(true)
+
+        composeRule.setContent {
+            val req by voiceRequested.collectAsState()
+            CompositionLocalProvider(
+                LocalActivityResultRegistryOwner provides owner,
+                LocalVoiceSttArbiterClock provides { now },
+            ) {
+                ChatScreen(
+                    padding = PaddingValues(0.dp),
+                    viewModel = vm,
+                    userSwitches = mapOf(VoiceTools.SWITCH_INPUT to true),
+                    voiceInputRequested = req,
+                    onVoiceInputConsumed = { voiceRequested.value = false },
+                    voiceSwitchesLoaded = true,
+                )
+            }
+        }
+        composeRule.waitForIdle()
+        assertEquals(1, registry.launchedIntents.size) // A INITIAL gen1 slot0, hangs
+
+        composeRule.runOnIdle { now += VoiceSttArbiter.RECOGNIZER_WATCHDOG_NANOS + 1_000L }
+        composeRule.onNodeWithContentDescription("語音輸入").performClick()
+        composeRule.waitForIdle()
+        assertEquals(2, registry.launchedIntents.size) // B USER gen2 slot1, hangs
+
+        composeRule.runOnIdle { now += VoiceSttArbiter.RECOGNIZER_WATCHDOG_NANOS + 1_000L }
+        composeRule.onNodeWithContentDescription("語音輸入").performClick()
+        composeRule.waitForIdle()
+        assertEquals(2, registry.launchedIntents.size) // both wedged → unresponsive
+        composeRule.onNodeWithText(
+            VoiceStt.fallbackMessage(DenyReason.NO_PRIVILEGE, VoiceStt.DETAIL_RECOGNIZER_UNRESPONSIVE),
+        ).assertIsDisplayed()
+
+        // Hard reset: pre-reset launchers are disposed/unregistered; unresponsive notice dismissed.
+        composeRule.onNodeWithText("重設語音辨識").performClick()
+        composeRule.waitForIdle()
+        composeRule.onAllNodesWithText(
+            VoiceStt.fallbackMessage(DenyReason.NO_PRIVILEGE, VoiceStt.DETAIL_RECOGNIZER_UNRESPONSIVE),
+        ).assertCountEquals(0)
+
+        // Mic → C admits (gen3) on the freed slot0. Its launch is a NEW registry key derived from
+        // the advanced resetEpoch, so its rc must differ from both pre-reset launches.
+        // (rc-distinctness is a canary pinning androidx-internal minting — rc uniqueness off occupied
+        // rcToKey entries — not a contract guarantee.)
+        composeRule.onNodeWithContentDescription("語音輸入").performClick()
+        composeRule.waitForIdle()
+        assertEquals(3, registry.launchedIntents.size)
+        val rcA = registry.launchedRequestCodes[0]
+        val rcB = registry.launchedRequestCodes[1]
+        val rcC = registry.launchedRequestCodes[2]
+        assertTrue(rcC != rcA)
+        assertTrue(rcC != rcB)
+
+        // A's late pre-reset result: undeliverable at the registry boundary — must not prefill
+        // and must not settle C's gate early. (The gate is probed indirectly here — no premature
+        // C prefill/settle; the direct probe lives in T3, resetEpoch_oldCancelAfterReoccupancy_….)
+        val staleResult = Intent().putStringArrayListExtra(
+            RecognizerIntent.EXTRA_RESULTS,
+            arrayListOf("pre-reset stale transcript"),
+        )
+        composeRule.runOnIdle {
+            registry.dispatchResult(rcA, ActivityResult(Activity.RESULT_OK, staleResult))
+        }
+        composeRule.waitForIdle()
+        assertEquals("", vm.input.value)
+        assertEquals(3, registry.launchedIntents.size)
+
+        // C's own result: fresh, prefills, and settles exactly its own launch.
+        val freshResult = Intent().putStringArrayListExtra(
+            RecognizerIntent.EXTRA_RESULTS,
+            arrayListOf("fresh"),
+        )
+        composeRule.runOnIdle {
+            registry.dispatchResult(rcC, ActivityResult(Activity.RESULT_OK, freshResult))
+        }
+        composeRule.waitForIdle()
+        assertEquals("fresh", vm.input.value)
+        assertEquals(0, provider.streamCalls)
+
+        // C's settle was exact: a subsequent mic tap launches again. (Clear the draft first — a
+        // non-blank draft hides the mic behind the send button.)
+        composeRule.runOnIdle { vm.onInputChange("") }
+        composeRule.waitForIdle()
+        composeRule.onNodeWithContentDescription("語音輸入").performClick()
+        composeRule.waitForIdle()
+        assertEquals(4, registry.launchedIntents.size)
+    }
+
+    @Test
+    fun resetEpoch_freshResultArrivesFirst_freshPrefillsThenStaleDropped() {
+        // GUARD — passes pre- and post-fix; pins ordering, not the F1 mechanism.
+        registerRecognitionService()
+        val provider = VoiceLaunchFakeProvider()
+        val vm = newVm(provider)
+        val registry = RecordingRegistry()
+        val owner = object : ActivityResultRegistryOwner {
+            override val activityResultRegistry: ActivityResultRegistry = registry
+        }
+        var now = 1_000_000_000L
+        val voiceRequested = MutableStateFlow(true)
+
+        composeRule.setContent {
+            val req by voiceRequested.collectAsState()
+            CompositionLocalProvider(
+                LocalActivityResultRegistryOwner provides owner,
+                LocalVoiceSttArbiterClock provides { now },
+            ) {
+                ChatScreen(
+                    padding = PaddingValues(0.dp),
+                    viewModel = vm,
+                    userSwitches = mapOf(VoiceTools.SWITCH_INPUT to true),
+                    voiceInputRequested = req,
+                    onVoiceInputConsumed = { voiceRequested.value = false },
+                    voiceSwitchesLoaded = true,
+                )
+            }
+        }
+        composeRule.waitForIdle()
+        assertEquals(1, registry.launchedIntents.size) // A INITIAL gen1 slot0, hangs
+
+        composeRule.runOnIdle { now += VoiceSttArbiter.RECOGNIZER_WATCHDOG_NANOS + 1_000L }
+        composeRule.onNodeWithContentDescription("語音輸入").performClick()
+        composeRule.waitForIdle()
+        assertEquals(2, registry.launchedIntents.size) // B USER gen2 slot1, hangs
+
+        composeRule.runOnIdle { now += VoiceSttArbiter.RECOGNIZER_WATCHDOG_NANOS + 1_000L }
+        composeRule.onNodeWithContentDescription("語音輸入").performClick()
+        composeRule.waitForIdle()
+        assertEquals(2, registry.launchedIntents.size) // both wedged → unresponsive
+
+        composeRule.onNodeWithText("重設語音辨識").performClick()
+        composeRule.waitForIdle()
+        composeRule.onNodeWithContentDescription("語音輸入").performClick()
+        composeRule.waitForIdle()
+        assertEquals(3, registry.launchedIntents.size) // C USER gen3 slot0
+        val rcA = registry.launchedRequestCodes[0]
+        val rcC = registry.launchedRequestCodes[2]
+
+        // C reports first: fresh result prefills and settles.
+        val freshResult = Intent().putStringArrayListExtra(
+            RecognizerIntent.EXTRA_RESULTS,
+            arrayListOf("fresh"),
+        )
+        composeRule.runOnIdle {
+            registry.dispatchResult(rcC, ActivityResult(Activity.RESULT_OK, freshResult))
+        }
+        composeRule.waitForIdle()
+        assertEquals("fresh", vm.input.value)
+
+        // A's late pre-reset result afterwards: undeliverable, no effect on the settled state.
+        val staleResult = Intent().putStringArrayListExtra(
+            RecognizerIntent.EXTRA_RESULTS,
+            arrayListOf("stale"),
+        )
+        composeRule.runOnIdle {
+            registry.dispatchResult(rcA, ActivityResult(Activity.RESULT_OK, staleResult))
+        }
+        composeRule.waitForIdle()
+
+        // B's late pre-reset result (slot1 axis): likewise undeliverable at the registry boundary.
+        val slot1StaleResult = Intent().putStringArrayListExtra(
+            RecognizerIntent.EXTRA_RESULTS,
+            arrayListOf("slot1 stale transcript"),
+        )
+        composeRule.runOnIdle {
+            registry.dispatchResult(registry.launchedRequestCodes[1], ActivityResult(Activity.RESULT_OK, slot1StaleResult))
+        }
+        composeRule.waitForIdle()
+        assertEquals("fresh", vm.input.value)
+        assertEquals(3, registry.launchedIntents.size)
+        assertEquals(0, provider.streamCalls)
+    }
+
+    @Test
+    fun resetEpoch_oldCancelAfterReoccupancy_noPrefillNoEarlySettle() {
+        registerRecognitionService()
+        val provider = VoiceLaunchFakeProvider()
+        val vm = newVm(provider)
+        val registry = RecordingRegistry()
+        val owner = object : ActivityResultRegistryOwner {
+            override val activityResultRegistry: ActivityResultRegistry = registry
+        }
+        var now = 1_000_000_000L
+        val voiceRequested = MutableStateFlow(true)
+
+        composeRule.setContent {
+            val req by voiceRequested.collectAsState()
+            CompositionLocalProvider(
+                LocalActivityResultRegistryOwner provides owner,
+                LocalVoiceSttArbiterClock provides { now },
+            ) {
+                ChatScreen(
+                    padding = PaddingValues(0.dp),
+                    viewModel = vm,
+                    userSwitches = mapOf(VoiceTools.SWITCH_INPUT to true),
+                    voiceInputRequested = req,
+                    onVoiceInputConsumed = { voiceRequested.value = false },
+                    voiceSwitchesLoaded = true,
+                )
+            }
+        }
+        composeRule.waitForIdle()
+        assertEquals(1, registry.launchedIntents.size) // A INITIAL gen1 slot0, hangs
+
+        composeRule.runOnIdle { now += VoiceSttArbiter.RECOGNIZER_WATCHDOG_NANOS + 1_000L }
+        composeRule.onNodeWithContentDescription("語音輸入").performClick()
+        composeRule.waitForIdle()
+        assertEquals(2, registry.launchedIntents.size) // B USER gen2 slot1, hangs
+
+        composeRule.runOnIdle { now += VoiceSttArbiter.RECOGNIZER_WATCHDOG_NANOS + 1_000L }
+        composeRule.onNodeWithContentDescription("語音輸入").performClick()
+        composeRule.waitForIdle()
+        assertEquals(2, registry.launchedIntents.size) // both wedged → unresponsive
+
+        composeRule.onNodeWithText("重設語音辨識").performClick()
+        composeRule.waitForIdle()
+        composeRule.onNodeWithContentDescription("語音輸入").performClick()
+        composeRule.waitForIdle()
+        assertEquals(3, registry.launchedIntents.size) // C USER gen3 slot0
+        val rcA = registry.launchedRequestCodes[0]
+        val rcC = registry.launchedRequestCodes[2]
+
+        // A's pre-reset recognizer reports RESULT_CANCELED late: undeliverable at the registry
+        // boundary — must not prefill, must not settle C's gate.
+        composeRule.runOnIdle {
+            registry.dispatchResult(rcA, ActivityResult(Activity.RESULT_CANCELED, null))
+        }
+        composeRule.waitForIdle()
+        assertEquals("", vm.input.value)
+
+        // C's gate is still held: a mic tap queues a USER arm without launching.
+        composeRule.onNodeWithContentDescription("語音輸入").performClick()
+        composeRule.waitForIdle()
+        assertEquals(3, registry.launchedIntents.size)
+
+        // C's own fresh result: prefills.
+        val freshResult = Intent().putStringArrayListExtra(
+            RecognizerIntent.EXTRA_RESULTS,
+            arrayListOf("fresh"),
+        )
+        composeRule.runOnIdle {
+            registry.dispatchResult(rcC, ActivityResult(Activity.RESULT_OK, freshResult))
+        }
+        composeRule.waitForIdle()
+        assertEquals("fresh", vm.input.value)
+        assertEquals(0, provider.streamCalls)
+    }
+
+    @Test
+    fun resetEpoch_staleResultAfterFreshResult_noEffectOnSettledState() {
+        // GUARD — passes pre- and post-fix; pins ordering, not the F1 mechanism.
+        registerRecognitionService()
+        val provider = VoiceLaunchFakeProvider()
+        val vm = newVm(provider)
+        val registry = RecordingRegistry()
+        val owner = object : ActivityResultRegistryOwner {
+            override val activityResultRegistry: ActivityResultRegistry = registry
+        }
+        var now = 1_000_000_000L
+        val voiceRequested = MutableStateFlow(true)
+
+        composeRule.setContent {
+            val req by voiceRequested.collectAsState()
+            CompositionLocalProvider(
+                LocalActivityResultRegistryOwner provides owner,
+                LocalVoiceSttArbiterClock provides { now },
+            ) {
+                ChatScreen(
+                    padding = PaddingValues(0.dp),
+                    viewModel = vm,
+                    userSwitches = mapOf(VoiceTools.SWITCH_INPUT to true),
+                    voiceInputRequested = req,
+                    onVoiceInputConsumed = { voiceRequested.value = false },
+                    voiceSwitchesLoaded = true,
+                )
+            }
+        }
+        composeRule.waitForIdle()
+        assertEquals(1, registry.launchedIntents.size) // A INITIAL gen1 slot0, hangs
+
+        composeRule.runOnIdle { now += VoiceSttArbiter.RECOGNIZER_WATCHDOG_NANOS + 1_000L }
+        composeRule.onNodeWithContentDescription("語音輸入").performClick()
+        composeRule.waitForIdle()
+        assertEquals(2, registry.launchedIntents.size) // B USER gen2 slot1, hangs
+
+        composeRule.runOnIdle { now += VoiceSttArbiter.RECOGNIZER_WATCHDOG_NANOS + 1_000L }
+        composeRule.onNodeWithContentDescription("語音輸入").performClick()
+        composeRule.waitForIdle()
+        assertEquals(2, registry.launchedIntents.size) // both wedged → unresponsive
+
+        composeRule.onNodeWithText("重設語音辨識").performClick()
+        composeRule.waitForIdle()
+        composeRule.onNodeWithContentDescription("語音輸入").performClick()
+        composeRule.waitForIdle()
+        assertEquals(3, registry.launchedIntents.size) // C USER gen3 slot0
+        val rcA = registry.launchedRequestCodes[0]
+        val rcC = registry.launchedRequestCodes[2]
+
+        // C settles first (fresh).
+        val freshResult = Intent().putStringArrayListExtra(
+            RecognizerIntent.EXTRA_RESULTS,
+            arrayListOf("fresh"),
+        )
+        composeRule.runOnIdle {
+            registry.dispatchResult(rcC, ActivityResult(Activity.RESULT_OK, freshResult))
+        }
+        composeRule.waitForIdle()
+        assertEquals("fresh", vm.input.value)
+
+        // A's late pre-reset result afterwards: undeliverable; settled state unchanged.
+        val staleResult = Intent().putStringArrayListExtra(
+            RecognizerIntent.EXTRA_RESULTS,
+            arrayListOf("stale"),
+        )
+        composeRule.runOnIdle {
+            registry.dispatchResult(rcA, ActivityResult(Activity.RESULT_OK, staleResult))
+        }
+        composeRule.waitForIdle()
+        assertEquals("fresh", vm.input.value)
+        assertEquals(3, registry.launchedIntents.size)
+        assertEquals(0, provider.streamCalls)
+    }
+
+    @Test
+    fun resetEpoch_pendingInitialArmSurvivesReset_launchesAndAttributes() {
+        registerRecognitionService()
+        val provider = VoiceLaunchFakeProvider()
+        val vm = newVm(provider)
+        val registry = RecordingRegistry()
+        val owner = object : ActivityResultRegistryOwner {
+            override val activityResultRegistry: ActivityResultRegistry = registry
+        }
+        var now = 1_000_000_000L
+        val voiceRequested = MutableStateFlow(false)
+        var consumedCount = 0
+
+        composeRule.setContent {
+            val req by voiceRequested.collectAsState()
+            CompositionLocalProvider(
+                LocalActivityResultRegistryOwner provides owner,
+                LocalVoiceSttArbiterClock provides { now },
+            ) {
+                ChatScreen(
+                    padding = PaddingValues(0.dp),
+                    viewModel = vm,
+                    userSwitches = mapOf(VoiceTools.SWITCH_INPUT to true),
+                    voiceInputRequested = req,
+                    onVoiceInputConsumed = {
+                        consumedCount++
+                        voiceRequested.value = false
+                    },
+                    voiceSwitchesLoaded = true,
+                )
+            }
+        }
+        composeRule.waitForIdle()
+
+        // Wedge both slots with mic taps: A USER gen1 slot0, B USER gen2 slot1.
+        composeRule.onNodeWithContentDescription("語音輸入").performClick()
+        composeRule.waitForIdle()
+        assertEquals(1, registry.launchedIntents.size)
+        composeRule.runOnIdle { now += VoiceSttArbiter.RECOGNIZER_WATCHDOG_NANOS + 1_000L }
+        composeRule.onNodeWithContentDescription("語音輸入").performClick()
+        composeRule.waitForIdle()
+        assertEquals(2, registry.launchedIntents.size)
+
+        // An INITIAL request arrives while both slots are wedged: reserved-before-consume —
+        // not launched, not consumed, unresponsive banner stays up.
+        composeRule.runOnIdle { now += VoiceSttArbiter.RECOGNIZER_WATCHDOG_NANOS + 1_000L }
+        composeRule.runOnIdle { voiceRequested.value = true }
+        composeRule.waitForIdle()
+        assertEquals(2, registry.launchedIntents.size)
+        assertEquals(0, consumedCount)
+        assertTrue(voiceRequested.value)
+        composeRule.onNodeWithText(
+            VoiceStt.fallbackMessage(DenyReason.NO_PRIVILEGE, VoiceStt.DETAIL_RECOGNIZER_UNRESPONSIVE),
+        ).assertIsDisplayed()
+
+        // Hard reset: the pending INITIAL arm survives; the settle-sequence bump re-decides and
+        // admits it as gen3 onto the freed slot0.
+        composeRule.onNodeWithText("重設語音辨識").performClick()
+        composeRule.waitForIdle()
+        assertEquals(3, registry.launchedIntents.size)
+        assertEquals(1, consumedCount)
+        assertEquals(false, voiceRequested.value)
+        val rcA = registry.launchedRequestCodes[0]
+        val rcC = registry.launchedRequestCodes[2]
+        // (rc-distinctness is a canary pinning androidx-internal minting — rc uniqueness off occupied
+        // rcToKey entries — not a contract guarantee.)
+        assertTrue(rcC != registry.launchedRequestCodes[0])
+        assertTrue(rcC != registry.launchedRequestCodes[1])
+
+        // A's late pre-reset result: undeliverable at the registry boundary.
+        val staleResult = Intent().putStringArrayListExtra(
+            RecognizerIntent.EXTRA_RESULTS,
+            arrayListOf("stale"),
+        )
+        composeRule.runOnIdle {
+            registry.dispatchResult(rcA, ActivityResult(Activity.RESULT_OK, staleResult))
+        }
+        composeRule.waitForIdle()
+        assertEquals("", vm.input.value)
+
+        // C's own fresh result attributes correctly.
+        val freshResult = Intent().putStringArrayListExtra(
+            RecognizerIntent.EXTRA_RESULTS,
+            arrayListOf("fresh"),
+        )
+        composeRule.runOnIdle {
+            registry.dispatchResult(rcC, ActivityResult(Activity.RESULT_OK, freshResult))
+        }
+        composeRule.waitForIdle()
+        assertEquals("fresh", vm.input.value)
+        assertEquals(0, provider.streamCalls)
+    }
+
+    @Test
+    fun resetEpoch_retriggerArmSurvivesReset_consumesOnceAndAttributes() {
+        registerRecognitionService()
+        val provider = VoiceLaunchFakeProvider()
+        val vm = newVm(provider)
+        val registry = RecordingRegistry()
+        val owner = object : ActivityResultRegistryOwner {
+            override val activityResultRegistry: ActivityResultRegistry = registry
+        }
+        var now = 1_000_000_000L
+        val retriggerToken = MutableStateFlow(0L)
+        val consumedRetrigger = ArrayList<Long>()
+        var consumeLambdaCalls = 0
+
+        composeRule.setContent {
+            val token by retriggerToken.collectAsState()
+            CompositionLocalProvider(
+                LocalActivityResultRegistryOwner provides owner,
+                LocalVoiceSttArbiterClock provides { now },
+            ) {
+                ChatScreen(
+                    padding = PaddingValues(0.dp),
+                    viewModel = vm,
+                    userSwitches = mapOf(VoiceTools.SWITCH_INPUT to true),
+                    voiceSwitchesLoaded = true,
+                    voiceRetriggerToken = token,
+                    onVoiceRetriggerConsumed = {
+                        consumeLambdaCalls++
+                        consumedRetrigger += it
+                        retriggerToken.value = 0L
+                        true
+                    },
+                )
+            }
+        }
+        composeRule.waitForIdle()
+
+        // Wedge both slots with mic taps: A USER gen1 slot0, B USER gen2 slot1. Neither returns.
+        composeRule.onNodeWithContentDescription("語音輸入").performClick()
+        composeRule.waitForIdle()
+        assertEquals(1, registry.launchedIntents.size)
+        composeRule.runOnIdle { now += VoiceSttArbiter.RECOGNIZER_WATCHDOG_NANOS + 1_000L }
+        composeRule.onNodeWithContentDescription("語音輸入").performClick()
+        composeRule.waitForIdle()
+        assertEquals(2, registry.launchedIntents.size)
+
+        // Retrigger token arrives while both slots are wedged: reserved-before-consume — the
+        // one-shot token must NOT be consumed, no third recognizer launches, banner stays up.
+        composeRule.runOnIdle { now += VoiceSttArbiter.RECOGNIZER_WATCHDOG_NANOS + 1_000L }
+        composeRule.runOnIdle { retriggerToken.value = 77L }
+        composeRule.waitForIdle()
+        assertEquals(0, consumeLambdaCalls)
+        assertEquals(emptyList<Long>(), consumedRetrigger)
+        assertEquals(77L, retriggerToken.value)
+        assertEquals(2, registry.launchedIntents.size)
+        composeRule.onNodeWithText(
+            VoiceStt.fallbackMessage(DenyReason.NO_PRIVILEGE, VoiceStt.DETAIL_RECOGNIZER_UNRESPONSIVE),
+        ).assertIsDisplayed()
+
+        // Hard reset: the pending RETRIGGER arm survives; the settle-sequence bump re-decides and
+        // admits it as gen3 on the freed slot0 (first free slot).
+        composeRule.onNodeWithText("重設語音辨識").performClick()
+        composeRule.waitForIdle()
+        assertEquals(3, registry.launchedIntents.size)
+        assertEquals(1, consumeLambdaCalls)
+        assertEquals(listOf(77L), consumedRetrigger)
+        assertEquals(0L, retriggerToken.value)
+        val rcA = registry.launchedRequestCodes[0]
+        val rcC = registry.launchedRequestCodes[2]
+        // The third launch re-keys on the advanced resetEpoch, so its rc differs from both
+        // pre-reset launches.
+        assertTrue(rcC != registry.launchedRequestCodes[0])
+        assertTrue(rcC != registry.launchedRequestCodes[1])
+
+        // A's late pre-reset result: undeliverable at the registry boundary.
+        val staleResult = Intent().putStringArrayListExtra(
+            RecognizerIntent.EXTRA_RESULTS,
+            arrayListOf("stale"),
+        )
+        composeRule.runOnIdle {
+            registry.dispatchResult(rcA, ActivityResult(Activity.RESULT_OK, staleResult))
+        }
+        composeRule.waitForIdle()
+        assertEquals("", vm.input.value)
+
+        // C's own fresh result attributes correctly.
+        val freshResult = Intent().putStringArrayListExtra(
+            RecognizerIntent.EXTRA_RESULTS,
+            arrayListOf("fresh"),
+        )
+        composeRule.runOnIdle {
+            registry.dispatchResult(rcC, ActivityResult(Activity.RESULT_OK, freshResult))
+        }
+        composeRule.waitForIdle()
+        assertEquals("fresh", vm.input.value)
+        assertEquals(0, provider.streamCalls)
+    }
+
+    @Test
+    fun resetEpoch_stateRestorationAfterReset_oldRcUndeliverableAfterRestore() {
+        registerRecognitionService()
+        val provider = VoiceLaunchFakeProvider()
+        val vm = newVm(provider)
+        val registry = RecordingRegistry()
+        val owner = object : ActivityResultRegistryOwner {
+            override val activityResultRegistry: ActivityResultRegistry = registry
+        }
+        var now = 1_000_000_000L
+        val voiceRequested = MutableStateFlow(true)
+
+        val tester = StateRestorationTester(composeRule)
+        tester.setContent {
+            val req by voiceRequested.collectAsState()
+            CompositionLocalProvider(
+                LocalActivityResultRegistryOwner provides owner,
+                LocalVoiceSttArbiterClock provides { now },
+            ) {
+                ChatScreen(
+                    padding = PaddingValues(0.dp),
+                    viewModel = vm,
+                    userSwitches = mapOf(VoiceTools.SWITCH_INPUT to true),
+                    voiceInputRequested = req,
+                    onVoiceInputConsumed = { voiceRequested.value = false },
+                    voiceSwitchesLoaded = true,
+                )
+            }
+        }
+        composeRule.waitForIdle()
+        assertEquals(1, registry.launchedIntents.size) // A INITIAL gen1 slot0, hangs
+
+        composeRule.runOnIdle { now += VoiceSttArbiter.RECOGNIZER_WATCHDOG_NANOS + 1_000L }
+        composeRule.onNodeWithContentDescription("語音輸入").performClick()
+        composeRule.waitForIdle()
+        assertEquals(2, registry.launchedIntents.size) // B USER gen2 slot1, hangs
+
+        composeRule.runOnIdle { now += VoiceSttArbiter.RECOGNIZER_WATCHDOG_NANOS + 1_000L }
+        composeRule.onNodeWithContentDescription("語音輸入").performClick()
+        composeRule.waitForIdle()
+        assertEquals(2, registry.launchedIntents.size) // both wedged → unresponsive
+
+        composeRule.onNodeWithText("重設語音辨識").performClick()
+        composeRule.waitForIdle()
+        composeRule.onNodeWithContentDescription("語音輸入").performClick()
+        composeRule.waitForIdle()
+        assertEquals(3, registry.launchedIntents.size) // C USER gen3 slot0
+        val rcA = registry.launchedRequestCodes[0]
+        val rcC = registry.launchedRequestCodes[2]
+
+        // Recreation through the real saveable round-trip (resetEpoch itself is rememberSaveable,
+        // so the restored composition registers the same post-reset keys).
+        tester.emulateSavedInstanceStateRestore()
+        composeRule.waitForIdle()
+        assertEquals(3, registry.launchedIntents.size)
+
+        // A's pre-reset rc: undeliverable after the restore too — its key is gone from the
+        // registry (unregistered pre-reset; never re-registered).
+        val staleResult = Intent().putStringArrayListExtra(
+            RecognizerIntent.EXTRA_RESULTS,
+            arrayListOf("stale"),
+        )
+        composeRule.runOnIdle {
+            registry.dispatchResult(rcA, ActivityResult(Activity.RESULT_OK, staleResult))
+        }
+        composeRule.waitForIdle()
+        assertEquals("", vm.input.value)
+        assertEquals(3, registry.launchedIntents.size)
+
+        // C's result: fresh, prefills.
+        val freshResult = Intent().putStringArrayListExtra(
+            RecognizerIntent.EXTRA_RESULTS,
+            arrayListOf("fresh"),
+        )
+        composeRule.runOnIdle {
+            registry.dispatchResult(rcC, ActivityResult(Activity.RESULT_OK, freshResult))
+        }
+        composeRule.waitForIdle()
+        assertEquals("fresh", vm.input.value)
         assertEquals(0, provider.streamCalls)
     }
 }

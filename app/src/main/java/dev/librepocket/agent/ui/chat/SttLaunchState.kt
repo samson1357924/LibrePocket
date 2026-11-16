@@ -1,13 +1,16 @@
 package dev.librepocket.agent.ui.chat
 
+import androidx.compose.runtime.MutableIntState
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.staticCompositionLocalOf
+import androidx.compose.runtime.saveable.Saver
 import androidx.compose.runtime.saveable.listSaver
 
 /**
- * Activity 重建（recreation）時，`rememberLauncherForActivityResult()` 登記的 launched key
- * 與 pending result 由 ActivityResultRegistry 存在 saved bundle 中、重建後重新投遞給新組合的
- * callback——因此「重建前 launch 的 recognizer，其結果可能在重建後的 composition 回來」是合法
- * 路徑，而不是錯誤。此時 slot/arbiter 的記憶體狀態（`remember{}`）會是全新的，無法僅憑
+ * Activity 重建（recreation）時，ChatScreen 登記於 ActivityResultRegistry 的 launched key
+ * （"stt-slotN-<resetEpoch>"，resetEpoch 亦為 rememberSaveable）與 pending result 由 registry
+ * 存在 saved bundle 中、重建後重新投遞給新組合的 callback——因此「重建前 launch 的 recognizer，其
+ * 結果可能在重建後的 composition 回來」是合法路徑，而不是錯誤。此時 slot/arbiter 的記憶體狀態（`remember{}`）會是全新的，無法僅憑
  * 新值判斷結果歸屬；本檔將每個 slot 的 launch 身分（slotBusy/slotGen）與 arbiter 的
  * generation 水位釘進 `rememberSaveable`，重建後還原，使重建前 launch 的結果仍能被精確歸屬。
  *
@@ -136,6 +139,14 @@ internal fun restoreSttLaunchState(saved: List<Any?>): SttLaunchState? {
 internal val SttLaunchStateSaver = listSaver(
     save = { state -> saveSttLaunchState(state) },
     restore = { saved -> restoreSttLaunchState(saved) },
+)
+
+/**
+ * `resetEpoch` 的 fail-closed saver：負數還原為 0、單調值原樣通過 — 對 crafted Bundle 的縱深防禦。
+ */
+internal val ResetEpochSaver = Saver<MutableIntState, Int>(
+    save = { it.intValue },
+    restore = { if (it >= 0) mutableIntStateOf(it) else mutableIntStateOf(0) },
 )
 
 /**

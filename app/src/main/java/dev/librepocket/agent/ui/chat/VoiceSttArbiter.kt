@@ -142,12 +142,13 @@ internal class VoiceSttArbiter(
      * post-reset admit can never reuse a pre-reset generation. Used ONLY by the explicit user
      * recovery action; never by internal bookkeeping.
      *
-     * Attribution caveat (honest): after the shell clears its slot tables, a pre-reset late
-     * result is unattributable ONLY while its slot stays unoccupied (slot tables read 0L →
-     * fail-closed drop). Once the slot is re-occupied post-reset, a pre-reset late result is
-     * indistinguishable from the new occupant's at the OS callback boundary and may prefill /
-     * settle the new launch early. Accepted by explicit user action; documented here and in
-     * the shell reset notes.
+     * Attribution caveat (honest): a pre-reset recognizer's request code can never reach the
+     * shell's result handler post-reset. Its launcher is unregistered at epoch advance, the
+     * pre-reset registry key is never re-registered, and the registry parks the late result
+     * undeliverable under the dead key. The slot/generation pairing (slot tables read 0L →
+     * fail-closed drop) is only the second layer — defense in depth. The sole remaining path
+     * is the framework's pending-result re-dispatch after true process death (same-epoch key
+     * restore); documented in CAPABILITY_MATRIX/THREAT_MODEL.
      */
     fun hardReset() {
         inFlight = null

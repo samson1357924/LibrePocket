@@ -6,8 +6,10 @@ import android.content.pm.PackageManager
 import android.os.SystemClock
 import android.speech.RecognizerIntent
 import android.util.Log
-import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.compose.LocalActivityResultRegistryOwner
 import androidx.activity.result.ActivityResult
+import androidx.activity.result.ActivityResultCallback
+import androidx.activity.result.ActivityResultLauncher
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.annotation.VisibleForTesting
 import androidx.compose.foundation.layout.Arrangement
@@ -56,9 +58,11 @@ import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableLongStateOf
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.staticCompositionLocalOf
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -357,6 +361,13 @@ fun ChatScreen(
     // （如兩 slot 楔住時未消費的 INITIAL）會擱淺到下一次無關的狀態翻轉；以此旗標作為決策
     // 效應的 key，讓 settle 確定性地喚起一次重裁決。
     var sttSettleSeq by remember { mutableStateOf(0) }
+    // 使用者硬重設世代（reset）：「重設語音辨識」+1。launcher 的 registry key 由此世代推導
+    //（"stt-slotN-<epoch>"）：重設後，重設前的 launch（與其 rc→key 綁定）永遠不可達——其晚到
+    // 結果在 registry 邊界永不投遞（late result 停靠 pendingResults，鍵不再註冊），無法冒充
+    // 重設後的 launch；slot/gen 表僅為第二層縱深防禦。
+    // rememberSaveable：跨 activity 重建還原（epoch>0 時 outstanding launch 重建後仍可歸屬）。
+    // Int 單調遞增；若 wrap 到負值亦各自唯一、不衝突（無需驗證，僅此註記）。
+    var resetEpoch by rememberSaveable(saver = ResetEpochSaver) { mutableIntStateOf(0) }
     // 每枚進行中 launch 各自佔一個回呼 slot（共 2 枚）：slotBusy 標記佔用、slotGen 記錄該 slot 對應的
     // admit generation（launch 時自 currentGeneration 讀取，即剛承認的那一枚 arm 的 generation）。
     // result callback 以 slot 歸屬配對——每枚 pending launch 各自佔 slot、歸屬精確，不受回傳順序影響
@@ -385,11 +396,12 @@ fun ChatScreen(
 
     // 使用者明確觸發的硬重設（語音楔住恢復鈕）：清空 slot 表與閘、保留 generation 水位與
     // 一次性 pending arm（INITIAL／RETRIGGER 由宿主持有，不得被本函式靜默丟棄）；mic（USER）
-    // 一次性 arm 由使用者明確放棄。重設後，重設前 launch 的晚到結果只在「該 slot 尚未被新 launch
-    // 重新佔用」時才 fail-closed 丟棄；一旦 slot 被重新佔用，重設前的晚到結果在 OS 回呼邊界上
-    // 與新結果無法區分，可能被歸給新 launch（含 prefill／提早釋放其閘）——此為明確接受、僅限
-    // 使用者主動重設觸發的殘餘邊界（launcher request code 是每 slot 非每 launch，無法在回呼
-    // 邊界再區分）。sttSettleSeq 遞增使 pending arm 確定性續行裁決。
+    // 一次性 arm 由使用者明確放棄。重設遞增 resetEpoch：重設後的 launcher 以新世代 key
+    // （"stt-slotN-<epoch>"）於重組時同步註冊，重設前的 launcher 在其 onDispose 中同步 unregister——
+    // 依 androidx.activity.result 契約，in-flight unregister 保留 rc→key 綁定但移除 callback，
+    // 重設前 launch 的晚到結果自此在 registry 邊界永不投遞（late result 停靠 pendingResults，鍵不再註冊），
+    // 無法冒充重設後的 launch、也無法提早 prefill／結算其閘；slot/gen 表（gen==0L fail-closed）
+    // 僅作為第二層縱深防禦。sttSettleSeq 遞增使 pending arm 確定性續行裁決。
     fun resetVoiceSttCluster() {
         slotBusy[0] = false
         slotBusy[1] = false
@@ -399,6 +411,7 @@ fun ChatScreen(
         sttArbiterState = null
         userVoiceArmed = false
         sttSettleSeq += 1
+        resetEpoch += 1
         persistLaunchState()
         voiceErrors.clearSttError()
         showVoiceReset = false
@@ -433,6 +446,9 @@ fun ChatScreen(
         // admitGeneration（successor 已承認超越），或回呼進入當下 gate 已不歸屬本次啟動
         // （watchdog 釋放後無 successor——generation 不動、slot 已空）。gen == 0L 已於函式頂端
         // fail-closed 丟棄（重建後 registry 重新投遞重建前結果、slot 表全新時），此處必非 0L。
+        // 注意層次：重設（「重設語音辨識」）之後，重設前 rc 的晚到結果在 registry 邊界永不投遞
+        // （late result 停靠 pendingResults，鍵不再註冊；pre-reset launcher unregister 後 callback 移除），根本不會進入本函式；gen == 0L 的
+        // 頂端 fail-closed 僅為第二層縱深防禦。
         // STALE-SPECIMENS: stale-result 案例（S3-style watchdog 驅逐、successor 超越、gen==0L fail-closed drop）
         // 釘在 VoiceSttArbiterTest／isStaleVoiceResult 純述詞層／SttLaunchStateTest；Compose 層 stale 模擬亦可經
         // LocalVoiceSttArbiterClock 注入假時鐘（見 ChatScreenVoiceLaunchTest）。
@@ -467,12 +483,40 @@ fun ChatScreen(
         }
         // 非 OK（使用者取消）維持手動輸入，不報錯。
     }
-    val slot0Launcher = rememberLauncherForActivityResult(
-        ActivityResultContracts.StartActivityForResult(),
-    ) { result -> handleSttResult(0, result) }
-    val slot1Launcher = rememberLauncherForActivityResult(
-        ActivityResultContracts.StartActivityForResult(),
-    ) { result -> handleSttResult(1, result) }
+    val sttRegistry = LocalActivityResultRegistryOwner.current?.activityResultRegistry
+        ?: error("No ActivityResultRegistryOwner was provided via LocalActivityResultRegistryOwner")
+    // androidx.activity.compose 1.13.0 rememberLauncherForActivityResult 的手工等價物，差異：
+    // (1) key 由 resetEpoch 推導（非隨機 UUID）——重設後重設前 launch 立即與 registry 斷鏈；
+    // (2) callbacks 經 rememberUpdatedState 委派當代 handleSttResult（與 androidx 相同）。
+    val latestHandleSttResult by rememberUpdatedState { slot: Int, result: ActivityResult -> handleSttResult(slot, result) }
+    val slot0LauncherHolder = remember { object { var launcher: ActivityResultLauncher<Intent>? = null } }
+    val slot1LauncherHolder = remember { object { var launcher: ActivityResultLauncher<Intent>? = null } }
+    val slot0Key = "stt-slot0-$resetEpoch"
+    val slot1Key = "stt-slot1-$resetEpoch"
+    DisposableEffect(slot0Key, sttRegistry) {
+        val launcher = sttRegistry.register(
+            slot0Key,
+            ActivityResultContracts.StartActivityForResult(),
+            ActivityResultCallback { result -> latestHandleSttResult(0, result) },
+        )
+        slot0LauncherHolder.launcher = launcher
+        onDispose {
+            launcher.unregister()
+            slot0LauncherHolder.launcher = null
+        }
+    }
+    DisposableEffect(slot1Key, sttRegistry) {
+        val launcher = sttRegistry.register(
+            slot1Key,
+            ActivityResultContracts.StartActivityForResult(),
+            ActivityResultCallback { result -> latestHandleSttResult(1, result) },
+        )
+        slot1LauncherHolder.launcher = launcher
+        onDispose {
+            launcher.unregister()
+            slot1LauncherHolder.launcher = null
+        }
+    }
     // true iff launchSystemStt() invoked the chosen slot launcher without throwing (degrade paths and exceptions return false).
     fun launchSystemStt(): Boolean {
         val probe = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
@@ -520,13 +564,16 @@ fun ChatScreen(
         showVoiceReset = false
         persistLaunchState()
         return try {
-            if (slotIndex == 0) {
-                slot0Launcher.launch(intent)
-            } else {
-                slot1Launcher.launch(intent)
+            val launcher = if (slotIndex == 0) slot0LauncherHolder.launcher else slot1LauncherHolder.launcher
+            if (launcher == null) {
+                // reset 進行中途狀態：記錄後走 checkNotNull → catch 的既有降級路徑（釋放 slot、報錯、不 wedge）。
+                Log.w(TAG, "STT launcher not mounted (reset in flight); failing closed")
             }
+            checkNotNull(launcher) { "STT launcher not mounted (reset in flight)" }
+            launcher.launch(intent)
             true
-        } catch (_: Exception) {
+        } catch (t: Exception) {
+            Log.w(TAG, "STT launch failed; degrading", t)
             slotBusy[slotIndex] = false
             slotGen[slotIndex] = 0L
             persistLaunchState()
@@ -925,9 +972,10 @@ fun ChatScreen(
             voiceErrors.sttError?.let {
                 if (showVoiceReset) {
                     // 無 slot 可派（兩 slot 皆被懸掛 recognizer 佔用）時附重設鈕：使用者觸發的
-                    // 硬重設——清空 slot 表與閘、保留 generation 水位。語義是「放棄未返回的辨識
-                    // 結果（晚到者在 slot 未被重新佔用前 fail-closed 丟棄；slot 一旦重新佔用即
-                    // 不可區分，見 resetVoiceSttCluster 註解）」，不是「修好卡住的辨識器」。
+                    // 硬重設——清空 slot 表與閘、保留 generation 水位、遞增 resetEpoch（重設前
+                    // launcher 於重組時同步 unregister，其晚到結果在 registry 邊界永不投遞）。語義是
+                    // 「放棄未返回的辨識結果（晚到者在 registry 邊界永不投遞，slot/gen 表為第二層
+                    // 縱深防禦，見 resetVoiceSttCluster 註解）」，不是「修好卡住的辨識器」。
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()

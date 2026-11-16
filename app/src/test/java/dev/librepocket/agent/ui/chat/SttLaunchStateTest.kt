@@ -1,5 +1,7 @@
 package dev.librepocket.agent.ui.chat
 
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.saveable.SaverScope
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
@@ -222,6 +224,18 @@ class SttLaunchStateTest {
         assertNull(restore(listOf(listOf(false, false), listOf(0L, 0L), 4L, "INITIAL", 5L)))
         // At least one busy slot satisfies the invariant.
         assertNotNull(restore(listOf(listOf(true, false), listOf(3L, 0L), 4L, "INITIAL", 5L)))
+    }
+
+    private val testSaverScope = object : SaverScope {
+        override fun canBeSaved(value: Any): Boolean = true
+    }
+
+    @Test
+    fun `ResetEpochSaver restore negative resets to zero, positive passes through, save round-trips`() {
+        assertEquals(0, ResetEpochSaver.restore(-1)?.intValue)
+        assertEquals(5, ResetEpochSaver.restore(5)?.intValue)
+        val saved = with(ResetEpochSaver) { testSaverScope.save(mutableIntStateOf(7)) }
+        assertEquals(7, saved)
     }
 
     @Test

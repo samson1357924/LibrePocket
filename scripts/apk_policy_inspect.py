@@ -76,24 +76,27 @@ so the canonical path is only the label/fallback, never a hard-coded dump
 operand.
 
 Modes: ``--mode play`` / ``--mode foss`` run every scanner policy.  The
-additional ``--mode github`` runs ONLY the mode-independent artifact
+additional ``--mode github`` runs the mode-independent artifact
 authorities (merged manifest backup bindings, compiled backup-rules bytes,
 merged networkSecurityConfig binding + compiled NSC) plus the COMMON flavor
 permission policy below: the Github debug artifact is neither a Play nor a
 Foss package, so the flavor DEX class-table policies do not apply, while the
 same manifest/resource merger paths this scanner exists to police are shared
-by all three flavors. The github mode DOES parse the root DEX shards with
-the same bounded parser as play/foss (DEX tables are no longer skipped):
-every DEX-evidenced ``ShizukuProvider`` subclass must be declared in the
-merged manifest and carry the full attribute contract, so a renamed
-``Bridge extends ShizukuProvider`` with an arbitrary authority cannot pass as
-invisible. In github mode ``--expect-provider required`` upgrades
-the ShizukuProvider check to a fail-closed existence contract (the merged
-manifest must declare exactly one compliant provider); the default
-``optional`` only verifies provider attributes when a provider is present.
-When a ShizukuProvider is present, the upstream ``attachInfo()`` hard
-contract is pinned regardless of mode: ``exported`` must be the exact
-boolean true and ``multiprocess`` absent or the exact boolean false.
+by all three flavors. The github mode additionally enforces the
+ShizukuProvider existence/contract pin: every DEX-evidenced subclass must be
+declared in the merged manifest and carry the full attribute contract
+(``android:enabled=true``; base permission; exported=true; multiprocess
+absent|false), so a renamed ``Bridge extends ShizukuProvider`` with an
+arbitrary authority cannot pass as invisible; heuristic-detected providers
+(name- or authority-suffix ``.shizuku``) must declare ``android:authorities``
+exactly ``{merged-package}.shizuku`` (the Shizuku binder channel). In github
+mode ``--expect-provider required`` upgrades the ShizukuProvider check to a
+fail-closed existence contract (the merged manifest must declare exactly one
+compliant provider); the default ``optional`` only verifies provider
+attributes when a provider is present. When a ShizukuProvider is present, the
+upstream ``attachInfo()`` hard contract is pinned regardless of mode:
+``exported`` must be the exact boolean true and ``multiprocess`` absent or
+the exact boolean false.
 
 Common manifest policy (P2-1): SMS, MANAGE_EXTERNAL_STORAGE, and VPN
 declarations are forbidden in EVERY flavor (``COMMON_FORBIDDEN_PERMISSIONS``

@@ -2974,7 +2974,7 @@ class ApkPolicyHarness(unittest.TestCase):
         ]
         self.assertEqual(dumped, ["res/Qq.xml", "res/4j.xml", "res/8G.xml"])
 
-    # -- github artifact mode (mode-independent authorities only) --
+    # -- github artifact mode (authorities + ShizukuProvider contract) --
 
     def _run_scanner_cli(
         self,

@@ -622,7 +622,10 @@ class FastRouter(
                 // `查Foo符號等審批後再做` 皆否決（fail-safe direction；deny-by-admission，never FAST）。
                 // 動詞核為 common CJK action verbs 之有界集——不封閉宣稱（非 open-world closure）：
                 // 核外動詞（未列入此 12 個者）仍不匹配 ⇒ fail-OPEN（open-world 殘餘，如實記錄；見 KDoc「未列示 consent 動詞」節）。
-                "|(?:再|才)(?:做|查|跑|說|寫|讀|處理|執行|更新|重啟|處辦|辦理)" + // arm H：deferred-action nucleus（stage-9.1）——任意位置 CJK 再|才＋有界動作動詞核 ⇒ clause gate 否決
+                // 【接受之 fail-safe 過度否決（記錄，不得「收回」）】：識別字本身含 再|才×動作動詞核（如 `查 再做 符號`／
+                // `查 再做一次 符號`／`查 才做 符號`／`查 再查 符號`／`查 授權再做 符號`）一律 DENIED——黏合 CJK 識別字 vs
+                // 延後條件句無法僅憑語法分離（與 arm I `的話` 同一接受類；識別字若不可查，使用者可改寫查詢）。
+                "|(?:再|才)(?:做|查|跑|說|寫|讀|處理|執行|更新|重啟|處辦|辦理)" + // arm H：deferred-action nucleus（stage-9.1）——任意位置 CJK 再|才＋有界動作動詞核 ⇒ clause gate 否決（識別字含核者一律 DENIED，accepted fail-safe）
                 // #19 B3 stage-9.1（Re-review #9 A1，[P1]）：arm I——conditional-framing nucleus（任意位置，CJK）。
                 // 文中任意位置出現條件框架顆粒（如果|假如|倘若|要是|的話）即否決（clause gate at admission）。
                 // `查Foo符號如果我同意` 否決。`的話` over-deny 黏合識別字為 accepted fail-safe（記錄，不得「收回」）。
@@ -1439,6 +1442,13 @@ class FastRouter(
          *   substring 搶先而被錯配 gui.automate／FLAVOR_BLOCKED——已翻轉）。
          *   識別字內容一律視為 LSP 內容（不透明），非自動化權限；fast lane 不執行任何
          *   自動化動作（自動化語句仍落 SLOW，未接線把關）。
+         * - CJK-leading single-token CJK-preferred-fallback residual (stage-9.2, accepted verbatim):
+         *   CJK-leading 語句先讀 CJK 語法 ⇒ CJK 階段通過後，含裸 `find|search|lookup|locate|symbol(s)`
+         *   字面 token 的識別字原樣執行（`查 search 符號`⇒`search`、`查 symbol`⇒`symbol`、
+         *   `查 locate 符號`⇒`locate`、`查 Symbols 符號`⇒`Symbols`（大小寫不敏感）以及雙 cue 混合
+         *   形態（`查 symbols symbols`⇒`symbols`、`find symbol symbols`⇒`symbols`）皆 FAST；
+         *   verbatim 識別字 binding、READ-only、escal() JSON-escape、L/N 錨點仍由 Step E 把關；不改寫、
+         *   不執行 consent/條件形態）。EN-started 語句（如 `find symbol Foo`）亦依 cue-budget 語義保證。
          * - EN-delimited glued-cue residual (stage-8.3, accepted verbatim-
          *   preservation rule): `symbols 符號符號` → FAST `符號符號`（EN grammar
          *   劃定之 identifier——glued cue 原樣保留為查詢字串 `符號符號`；

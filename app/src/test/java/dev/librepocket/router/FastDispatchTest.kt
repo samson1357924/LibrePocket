@@ -3305,6 +3305,15 @@ class FastDispatchTest {
             // CJK 階段失敗 ⇒ EN fallback 路徑 ⇒ `Foo`（記錄已接受殘餘：
             // `Symbol` 與 `Foo` 間空白被 EN grammar 劃定）。
             "查 Symbol Foo" to "Foo",
+            // stage-9.4（release-gate 鎳）：CJK-leading single-token CJK-preferred-fallback 代表例——
+            // 裸 EN cue 字面 token 為 READ-only 識別字 binding（esc() JSON-escape、L/N 錨點仍由 Step E 把關）：
+            "查 search 符號" to "search",
+            "查 locate 符號" to "locate",
+            "查 symbol" to "symbol",
+            "查 Symbols 符號" to "Symbols",
+            // 雙 cue 混合形態（cue budget 1：CMD 消費 `symbols ` ⇒ Step B 跳過）：
+            "查 symbols symbols" to "symbols",
+            "find symbol symbols" to "symbols",
         )) {
             val d = decide(text)
             assertEquals(text, RouteKind.FAST, d.route)
@@ -3342,7 +3351,7 @@ class FastDispatchTest {
             assertFalse(text, result.outcome is FastDispatchOutcome.Executed)
             assertEquals(text, before, backend.invocations.get())
         }
-        assertEquals(5, backend.invocations.get())
+        assertEquals(11, backend.invocations.get())
     }
 
     // #19 B3 stage-8.4（Re-review #8 A3）：C++ global-namespace 前綴 `::Foo` 是

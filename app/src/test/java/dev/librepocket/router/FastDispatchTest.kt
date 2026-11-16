@@ -859,6 +859,40 @@ class FastDispatchTest {
         assertEquals(0, backend.invocations.get())
     }
 
+    @Test fun extractionSeparatorBlowupPinsDenyZeroBackend() = runBlocking {
+        // #19 B3 stage-8.2：超線性多項式（實測 ~O(n²)）分割枚舉修復之回歸釘——
+        // `SYMBOL_CJK_KEYWORD_SUFFIX`／`BARE_SYMBOL_CUE_WRAP` 的平坦貪婪分隔符槽
+        // 改為原子群組（同集合、僅原子性；成功路徑匹配逐字相同）。修前此輸入經
+        // Step C 的 replaceFirst／兩處模糊守衛 containsMatchIn 觸發分割枚舉
+        // （實測 n=400→~267 ms 且倍增，4096 字元上限下推定數十秒至數分鐘）；
+        // 修後為逐位置掃描。無 wall-clock 斷言（不釘時鐘）；長度恰為
+        // MAX_INTENT_CHARS＝4096（再多會撞輸入長度閘，到不了 extraction）。
+        // 方向恆 fail-closed：step E 拒絕 U+FF0C（非 L/N、非 allow-list、cp>0x7E）
+        // ⇒ extraction 失敗 ⇒ missingQuestionFor ⇒ DENIED＋NEED_CLARIFICATION；
+        // 絕不執行（reasonCode 以實際決策為準：NEED_CLARIFICATION）。
+        val backend = CountingBackend()
+        val dispatcher = lspDispatcher(backend)
+        val text = "查Foo符號" + "，".repeat(4089) + "X"
+        assertEquals(4096, text.length)
+        for (t in listOf(text)) {
+            // decide()：DENIED＋NEED_CLARIFICATION、toolCall == null。
+            val d = decide(t)
+            assertEquals(t, RouteKind.DENIED, d.route)
+            assertEquals(t, DenyReason.NEED_CLARIFICATION, d.reasonCode)
+            assertNull(t, d.toolCall)
+            // decideAndDispatch：outcome 非 Executed、backend.invocations 不增。
+            val before = backend.invocations.get()
+            val result = dispatcher.decideAndDispatch(t, lspOn, sessionId = "s1", turnIndex = 1)
+            assertEquals(t, RouteKind.DENIED, result.decision.route)
+            assertEquals(t, DenyReason.NEED_CLARIFICATION, result.decision.reasonCode)
+            assertNull(t, result.decision.toolCall)
+            assertFalse(t, result.outcome is FastDispatchOutcome.Executed)
+            assertEquals(t, before, backend.invocations.get())
+        }
+        // 整個 loop 後端零呼叫（ZeroBackend）。
+        assertEquals(0, backend.invocations.get())
+    }
+
     @Test fun emptyRemainderClarifiesAndInvalidCharsetClarifies() {
         // #19 stage-2：空殘餘 / 帶空白殘餘 / 非 allow-list 字元（`!`）一律
         // NEED_CLARIFICATION——絕不改寫成另一個 query 執行。
@@ -2942,11 +2976,14 @@ class FastDispatchTest {
             // 長度恰為 MAX_INTENT_CHARS＝4096（再多字元會撞輸入長度閘——該閘先於任何 regex，
             // 否決毫無回歸意義）。
             // 結尾 `呢` 使 admission 於疑問尾標探針否決 ⇒ decide() 落 RULES 無命中 ⇒ no-match DENIED，
-            // 不進 extraction 路徑——stage-7.3 既有模式（`SYMBOL_CJK_KEYWORD_SUFFIX`／`BARE_SYMBOL_CUE_WRAP`
-            // 兩相鄰貪婪 `[\s，,]*` 類，其等長交疊之分割枚舉於長逗號串為超線性多項式（O(n²)，實務長逗號串可致掛起/超時））經 decide() 觸發會掛起；
-            // 該路徑不在本 stage 範圍（extraction 不動）。本釘仍強迫 PERMISSION_CONDITIONAL_CLAUSE
-            // 對完整原始文本跑 raw 探針（M1 於此釘被實際演練）；若有人把 atomic delimiter 退回非原子，
-            // 本測試會永久掛住（＝回歸被抓到）。
+            // 不進 extraction 路徑（此釘刻意隔離條件句探針，與 extraction 解耦）。
+            // 背景：stage-8.2 已將 extraction 的 flat 分隔符槽（`SYMBOL_CJK_KEYWORD_SUFFIX`／
+            // `BARE_SYMBOL_CUE_WRAP`）改為原子群組，同一裸逗號串經 extraction 亦不再分割枚舉
+            // （修前為超線性多項式 O(n²)，長逗號串可致掛起/超時）；此處保留 `呢` 尾標，
+            // 使本釘持續單獨演練 PERMISSION_CONDITIONAL_CLAUSE raw 探針（M1 回歸），
+            // 不依賴 extraction 的時序特性；若有人把 atomic delimiter 退回非原子，
+            // 本測試會永久掛住（＝回歸被抓到）。extraction 裸逗號路徑的回歸釘另見
+            // [extractionSeparatorBlowupPinsDenyZeroBackend]。
             "查Foo符號等" + "，".repeat(4087) + "X呢",
         )) {
             // decide()：decision is DENIED, toolCall == null。

@@ -1112,8 +1112,10 @@ class FastRouter(
          * Step C — peel at most ONE trailing CJK keyword-SUFFIX cue,
          *   END-anchored, then apply the ambiguity guard (stage-7.3, A3):
          *   a single match of
-         *   `[\s，,]*(?:這個|这个|一下)?[\s，,]*(?:符號|符号)[\s，,]*$` is
-         *   removed — e.g. ` 這個符號`, ` 这个符號`, `一下符號`, ` 符號`
+         *   `(?>[\s，,]*)(?:這個|这个|一下)?(?>[\s，,]*)(?:符號|符号)(?>[\s，,]*)$` is
+         *   removed (stage-8.2: the flat separator slots are atomic groups — a pure
+         *   separator run is never re-partitioned between adjacent slots on a failure
+         *   path; success-path matches are byte-identical) — e.g. ` 這個符號`, ` 这个符號`, `一下符號`, ` 符號`
          *   suffixes:
          *   `查 AlarmManager這個符號` → `AlarmManager` (glued single cue),
          *   `查 AlarmManager 這個符號` → `AlarmManager`,
@@ -1311,22 +1313,42 @@ class FastRouter(
         // content, never strip words —
         // `查 函式 符號` routes FAST with query `函式`, and
         // `查 Foo 函式 符號` clarifies (multi-token).
+        // #19 B3 stage-8.2 — 三個平坦貪婪分隔符槽改為原子群組（同集合、僅原子性）：
+        // 純分隔符 run 不可能屬於 `這個|这个|一下`／`符號|符号` 各交替字元，也不可能
+        // 被 `$` 以外的必需字元消化——原子接管 run 後，失敗路徑不再枚舉分割；成功路徑
+        // 匹配逐字相同。修前對長逗號串為超線性多項式（實測 ~O(n²)，n=400→~267 ms，
+        // 4096 字元上限下可致數十秒至數分鐘）；修後為逐位置掃描（4096 字元 full-run
+        // <100 ms；等價性以 41,370 個長度≤4 枚舉字串抽驗 containsMatchIn/replaceFirst
+        // 全等）。方向恆為 fail-closed（DENIED/澄清），從不執行。
         private val SYMBOL_CJK_KEYWORD_SUFFIX = Regex(
-            "[\\s，,]*(?:這個|这个|一下)?[\\s，,]*(?:符號|符号)[\\s，,]*$",
+            "(?>[\\s，,]*)(?:這個|这个|一下)?(?>[\\s，,]*)(?:符號|符号)(?>[\\s，,]*)$",
         )
         // #19 B3 stage-7.3 (A3/F1c)：全匹配守衛——殘餘恰好是被識別字標點
         // （SYMBOL_ALLOWED_PUNCT 子集，含成對包裹）包夾的單一 cue（可選 這個/一下
         // 黏在 cue 上）⇒ 拒絕（澄清）。`get(符號)`／`使用者(符號)` 不匹配（有識別字
         // 內容於包裹之外）⇒ 保留 verbatim FAST；`(符號)`／`-符號-`／`_符號_` 澄清。
+        // #19 B3 stage-8.2 — 包夾兩個平坦貪婪類（SYMBOL_ALLOWED_PUNCT 子集）改為原子
+        // 群組（同集合、僅原子性）。（防禦一致形態：與 SYMBOL_CJK_KEYWORD_SUFFIX 同類
+        // 相鄰 greedy 收尾，縱然本 pattern 現為線性／~次毫秒可證，仍採原子群組統一防禦；
+        // exhaustive differential 41,370 字串語義一致）；成功路徑匹配逐字相同（含雙端
+        // `^…$` 全匹配守衛語意）。
         private val BARE_SYMBOL_CUE_WRAP = Regex(
-            "^[\\s，,._\$#@/():,;+=~-]*(?:這個|这个|一下)?(?:符號|符号)[\\s，,._\$#@/():,;+=~-]*$",
+            "^(?>[\\s，,._\$#@/():,;+=~-]*)(?:這個|这个|一下)?(?:符號|符号)(?>[\\s，,._\$#@/():,;+=~-]*)$",
         )
         private val SYMBOL_LEADING_CONNECTIVE = Regex(
             "^(?:for|the|a|an|named|called|of|to)\\s+(?=\\S)",
             RegexOption.IGNORE_CASE,
         )
+        // #19 B3 stage-8.2 — 尾端分支改為 possessive（`++`，同集合、僅原子性）：
+        // Step D 的 SYMBOL_EDGE.replace() 在長尾標點 run（如 4096 字元上限下整串逗號）
+        // 對每個 start position 重新貪婪掃掠全尾 run 並逐格回溯重檢 `$`，呈超線性
+        // （4096 字元輸入實測「修前」~246 ms/次，單次提取即含一輪）。possessive 消費不退讓：
+        // 純尾標點 run 在 `$` 錨之外無消費者，故不能剪掉任何成功匹配（成功路徑匹配
+        // 逐字相同）；失敗路徑一次掃掠定局。前導分支不動；`:`／`：` 兩個類內皆原樣保留
+        // ——移動/移除 colon 類屬 stage-8.4 範圍，stage-8.4 語意互動不受本檔影響。
+        // possessive 變更實測無效能收益（no-op；start-position × trailing-run 掃描仍為超線性——僅消除單次 attempt 內的 give-back 回溯，已量測 ~246/275 ms 修前後不變）；保留為安全/正典形態。
         private val SYMBOL_EDGE = Regex(
-            "^[\\s，。、？?：:「」『』“”\"'（）]+|[\\s，。、？?：:「」『』“”\"'（）]+$",
+            "^[\\s，。、？?：:「」『』“”\"'（）]+|[\\s，。、？?：:「」『』“”\"'（）]++$",
         )
         private const val SYMBOL_ALLOWED_PUNCT = "._-${'$'}#@/():,;+=~"
 

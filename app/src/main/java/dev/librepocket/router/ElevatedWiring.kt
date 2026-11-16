@@ -38,12 +38,18 @@ import kotlin.coroutines.coroutineContext
  *   verdict=null → 拒），僅 ALLOW 放行——ASK／DENY／異常一律拒（ASK 不默認為 ALLOW）；
  * - ASK 確認：[PrivilegeGate] 四參 args-aware（`reasonCode` 非空＋`confirmed`），
  *   `confirmed=false`／空白 `reasonCode` 一律 `NeedConfirm`→拒，絕不靜默放行；
+ * - 入口預綁定（turn-9 P2）：confirmed=true 路徑在任何可掛起供應器（ctxSupplier／
+ *   policy evaluateFresh／bridgeGranted／grantCheck）之前，先有界凍結 argv＋reasonCode
+ *   基線；呼叫方仍持有的 list 事後任何突變（含供應器執行期間）都不可能改變此基線；
+ *   呼叫方 list 事後突變造成 `argvMatchesSnapshot` 失敗 → BLACKLISTED Denied、零 spawn；
+ *   spawn／audit 只讀凍結拷貝；confirmed=false cheap deny 不碰 argv，語義不變；
  * - 不可變快照 [ElevatedSnapshot]：argv（防禦拷貝＋不可變包裝）／
  *   reasonCode／flavor／投影開關（freeze 後的不可變有界拷貝）／grant 身份
  *   （grantProviderId／grantConfigRevision）；
  *   確認後 spawn 前重驗快照一致性（開關／flavor／已授權權限集合／grant 身份／policy 任一翻轉、
  *   argv 被竄改即作廢，零 spawn；reason 為不可變 String、入口凍結後只讀快照，不存在竄改面）。
- *   argv 受監督比對共兩個重驗點，任一點觀察到呼叫方原始 list 竄改即作廢（零 spawn）：
+ *   argv 受監督比對共兩個重驗點，任一點觀察到呼叫方原始 list 自入口起的任何突變即作廢
+ *   （零 spawn；入口凍結後此比對涵蓋整個 post-entry 窗口，含 pre-snapshot 供應器執行期間）：
  *   （1）重驗入口（freeze ctx2 之後、ctx 一致性比對之前）；
  *   （2）grant2 最終有效性確認之後、dispatch 之前（最終防線，封閉「確認→改→spawn」缺口）。
  *   dispatch 之後的竄改不在此保證（也無需）：runner 只吃不可變快照 argv，審計綁定 snapshot；
@@ -280,8 +286,10 @@ object ElevatedWiring {
     /**
      * 接線執行（suspend；門禁／supplier 具取消協作與有界 best-effort，runner 於 IO dispatch）。
      *
-     * F6 cheap-gate-first：argv 相關有界凍結僅在 cheap gate 通過且需建不可變快照時執行一次；
-     * 早期 deny 路徑不觸碰不可信 argv 迭代（審計以空 argv＋有界 reason 記錄）。
+     * F6 cheap-gate-first：argv 相關有界凍結僅在 cheap gate 通過後發生；confirmed=true 路徑
+     * 以「入口預綁定」為 confirmed=true 流程的第一步（在 ctxSupplier 之前），凍結一次供快照／
+     * 重驗／audit／派發共用（不再二次凍結）；早期 deny 路徑不觸碰不可信 argv 迭代
+     * （審計以空 argv＋有界 reason 記錄）。confirmed=false cheap deny 不碰 argv，語義不變。
      * F3：重驗參數竄改以有界重凍結比對，不直接對不可信 list 呼叫未受控 equals/iterator。
      * F4：ctx/bridge/grant supplier 走有界專用池（ElevatedSupplierPool，POOL_SIZE=2、零佇列、
      *   daemon；與快照池分離），caller 恆有界（get ≤ ~1.2s；get 1s＋grace 200ms；池滿即 null）；池滿或忽略 interrupt
@@ -348,6 +356,8 @@ object ElevatedWiring {
         // runner 永遠收到有界正預算。
         val effectiveTimeoutMs = timeoutMs.coerceAtMost(ShellPolicy.MAX_ELEVATED_TIMEOUT_MS)
         // --- Cheap gates first (F6): no argv iteration/snapshot before these pass ---
+        // （confirmed=true 流程的第一步是 cheap gate 之後、ctxSupplier 之前的「入口預綁定」凍結；
+        //   cheap gate 本身仍不碰 argv，語義不變。）
         val tool = ToolRegistry.find(TOOL_NAME)
             ?: run {
                 audit.record(emptyList(), "", PrivilegeAuditLog.verdictName(
@@ -409,6 +419,27 @@ object ElevatedWiring {
             audit.record(emptyList(), safeReason(reasonCode), PrivilegeAuditLog.verdictName(denied))
             return denied
         }
+
+        // --- 確認向量預綁定（turn-9 P2）---
+        // confirmed=true 路徑：在任何可掛起供應器（ctxSupplier／policy evaluateFresh／
+        // bridgeGranted／grantCheck）之前，先有界凍結 argv＋reasonCode 基線。
+        // 呼叫方仍持有的 mutable/adversarial list 之後任何突變皆不可能改變此基線；
+        // 快照／重驗／audit／runner 派發一律讀此不可變拷貝。下方的
+        // argvMatchesSnapshot(caller argv, snapshot.argv) 讀呼叫方原始 list 以偵測
+        // 事後突變——入口凍結後此比對封閉任意 post-entry 突變，嚴格只會執行
+        // 入口確認向量。confirmed=false cheap deny 維持不碰 argv，語義不變。
+        val entryFrozen = ElevatedRequest(argv, reasonCode).frozenOrNull()
+            ?: run {
+                val denied = ShellResult.Denied(
+                    ShellDeny.BLACKLISTED,
+                    "elevated snapshot failed (fail-closed, no spawn)",
+                )
+                audit.record(emptyList(), safeReason(reasonCode), PrivilegeAuditLog.verdictName(denied))
+                return denied
+            }
+        // Fresh, immutable bound copies — never re-read the caller's list for these.
+        val boundArgv: List<String> = entryFrozen.argv
+        val boundReason: String = entryFrozen.reasonCode
 
         // Precheck projection/context (F4 bounded) without argv snapshot
         val ctx1: ProjectionContext = fetchCtx(ctxSupplier) ?: run {
@@ -524,18 +555,11 @@ object ElevatedWiring {
         }
         val validGrant1 = grant1 as ElevatedGrant.Valid
 
-        // Prechecks passed: perform single bounded freeze to build immutable snapshot (F6,F7).
-        val frozenEntry = ElevatedRequest(argv, reasonCode).frozenOrNull()
-            ?: run {
-                val denied = ShellResult.Denied(ShellDeny.BLACKLISTED, "elevated snapshot failed (fail-closed, no spawn)")
-                audit.record(emptyList(), safeReason(reasonCode), PrivilegeAuditLog.verdictName(denied))
-                return denied
-            }
-        val argvCopy: List<String> = frozenEntry.argv
-        val reasonCopy: String = frozenEntry.reasonCode
+        // Prechecks passed: 重用入口預綁定快照（turn-9 P2；F6、F7 單次凍結——入口一次），
+        // 不二次凍結、不再讀呼叫方 list。snapshot 與 runner 派發皆讀此不可變拷貝。
         val snapshot = ElevatedSnapshot(
-            argv = argvCopy,
-            reasonCode = reasonCopy,
+            argv = boundArgv,
+            reasonCode = boundReason,
             flavor = frozenCtx1.flavor,
             userSwitches = frozenCtx1.userSwitches,
             grantedPermissions = frozenCtx1.grantedPermissions,
@@ -545,6 +569,8 @@ object ElevatedWiring {
         coroutineContext.ensureActive()
         // 確認後 spawn 前重驗：重新投影＋fresh policy＋重求 bridge／grant＋
         // 快照一致性；snapshot 已存在且不觸不可信 argv 的 deny 用 snapshot argv＋有界 reason 記錄（F8）。
+        // argv 重驗點讀呼叫方原始 list，入口凍結後可偵測任意 post-entry 突變（含入口→快照間的
+        // pre-snapshot 供應器窗口之突變）；形狀不變、覆蓋面加寬。
         val ctx2: ProjectionContext = fetchCtx(ctxSupplier) ?: run {
             val denied = ShellResult.Denied(ShellDeny.NOT_WHITELISTED, "reverify projection unavailable (fail-closed, no spawn)")
             audit.record(snapshot.argv, safeReason(snapshot.reasonCode), PrivilegeAuditLog.verdictName(denied))
@@ -557,6 +583,7 @@ object ElevatedWiring {
             return denied
         }
         // F3: bounded/safe recheck of untrusted argv (no uncontrolled equals/iterator on adversarial list)
+        // 入口凍結後，此比對涵蓋入口起任意時點的突變（含 pre-snapshot 供應器窗口）；形狀不變、覆蓋面加寬。
         // 註：argvMatchesSnapshot 為非掛起函式且 frozenOrNull 全收斂 Throwable→null，此處 CE catch 為
         // 防禦縱深（現況下不可達——frozenOrNull 全收斂 Throwable→null）；hostile list 的 CE 已於
         // copyArgvBounded 內收斂為 null → argvMatchesSnapshot 回 false → Denied，見 reverifyArgvRecheckCancellationDeniedZeroSpawnPin。
@@ -673,7 +700,9 @@ object ElevatedWiring {
         }
         // 最終 argv 防線（grant2 最終有效性確認之後、dispatch 之前）：
         // grantCheck／bridgeGranted supplier 可能於 grant2 評估期間竄改 caller 原始 argv——
-        // 再做一次受監督比對，封閉「確認→改→spawn」語義缺口。與重驗入口同形：CE 重拋；
+        // 再做一次受監督比對，封閉「確認→改→spawn」語義缺口。入口凍結後，此比對與重驗入口點
+        // 一起涵蓋入口起任意時點的突變（含 pre-snapshot 供應器執行窗口、grant2 評估窗口），
+        // 形狀不變、覆蓋面加寬。與重驗入口同形：CE 重拋；
         // 其餘 Throwable→false（fail-closed，零 spawn）。runner 只吃不可變快照
         // [ElevatedSnapshot.argv]，此比對針對呼叫方原始 list 的竄改面（見檔頂 KDoc 兩重驗點）。
         val argvOkFinal = try {

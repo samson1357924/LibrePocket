@@ -518,6 +518,71 @@ class ElevatedWiringTest {
         assertEquals(mapOf("DENY" to 1), audit.countByVerdict())
     }
 
+    @Test fun confirmAfterFirstSupplierMutationVoids() = runBlocking {
+        // 入口凍結後（turn-9 P2）：ctxSupplier 第一次呼叫執行期間竄改 caller 原始 list——
+        // 入口基線不受影響，重驗點觀測到 live list 與快照不一致 → Denied、零 spawn。
+        val mutable = mutableListOf("id")
+        var calls = 0
+        val ctxSupplier: () -> ProjectionContext = {
+            calls++
+            if (calls == 1) {
+                mutable.clear()
+                mutable.add("whoami")
+            }
+            elevatedCtx()
+        }
+        val runner = SpawnCounter()
+        val audit = PrivilegeAuditLog()
+        val r = ElevatedWiring.execute(
+            argv = mutable,
+            reasonCode = "B3-T",
+            confirmed = true,
+            ctxSupplier = ctxSupplier,
+            policyStore = allowPolicy(),
+            runner = runner,
+            audit = audit,
+            grantCheck = { validGrant() },
+            bridgeGranted = { true },
+        )
+        assertTrue("$r", r is ShellResult.Denied)
+        assertTrue("$r", (r as ShellResult.Denied).message.contains("changed after confirm"))
+        assertEquals(0, runner.calls)
+        assertEquals(mapOf("DENY" to 1), audit.countByVerdict())
+    }
+
+    @Test fun confirmAfterFirstGrantSupplierMutationVoids() = runBlocking {
+        // 入口凍結後（turn-9 P2）：grantCheck 第一次呼叫（pre-snapshot 階段）竄改 caller
+        // 原始 list——入口基線不受影響，重驗點觀測到 live list 與快照不一致 → Denied、零 spawn。
+        // （修復前此 fixture 會通過重驗並以被竄改向量 spawn。）
+        val mutable = mutableListOf("id")
+        var grantCalls = 0
+        val grantCheck: () -> ElevatedWiring.ElevatedGrant = {
+            grantCalls++
+            if (grantCalls == 1) {
+                mutable.clear()
+                mutable.add("whoami")
+            }
+            validGrant()
+        }
+        val runner = SpawnCounter()
+        val audit = PrivilegeAuditLog()
+        val r = ElevatedWiring.execute(
+            argv = mutable,
+            reasonCode = "B3-T",
+            confirmed = true,
+            ctxSupplier = { elevatedCtx() },
+            policyStore = allowPolicy(),
+            runner = runner,
+            audit = audit,
+            grantCheck = grantCheck,
+            bridgeGranted = { true },
+        )
+        assertTrue("$r", r is ShellResult.Denied)
+        assertTrue("$r", (r as ShellResult.Denied).message.contains("changed after confirm"))
+        assertEquals(0, runner.calls)
+        assertEquals(mapOf("DENY" to 1), audit.countByVerdict())
+    }
+
     @Test fun adversarialEqualsMutationDetectedBySafeRecheck() = runBlocking {
         // F3: untrusted argv must not be compared via uncontrolled equals/iterator; bounded re-freeze detects mutation.
         class EvilArgv(private val backing: MutableList<String>) : AbstractList<String>() {

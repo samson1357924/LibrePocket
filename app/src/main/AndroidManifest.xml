@@ -7,7 +7,8 @@
   service is declared only in src/foss + src/github overlays (service
   hardening relies on DEX superclass + xmltree gates).
 -->
-<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
 
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
@@ -19,6 +20,15 @@
          Play 無需申報）。完整理由與 <queries> 可見性契約：
          docs/specs/ANDROID_INTENT_VISIBILITY.md -->
     <uses-permission android:name="com.android.alarm.permission.SET_ALARM" />
+
+    <!-- 零新增權限契約（Issue #137 C1/C2）：防範任何 transitive AAR 依賴
+         （如 github flavor 的 azure-speech sdk）意外合入 RECORD_AUDIO。
+         本 App 語音錄製一律走系統 RecognizerIntent 委派，永遠不直接持有 RECORD_AUDIO。
+         OEM 備註：若 OEM 出貨自訂 recognizer Activity，錄音權限由該 Activity 持有，
+         不在本 App 的權限聲明範圍；此 remove 是 load-bearing 的（github flavor 的
+         azure-speech transitive AAR 會帶入 RECORD_AUDIO），OEM 不相容時的 fallback
+         是使用者手動聽寫，絕不可放寬此 remove。merged-manifest Robolectric 測試鎖定之。 -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" tools:node="remove" />
 
     <!-- queries 可見性（S2 語音 + #14 intent adapter）：targetSdk 36 package
          visibility 會把未宣告的隱式 Intent 過濾掉，resolve-first launcher 即
@@ -106,7 +116,7 @@
              清理僅 main process 執行（見 LibrePocketApp 進程閘門；:voice 跳過
              並記 log，避免與主行程安裝窗口併發）。三 flavor 共用 main
              manifest，本 PR 無需 flavor overlay。
-             C1 三服務同 :voice（stub 無狀態）；C2 接 UI/STT 前將 SessionService（+Recognition）另開 :voice_session 並測量 PSS/啟動時延。TODO(C2-voice-process)。 -->
+             C1 三服務同 :voice（以 process 隔離主 App 崩潰/OOM）；C2 會話本體亦留在 :voice（LibreVoiceInteractionSession 持有 activeTaskId／sessionInstanceId 並發佈 target-bound one-shot token）：目前未見 PSS/啟動時延壓力，獨立 :voice_session process 列為預留優化項，本 PR 不引入。 -->
         <service
             android:name=".assistant.LibreVoiceInteractionService"
             android:exported="true"
@@ -137,5 +147,15 @@
                 <action android:name="android.speech.RecognitionService" />
             </intent-filter>
         </service>
+
+        <!-- C2 voice retrigger handoff（Issue #137）：main-process, app-private cross-process
+             channel for :voice session -> trusted voice UI token delivery.
+             無 android:process 屬性＝預設為 app main process。 -->
+        <provider
+            android:name=".assistant.VoiceHandoffProvider"
+            android:authorities="${applicationId}.voice.handoff"
+            android:exported="false"
+            android:grantUriPermissions="false"
+            android:multiprocess="false" />
     </application>
 </manifest>

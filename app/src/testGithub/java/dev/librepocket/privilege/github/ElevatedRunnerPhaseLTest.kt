@@ -484,4 +484,56 @@ class ElevatedRunnerPhaseLTest {
 )
         }
     }
+
+    // ---- P1-3：quota 後 `isExpired` 提交前顯式門旗標釘（preSpawnLinger(false) 映射） ----
+    //
+    // 兩 runner（RootSuRunner／ShizukuShellRunner）的 quota 後最後一門共用映射
+    // `preSpawnExpired(timeoutMs, preSpawnLinger(false))`（本門從未啟動 worker）——
+    // `preSpawnLinger(false)` ≡ `outstanding() > 0`（全域無殘留即 false，否則置旗）。
+    // runner 層無時鐘接縫：該門需所有 pre-spawn gate 通過**且** deadline 恰於
+    // `quota.tryAcquire()` 與 `isExpired` 查核之間耗盡——真時鐘下為非確定性競態，
+    // 純 unit 風格不可達（pre-spawn gate 皆經 isExpired-first 的 awaitPreSpawn，
+    // 提前逾期時會先被該門截獲，不會落到此門）。故於共享實作層
+    // [ElevatedRunnerCommon]（internal，同 module 可見）釘住旗標矩陣——兩 runner
+    // 同取此映射，語義即該門的語義（見兩 runner 的 `isExpired` 提交前檢查點）。
+
+    @Test fun quotaAfterPreSpawnExpiredFlagsLingerWhenResidueSeeded() {
+        ElevatedCleanupTracker.clearUnverified()
+        ElevatedCleanupTracker.noteClean()
+        pollOutstandingTo(0)
+        assertTrue(ElevatedCleanupTracker.acquireSlot())
+        try {
+            assertEquals(1, ElevatedCleanupTracker.outstanding())
+            val r = ElevatedRunnerCommon.preSpawnExpired(
+                1_000L,
+                ElevatedRunnerCommon.preSpawnLinger(false),
+            )
+            assertTrue("seeded residue must flag cleanupIncomplete", r.cleanupIncomplete)
+            assertEquals(1_000L, r.timeoutMs)
+            assertEquals(0, r.partialStdout.size)
+            assertEquals(0, r.partialStderr.size)
+            assertFalse(r.truncated)
+        } finally {
+            ElevatedCleanupTracker.releaseSlot()
+            pollOutstandingTo(0)
+            ElevatedCleanupTracker.noteClean()
+            pollActiveTo(0)
+        }
+    }
+
+    @Test fun quotaAfterPreSpawnExpiredCleanWhenNoResidue() {
+        ElevatedCleanupTracker.clearUnverified()
+        ElevatedCleanupTracker.noteClean()
+        pollOutstandingTo(0)
+        assertEquals(0, ElevatedCleanupTracker.outstanding())
+        val r = ElevatedRunnerCommon.preSpawnExpired(
+            1_000L,
+            ElevatedRunnerCommon.preSpawnLinger(false),
+        )
+        assertFalse("no residue must mean cleanupIncomplete=false", r.cleanupIncomplete)
+        assertEquals(1_000L, r.timeoutMs)
+        assertEquals(0, r.partialStdout.size)
+        assertEquals(0, r.partialStderr.size)
+        assertFalse(r.truncated)
+    }
 }

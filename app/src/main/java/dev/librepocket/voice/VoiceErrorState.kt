@@ -27,6 +27,11 @@ class VoiceErrorState {
         sttError = null
     }
 
+    /** 使用者重置語音楔住狀態：清 STT 錯誤橫幅（語義不是「辨識成功」，只是狀態重置）。 */
+    fun clearSttError() {
+        sttError = null
+    }
+
     fun onSttFailure(message: String) {
         sttError = message
     }

@@ -1,7 +1,9 @@
 package dev.librepocket.agent.ui.chat
 
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.saveable.SaverScope
+import java.util.UUID
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
@@ -236,6 +238,33 @@ class SttLaunchStateTest {
         assertEquals(5, ResetEpochSaver.restore(5)?.intValue)
         val saved = with(ResetEpochSaver) { testSaverScope.save(mutableIntStateOf(7)) }
         assertEquals(7, saved)
+    }
+
+    @Test
+    fun screenIdSaver_roundTrip_validUuidRestored() {
+        val uuid = "123e4567-e89b-42d3-a456-426655440000"
+        val saved = with(ScreenIdSaver) { testSaverScope.save(mutableStateOf(uuid)) }
+        assertEquals(uuid, saved)
+        val restored = ScreenIdSaver.restore(saved!!) ?: error("restored must not be null")
+        assertEquals(uuid, restored.value)
+    }
+
+    @Test
+    fun screenIdSaver_corruptRestore_yieldsFreshUnmatchableUuid() {
+        listOf("garbage", 123, null).forEach { corrupt ->
+            val restored = restoreScreenId(corrupt)
+            assertEquals(36, restored.value.length)
+            assertTrue(runCatching { UUID.fromString(restored.value) }.isSuccess)
+            assertTrue(restored.value != "garbage")
+        }
+        // 同一顆腐化值經 saver 本身的 restore 入口也 fail-closed（非空值；null 沒入口但同走 restoreScreenId）。
+        assertEquals(36, (ScreenIdSaver.restore(123) ?: error("restored must not be null")).value.length)
+        // 36 字元但非合法 UUID 的字串同樣 fail-closed 發 fresh UUID。
+        val invalid36 = "zzzzzzzz-zzzz-zzzz-zzzz-zzzzzzzzzzzz"
+        assertEquals(36, invalid36.length)
+        val restored = restoreScreenId(invalid36)
+        assertTrue(runCatching { UUID.fromString(restored.value) }.isSuccess)
+        assertTrue(restored.value != invalid36)
     }
 
     @Test

@@ -143,12 +143,26 @@ internal class VoiceSttArbiter(
      * recovery action; never by internal bookkeeping.
      *
      * Attribution caveat (honest): a pre-reset recognizer's request code can never reach the
-     * shell's result handler post-reset. Its launcher is unregistered at epoch advance, the
-     * pre-reset registry key is never re-registered, and the registry parks the late result
-     * undeliverable under the dead key. The slot/generation pairing (slot tables read 0L →
-     * fail-closed drop) is only the second layer — defense in depth. The sole remaining path
-     * is the framework's pending-result re-dispatch after true process death (same-epoch key
-     * restore); documented in CAPABILITY_MATRIX/THREAT_MODEL.
+     * shell's result handler with an attributable effect post-reset (in-process). Its launcher
+     * is unregistered at epoch advance, the pre-reset registry key is never re-registered within
+     * the same entry, and the registry parks the late result undeliverable under the dead key.
+     * Cross-entry late results terminate at the registry boundary (keys embed the per-entry
+     * screenId, so a NEW ChatScreen entry never re-registers the destroyed entry's key; precondition:
+     * CHAT back-stack entries are never restored with restoreState=true — see screenId KDoc / docs). The
+     * remaining framework-level path is the same-entry re-registration and re-dispatch of a
+     * pending result across process death (androidx contract, not simulated here): it enters the
+     * handler; attribution is preserved when the SttLaunchState snapshot restores (delivery is
+     * the designed outcome, pinned by the recreation tests), and gen==0L fail-closed drops only
+     * when the snapshot failed to restore. Post-reset the pre-reset key never re-registers in
+     * any restore whose parcel carries the post-reset (or later) saved state — the normal case
+     * for configuration change and process death. If process death occurs before the first
+     * post-reset onSaveInstanceState, the parcel predates the reset: epoch and screenId restore
+     * as-pre-reset, the key re-registers identically, and the parked result re-enters under the
+     * pre-reset identity — residual (a) (delivery with restored attribution, prefill only; or
+     * gen==0L fail-closed drop). Never cross-entry misattribution. See
+     * CAPABILITY_MATRIX and THREAT_MODEL residual (a). The slot/generation
+     * pairing (slot tables read 0L → fail-closed drop) is only the second layer — defense in
+     * depth. Documented in CAPABILITY_MATRIX/THREAT_MODEL.
      */
     fun hardReset() {
         inFlight = null

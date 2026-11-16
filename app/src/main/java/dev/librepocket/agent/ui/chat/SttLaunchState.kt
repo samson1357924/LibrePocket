@@ -1,14 +1,17 @@
 package dev.librepocket.agent.ui.chat
 
 import androidx.compose.runtime.MutableIntState
+import androidx.compose.runtime.MutableState
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.staticCompositionLocalOf
 import androidx.compose.runtime.saveable.Saver
 import androidx.compose.runtime.saveable.listSaver
+import java.util.UUID
 
 /**
  * Activity 重建（recreation）時，ChatScreen 登記於 ActivityResultRegistry 的 launched key
- * （"stt-slotN-<resetEpoch>"，resetEpoch 亦為 rememberSaveable）與 pending result 由 registry
+ * （"stt-<screenId>-slotN-<resetEpoch>"，screenId 為 entry-scoped rememberSaveable、resetEpoch 亦為 rememberSaveable）與 pending result 由 registry
  * 存在 saved bundle 中、重建後重新投遞給新組合的 callback——因此「重建前 launch 的 recognizer，其
  * 結果可能在重建後的 composition 回來」是合法路徑，而不是錯誤。此時 slot/arbiter 的記憶體狀態（`remember{}`）會是全新的，無法僅憑
  * 新值判斷結果歸屬；本檔將每個 slot 的 launch 身分（slotBusy/slotGen）與 arbiter 的
@@ -149,6 +152,29 @@ internal val SttLaunchStateSaver = listSaver(
 internal val ResetEpochSaver = Saver<MutableIntState, Int>(
     save = { it.intValue },
     restore = { if (it >= 0) mutableIntStateOf(it) else mutableIntStateOf(0) },
+)
+
+/**
+ * [ScreenIdSaver] 的還原邏輯（抽成 internal top-level 供 JVM 單元測試直接驗證）。
+ * 僅接受 36 字元且可 `UUID.fromString` 解析的字串；其餘（型別不符／腐化 bundle）一律發
+ * fresh random UUID——永不 crash，腐化 bundle 產生的 key 不可匹配任何既有 outstanding
+ * rc→key 綁定。
+ */
+internal fun restoreScreenId(saved: Any?): MutableState<String> {
+    val valid = (saved as? String)?.takeIf { s ->
+        s.length == 36 && runCatching { UUID.fromString(s) }.isSuccess
+    }
+    return mutableStateOf(valid ?: UUID.randomUUID().toString())
+}
+
+/**
+ * Per-entry `screenId` 的 fail-closed saver（entry-scoped identity；rememberSaveable 保存隨機
+ * UUID）。還原時驗證為 36 字元且可 `UUID.fromString` 解析的字串，否則發 fresh random UUID——
+ * 永不 crash；腐化／型別不符的 bundle 使 key 不可匹配任何既有 outstanding rc→key 綁定。
+ */
+internal val ScreenIdSaver = Saver<MutableState<String>, Any>(
+    save = { it.value },
+    restore = { saved -> restoreScreenId(saved) },
 )
 
 /**

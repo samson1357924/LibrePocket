@@ -17,6 +17,7 @@ import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.ui.test.ExperimentalTestApi
 import androidx.compose.ui.test.junit4.StateRestorationTester
 import androidx.compose.ui.test.assertCountEquals
@@ -2472,8 +2473,9 @@ class ChatScreenVoiceLaunchTest {
 
         // Mic → C admits (gen3) on the freed slot0. Its launch is a NEW registry key derived from
         // the advanced resetEpoch, so its rc must differ from both pre-reset launches.
-        // (rc-distinctness is a canary pinning androidx-internal minting — rc uniqueness off occupied
-        // rcToKey entries — not a contract guarantee.)
+        // rc-distinctness is not a contract androidx guarantees to callers, but is deterministic here
+        // (fresh keys mint fresh rcs outside rcToKey; A's in-flight binding persists) — the canary pins
+        // the binding mechanism, behavior asserts below are the real gate.
         composeRule.onNodeWithContentDescription("語音輸入").performClick()
         composeRule.waitForIdle()
         assertEquals(3, registry.launchedIntents.size)
@@ -2817,8 +2819,9 @@ class ChatScreenVoiceLaunchTest {
         assertEquals(false, voiceRequested.value)
         val rcA = registry.launchedRequestCodes[0]
         val rcC = registry.launchedRequestCodes[2]
-        // (rc-distinctness is a canary pinning androidx-internal minting — rc uniqueness off occupied
-        // rcToKey entries — not a contract guarantee.)
+        // rc-distinctness is not a contract androidx guarantees to callers, but is deterministic here
+        // (fresh keys mint fresh rcs outside rcToKey; A's in-flight binding persists) — the canary pins
+        // the binding mechanism, behavior asserts below are the real gate.
         assertTrue(rcC != registry.launchedRequestCodes[0])
         assertTrue(rcC != registry.launchedRequestCodes[1])
 
@@ -3023,6 +3026,167 @@ class ChatScreenVoiceLaunchTest {
         }
         composeRule.waitForIdle()
         assertEquals("fresh", vm.input.value)
+        assertEquals(0, provider.streamCalls)
+    }
+
+    // ── 跨 ChatScreen entry 實例（pop → 新 entry）：新 entry 不得重用舊 rc→key 綁定 ────────────
+    // F1（round-3 review, P2/BLOCK）：resetEpoch 由 rememberSaveable 初始化為 0，且不含
+    // screen/entry instance identity；舊 CHAT entry 被 popUpTo(CHAT, inclusive=true) 銷毀（其
+    // launcher onDispose 會 unregister，但 outstanding launch 的 rc→key 綁定留在 Activity-scoped
+    // registry）後，全新 CHAT entry 一律從 epoch 0 起算、以相同 key 重新註冊（"stt-slot0-0"），
+    // 依 androidx registerKey 早退重用同一 requestCode——使舊辨識的晚到 RESULT_OK 被投遞進新
+    // entry 的 callback，prefill 舊逐字稿覆寫新草稿並提早結算新閘。此節的鑰匙是 entry-scoped
+    // screenId（per-entry 隨機 UUID，rememberSaveable），key 推導為 "stt-<screenId>-slotN-<epoch>"：
+    // 同一 entry 的 recreation 沿用原 key 可收回有效結果；新 entry 絕不重用已銷毀 entry 的
+    // outstanding rc→key；重設仍以 epoch 斷開舊 callback。
+
+    @Test
+    fun newChatEntry_popThenNewEntry_outstandingOldResultNeverPrefillsOrSettlesIt() {
+        registerRecognitionService()
+        val provider = VoiceLaunchFakeProvider()
+        val vm = newVm(provider)
+        val registry = RecordingRegistry()
+        val owner = object : ActivityResultRegistryOwner {
+            override val activityResultRegistry: ActivityResultRegistry = registry
+        }
+        val entryId = MutableStateFlow("A")
+        val voiceRequested = MutableStateFlow(true)
+
+        composeRule.setContent {
+            val id by entryId.collectAsState()
+            val req by voiceRequested.collectAsState()
+            CompositionLocalProvider(LocalActivityResultRegistryOwner provides owner) {
+                // key(id) 換鍵＝舊 entry 離開組合（DisposableEffect onDispose 會 unregister，
+                // in-flight outstanding launch 的 rc→key 綁定留在 registry），新 entry 全新組合
+                // （fresh screenId UUID、resetEpoch=0、slot 表全空）。
+                key(id) {
+                    ChatScreen(
+                        padding = PaddingValues(0.dp),
+                        viewModel = vm,
+                        userSwitches = mapOf(VoiceTools.SWITCH_INPUT to true),
+                        voiceInputRequested = req,
+                        onVoiceInputConsumed = { voiceRequested.value = false },
+                        voiceSwitchesLoaded = true,
+                    )
+                }
+            }
+        }
+        composeRule.waitForIdle()
+        assertEquals(1, registry.launchedIntents.size) // A INITIAL gen1 slot0, hangs
+        // A 的結果懸空不投遞——這正是本測試的前提。
+        val rcA = registry.launchedRequestCodes[0]
+
+        // Pop the old entry: A 離開組合（unregister；in-flight 綁定保留），C 全新組合進場。
+        composeRule.runOnIdle { entryId.value = "C" }
+        composeRule.waitForIdle()
+
+        // 新 entry 的 mic 啟動 C（slot0 全空，可派）。
+        composeRule.onNodeWithContentDescription("語音輸入").performClick()
+        composeRule.waitForIdle()
+        assertEquals(2, registry.launchedIntents.size)
+        val rcC = registry.launchedRequestCodes[1]
+        // Canary pinning androidx-internal minting（registerKey 早退重用已占用 rc 的行為）：
+        // pre-fix 的新 entry 以相同 key "stt-slot0-0" 重新註冊 → rcC == rcA。
+        // rc-distinctness is not a contract androidx guarantees to callers, but is deterministic here
+        // (fresh keys mint fresh rcs outside rcToKey; A's in-flight binding persists) — the canary pins
+        // the binding mechanism, behavior asserts below are the real gate.
+        assertTrue(rcC != rcA)
+
+        // A 的晚到結果（舊 entry 已 pop）：必須在 registry 邊界終結——不得 prefill C 的草稿、
+        // 不得結算 C 的閘。
+        val staleResult = Intent().putStringArrayListExtra(
+            RecognizerIntent.EXTRA_RESULTS,
+            arrayListOf("old transcript"),
+        )
+        composeRule.runOnIdle {
+            registry.dispatchResult(rcA, ActivityResult(Activity.RESULT_OK, staleResult))
+        }
+        composeRule.waitForIdle()
+        assertEquals("", vm.input.value)
+
+        // C 的 gate 仍被 C 自己的 launch 持有：mic tap 只佇列一枚 USER arm、不啟動
+        // gate 仍由 C 持有 ⇒ 佇列 arm 不被消費（此 USER arm 留至 C settle 時被消費，見下文）。
+        composeRule.onNodeWithContentDescription("語音輸入").performClick()
+        composeRule.waitForIdle()
+        assertEquals(2, registry.launchedIntents.size)
+
+        // C 自己的結果：fresh，正確 prefill，且 settle 的是自己的 launch（不 auto-send）。
+        val freshResult = Intent().putStringArrayListExtra(
+            RecognizerIntent.EXTRA_RESULTS,
+            arrayListOf("new transcript"),
+        )
+        composeRule.runOnIdle {
+            registry.dispatchResult(rcC, ActivityResult(Activity.RESULT_OK, freshResult))
+        }
+        composeRule.waitForIdle()
+        assertEquals("new transcript", vm.input.value)
+        assertEquals(0, provider.streamCalls)
+        // settle 釋放閘後，gate-hold probe 排隊的 USER arm 於 settle 點亮時被喚起 ⇒ 第三枚 recognizer 啟動（不依賴後續點按）
+        assertEquals(3, registry.launchedIntents.size)
+    }
+
+    @Test
+    fun newChatEntry_freshResultFirst_freshPrefillsThenPoppedEntryStaleResultIgnored() {
+        // GUARD — passes pre- and post-fix; pins the inverse dispatch order, not the F1 mechanism.
+        registerRecognitionService()
+        val provider = VoiceLaunchFakeProvider()
+        val vm = newVm(provider)
+        val registry = RecordingRegistry()
+        val owner = object : ActivityResultRegistryOwner {
+            override val activityResultRegistry: ActivityResultRegistry = registry
+        }
+        val entryId = MutableStateFlow("A")
+        val voiceRequested = MutableStateFlow(true)
+
+        composeRule.setContent {
+            val id by entryId.collectAsState()
+            val req by voiceRequested.collectAsState()
+            CompositionLocalProvider(LocalActivityResultRegistryOwner provides owner) {
+                key(id) {
+                    ChatScreen(
+                        padding = PaddingValues(0.dp),
+                        viewModel = vm,
+                        userSwitches = mapOf(VoiceTools.SWITCH_INPUT to true),
+                        voiceInputRequested = req,
+                        onVoiceInputConsumed = { voiceRequested.value = false },
+                        voiceSwitchesLoaded = true,
+                    )
+                }
+            }
+        }
+        composeRule.waitForIdle()
+        assertEquals(1, registry.launchedIntents.size) // A INITIAL gen1 slot0, hangs
+        val rcA = registry.launchedRequestCodes[0]
+
+        composeRule.runOnIdle { entryId.value = "C" }
+        composeRule.waitForIdle()
+
+        composeRule.onNodeWithContentDescription("語音輸入").performClick()
+        composeRule.waitForIdle()
+        assertEquals(2, registry.launchedIntents.size)
+        val rcC = registry.launchedRequestCodes[1]
+
+        // 新鮮（C 的）結果先回：prefill。
+        val freshResult = Intent().putStringArrayListExtra(
+            RecognizerIntent.EXTRA_RESULTS,
+            arrayListOf("new transcript"),
+        )
+        composeRule.runOnIdle {
+            registry.dispatchResult(rcC, ActivityResult(Activity.RESULT_OK, freshResult))
+        }
+        composeRule.waitForIdle()
+        assertEquals("new transcript", vm.input.value)
+
+        // 舊 entry（A）的過期結果後回：草稿不得被覆寫。
+        val staleResult = Intent().putStringArrayListExtra(
+            RecognizerIntent.EXTRA_RESULTS,
+            arrayListOf("stale transcript"),
+        )
+        composeRule.runOnIdle {
+            registry.dispatchResult(rcA, ActivityResult(Activity.RESULT_OK, staleResult))
+        }
+        composeRule.waitForIdle()
+        assertEquals("new transcript", vm.input.value)
         assertEquals(0, provider.streamCalls)
     }
 }

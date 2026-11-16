@@ -90,6 +90,7 @@ import dev.librepocket.voice.shouldApplyUiEvent
 import dev.librepocket.voice.VoiceTts
 import dev.librepocket.voice.VoiceTtsConfirmState
 import dev.librepocket.voice.TtsConfirmDecision
+import java.util.UUID
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -361,14 +362,19 @@ fun ChatScreen(
     // （如兩 slot 楔住時未消費的 INITIAL）會擱淺到下一次無關的狀態翻轉；以此旗標作為決策
     // 效應的 key，讓 settle 確定性地喚起一次重裁決。
     var sttSettleSeq by remember { mutableStateOf(0) }
-    // 使用者硬重設世代（reset）：「重設語音辨識」+1。launcher 的 registry key 由此世代推導
-    //（"stt-slotN-<epoch>"）：重設後，重設前的 launch（與其 rc→key 綁定）永遠不可達——其晚到
+    // 使用者硬重設世代（reset）：「重設語音辨識」+1。launcher 的 registry key 由 per-entry
+    // screenId＋此世代推導（"stt-<screenId>-slotN-<epoch>"）：重設後，重設前的 launch（與其 rc→key 綁定）永遠不可達——其晚到
     // 結果在 registry 邊界永不投遞（late result 停靠 pendingResults，鍵不再註冊），無法冒充
     // 重設後的 launch；slot/gen 表僅為第二層縱深防禦。
     // wrap 為負唯一且不衝突；跨重建的負數還原經 ResetEpochSaver 夾為 0（與 epoch-0 鍵名相同但
     //  fail-closed 丟棄，無 misattribution）。rememberSaveable：跨 activity 重建還原（epoch>0 時
     //  outstanding launch 重建後仍可歸屬）。
     var resetEpoch by rememberSaveable(saver = ResetEpochSaver) { mutableIntStateOf(0) }
+    // Entry-scoped identity：entry-scoped rememberSaveable＋ScreenIdSaver（restore 驗證
+    // 36-char UUID 或 fresh random；never crashes；corruption ⇒ keys unmatchable）；同一 entry
+    // recreation 還原同一 UUID，新 entry 必得新 UUID。前提：CHAT back-stack entry 永不以
+    // restoreState=true 還原（目前全倉皆無此用法）；未來若引入，須重新驗證跨 entry 歸屬。
+    var screenId by rememberSaveable(saver = ScreenIdSaver) { mutableStateOf(UUID.randomUUID().toString()) }
     // 每枚進行中 launch 各自佔一個回呼 slot（共 2 枚）：slotBusy 標記佔用、slotGen 記錄該 slot 對應的
     // admit generation（launch 時自 currentGeneration 讀取，即剛承認的那一枚 arm 的 generation）。
     // result callback 以 slot 歸屬配對——每枚 pending launch 各自佔 slot、歸屬精確，不受回傳順序影響
@@ -398,7 +404,7 @@ fun ChatScreen(
     // 使用者明確觸發的硬重設（語音楔住恢復鈕）：清空 slot 表與閘、保留 generation 水位與
     // 一次性 pending arm（INITIAL／RETRIGGER 由宿主持有，不得被本函式靜默丟棄）；mic（USER）
     // 一次性 arm 由使用者明確放棄。重設遞增 resetEpoch：重設後的 launcher 以新世代 key
-    // （"stt-slotN-<epoch>"）於重組時同步註冊，重設前的 launcher 在其 onDispose 中同步 unregister——
+    // （"stt-<screenId>-slotN-<epoch>"，screenId 為 per-entry identity）於重組時同步註冊，重設前的 launcher 在其 onDispose 中同步 unregister——
     // 依 androidx.activity.result 契約，in-flight unregister 保留 rc→key 綁定但移除 callback，
     // 重設前 launch 的晚到結果自此在 registry 邊界永不投遞（late result 停靠 pendingResults，鍵不再註冊），
     // 無法冒充重設後的 launch、也無法提早 prefill／結算其閘；slot/gen 表（gen==0L fail-closed）
@@ -449,7 +455,9 @@ fun ChatScreen(
         // fail-closed 丟棄（重建後 registry 重新投遞重建前結果、slot 表全新時），此處必非 0L。
         // 注意層次：重設（「重設語音辨識」）之後，重設前 rc 的晚到結果在 registry 邊界永不投遞
         // （late result 停靠 pendingResults，鍵不再註冊；pre-reset launcher unregister 後 callback 移除），根本不會進入本函式；gen == 0L 的
-        // 頂端 fail-closed 僅為第二層縱深防禦。
+        // 頂端 fail-closed 僅為第二層縱深防禦。跨 entry 的晚到結果同理在 registry 邊界終結：
+        // key 內嵌 per-entry screenId，已 popUpTo 銷毀 entry 的 outstanding result 永遠不會投遞進
+        // 新 entry 的 callback，根本不會進入本函式。（前提：CHAT entry 永不以 restoreState=true 還原；見 screenId KDoc／docs）
         // STALE-SPECIMENS: stale-result 案例（S3-style watchdog 驅逐、successor 超越、gen==0L fail-closed drop）
         // 釘在 VoiceSttArbiterTest／isStaleVoiceResult 純述詞層／SttLaunchStateTest；Compose 層 stale 模擬亦可經
         // LocalVoiceSttArbiterClock 注入假時鐘（見 ChatScreenVoiceLaunchTest）。
@@ -487,13 +495,13 @@ fun ChatScreen(
     val sttRegistry = LocalActivityResultRegistryOwner.current?.activityResultRegistry
         ?: error("No ActivityResultRegistryOwner was provided via LocalActivityResultRegistryOwner")
     // androidx.activity.compose（libs.versions.toml 聲明 1.10.1，atomic-group 衝突解析實際採用 1.13.0；bytecode 已驗證）的 rememberLauncherForActivityResult 的手工等價物，差異：
-    // (1) key 由 resetEpoch 推導（非隨機 UUID）——重設後重設前 launch 立即與 registry 斷鏈；
+    // (1) key 由 per-entry screenId＋resetEpoch 推導（entry-scoped identity＋每枚重設世代）——重設後重設前 launch 立即與 registry 斷鏈；
     // (2) callbacks 經 rememberUpdatedState 委派當代 handleSttResult（與 androidx 相同）。
     val latestHandleSttResult by rememberUpdatedState { slot: Int, result: ActivityResult -> handleSttResult(slot, result) }
     val slot0LauncherHolder = remember { object { var launcher: ActivityResultLauncher<Intent>? = null } }
     val slot1LauncherHolder = remember { object { var launcher: ActivityResultLauncher<Intent>? = null } }
-    val slot0Key = "stt-slot0-$resetEpoch"
-    val slot1Key = "stt-slot1-$resetEpoch"
+    val slot0Key = "stt-$screenId-slot0-$resetEpoch"
+    val slot1Key = "stt-$screenId-slot1-$resetEpoch"
     DisposableEffect(slot0Key, sttRegistry) {
         val launcher = sttRegistry.register(
             slot0Key,
@@ -977,6 +985,7 @@ fun ChatScreen(
                     // launcher 於重組時同步 unregister，其晚到結果在 registry 邊界永不投遞）。語義是
                     // 「放棄未返回的辨識結果（晚到者在 registry 邊界永不投遞，slot/gen 表為第二層
                     // 縱深防禦，見 resetVoiceSttCluster 註解）」，不是「修好卡住的辨識器」。
+                    // 每個 entry 各自 screenId，重設世代為 per-entry 推導。
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()

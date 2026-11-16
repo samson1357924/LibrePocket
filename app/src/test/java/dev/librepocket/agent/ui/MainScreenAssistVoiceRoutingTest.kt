@@ -188,6 +188,7 @@ class MainScreenAssistVoiceRoutingTest {
     private class RecordingRegistry : ActivityResultRegistry() {
         var lastRequestCode = -1
         val launchedIntents = mutableListOf<Intent>()
+        val launchedRequestCodes = mutableListOf<Int>()
 
         override fun <I : Any?, O : Any?> onLaunch(
             requestCode: Int,
@@ -196,6 +197,7 @@ class MainScreenAssistVoiceRoutingTest {
             options: ActivityOptionsCompat?,
         ) {
             lastRequestCode = requestCode
+            launchedRequestCodes += requestCode
             if (input is Intent) {
                 launchedIntents += input
             }
@@ -1653,6 +1655,143 @@ class MainScreenAssistVoiceRoutingTest {
         assertEquals(0, h.retriggerConsumedCount)
         assertTrue(h.registry.launchedIntents.isEmpty())
         assertNull(h.providerPending())
+    }
+
+    // ── 跨 ChatScreen entry 實例（pop CHAT inclusive → 新 CHAT entry）：新 entry 不得重用舊 rc→key 綁定 ──
+    // F1（round-3 review, P2/BLOCK）：resetEpoch 由 rememberSaveable 初始化為 0，且不含 entry
+    // instance identity；真實 hard-gate／SETTINGS recovery／ReadFailure 路徑以
+    // popUpTo(Routes.CHAT) { inclusive = true } 銷毀舊 CHAT entry 後建立全新 entry，全新 entry
+    // 以同一 registry key（"stt-slot0-0"）重新註冊、綁回舊 outstanding launch 的 requestCode。
+    // 這裡走真實 StartupGateHost 的 pop 路徑（非 fake shell）佐證跨 entry 隔離。
+    @Test
+    fun poppedChatEntry_outstandingSttResultNeverDeliveredToNewEntry() {
+        registerRecognitionService()
+        val provider = RoutingFakeProvider()
+        val h = Harness(newChatViewModel(provider))
+        h.gate.value = EndpointGate.Ready(sampleEndpoint())
+        h.voiceSwitchesLoaded.value = true
+        h.userSwitches.value = mapOf(VoiceTools.SWITCH_INPUT to true)
+
+        render(h)
+        awaitRoute(h, Routes.CHAT)
+
+        // 舊 entry A 啟動 INITIAL STT（rcA），結果懸空不投遞。
+        composeRule.runOnIdle { h.assistVoiceRequested.value = true }
+        composeRule.waitForIdle()
+        assertEquals(1, h.registry.launchedIntents.size)
+        val rcA = h.registry.launchedRequestCodes[0]
+
+        // 真實 hard gate：gate 落為 NoEndpoint ⇒ StartupGateHost 的 LaunchedEffect 以
+        // popUpTo(CHAT, inclusive=true) 銷毀舊 CHAT entry 並導向 SETUP。
+        composeRule.runOnIdle { h.gate.value = EndpointGate.NoEndpoint }
+        awaitRoute(h, Routes.SETUP)
+        composeRule.waitForIdle()
+
+        // 重建 CHAT（與 coldStart 測試相同方式：回 CHAT 並 inclusive pop 掉 SETUP）⇒ 全新 entry。
+        composeRule.runOnIdle {
+            h.gate.value = EndpointGate.Ready(sampleEndpoint())
+            h.nav.navigate(Routes.CHAT) {
+                popUpTo(Routes.SETUP) { inclusive = true }
+                launchSingleTop = true
+            }
+        }
+        awaitRoute(h, Routes.CHAT)
+        composeRule.waitForIdle()
+
+        // 新 entry C 的 assist voice 請求 ⇒ 新 launch（rcC）。
+        composeRule.runOnIdle { h.assistVoiceRequested.value = true }
+        composeRule.waitForIdle()
+        assertEquals(2, h.registry.launchedIntents.size)
+        val rcC = h.registry.launchedRequestCodes[1]
+        // Canary：pre-fix 的新 entry 以相同 key "stt-slot0-0" 重新註冊 → registerKey 早退重用 rcA。
+        // rc-distinctness is not a contract androidx guarantees to callers, but is deterministic here
+        // (fresh keys mint fresh rcs outside rcToKey; A's in-flight binding persists) — the canary pins
+        // the binding mechanism, behavior asserts below are the real gate.
+        assertTrue(rcC != rcA)
+
+        // A 的晚到結果：不得 prefill 新 entry 的草稿。
+        val staleResult = Intent().putStringArrayListExtra(
+            RecognizerIntent.EXTRA_RESULTS,
+            arrayListOf("old transcript"),
+        )
+        composeRule.runOnIdle {
+            h.registry.dispatchResult(rcA, ActivityResult(Activity.RESULT_OK, staleResult))
+        }
+        composeRule.waitForIdle()
+        assertEquals("", h.chatViewModel.input.value)
+
+        // C 自己的結果：fresh，正確 prefill。
+        val freshResult = Intent().putStringArrayListExtra(
+            RecognizerIntent.EXTRA_RESULTS,
+            arrayListOf("new transcript"),
+        )
+        composeRule.runOnIdle {
+            h.registry.dispatchResult(rcC, ActivityResult(Activity.RESULT_OK, freshResult))
+        }
+        composeRule.waitForIdle()
+        assertEquals("new transcript", h.chatViewModel.input.value)
+        assertEquals(0, provider.streamCalls)
+    }
+
+    @Test
+    fun poppedChatEntry_freshResultFirst_thenStaleFromPoppedEntryIgnored() {
+        // GUARD — passes pre- and post-fix; pins the inverse dispatch order, not the F1 mechanism.
+        registerRecognitionService()
+        val provider = RoutingFakeProvider()
+        val h = Harness(newChatViewModel(provider))
+        h.gate.value = EndpointGate.Ready(sampleEndpoint())
+        h.voiceSwitchesLoaded.value = true
+        h.userSwitches.value = mapOf(VoiceTools.SWITCH_INPUT to true)
+
+        render(h)
+        awaitRoute(h, Routes.CHAT)
+
+        composeRule.runOnIdle { h.assistVoiceRequested.value = true }
+        composeRule.waitForIdle()
+        assertEquals(1, h.registry.launchedIntents.size)
+        val rcA = h.registry.launchedRequestCodes[0]
+
+        composeRule.runOnIdle { h.gate.value = EndpointGate.NoEndpoint }
+        awaitRoute(h, Routes.SETUP)
+        composeRule.waitForIdle()
+
+        composeRule.runOnIdle {
+            h.gate.value = EndpointGate.Ready(sampleEndpoint())
+            h.nav.navigate(Routes.CHAT) {
+                popUpTo(Routes.SETUP) { inclusive = true }
+                launchSingleTop = true
+            }
+        }
+        awaitRoute(h, Routes.CHAT)
+        composeRule.waitForIdle()
+
+        composeRule.runOnIdle { h.assistVoiceRequested.value = true }
+        composeRule.waitForIdle()
+        assertEquals(2, h.registry.launchedIntents.size)
+        val rcC = h.registry.launchedRequestCodes[1]
+
+        // 新鮮（C 的）結果先回：prefill。
+        val freshResult = Intent().putStringArrayListExtra(
+            RecognizerIntent.EXTRA_RESULTS,
+            arrayListOf("new transcript"),
+        )
+        composeRule.runOnIdle {
+            h.registry.dispatchResult(rcC, ActivityResult(Activity.RESULT_OK, freshResult))
+        }
+        composeRule.waitForIdle()
+        assertEquals("new transcript", h.chatViewModel.input.value)
+
+        // 舊 entry（A）的過期結果後回：草稿不得被覆寫。
+        val staleResult = Intent().putStringArrayListExtra(
+            RecognizerIntent.EXTRA_RESULTS,
+            arrayListOf("old transcript"),
+        )
+        composeRule.runOnIdle {
+            h.registry.dispatchResult(rcA, ActivityResult(Activity.RESULT_OK, staleResult))
+        }
+        composeRule.waitForIdle()
+        assertEquals("new transcript", h.chatViewModel.input.value)
+        assertEquals(0, provider.streamCalls)
     }
 
     private fun gateDrawer(): DrawerState =

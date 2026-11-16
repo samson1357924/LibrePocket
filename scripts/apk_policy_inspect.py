@@ -2797,6 +2797,18 @@ def _github_required_provider_total(
         if _is_shizuku_provider(attrs.get("name", ""), attrs.get("authorities", ""))
     ]
     counts_by_name: dict[str, int] = {}
+    # Design decision (intentional, reviewed): duplicate detection keys on the
+    # RAW android:name string, not the canonical java_name. Two plausible
+    # spellings of the same renamed subclass (`.Bridge` / `Bridge` / mixed-case
+    # class tail) therefore do NOT trip this guard — both blocks still must
+    # carry the full attribute contract (`_check_github_shizuku_provider` en-
+    # forces it on every detected provider), and both consume the same DEX-
+    # evidenced class, so `total` still charges exactly one surface per
+    # evidenced java name. Keeping the raw key preserves the reject
+    # "identical android:name" semantic (duplicate blocks of the official
+    # FQN), which is the realistic bypass shape; canonical-collision handling
+    # is left to the attribute contract on purpose (failing it there carries
+    # the same fail-closed outcome with a clearer error).
     for _index, name in detected_blocks:
         counts_by_name[name] = counts_by_name.get(name, 0) + 1
     for name in sorted(counts_by_name):

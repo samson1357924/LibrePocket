@@ -23,11 +23,12 @@
 | `Round-6 D-A1..D-E7` | 子代碼複審發現編號（A=併發、B=提權執行安全、C=測試、D=架構/KDoc、E=scope/CI） | `pr167-review-aggregation.md`（repo 外彙整表，不入庫）；B3 待辦見本檔末節 |
 | `Round-6 PG-#` | PocketGuard bot 發現（BLOCK/WARN/SUGGESTION） | 同上 |
 | `drainFailClosedDrained` | drain 內部逃逸時的 catch-all 收斂臂：caller 零外部 process IPC（無 destroy／getter／waitFor）＋中斷 thread＋登記 quarantine＋計數；有界返回由構造保證；outstanding 不釋放（B3＝重啟恢復） | `ElevatedProcessIo.drainWithThreadStarter`／`drainFailClosedDrained` |
-| `提交階梯（Round-6 → Round-8）` | 5dc23257 linger-debt seal → eb311aed sticky brick＋catch-all backstop → 6ffaca31 遙測/文件 → d37718f0 有界 tearDown/本檔 → 6b295e78 final fixups → 4f2a1f2e de-IPC catch-all → cdd78918 D-A5 claim hygiene → c1104d47 P3 doc/test → a4ee4765 final-gate honesty → 7c75c074 Round-7 claim protocol convergence → a40b32e3 Round-8 R1 fail-toward+VME belt → 338b3fc5 Round-8 gate fixups | `git log --oneline origin/main..HEAD` |
+| `提交階梯（Round-6 → Round-9）` | 5dc23257 linger-debt seal → eb311aed sticky brick＋catch-all backstop → 6ffaca31 遙測/文件 → d37718f0 有界 tearDown/本檔 → 6b295e78 final fixups → 4f2a1f2e de-IPC catch-all → cdd78918 D-A5 claim hygiene → c1104d47 P3 doc/test → a4ee4765 final-gate honesty → 7c75c074 Round-7 claim protocol convergence → a40b32e3 Round-8 R1 fail-toward+VME belt → 338b3fc5 Round-8 gate fixups → e254da22 Round-9 constructor-throw convergences（constructor arm＋seams：`cleanupThreadFactory`／`lateSpawnThreadFactory`／`spawnThreadFactory`，advisory Round-9 P2） | `git log --oneline origin/main..HEAD` |
 | `quarantine（閘）／QUARANTINE` | 未驗證死亡 handle 的持久登記，admission 末門 QUARANTINE（fail-closed） | `ElevatedCleanupTracker.quarantineUnverified` |
 | `sweep／verify-only sweep` | 以 `waitFor(0ms)` 有界驗證後才移除 quarantine 條目 | `verifyQuarantinedOneBounded` |
 | `AB1` | 呼叫級准入（activeCalls / tryEnterReserved），上限 MAX_CONCURRENT_CALLS=4 | `tryEnterReserved` |
 | `killTree` | PID-reuse 守門＋信號樹（descendants reflective seam＋本體 attest） | `ElevatedProcessKiller.kt` |
+| `Round-9 P2（constructor-throw never-started convergence）` | Thread constructor（含 `isDaemon`）被注入拋例 ⇒ 與 startThread 拋走同一 never-started 收斂臂；三臂皆經 @VisibleForTesting seam（`cleanupThreadFactory`／`lateSpawnThreadFactory`／`spawnThreadFactory`），worker body 一字不改（僅 SAM label `return@Thread`→`return@Runnable`） | `ElevatedProcessIo.kt` Rounds-9 |
 
 ## 四態 state 詞彙（markLingering 四態）／cleanupSlotState 三態／custody 交接註記
 

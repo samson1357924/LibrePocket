@@ -3319,6 +3319,40 @@ class WebExtractD4Test {
         assertEquals("hop-2 絕不得被 fetch（gate 於 DNS/HTTP 之前）", 1, http.calls.get())
     }
 
+    // P2#4 續（post-parse arm）：redirect `Location` 原文 ≤ MAX_URL_CHARS（8192）
+    // → 不觸 raw-length arm（[redirectLocationOverCapFailsClosedUrlTooLongNoHop2Fetch]
+    // 已 pin 該 arm）；但經 OkHttp parse+rebuild（resolveRedirect＋stripFragment）解析後的
+    // 絕對 URL 超過上限 → post-parse gate（`resolved.length > MAX_URL_CHARS`）
+    // 於下一跳 DNS／HTTP／chain 處理之前 fail-closed
+    //（Unavailable(URL_TOO_LONG, denyCode=null)）。
+    //
+    // 尺寸精算（OkHttp `HttpUrl.resolve` 語義：絕對路徑 `/...` 會「取代」base 之 path，
+    // 故 resolved ＝ origin＋Location 之絕對路徑，與 base 路徑長度無關）：
+    //   base         = "https://same.example/"(21) + "a"*7800 ＝ 7_821 ≤ 8192（入口 gate 放行）
+    //   raw Location = "/" + "b"*8180                ＝ 8_181 ≤ 8192（故 raw arm 不觸發）
+    //   resolved     = "https://same.example/" + "b"*8180 ＝ 8_201 >  8192（post-parse gate 必拒）
+    // 舊碼若缺此 post-parse gate，會 proceed 至 hop-2（DNS＋HTTP，calls≥2）→ 本測試以
+    // calls==1＋Unavailable(URL_TOO_LONG) red-on-old-code by construction。
+    @Test fun redirectLocationResolvedOverCapFailsClosedUrlTooLongNoHop2Fetch() = runBlocking {
+        val url = "https://same.example/" + "a".repeat(7_800)
+        val location = "/" + "b".repeat(8_180)
+        val resolved = "https://same.example/" + "b".repeat(8_180)
+        assertTrue("base 必須 ≤ 上限（入口 gate 放行）", url.length <= WebExtract.MAX_URL_CHARS)
+        assertTrue("raw Location 必須 ≤ 上限（post-parse arm 才是被測 arm）", location.length <= WebExtract.MAX_URL_CHARS)
+        assertTrue("resolved 必須 > 上限（post-parse gate 必拒）", resolved.length > WebExtract.MAX_URL_CHARS)
+        val dns = publicDns("same.example")
+        val http = FakeExtract { _ ->
+            WebExtractRawResponse(302, ByteArray(0), mapOf("Location" to location))
+        }
+        val svc = WebExtractService(http)
+        val out = svc.extract(url, resolver = dns)
+        assertTrue("expected Unavailable, got $out", out is WebExtractOutcome.Unavailable)
+        val u = out as WebExtractOutcome.Unavailable
+        assertEquals(WebExtract.DETAIL_URL_TOO_LONG, u.detail)
+        assertEquals(null, u.denyCode)
+        assertEquals("hop-2 絕不得被 fetch（post-parse gate 於 DNS/HTTP 之前）", 1, http.calls.get())
+    }
+
     // P3#5（B1 正規化契約 service 路徑）：service 建 key 前經 stripFragment 正規化
     // host（小寫）／default port（依 scheme 去除）／fragment（一律去除）——等價 URL 必同 key、
     // 第二次呼叫 cached==true 且零上游。

@@ -58,6 +58,7 @@ class ElevatedRunnerP1B2Test {
         )
         floorBefore = ElevatedCleanupTracker.releaseFloorHits()
         lingerFloorBefore = ElevatedCleanupTracker.lingerDebtFloorHits()
+        ElevatedProcessIo.quarantineRegistrar = { ElevatedCleanupTracker.quarantineUnverified(it) }
         ElevatedCleanupTracker.clearUnverified()
         ElevatedCleanupTracker.forceAcquireSlotOrQuarantineThrow = false
         ElevatedCleanupTracker.clearRegistrationFailedStickyForTest()
@@ -1305,21 +1306,31 @@ class ElevatedRunnerP1B2Test {
         }
     }
 
-    // ---- Round-6 P2（D-A5）：cleanup worker 起線程「已起 OS 線程後再拋」——claimed worker 殘留之 P2 pin ----
+    // ---- Round-6 P2（D-A5）＋Round-7 P2（claim-CAS）：cleanup worker 起線程「已起 OS 線程後再拋」——claimed worker 殘留之 P2 pin ----
 
     /**
-     * (Phase-2 A) acquired==true 變體：未飽和（無預填），worker 已 OS 起動並阻塞於
-     * `BinderBlockedDestroyProcess.destroy()`；starter 於 worker 入體後才 `t.start(); throw OOME`
-     * （D-A5 start-then-throw 極角）。確定性：starter 內阻塞至 `killerEntered` 才拋
-     * （worker claim 先行於 `block()`，故 catch 臂必觀察到 `workerClaimed==true`）。
+     * (Phase-2 A／Round-7 P2 正常流程改向) acquired==true 變體：未飽和（無預填），worker 已
+     * OS 起動並阻塞於 `BinderBlockedDestroyProcess.destroy()`（`destroy()` 不置任何 exit 證據、
+     * `waitFor≡false` 恆成立——verified==false 臂）；starter 於 worker 入體後才
+     * `t.start(); throw OOME`（start-then-throw 極角）。確定性：starter 內阻塞至
+     * `killerEntered` 才拋（worker claim 先行於 `block()`，故 catch 臂必觀察到
+     * `workerClaimed==true`）。
      *
-     * registrar 一律拋（本臂釘「登記失敗＋已佔槽保留」語義）：catch 臂首嘗＋drain-end
-     * verify helper 各記 1 次 `noteQuarantineRegistrationFailed`（+2）；slotHeld==true ⇒
-     * helper 保留槽、不置 sticky brick（admission 以 reservation 門續拒而非 REGISTRATION_FAILED）；
-     * quarantine 空（雙登記皆拋）⇒ BACKLOG_FULL 只能源於 gate 5 reservation，不經 gate 7。
-     * 結束時：`destroyLatch.countDown()` ⇒ worker finally（state 0→2、acquired==true 不
-     * endLingerDebt／不 release）恰好一次，槽仍保留——由測試手動 `releaseSlot()` 收斂
-     * （同 teardown 的孤槽 remediation 語義）；floor 全程不命中。
+     * Round-7 P2 claim-CAS 仲裁：worker 已認領 ⇒ catch 臂 CAS 敗 ⇒ **無 fail-closed epilogue**：
+     * 不呼 registrar、不重釋槽、不提前 endLingerDebt、不計 killNeverAttempted；照 normal-start
+     * 流程——join(timeout) 超界 → isAlive → interrupt＋grace join 超界 → acquired && isAlive ⇒
+     * custody 轉移 0→1、`slotHeldOut=false`、`cleanupWorkerStalledAfterVerify` +1 → `return
+     * acquired && !t.isAlive` == false。drain-end verify：verified==FALSE
+     * （`waitFor≡false` 恆成立）⇒ helper 呼叫 `quarantineRegistrar`——本 pin 不注入 registrar，
+     * 預設即 `quarantineUnverified` 成功登記 ⇒ **helper 於 drain 內登記 victim（quarantine +1）；
+     * `slotHeld==false`（custody 已移交 stalled worker）⇒ 不釋放槽**（槽仍由 worker custody 持有；
+     * worker finally 於退出時恰好釋放一次）。registrar 不拋 ⇒ failures 不動；無 brick；Sticky 不置位。
+     * 結束時：`destroyLatch.countDown()` ⇒ worker 退出 ⇒ state 1→2、恰好 releaseSlot 一次 ⇒ outstanding
+     * 歸零。victim 已入 quarantine 且 `waitFor≡false` 恆成立——sweep 無法驗證死亡 ⇒ gate 7 恆封
+     * ⇒ admission 穩定為 QUARANTINE（非 OK）；`clearUnverified()` 於 finally 收尾（teardown 期望 0）。
+     * （verified==true 之 healthy 臂見
+     * [cleanupStartThenThrowAfterClaimWithDefaultRegistrarKeepsSlotAndReleasesExactlyOnce]；
+     * registrar 一律拋之臂由兩飽和 DoesNotBrick/HelperRetry pin 覆蓋。）
      */
     @Test fun cleanupStartThreadThrowsAfterStartKeepsSlotWhileWorkerBlocked() {
         ElevatedCleanupTracker.clearUnverified()
@@ -1333,10 +1344,6 @@ class ElevatedRunnerP1B2Test {
         val killerEntered = CountDownLatch(1)
         val destroyLatch = CountDownLatch(1)
         val victim = BinderBlockedDestroyProcess(destroyLatch)
-        // registrar 一律拋（首嘗＋helper 重試雙失敗臂）；restore in finally。
-        ElevatedProcessIo.quarantineRegistrar = {
-            throw OutOfMemoryError("OOM in quarantine registrar (test seam)")
-        }
         try {
             val d = ElevatedProcessIo.drainWithThreadStarter(
                 process = victim,
@@ -1369,10 +1376,119 @@ class ElevatedRunnerP1B2Test {
             }
             assertTrue("cleanupIncomplete must stay true", d.cleanupIncomplete)
             assertTrue("timedOut must stay true (kill path)", d.timedOut)
-            assertTrue("untrackedResidual must surface on the start-failure arm", d.untrackedResidual)
-            // 槽保留（fail-closed，已佔槽）：admission 續拒。
+            assertFalse(
+                "untrackedResidual must stay false on the claimed arm (telemetry only from post-try saturation block)",
+                d.untrackedResidual,
+            )
+            // 槽保留（fail-closed，custody 已於 post-grace 轉移給 stalled worker）：admission 續拒（gate 5 預留）。
             assertEquals(1, ElevatedCleanupTracker.outstanding())
-            // 隔離 gate 7（quarantine 空、second-chance 登記亦失敗）：BACKLOG_FULL 必源於 gate 5 reservation。
+            // acquisition-time 不登記 quarantine（unsaturated acquire）；
+            // verified==false ⇒ drain-end helper 於 drain 內登記 victim（default registrar 成功）⇒ quarantine +1。
+            assertEquals(quarantineBefore + 1, ElevatedCleanupTracker.quarantinedCount())
+            assertEquals(
+                ElevatedCleanupTracker.Admission.BACKLOG_FULL,
+                ElevatedCleanupTracker.tryEnterReserved(),
+            )
+            assertEquals(0, ElevatedCleanupTracker.activeCalls())
+            assertEquals(floorBefore, ElevatedCleanupTracker.releaseFloorHits())
+            assertEquals(debtBefore, ElevatedCleanupTracker.lingerDebtCount())
+            // 已佔槽、verified==false 臂：registrar 於 drain 內呼叫成功（default）⇒ failures 不動；
+            // 登記成功 ⇒ 無 brick、Sticky 不置位；slotHeld==false（custody 已移交 worker）⇒ 不釋放槽。
+            assertFalse(
+                "registered arm must not brick admission",
+                ElevatedCleanupTracker.isRegistrationFailedSticky(),
+            )
+            assertEquals(
+                failuresBefore,
+                ElevatedCleanupTracker.quarantineRegistrationFailedCount(),
+            )
+            // claimed（worker 已認領）⇒ catch 臂不計 killNeverAttempted（killer 可能已執行）。
+            assertEquals(killNeverBefore, ElevatedCleanupTracker.killNeverAttemptedCount())
+            // 放行：worker 退出（state 1→2）恰好釋放一次 ⇒ outstanding 歸零；
+            // floor 全程不命中（1→0 非 floor 事件）。
+            destroyLatch.countDown()
+            pollTrue("cleanup worker must exit after destroy latch release", 10_000L) {
+                countLive("elevated-cleanup") == 0
+            }
+            pollOutstandingTo(0)
+            assertEquals(debtBefore, ElevatedCleanupTracker.lingerDebtCount())
+            assertEquals(floorBefore, ElevatedCleanupTracker.releaseFloorHits())
+            // victim 已入 quarantine（helper 登記）且 BinderBlockedDestroyProcess.waitFor≡false
+            // 恆成立——sweep 無法驗證死亡 ⇒ gate 7 恆封 ⇒ QUARANTINE（非 OK）。
+            assertEquals(
+                ElevatedCleanupTracker.Admission.QUARANTINE,
+                ElevatedCleanupTracker.tryEnterReserved(),
+            )
+        } finally {
+            destroyLatch.countDown()
+            // 斷言先於手動回收失敗時的兜底（至多預期洩漏 1 槽）；成功路徑 outstanding==0 無動作。
+            if (ElevatedCleanupTracker.outstanding() > 0) {
+                ElevatedCleanupTracker.releaseSlot()
+            }
+            pollOutstandingTo(0)
+            ElevatedCleanupTracker.clearUnverified()
+            ElevatedCleanupTracker.noteClean()
+            awaitNoElevatedThreads()
+        }
+    }
+
+    /**
+     * Round-7 P2（P2a/P2b fix 的號頭釘）：claimed＋acquired==true＋default registrar（無注入）
+     * 之正常流程恰好一次釋放 pin。starter `{ t.start(); await killerEntered; throw OOM }` ⇒
+     * worker 已認領、blocked 於 KillableBlockedDestroyProcess.destroy()（destroy 先置
+     * `destroyed=true`，`waitFor≡true` ⇒ drain-end verify==true）；catch 臂 CAS 敗 ⇒ 無
+     * fail-closed epilogue、照 normal-start flow：join 超界 → interrupt＋grace 超界 →
+     * acquired && isAlive ⇒ custody 0→1、`slotHeldOut=false`、`cleanupWorkerStalledAfterVerify` +1
+     * → `return acquired && !t.isAlive` == false。verified==true ⇒ drain-end helper 早返回
+     * （無 registrar 呼叫、無 release、無 quarantine 登記）。
+     * 恰好一次釋放：worker 退出時 state 1→2 ⇒ releaseSlot 恰好一次（不雙釋、不漏釋）；
+     * floor 全程不命中（1→0 非 floor 事件）；debt==debtBefore（acquired⇒不記債）；
+     * killNeverAttempted／failures／sticky 皆不動；admission 歸零後回 OK。
+     */
+    @Test fun cleanupStartThenThrowAfterClaimWithDefaultRegistrarKeepsSlotAndReleasesExactlyOnce() {
+        ElevatedCleanupTracker.clearUnverified()
+        ElevatedCleanupTracker.noteClean()
+        ElevatedCleanupTracker.resetPeak()
+        pollOutstandingTo(0)
+        val debtBefore = ElevatedCleanupTracker.lingerDebtCount()
+        val quarantineBefore = ElevatedCleanupTracker.quarantinedCount()
+        val failuresBefore = ElevatedCleanupTracker.quarantineRegistrationFailedCount()
+        val killNeverBefore = ElevatedCleanupTracker.killNeverAttemptedCount()
+        val stalledBefore = ElevatedCleanupTracker.cleanupWorkerStalledAfterVerifyCount()
+        val killerEntered = CountDownLatch(1)
+        val observed = AtomicBoolean(false)
+        val destroyLatch = CountDownLatch(1)
+        val victim = KillableBlockedDestroyProcess(destroyLatch)
+        try {
+            val d = ElevatedProcessIo.drainWithThreadStarter(
+                process = victim,
+                timeoutMs = 300L,
+                killer = { p ->
+                    killerEntered.countDown()
+                    p.destroy()
+                },
+                isCancelled = { false },
+                startThread = { t ->
+                    if (t.name == "elevated-cleanup") {
+                        t.start()
+                        if (killerEntered.await(10, TimeUnit.SECONDS)) observed.set(true)
+                        throw OutOfMemoryError("OOM after OS start (test seam)")
+                    }
+                    t.start()
+                },
+            )
+            assertTrue("worker must have entered block before OOM", observed.get())
+            pollTrue("cleanup worker must enter the blocked destroy fixture", 5_000L) {
+                victim.destroyEntered.get() == 1
+            }
+            assertTrue("cleanupIncomplete must stay true", d.cleanupIncomplete)
+            assertTrue("timedOut must stay true (kill path)", d.timedOut)
+            assertFalse(
+                "untrackedResidual must stay false on the claimed arm (telemetry only from post-try saturation block)",
+                d.untrackedResidual,
+            )
+            // while blocked：custody 已轉移 worker（槽保留）；admission 續拒（gate 5 預留）；floor 不動。
+            assertEquals(1, ElevatedCleanupTracker.outstanding())
             assertEquals(quarantineBefore, ElevatedCleanupTracker.quarantinedCount())
             assertEquals(
                 ElevatedCleanupTracker.Admission.BACKLOG_FULL,
@@ -1381,30 +1497,29 @@ class ElevatedRunnerP1B2Test {
             assertEquals(0, ElevatedCleanupTracker.activeCalls())
             assertEquals(floorBefore, ElevatedCleanupTracker.releaseFloorHits())
             assertEquals(debtBefore, ElevatedCleanupTracker.lingerDebtCount())
-            // 已佔槽＋雙登記皆拋 ⇒ helper slotHeld=true 形式不置磚（無零追蹤殘留）。
+            assertEquals(stalledBefore + 1, ElevatedCleanupTracker.cleanupWorkerStalledAfterVerifyCount())
             assertFalse(
-                "acquired==true with kept slot must not brick admission",
+                "verified==true arm must not brick admission",
                 ElevatedCleanupTracker.isRegistrationFailedSticky(),
             )
-            // 臂內首嘗＋drain-end helper 重試，至多 2 次失敗計數。
             assertEquals(
-                failuresBefore + 2,
+                failuresBefore,
                 ElevatedCleanupTracker.quarantineRegistrationFailedCount(),
             )
-            assertEquals(killNeverBefore + 1, ElevatedCleanupTracker.killNeverAttemptedCount())
-            // 放行：worker 退出（state 0→2、acquired==true ⇒ 不 endLingerDebt／不 release）；
-            // 槽仍保留（helper 已保留）——測試手動收斂孤槽。
+            assertEquals(killNeverBefore, ElevatedCleanupTracker.killNeverAttemptedCount())
+            // 放行：worker 退出（state 1→2）恰好釋放一次 ⇒ outstanding 歸零（不雙釋、不漏釋、不 floor）。
             destroyLatch.countDown()
             pollTrue("cleanup worker must exit after destroy latch release", 10_000L) {
                 countLive("elevated-cleanup") == 0
             }
-            assertEquals(1, ElevatedCleanupTracker.outstanding())
-            // 手動收斂測試特意保留的槽（verified=false 需成功登記才能由 helper 釋放；此處
-            // 直接 releaseSlot 收斂，與 teardown 的孤槽 remediation 同式）。
-            ElevatedCleanupTracker.releaseSlot()
             pollOutstandingTo(0)
-            assertEquals(debtBefore, ElevatedCleanupTracker.lingerDebtCount())
+            assertEquals(stalledBefore + 1, ElevatedCleanupTracker.cleanupWorkerStalledAfterVerifyCount())
             assertEquals(floorBefore, ElevatedCleanupTracker.releaseFloorHits())
+            assertEquals(debtBefore, ElevatedCleanupTracker.lingerDebtCount())
+            assertEquals(quarantineBefore, ElevatedCleanupTracker.quarantinedCount())
+            assertEquals(failuresBefore, ElevatedCleanupTracker.quarantineRegistrationFailedCount())
+            assertEquals(killNeverBefore, ElevatedCleanupTracker.killNeverAttemptedCount())
+            assertFalse(ElevatedCleanupTracker.isRegistrationFailedSticky())
             val admission = ElevatedCleanupTracker.tryEnterReserved()
             if (admission == ElevatedCleanupTracker.Admission.OK) {
                 ElevatedCleanupTracker.leaveCall()
@@ -1412,7 +1527,6 @@ class ElevatedRunnerP1B2Test {
             assertEquals(ElevatedCleanupTracker.Admission.OK, admission)
         } finally {
             destroyLatch.countDown()
-            ElevatedProcessIo.quarantineRegistrar = { ElevatedCleanupTracker.quarantineUnverified(it) }
             // 斷言先於手動回收失敗時的兜底（至多預期洩漏 1 槽）；成功路徑 outstanding==0 無動作。
             if (ElevatedCleanupTracker.outstanding() > 0) {
                 ElevatedCleanupTracker.releaseSlot()
@@ -1420,6 +1534,161 @@ class ElevatedRunnerP1B2Test {
             pollOutstandingTo(0)
             ElevatedCleanupTracker.clearUnverified()
             ElevatedCleanupTracker.noteClean()
+            awaitNoElevatedThreads()
+        }
+    }
+
+    /**
+     * Round-7 fixup（code-reviewer Required，healthy claimed 臂）：claimed＋acquired==true
+     * （無預填、飽和不適用）且 killer 瞬時（KillableImmediateProcess——destroy 置旗後即返回，
+     * `waitFor≡destroyed`）——drain 走 kill 路徑（wait 循環恆至 300ms deadline：夾具僅於
+     * killer 後才回 destroyed=true，finished 不可能為 true），killer 恰好一次；worker 於
+     * block() 內 instant 返回並自行退出：starter await killerEntered 保證 worker 已入體、
+     * claim-won（catch 臂 CAS 敗）⇒ 正常流程，custody 不轉移（worker 已死）⇒ helper 於
+     * verified==true 早返回（無 registrar 呼叫、無 quarantine 登記、verified 時釋槽恰好一次）。
+     * 斷言：cleanupIncomplete==false、untrackedResidual==false、kills==1、outstanding 有界
+     * 歸零、admission OK、floor 不動、registrar 零接觸（failures／quarantine 皆不動）、
+     * killNeverAttempted 不動、sticky 假、debt 不動。
+     * 誠實註記：`d.timedOut==true`（kill 路徑＝逾期語義；本夾具 waitFor≡false 直至 killer
+     * 置旗，`finished` 恆 false）——與 sibling 同斷 true，而非誤斷 false。
+     */
+    @Test fun cleanupStartThenThrowAfterClaimWithHealthyWorkerReturnsComplete() {
+        ElevatedCleanupTracker.clearUnverified()
+        ElevatedCleanupTracker.noteClean()
+        pollOutstandingTo(0)
+        val debtBefore = ElevatedCleanupTracker.lingerDebtCount()
+        val quarantineBefore = ElevatedCleanupTracker.quarantinedCount()
+        val failuresBefore = ElevatedCleanupTracker.quarantineRegistrationFailedCount()
+        val killNeverBefore = ElevatedCleanupTracker.killNeverAttemptedCount()
+        val killerEntered = CountDownLatch(1)
+        val observed = AtomicBoolean(false)
+        val kills = AtomicInteger(0)
+        try {
+            val victim = KillableImmediateProcess()
+            val d = ElevatedProcessIo.drainWithThreadStarter(
+                process = victim,
+                timeoutMs = 300L,
+                killer = { p ->
+                    kills.incrementAndGet()
+                    killerEntered.countDown()
+                    p.destroy()
+                },
+                isCancelled = { false },
+                startThread = { t ->
+                    if (t.name == "elevated-cleanup") {
+                        // worker 已入體（殺手已信號＝worker 已過 claim CAS）才拋 ⇒ claim-won。
+                        t.start()
+                        if (killerEntered.await(10, TimeUnit.SECONDS)) observed.set(true)
+                        throw OutOfMemoryError("OOM after OS start (test seam)")
+                    }
+                    t.start()
+                },
+            )
+            assertTrue("cleanup worker must run the instant killer before the starter throws", observed.get())
+            assertTrue("kill path deadline ⇒ timedOut stays true (kill path)", d.timedOut)
+            assertFalse("healthy claimed arm must complete (cleanupIncomplete==false)", d.cleanupIncomplete)
+            assertFalse(
+                "claimed arm: untrackedResidual stays false (telemetry only from post-try saturation block)",
+                d.untrackedResidual,
+            )
+            assertEquals("killer must fire exactly once", 1, kills.get())
+            pollOutstandingTo(0)
+            val admission = ElevatedCleanupTracker.tryEnterReserved()
+            if (admission == ElevatedCleanupTracker.Admission.OK) {
+                ElevatedCleanupTracker.leaveCall()
+            }
+            assertEquals(ElevatedCleanupTracker.Admission.OK, admission)
+            assertEquals(floorBefore, ElevatedCleanupTracker.releaseFloorHits())
+            assertEquals(
+                "verified==true ⇒ verify-arm registrar untouched (helper early-returns)",
+                failuresBefore,
+                ElevatedCleanupTracker.quarantineRegistrationFailedCount(),
+            )
+            assertEquals(
+                "verified==true ⇒ no quarantine registration",
+                quarantineBefore,
+                ElevatedCleanupTracker.quarantinedCount(),
+            )
+            assertEquals(killNeverBefore, ElevatedCleanupTracker.killNeverAttemptedCount())
+            assertFalse(ElevatedCleanupTracker.isRegistrationFailedSticky())
+            assertEquals(debtBefore, ElevatedCleanupTracker.lingerDebtCount())
+        } finally {
+            pollOutstandingTo(0)
+            ElevatedCleanupTracker.clearUnverified()
+            ElevatedCleanupTracker.noteClean()
+            awaitNoElevatedThreads()
+        }
+    }
+
+    /**
+     * Round-7 P2（P2b fix 的 claim-lost／casualty 收斂釘）：starter `{ t.start(); throw OOM }`
+     * （**不 await**），KillableBlocked fixture、timeoutMs=300。winner-agnostic：
+     * - claim-won（正常流程）：worker blocked 於 destroy；drain 回 false；latch 放行後 worker
+     *   finally（state 1→2）恰好釋放；
+     * - claim-lost（never-started）：catch 臂 CAS 成 ⇒ worker 醒後於入口首句 CAS 敗、直接退出、
+     *   絕不執行 block()（victim 從未被 destroy）；catch 臂登記先行（default registrar 成功
+     *   ⇒ quarantine +1）→ `releaseSlot` → debt 無關（acquired⇒無債）→ killNeverAttempted +1。
+     * winner-agnostic 不變量：drain 回 false；cleanupIncomplete=true；outstanding 有界收斂 0；
+     * debt 歸零（acquired⇒無債）；floor 不命中；admission 經 `clearUnverified()` 收尾後回 OK
+     * （claim-lost 會留 catch-time quarantine 目——`waitFor≡destroyed≡false` 恆成立 ⇒ sweep 無法
+     * 解除，故此處不斷 QUARANTINE 而斷 OK 係 after test-seam clear；claim-won 無登記目，clear 無害）；
+     * killNeverAttempted delta ∈ {0,1}（claim-won=0；claim-lost=1）——honest winner-agnostic 界。
+     * Bounded polls everywhere；finally 保底放 latch＋clearUnverified。
+     */
+    @Test fun cleanupStartThenThrowWithWinnerAgnosticClaimConvergesExactlyOnce() {
+        ElevatedCleanupTracker.clearUnverified()
+        ElevatedCleanupTracker.noteClean()
+        pollOutstandingTo(0)
+        val debtBefore = ElevatedCleanupTracker.lingerDebtCount()
+        val killNeverBefore = ElevatedCleanupTracker.killNeverAttemptedCount()
+        val destroyLatch = CountDownLatch(1)
+        val victim = KillableBlockedDestroyProcess(destroyLatch)
+        try {
+            val d = ElevatedProcessIo.drainWithThreadStarter(
+                process = victim,
+                timeoutMs = 300L,
+                killer = { p -> p.destroy() },
+                isCancelled = { false },
+                startThread = { t ->
+                    if (t.name == "elevated-cleanup") {
+                        t.start()
+                        throw OutOfMemoryError("OOM right after OS start (test seam)")
+                    }
+                    t.start()
+                },
+            )
+            // 兩勝負皆成立：drain 回 false（claim-won join 超界／claim-lost never-started），cleanupIncomplete。
+            assertTrue("cleanupIncomplete must stay true", d.cleanupIncomplete)
+            // 放行 latch（claim-won 時 worker 以此脫離 destroy；claim-lost 時 no-op）。
+            destroyLatch.countDown()
+            // outstanding 有界收斂 0：claim-won ⇒ worker finally 釋放；claim-lost ⇒ catch 臂已釋放。
+            pollOutstandingTo(0)
+            awaitNoElevatedThreads()
+            assertEquals(debtBefore, ElevatedCleanupTracker.lingerDebtCount())
+            assertEquals(floorBefore, ElevatedCleanupTracker.releaseFloorHits())
+            // killNeverAttempted delta ∈ {0,1}（claim-won ⇒ 0；claim-lost ⇒ 1）。
+            val killNeverDelta = ElevatedCleanupTracker.killNeverAttemptedCount() - killNeverBefore
+            assertTrue(
+                "kill-never-attempted delta must be 0 (claim-won) or 1 (claim-lost), got $killNeverDelta",
+                killNeverDelta == 0 || killNeverDelta == 1,
+            )
+            // Round-7 Item-1 對齊（honest winner-agnostic 斷言）：claimed fall-through 不再置
+            // untrackedOut ⇒ claim-won ⇒ false；claim-lost（never-started 臂）⇒ true——故以
+            // killNeverDelta（同一 CAS 分支的可觀測 oracle）斷 twin-tracking，不無條件斷 true。
+            assertEquals("untrackedResidual must track the winner (claim-lost ⇒ true)", killNeverDelta == 1, d.untrackedResidual)
+            // claim-lost 會留 catch-time quarantine 目（waitFor≡false 恆成立 ⇒ sweep 無法解除）；
+            // claim-won 無登記目（verified==true 臂 helper 早返回）⇒ 統一以 test-seam clearUnverified 收尾後斷 OK。
+            ElevatedCleanupTracker.clearUnverified()
+            val admission = ElevatedCleanupTracker.tryEnterReserved()
+            if (admission == ElevatedCleanupTracker.Admission.OK) {
+                ElevatedCleanupTracker.leaveCall()
+            }
+            assertEquals(ElevatedCleanupTracker.Admission.OK, admission)
+        } finally {
+            destroyLatch.countDown()
+            ElevatedCleanupTracker.clearUnverified()
+            ElevatedCleanupTracker.noteClean()
+            pollOutstandingTo(0)
             awaitNoElevatedThreads()
         }
     }
@@ -1504,7 +1773,8 @@ class ElevatedRunnerP1B2Test {
             assertEquals(ElevatedCleanupTracker.Admission.OK, ElevatedCleanupTracker.tryEnterReserved())
             ElevatedCleanupTracker.leaveCall()
             assertEquals(floorBefore, ElevatedCleanupTracker.releaseFloorHits())
-            assertEquals(killNeverBefore + 1, ElevatedCleanupTracker.killNeverAttemptedCount())
+            // claimed（worker 已認領）⇒ catch 臂不計 killNeverAttempted（killer 可能已執行）。
+            assertEquals(killNeverBefore, ElevatedCleanupTracker.killNeverAttemptedCount())
         } finally {
             destroyLatch.countDown()
             repeat(prefilled) { ElevatedCleanupTracker.releaseSlot() }
@@ -1522,16 +1792,16 @@ class ElevatedRunnerP1B2Test {
     }
 
     /**
-     * (Phase-2 fixup) 飽和＋acquired==false＋起線程 start-then-throw 孿生於
-     * [saturatedCleanupStartThreadThrowsAfterStartHoldsAdmissionWhileWorkerBlocked]，但 registrar 亦拋
+     * (Phase-2 fixup; Round-7 P2 改寫) 飽和＋acquired==false＋起線程 start-then-throw 孿生於
+     * [saturatedCleanupStartThreadThrowsAfterStartHoldsAdmissionWhileWorkerBlocked]，registrar 亦拋
      * （`quarantineRegistrar = { throw OutOfMemoryError("registrar oom") }`）——釘：
      * 飽和 acquisition 已於 acquireSlotOrQuarantine 同鎖原子登記 quarantine（acquisition-time），
      * verified==true 臂（殺手經 KillableBlockedDestroyProcess 使 waitFor→true，helper 於
-     * `verified==true` 提前返回，registrar/brick 路徑不執行；本 pin 覆蓋 catch-arm 及無條件
-     * sticky 回歸；verified==false 臂見
-     * [saturatedCleanupStartThreadThrowsAfterStartWithThrowingRegistrarDoesNotBrickAdmissionHelperRetry]），
-     * registrar 後續拋出（catch 臂二次登記）僅 ROS：telemetry 計數，不置 brick——
-     * handle 非零追蹤（gate 7 承載），brick ⇔ 零追蹤，非 ⇔ 登記拋出。
+     * `verified==true` 提前返回，registrar/brick 路徑不執行；verified==false 臂見
+     * [saturatedCleanupStartThreadThrowsAfterStartWithThrowingRegistrarDoesNotBrickAdmissionHelperRetry]）。
+     * Round-7 P2 claim-CAS：worker 已認領 ⇒ catch 臂 **不呼 registrar**（不計 killNeverAttempted）——
+     * registrar 全程零呼叫 ⇒ failures 不動；handle 非零追蹤（gate 7 承載），無 brick；
+     * brick ⇔ 零追蹤，非 ⇔ 登記拋出／被呼叫。
      * 不 sweep（隔離 gate 7）：admission 密封即 QUARANTINE；非 REGISTRATION_FAILED（無 brick）。
      * 放行 worker（debt 歸零）＋釋預填槽（outstanding→0，gate 2/gate 6 不遮蔽）後直斷 gate 7。
      */
@@ -1575,17 +1845,18 @@ class ElevatedRunnerP1B2Test {
             )
             assertTrue("cleanupIncomplete must stay true", d.cleanupIncomplete)
             assertTrue("untrackedResidual must surface on the start-failure arm", d.untrackedResidual)
-            // 關鍵 pin：registrar 拋（catch 臂二次登記失敗、僅遙測）⇒ sticky 不得置位。
+            // 關鍵 pin：registrar 拋不得置位 brick——claimed⇒catch 臂不呼 registrar；
+            // verified==true（KillableBlocked）⇒ helper 早返回、registrar 亦不呼 ⇒ failures 不動。
             assertFalse(
-                "acquisition-time quarantine registration must not brick on registrar throw",
+                "claimed arm must not brick admission on registrar throw",
                 ElevatedCleanupTracker.isRegistrationFailedSticky(),
             )
-            // acquisition-time 登記仍在位：registrar 拋不造成取消登記（gate 7 自彼時密封）。
+            // acquisition-time 登記仍在位（飽和路徑 acquireSlotOrQuarantine 同鎖登記——gate 7 自彼時密封）。
             assertEquals(1, ElevatedCleanupTracker.quarantinedCount())
             assertTrue("victim must be the quarantine entry", ElevatedCleanupTracker.quarantineContains(victim))
-            // 臂內首嘗（catch 臂）僅計 1 次——verified==true，helper 不重試。
+            // claimed＋verified==true ⇒ registrar 全程未被呼叫 ⇒ failures 不動。
             assertEquals(
-                failuresBefore + 1,
+                failuresBefore,
                 ElevatedCleanupTracker.quarantineRegistrationFailedCount(),
             )
             // 放行：worker 退出 ⇒ finally（state 0→2、!acquired）恰好 endLingerDebt 一次（gate 6 離封）。
@@ -1631,7 +1902,7 @@ class ElevatedRunnerP1B2Test {
     }
 
     /**
-     * (Phase-2 fixup) 飽和＋acquired==false＋起線程 start-then-throw 孿生於
+     * (Phase-2 fixup; Round-7 P2 改寫) 飽和＋acquired==false＋起線程 start-then-throw 孿生於
      * [saturatedCleanupStartThreadThrowsAfterStartWithThrowingRegistrarDoesNotBrickAdmission]，
      * 但假件改為 [BinderBlockedDestroyProcess]（waitFor≡false ⇒ verifyParentStoppedBounded 恆回
      * false，drain 走 verified==false 臂）——verified==false 臂：caller verify 臂以 verified==false
@@ -1639,7 +1910,8 @@ class ElevatedRunnerP1B2Test {
      * 重試 `quarantineRegistrar`（`quarantineRegistrar = { throw OutOfMemoryError("registrar oom") }`）
      * ⇒ noteQuarantineRegistrationFailed＋membership probe（`quarantineContains(victim)==true`，
      * acquisition-time 同鎖登記仍在）⇒ MUST NOT brick——handle 非零追蹤（gate 7 承載），
-     * brick ⇔ 零追蹤，非 ⇔ 登記拋出。
+     * brick ⇔ 零追蹤，非 ⇔ 登記拋出。Round-7 P2 claim-CAS：claimed ⇒ catch 臂不呼 registrar；
+     * registrar 於本 drain 僅被 helper 呼叫 1 次（failures +1）。
      * sibling 覆蓋 verified==true 臂（殺手經 KillableBlockedDestroyProcess 使 waitFor→true，helper
      * 於 `verified==true` 提前返回，registrar/brick 路徑不執行）。
      * 不 sweep（隔離 gate 7）：admission 密封即 QUARANTINE；非 REGISTRATION_FAILED（無 brick）。
@@ -1692,6 +1964,7 @@ class ElevatedRunnerP1B2Test {
             }
             // verified==false 臂：drain 已於 drainWithThreadStarter 內同步走到 verify——
             // helper 重試 registrar（拋）僅遙測＋membership probe ⇒ sticky 不得置位。
+            // （claimed ⇒ catch 臂不呼 registrar——registrar 於本 drain 僅 helper 呼叫 1 次。）
             assertFalse(
                 "acquisition-time quarantine registration must not brick on registrar throw",
                 ElevatedCleanupTracker.isRegistrationFailedSticky(),
@@ -1699,9 +1972,9 @@ class ElevatedRunnerP1B2Test {
             // acquisition-time 登記仍在位：registrar 拋不造成取消登記（gate 7 自彼時密封）。
             assertEquals(1, ElevatedCleanupTracker.quarantinedCount())
             assertTrue("victim must be the quarantine entry", ElevatedCleanupTracker.quarantineContains(victim))
-            // 臂內首嘗＋drain-end helper 重試，至多 2 次失敗計數。
+            // 僅 drain-end helper 重試 1 次——claimed 臂 catch 不呼 registrar。
             assertEquals(
-                failuresBefore + 2,
+                failuresBefore + 1,
                 ElevatedCleanupTracker.quarantineRegistrationFailedCount(),
             )
             // 放行：worker 退出 ⇒ finally（state 0→2、!acquired）恰好 endLingerDebt 一次（gate 6 離封）。

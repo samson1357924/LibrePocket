@@ -203,6 +203,74 @@ class ElevatedRunnerPhaseBLateCompensationTest {
         }
     }
 
+    /**
+     * Round-7 Phase-5A：可驗證死亡＋阻塞假件（對齊 ElevatedRunnerP1B2Test.KillableBlockedDestroyProcess）：
+     * `destroy()` 置 `destroyed=true` 後才永久阻塞於 [destroyLatch]（吞 interrupt）；
+     * `waitFor(timeout, unit)` 回 `destroyed`——destroy 信號後即可驗證死亡，
+     * compensation 路徑 verify 段走 verified==true 臂（releaseCleanupSlotAfterVerify
+     * 單次釋槽、不登記 quarantine）。latch 由測試於 POST 階段 countDown。
+     */
+    private class KillableBlockedDestroyProcess(
+        private val destroyLatch: CountDownLatch,
+    ) : Process() {
+        @Volatile
+        var destroyed = false
+            private set
+        val destroyEntered = AtomicInteger(0)
+        override fun getOutputStream(): OutputStream = ByteArrayOutputStream()
+        override fun getInputStream(): InputStream = ByteArrayInputStream(ByteArray(0))
+        override fun getErrorStream(): InputStream = ByteArrayInputStream(ByteArray(0))
+        override fun waitFor(): Int = 0
+        override fun waitFor(timeout: Long, unit: TimeUnit): Boolean = destroyed
+        override fun exitValue(): Int = 0
+        override fun destroy() {
+            destroyed = true
+            destroyEntered.incrementAndGet()
+            awaitLatchUninterruptibly()
+        }
+        override fun destroyForcibly(): Process {
+            destroy()
+            return this
+        }
+
+        private fun awaitLatchUninterruptibly() {
+            while (true) {
+                try {
+                    destroyLatch.await()
+                    return
+                } catch (_: InterruptedException) {
+                    // 吞中斷：Binder 不可中斷 stall——caller 永遠卡在 latch 上
+                }
+            }
+        }
+    }
+
+    /**
+     * 可殺瞬時模型（W2 winner-agnostic pin 用）：與 [KillableBlockedDestroyProcess]
+     * 同契約但 destroy 立即返回——專供 claim-then-throw 之即刻收斂（kill／reap／
+     * verify 皆瞬斷）。
+     */
+    private class KillableImmediateProcess : Process() {
+        @Volatile
+        var destroyed = false
+            private set
+        val destroyEntered = AtomicInteger(0)
+        override fun getOutputStream(): OutputStream = ByteArrayOutputStream()
+        override fun getInputStream(): InputStream = ByteArrayInputStream(ByteArray(0))
+        override fun getErrorStream(): InputStream = ByteArrayInputStream(ByteArray(0))
+        override fun waitFor(): Int = 0
+        override fun waitFor(timeout: Long, unit: TimeUnit): Boolean = destroyed
+        override fun exitValue(): Int = 0
+        override fun destroy() {
+            destroyed = true
+            destroyEntered.incrementAndGet()
+        }
+        override fun destroyForcibly(): Process {
+            destroy()
+            return this
+        }
+    }
+
     private fun rootRunner(
         spawn: (List<String>) -> Process,
         killer: (Process) -> Unit = { it.destroy() },
@@ -910,6 +978,231 @@ class ElevatedRunnerPhaseBLateCompensationTest {
             bg.join(10_000L)
             pollOutstandingTo(0)
             pollActiveTo(0)
+            ElevatedCleanupTracker.clearUnverified()
+            ElevatedCleanupTracker.noteClean()
+            awaitNoElevatedThreads()
+        }
+    }
+
+    /**
+     * (b3.7) Round-7 Phase-5A（P1 pin）：spawn worker「已起 OS 線程後 starter 再拋」
+     * （start-then-throw 且 worker 已 claim）——catch 臂觀察到 `spawnClaimed==true`
+     * （worker 贏）時的正式 expiry/ownership handoff pin：
+     * `expired.set(true)`＋`countUncleanOnce()`（恰好一次）＋`markLingering(worker, state)`。
+     *
+     * harness 同 (b3.5) 的 start-then-throw 形狀，但注入對象是 spawn worker（`elevated-supervisor`）
+     * 而非 late-spawn daemon：custom starter `{ t.start(); blockEntered.await(10s); throw OOME }`
+     * —— worker 先入體（claim 先於 block()）、starter 後拋 ⇒ catch 臂 CAS 必敗 ⇒ handoff 臂。
+     * spawn body 計數 [blockEntered] 後阻塞於 [destroyLatch]（victim 為
+     * [KillableBlockedDestroyProcess]）：caller 於 startThread 內即拋（先於輪詢迴圈進入），
+     * 故 [isCancelled] 恆 false、不參與本流程（不經 expireWorker）。
+     * PRE-RELEASE：caller 已返回 `Res.Expired(hasLinger=true)`（二 runner 映射
+     * `TimedOut(cleanupIncomplete=true)`）；admission 以 BACKLOG_FULL 密封（markLingering
+     * 槽持有，state cell 四態 0→1）；outstanding==1；breaker 恰計一次；killCount==0；
+     * floor 不動；sticky 不置；debt 不變；registrar-failure 計數不變。
+     * POST（`destroyLatch.countDown()`）：worker 發佈 Val ⇒ 見 expired==true ⇒ 自路由
+     * compensateInline ⇒ acquireSlotOrQuarantine 成功 ⇒ lateCompensateSpawn ⇒ kill 恰好
+     * 一次（`it.destroy()` ⇒ destroyed=true ⇒ reap／verify 皆 verified==true）⇒
+     * releaseCleanupSlotAfterVerify 恰好釋放補償槽；worker finally（state 1→2）釋放
+     * markLingering 槽 ⇒ outstanding 歸零、admission OK、debt／floor／sticky／killNever／
+     * registrar-failure 全數不變（breaker 維持 +1，verified-clean 不再計數）。
+     */
+    @Test fun spawnWorkerStartThenThrowAfterClaimHandsOffToInlineCompensationAndSealsAdmission() {
+        ElevatedCleanupTracker.clearUnverified()
+        ElevatedCleanupTracker.noteClean()
+        pollOutstandingTo(0)
+        pollActiveTo(0)
+        ElevatedCleanupTracker.resetPeak()
+        val breakerBefore = ElevatedCleanupTracker.consecutiveCount()
+        val debtBefore = ElevatedCleanupTracker.lingerDebtCount()
+        val killNeverBefore = ElevatedCleanupTracker.killNeverAttemptedCount()
+        val failuresBefore = ElevatedCleanupTracker.quarantineRegistrationFailedCount()
+        val blockEntered = CountDownLatch(1)
+        val observed = AtomicBoolean(false)
+        val destroyLatch = CountDownLatch(1)
+        val victim = KillableBlockedDestroyProcess(destroyLatch)
+        val resultRef = AtomicReference<ElevatedCallSupervisor.Res<Process>?>()
+        val kills = AtomicInteger(0)
+        val bg = Thread {
+            resultRef.set(
+                ElevatedCallSupervisor.awaitSpawnWithThreadStarter(
+                    deadlineNanos = System.nanoTime() + TimeUnit.SECONDS.toNanos(60),
+                    // isCancelled 不參與本流程（starter 於 startThread 內即拋，caller 不入輪詢迴圈）；
+                    // 恆 false 排除 expireWorker 路徑干擾。
+                    isCancelled = { false },
+                    killer = { p ->
+                        kills.incrementAndGet()
+                        p.destroy()
+                    },
+                    startThread = { t ->
+                        if (t.name == "elevated-supervisor") {
+                            t.start()
+                            if (blockEntered.await(10, TimeUnit.SECONDS)) observed.set(true)
+                            throw OutOfMemoryError("OOM after OS start (claim-lost fixture)")
+                        }
+                        t.start()
+                    },
+                ) {
+                    // 記必須先行：worker 入體即先置 blockEntered，再阻塞於 destroyLatch——
+                    // caller 返回時 killCount 必為 0（compensateInline 尚未發生）。
+                    blockEntered.countDown()
+                    stuckAwait(destroyLatch)
+                    victim
+                },
+            )
+        }.also { it.isDaemon = true; it.start() }
+        try {
+            // PRE-RELEASE：caller 於 block 阻塞期間即返回（starter 拋在 startThread 內）。
+            val res = pollRefNonNull(resultRef, "caller result", 15_000L)
+            assertTrue("worker must have entered block before OOM", observed.get())
+            assertTrue(
+                "expected Res.Expired(hasLinger=true), got $res",
+                res is ElevatedCallSupervisor.Res.Expired && res.hasLinger,
+            )
+            // seal 在位：markLingering 持槽（state 0→1）⇒ outstanding==1 ⇒ admission 拒。
+            assertEquals(1, ElevatedCleanupTracker.outstanding())
+            val admission = ElevatedCleanupTracker.tryEnterReserved()
+            if (admission == ElevatedCleanupTracker.Admission.OK) {
+                ElevatedCleanupTracker.leaveCall()
+            }
+            assertEquals(ElevatedCleanupTracker.Admission.BACKLOG_FULL, admission)
+            assertEquals(0, kills.get())
+            assertEquals(
+                "breaker must count exactly once (handoff arm)",
+                breakerBefore + 1,
+                ElevatedCleanupTracker.consecutiveCount(),
+            )
+            assertFalse(ElevatedCleanupTracker.isRegistrationFailedSticky())
+            assertEquals(debtBefore, ElevatedCleanupTracker.lingerDebtCount())
+            assertEquals(floorBefore, ElevatedCleanupTracker.releaseFloorHits())
+            // POST：放行 victim ⇒ worker 發佈 Val ⇒ 見 expired==true ⇒ 自路由 compensateInline。
+            destroyLatch.countDown()
+            pollTrue("worker must kill the victim exactly once", 10_000L) { kills.get() == 1 }
+            pollTrue("spawn worker must exit after compensation", 10_000L) {
+                countLive("elevated-supervisor") == 0
+            }
+            pollOutstandingTo(0)
+            val admissionAfter = ElevatedCleanupTracker.tryEnterReserved()
+            if (admissionAfter == ElevatedCleanupTracker.Admission.OK) {
+                ElevatedCleanupTracker.leaveCall()
+            }
+            assertEquals(ElevatedCleanupTracker.Admission.OK, admissionAfter)
+            assertEquals(floorBefore, ElevatedCleanupTracker.releaseFloorHits())
+            assertEquals(debtBefore, ElevatedCleanupTracker.lingerDebtCount())
+            assertEquals(killNeverBefore, ElevatedCleanupTracker.killNeverAttemptedCount())
+            assertEquals(
+                failuresBefore,
+                ElevatedCleanupTracker.quarantineRegistrationFailedCount(),
+            )
+            assertFalse(ElevatedCleanupTracker.isRegistrationFailedSticky())
+            assertEquals(
+                "verified-clean compensation must not recount the breaker",
+                breakerBefore + 1,
+                ElevatedCleanupTracker.consecutiveCount(),
+            )
+        } finally {
+            destroyLatch.countDown()
+            bg.join(10_000L)
+            pollOutstandingTo(0)
+            pollActiveTo(0)
+            ElevatedCleanupTracker.forceAcquireSlotOrQuarantineThrow = false
+            ElevatedProcessIo.quarantineRegistrar =
+                { ElevatedCleanupTracker.quarantineUnverified(it) }
+            ElevatedCleanupTracker.clearUnverified()
+            ElevatedCleanupTracker.noteClean()
+            awaitNoElevatedThreads()
+        }
+    }
+
+    /**
+     * (Phase-5A W2 pin；security MEDIUM／code-reviewer Optional-W2 採納)Round-7 fixup：
+     * starter `{ t.start(); blockEntered.await(10s); throw OOM }`（spawn worker
+     * `elevated-supervisor`）＋ block 立即返回 [KillableImmediateProcess]——caller 於
+     * startThread 內即拋（不入輪詢迴圈）；worker 發佈 Val 與 catch 臂 `expired.set(true)`
+     * 之間為真實競態（非 latch 決定序）——winner 可為 worker（inline compensation）、
+     * 本臂（publish 後搶 Val ⇒ startLateDaemon）、或 worker 發佈時見 expired==true 自
+     * 路由補償；三者恰贏其一（`holder` 同一 CAS 仲裁，恰好一次）。
+     * 任一 winner 皆收斂同一組斷言（winner-agnostic）：caller 返回
+     * `Res.Expired(hasLinger=true)`；kills 恰好 1（不雙補、不漏補）；outstanding 有界
+     * 歸零；admission 回 OK；debt 不動；breaker `before+1`（catch 臂 handoff 恰計一次，
+     * 補償 verified-clean 不再計數——`countUncleanOnce` CAS 保證 worker 補償不雙計）；
+     * quarantine 不增（verify==true ⇒ 無登記）；killNever／failures／sticky／floor 全不動。
+     * 無 block latch（block 即刻返回）；兩種 interleaving 皆通過同一組斷言。
+     */
+    @Test fun spawnWorkerStartThenThrowAfterClaimCompensatesExactlyOnce() {
+        ElevatedCleanupTracker.clearUnverified()
+        ElevatedCleanupTracker.noteClean()
+        pollOutstandingTo(0)
+        pollActiveTo(0)
+        ElevatedCleanupTracker.resetPeak()
+        val breakerBefore = ElevatedCleanupTracker.consecutiveCount()
+        val debtBefore = ElevatedCleanupTracker.lingerDebtCount()
+        val killNeverBefore = ElevatedCleanupTracker.killNeverAttemptedCount()
+        val failuresBefore = ElevatedCleanupTracker.quarantineRegistrationFailedCount()
+        val quarantineBefore = ElevatedCleanupTracker.quarantinedCount()
+        val blockEntered = CountDownLatch(1)
+        val observed = AtomicBoolean(false)
+        val victim = KillableImmediateProcess()
+        val kills = AtomicInteger(0)
+        val res = ElevatedCallSupervisor.awaitSpawnWithThreadStarter(
+            deadlineNanos = System.nanoTime() + TimeUnit.SECONDS.toNanos(60),
+            // starter 於 startThread 內即拋 ⇒ caller 不入輪詢迴圈；恆 false 排除 expireWorker 干擾。
+            isCancelled = { false },
+            killer = { p ->
+                kills.incrementAndGet()
+                p.destroy()
+            },
+            startThread = { t ->
+                if (t.name == "elevated-supervisor") {
+                    t.start()
+                    if (blockEntered.await(10, TimeUnit.SECONDS)) observed.set(true)
+                    throw OutOfMemoryError("OOM after OS start (test seam)")
+                }
+                t.start()
+            },
+        ) {
+            blockEntered.countDown()
+            victim
+        }
+        try {
+            assertTrue("worker must have entered block before OOM", observed.get())
+            assertTrue(
+                "expected Res.Expired(hasLinger=true), got $res",
+                res is ElevatedCallSupervisor.Res.Expired && res.hasLinger,
+            )
+            pollTrue("compensator must kill the victim exactly once", 10_000L) { kills.get() == 1 }
+            pollOutstandingTo(0)
+            pollActiveTo(0)
+            awaitNoElevatedThreads()
+            assertEquals("kills must be exactly once (no double/no missed compensation)", 1, kills.get())
+            assertEquals(0, ElevatedCleanupTracker.outstanding())
+            val admission = ElevatedCleanupTracker.tryEnterReserved()
+            if (admission == ElevatedCleanupTracker.Admission.OK) {
+                ElevatedCleanupTracker.leaveCall()
+            }
+            assertEquals(ElevatedCleanupTracker.Admission.OK, admission)
+            assertEquals(debtBefore, ElevatedCleanupTracker.lingerDebtCount())
+            assertEquals(
+                "breaker must count exactly one incomplete cleanup (arm handoff)",
+                breakerBefore + 1,
+                ElevatedCleanupTracker.consecutiveCount(),
+            )
+            assertEquals(
+                "verified-clean compensation must not register quarantine",
+                quarantineBefore,
+                ElevatedCleanupTracker.quarantinedCount(),
+            )
+            assertEquals(killNeverBefore, ElevatedCleanupTracker.killNeverAttemptedCount())
+            assertEquals(
+                failuresBefore,
+                ElevatedCleanupTracker.quarantineRegistrationFailedCount(),
+            )
+            assertFalse(ElevatedCleanupTracker.isRegistrationFailedSticky())
+            assertEquals(floorBefore, ElevatedCleanupTracker.releaseFloorHits())
+        } finally {
+            pollOutstandingTo(0)
+            pollActiveTo(0)
+            ElevatedProcessIo.quarantineRegistrar = { ElevatedCleanupTracker.quarantineUnverified(it) }
             ElevatedCleanupTracker.clearUnverified()
             ElevatedCleanupTracker.noteClean()
             awaitNoElevatedThreads()

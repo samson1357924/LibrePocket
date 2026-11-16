@@ -3075,6 +3075,12 @@ class FastDispatchTest {
             "查 同意 符號" to "同意",
             "查 批准 符號" to "批准",
             "查 許可 符號" to "許可",
+            // #19 B3 stage-9.1（Re-review #9 A1 [P1]）：識別字含 授權/審批（未列示 consent 動詞）
+            // 作為普通識別字內容時仍 FAST——arm H/I 否決的是 deferred action／conditional framing
+            // 顆粒，非識別字子串本身：
+            "查 授權 符號" to "授權",
+            "查 授權政策 符號" to "授權政策",
+            "查 審批流程 符號" to "審批流程",
             "search symbol afterApproval" to "afterApproval",
             "search symbol after_approval" to "after_approval",
             "查 ConsentFlow 符號" to "ConsentFlow",
@@ -3317,26 +3323,31 @@ class FastDispatchTest {
     }
 
     @Test fun enDelimitedClauseAndColonInteractionsArePinned() = runBlocking {
-        // #19 B3 stage-8.6（交互 pins；Re-review #8 release-gate required）：
+        // #19 B3 stage-8.6（交互 pins；Re-review #8 release-gate required）＋stage-9.1（Re-review #9 A1 [P1]）：
         // 釘住 EN-delimited verbatim carve-out（stage-8.3）× 尾綴/前導條件子句閘（stage-8.1）
         // × leading colon（stage-8.4）× SLOW 後備（stage-8.5）的跨階段交互——皆已實測無誤，
         // 僅缺 pin。准入判定在 raw 文本上跑 ⇒ enDelimited 不救 `…批准再做` 形態的子句 veto；
         // EN-delimited 之 verbatim identifier 僅可能落成有界單 token LSP 查詢（READ-only、
         // esc() JSON-escape、AFFIRM_…_gate 語義不變）。
+        // stage-9.1：CJK arm H（deferred-action nucleus `再|才`＋有界動作動詞核）／arm I
+        // （conditional-framing nucleus 如果|假如|倘若|要是|的話）於准入檢查（同一 PERMISSION_CONDITIONAL_CLAUSE
+        // clause gate，raw/spaced/joined 三探針聯集）落地、任意位置即否決——不依賴 consent 動詞識別；
+        // 未列示 consent 動詞（`審批`／`授權`…）不再是 fail-OPEN 捷徑（`…審批再做` 等已 flip 為 DENIED）。
+        // EN 側（`after i approve` 等）不變、not 觸動——本 stage 僅 CJK arm H/I。
         val backend = CountingBackend()
         val dispatcher = lspDispatcher(backend)
-        // FAST 交互 pins（EN-delimited × 前導冒號；及已接受 verbatim 殘餘類）：
+        // FAST 交互 pins（EN-delimited × 前導冒號；及識別字含 consent/授權 相鄰詞之既 FAST pins）：
         // EN 消費（opener 或 `symbols?` cue）⇒ verbatim（Step A/C/B 發生順序與 raw 一致）；
-        // 未列示 consent 動詞／識別字內為 CJK 插入 >16 者為已接受 fail-OPEN 殘餘
-        // （READ-only；`查 Foo符號等審批再做` 為首例）。
+        // 識別字含 consent 顆粒者（如 `symbols 同意`／`symbols 批准`）仍 FAST——consent 顆粒本身
+        // 非否決依據（無 `再|才`＋動作動詞核、無 如果|假如|倘若|要是|的話）。
+        // stage-8.7 之 FAST pins `查 Foo符號等審批再做`／`查Foo符號等授權再做` 自 stage-9.1 起 flip 為 DENIED
+        // （arm H：`再做`——deferred action；見下方 DENIED 交互 pins）。
         for ((text, expectedQuery) in listOf(
             "symbols ::Foo" to "::Foo",
             "find symbol ::Foo" to "::Foo",
             "查 symbols ::Foo" to "::Foo",
             "symbols Foo::" to "Foo",
             "查 symbols Foo::" to "Foo",
-            "查 Foo符號等審批再做" to "Foo符號等審批再做",
-            "查Foo符號等授權再做" to "Foo符號等授權再做",
             "symbols 同意" to "同意",
             "symbols 批准" to "批准",
         )) {
@@ -3360,8 +3371,12 @@ class FastDispatchTest {
                 executed.result.resultJson.contains("\"name\":\"$expectedQuery:example\""),
             )
         }
-        // DENIED 交互 pins：raw text 命中條件子句閘（arm A/B/等）⇒ 准入否決
+        // DENIED 交互 pins：raw text 命中條件子句閘（arm A/B/等/D′/H/I）⇒ 准入否決
         // （no-match DENIED；enDelimited/verbatim carve-out 救不了子句 veto）。
+        // stage-9.1 翻轉釘（Re-review #9 A1 [P1]，fail-open 修復）：`查 Foo符號等審批再做`／
+        // `查Foo符號等授權再做` 自 stage-8.7 FAST 移至 DENIED（arm H：`再|才`＋動作動詞核
+        // `做`——deferred action，clause gate 落地，never FAST）；新增 arm H/I 負向釘
+        // `查Foo符號如果我同意`／`查Foo符號明天再做`／`查Foo符號等審批後再做`。
         // `…符號呢` 尾疑問顆粒 ⇒ 准入否決 ⇒ 落 SLOW_HINTS（自動操作）→ FLAVOR_BLOCKED
         // （PLAY flavor；絕不執行）。route DENIED + toolCall==null + backend 零增。
         for (text in listOf(
@@ -3372,6 +3387,13 @@ class FastDispatchTest {
             "查 symbols 批准再做",
             "查 symbols 批准 再做",
             "查 自動操作 符號呢",
+            // #19 B3 stage-9.1 翻轉釘（由 FAST flip 為 DENIED；arm H）：
+            "查 Foo符號等審批再做",
+            "查Foo符號等授權再做",
+            // #19 B3 stage-9.1 新增 arm H/I 負向釘：
+            "查Foo符號如果我同意",
+            "查Foo符號明天再做",
+            "查Foo符號等審批後再做",
         )) {
             val d = decide(text)
             assertEquals(text, RouteKind.DENIED, d.route)
@@ -3383,7 +3405,7 @@ class FastDispatchTest {
             assertFalse(text, result.outcome is FastDispatchOutcome.Executed)
             assertEquals(text, before, backend.invocations.get())
         }
-        assertEquals(9, backend.invocations.get())
+        assertEquals(7, backend.invocations.get())
     }
 }
 

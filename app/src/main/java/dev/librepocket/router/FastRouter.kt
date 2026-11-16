@@ -68,7 +68,9 @@ import java.util.concurrent.atomic.AtomicLong
  * provided|upon|following|pending|with|subject to|prior to|given|on 後接可選受詞/限定詞（0–3 個）再接
  * approve/agree/consent/confirm/say/allow/release/permit/ok/ready/permission/
  * review 等詞幹（gerund 與過去式一併涵蓋）、wait for/until/till、hold on/off、
- * not yet、CJK 結構性條件句（等…（有界 possessor）同意、（後）再/才、只有…才等有界框架）等），
+ * not yet、CJK 結構性條件句（等…（有界 possessor）同意、（後）再/才、只有…才等有界框架、
+ * 以及 stage-9.1 arm H deferred-action nucleus `再|才`＋動作動詞核（做查跑說寫讀處理執行更新重啟處辦辦理）、
+ * arm I conditional-framing nucleus 如果|假如|倘若|要是|的話，皆任意位置、不依賴 consent 動詞識別）等），
  * 或任意教學/說明標記（命令式 opener + 教學標記否決：explain|teach|tutorial|
  * how-to|howto|mean|describe|demonstrate 等屈折形式，或 CJK 說明|説明|講解|
  * 讲解|介紹|介绍|討論|讨论|教程|方法（是）?|意思|名稱|名称|如何|怎麼|怎么|
@@ -127,7 +129,9 @@ import java.util.concurrent.atomic.AtomicLong
  *   「尚待批准／回覆」形態——所列形態與已知變體（含斜線 possessor、回覆族動詞、動詞內 ≤16 插入
  *   （CONSENT_VERBS_CJK_FLEX）、Cf 拆分）皆否決；未列示 consent 動詞（執行，fail-OPEN）及
  *   動詞內 >16 插入仍為已知殘餘（見下節「未列示 consent 動詞」與「動詞內 >16 插入」，
- *   皆 READ-only／未接線）；未列 possessor 亦皆收（`等主管批准`／`等老闆同意`／`等經理核准`／
+ *   皆 READ-only／未接線）；stage-9.1 起 arm H/I 顆粒（`再|才`＋動作動詞核／如果|假如|倘若|要是|的話）
+ *   於任意位置出現即否決，不受此框架形狀所限（deferred-action／conditional-framing 形態）；
+ *   未列 possessor 亦皆收（`等主管批准`／`等老闆同意`／`等經理核准`／
  *   `等董事會點頭`／`等董老闆批准`／長組織名如 `等安全審核委員會主席批准`／`等國家安全委員會批准`／
  *   9/12 位數字 `等123456789批准`／`等123456789012批准` 皆否決；`等我們同意`／`等你點頭` 仍匹配））＋ consent 動詞集
  *   同意|核准|核準|批准|確認|确认|許可|许可|點頭|点头|回覆|回复|答覆|答复（繁簡對稱；單一事實來源
@@ -164,10 +168,24 @@ import java.util.concurrent.atomic.AtomicLong
  *   （如 `等資安/法務批准`／`等CISO/CEO同意`／`等資安 / 法務批准`／`等主管-法務批准`／`等資安_法務批准`）
  *   新帶來的否決即為 A1 修正目標形態本身；任何超出該形態的黏合識別字過度否決一律接受——
  *   方向固定為 fail-safe（從不執行），不得以「收回」此類輸入為名放寬 possessor 槽。
- * - 已知殘餘（accepted, open-world fail-OPEN；Re-review #8 安全審計 M3）：未列示 consent 動詞
+ * - arm H（deferred-action nucleus；stage-9.1；Re-review #9 A1 [P1]；任意位置，CJK）：`(?:再|才)(?:做|查|跑|說|寫|讀|處理|執行|更新|重啟|處辦|辦理)`
+ *   ——文中任意位置出現 `再|才` ＋ 有界動作動詞核（12 個 Lo 動詞：做查跑說寫讀處理執行更新重啟處辦辦理）即否決；
+ *   不依賴 consent 動詞識別 ⇒ 未列示 consent 動詞亦無法繞過；`查Foo符號等審批再做`／`查Foo符號等授權再做`／
+ *   `查Foo符號明天再做`／`查Foo符號等審批後再做` 皆否決（deny-by-admission；READ-only 亦從不執行）。
+ *   動詞核為 common CJK action verbs 之有界集——不封閉宣稱：核外動詞（未列入此 12 個者）仍不匹配
+ *   ⇒ fail-OPEN（open-world 殘餘，如實記錄，不宣稱封閉；見下節「未列示 consent 動詞」）。
+ * - arm I（conditional-framing nucleus；stage-9.1；Re-review #9 A1 [P1]；任意位置，CJK）：`(?:如果|假如|倘若|要是|的話)`
+ *   ——文中任意位置出現條件框架顆粒即否決；`查Foo符號如果我同意` 否決。`的話` over-deny 黏合識別字
+ *   為 accepted fail-safe（記錄，不得「收回」）；arm I 同樣不依賴 consent 動詞識別。
+ *   arm H/I 於准入檢查（[isAffirmativeSymbolCommand] 之 PERMISSION_CONDITIONAL_CLAUSE gate，raw/spaced/joined
+ *   三探針聯集）落地，與其他 arm 同一 clause gate、同閘否決——非於 extraction。
+ * - 已知殘餘（accepted, open-world fail-OPEN；Re-review #8 安全審計 M3；stage-9.1 收窄）：未列示 consent 動詞
  *   （`審批`／`應允`／`承諾`／`認可`／`允許`／`授權`／`首肯`／`放行` 等近義詞族——列舉不盡，封閉清單不可能完備）
+ *   且不含 arm H/I 顆粒（無 `再|才`＋有界動作動詞核、無 如果|假如|倘若|要是|的話）者，
  *   一律不匹配條件句框架 ⇒ 不成立 clause-gate 否決 ⇒ 落其餘閘；是 FAST 即執行（fail-OPEN——與
- *   前閘「過度否決 fail-safe」前提相反，如實記錄之方向）。目前唯一 executionReady 工具為 lsp.symbols，
+ *   前閘「過度否決 fail-safe」前提相反，如實記錄之方向）。stage-9.1 起，`查Foo符號等審批再做`／
+ *   `查Foo符號等授權再做` 等形因 arm H（`再|才`＋動作動詞核）於准入檢查否決，不再 fail-OPEN；
+ *   核外動詞殘餘（動作動詞之無窮類 ∉ 12 個核內動詞）仍 fail-OPEN，如實記錄、不宣稱封閉。目前唯一 executionReady 工具為 lsp.symbols，
  *   READ-only、未接線——以本 lane 現況（唯一 executionReady 為 READ-only、未接線）之實害為零；含 consent 動詞內 >16 插入者亦同（FLEX 上限 16，對稱 arm D′）。
  *   若本 lane 未來接線非 READ 工具，封閉 consent 動詞清單必須先重新審視——已規劃的補救方向為
  *   對 `等…` 框架加超集 deny-guard（open-world deny-by-default 之一致化），非逐一枚舉動詞。
@@ -504,6 +522,13 @@ class FastRouter(
         //       （INS＝`[\p{L}\p{N}._-$#@/():,;+=~]`）——`批A准再做`／`批_准`／`核1準` 等
         //       動詞內 1 插入字元亦否決（fail-safe）；插入 >16 字仍為殘餘（fail-OPEN，見 M3 節）；
         //       以及有界缺口 `只有.{0,8}才`／`只許.{0,8}才|只许.{0,8}才`／`只允.{0,8}才`（無裸名詞 CJK 匹配）；
+        //       H＝deferred-action nucleus（stage-9.1；Re-review #9 A1 [P1]；任意位置，CJK）：`(?:再|才)(?:做|查|跑|說|寫|讀|處理|執行|更新|重啟|處辦|辦理)`
+        //        ——文中任意位置出現 `再|才` ＋ 有界動作動詞核（12 個 Lo 動詞）即否決；不依賴 consent 動詞識別；
+        //       `查Foo符號等審批再做`／`查Foo符號等授權再做`／`查Foo符號明天再做`／`查Foo符號等審批後再做` 皆否決；
+        //        動詞核為 common CJK action verbs 之有界集——不封閉宣稱：核外動詞仍 fail-OPEN（open-world 殘餘，如實記錄，見 M3 節）；
+        //       I＝conditional-framing nucleus（stage-9.1；Re-review #9 A1 [P1]；任意位置，CJK）：`(?:如果|假如|倘若|要是|的話)`
+        //        ——文中任意位置出現條件框架顆粒即否決；`查Foo符號如果我同意` 否決；`的話` over-deny 為接受之 fail-safe；
+        //        arm H/I 於准入檢查（isAffirmativeSymbolCommand 之 clause gate，raw/spaced/joined 三探針聯集）落地，非於 extraction；
         //       已知殘餘（accepted, frame-local）：`等` 與 consent 動詞之間的 possessor 超過 64 個單位
         //       不匹配 → fail-open（單 token 命令形 end-to-end FAST；帶空白則不執行）；
         //       插入 ≤16 字 L/N/了過＋必填再|才（arm D′）——`批准Ｄ再做` 等亦否決；
@@ -591,6 +616,18 @@ class FastRouter(
                 "|" + CONSENT_VERBS_CJK_FLEX + "[\\s，,.;；:：。、！？!?．‥…了過_]*(?:之後|之后|以後|以后|後|后)(?:[\\s，,.;；:：。、！？!?．‥…_]*(?:再|才))?" +
                 "|" + CONSENT_VERBS_CJK_FLEX + "[\\s，,.;；:：。、！？!?．‥…了過_]*(?:再|才)" +
                 "|" + CONSENT_VERBS_CJK_FLEX + "[\\p{L}\\p{N}了過\\s，,.;；:：。、！？!?．‥…_$#@/():,;+=~／＿-]{0,16}(?:再|才)" + // arm D′：FLEX 動詞＋CJK/ASCII/全形字母（NFKC 折）＋助詞＋識別字標點/空白（含 `／` U+FF0F／`＿` U+FF3F）插入於動詞與再|才之間（如 `批准Ｄ再做`/`同意白拿了再做`/`批准Ｄ_Ｄ再做`/`批准a-b再做`/`批准Ｄ/Ｄ再做`/`批准Ｄ／Ｄ再做`）——L/N/了過/標點/空白插入 ≤16 字、fail-safe 否決
+                // #19 B3 stage-9.1（Re-review #9 A1，[P1]）：arm H——deferred-action nucleus（任意位置，CJK）。
+                // 文中任意位置出現 `再|才` ＋ 有界動作動詞核（12 個 Lo 動詞：做查跑說寫讀處理執行更新重啟處辦辦理）
+                // 即否決（clause gate at admission）。`查Foo符號等審批再做`／`查Foo符號等授權再做`／`查Foo符號明天再做`／
+                // `查Foo符號等審批後再做` 皆否決（fail-safe direction；deny-by-admission，never FAST）。
+                // 動詞核為 common CJK action verbs 之有界集——不封閉宣稱（非 open-world closure）：
+                // 核外動詞（未列入此 12 個者）仍不匹配 ⇒ fail-OPEN（open-world 殘餘，如實記錄；見 KDoc「未列示 consent 動詞」節）。
+                "|(?:再|才)(?:做|查|跑|說|寫|讀|處理|執行|更新|重啟|處辦|辦理)" + // arm H：deferred-action nucleus（stage-9.1）——任意位置 CJK 再|才＋有界動作動詞核 ⇒ clause gate 否決
+                // #19 B3 stage-9.1（Re-review #9 A1，[P1]）：arm I——conditional-framing nucleus（任意位置，CJK）。
+                // 文中任意位置出現條件框架顆粒（如果|假如|倘若|要是|的話）即否決（clause gate at admission）。
+                // `查Foo符號如果我同意` 否決。`的話` over-deny 黏合識別字為 accepted fail-safe（記錄，不得「收回」）。
+                // arm H/I 不依賴 consent 動詞識別，未列示 consent 動詞亦無法繞過。
+                "|(?:如果|假如|倘若|要是|的話)" + // arm I：conditional-framing nucleus（stage-9.1）——任意位置 CJK 條件框架顆粒 ⇒ clause gate 否決（`的話` over-deny 為接受之 fail-safe）
                 "|只有.{0,8}才" +
                 "|只許.{0,8}才|只许.{0,8}才" +
                 "|只允.{0,8}才",

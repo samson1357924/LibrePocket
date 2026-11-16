@@ -331,8 +331,11 @@ internal object ElevatedCleanupTracker {
      * - 解除只兩途：[sweepQuarantine]／[kickSweepAsync] 背景重驗見確死，或
      *   [clearUnverified] 顯式 recovery（僅 B3 已驗證 recovery 或測試隔離可調）。
      *   [noteClean]／成功 drain 永不清除（見其 KDoc 分離聲明）；
-     * - 有界性：quarantine 非空即擋新 spawn，故登記數上界為准入前已在飛的併發呼叫數
-     *   （`<=MAX_CONCURRENT_CALLS` 量級，不無界增長）；重驗見 [sweepQuarantine]
+     * - 有界性：quarantine 非空即擋新 spawn。登記數無累計上界——條目僅可經
+     *   確死重驗移除（in-flight 上界仍為 `<=MAX_CONCURRENT_CALLS`，但累積
+     *   條目數隨「無法驗證死亡的特權子進程」數量增長；理論上 app 全生命週期
+     *   無上限，fail-closed 於每步（gate 7 擋新 spawn），見 #136-B3 待決策
+     *   （ceiling＋`quarantinedCount` 告警）；重驗見 [sweepQuarantine]
      *   （singleflight＋受監督有界驗證，見其 KDoc；絕不在呼叫側直接做外部 IPC）。
      *
      * 鎖：一切經 [lock]（與槽／計數器同一鎖，准入判定單一原子點）。
@@ -4612,7 +4615,7 @@ internal object ElevatedProcessIo {
  * [ElevatedCleanupTracker]）。
  *
  * Round-3 Phase E（P1-1）：未驗證 quarantine 持有（[quarantineHeld]）拒絕亦收斂至此，
- * 與 quota 同級（零 spawn、不耗配額），但原因碼獨立（`QUARANTINE`，不與上兩因混碼）。
+ * 與 quota 同級（零 spawn、不耗配額），但原因碼獨立（`QUARANTINE`，不與上列各因混碼）。
  *
  * Round-6（#136-B2 IR-P2）：登記 brick（[registrationFailed]，admission 以
  * [ElevatedCleanupTracker.Admission.REGISTRATION_FAILED] 永久密封）拒絕亦收斂至此，

@@ -20,21 +20,21 @@
 | `P1-A1/A2/A3/P1-4` | Round 的 P1 修正編號：原子二選一、untracked Residual 遙測、kill-never-attempted、飽和即拒 | `acquireSlotOrQuarantine`／`untrackedResidual` |
 | `Round-6 IR-P1` | 飽和無槽 lingering worker 會被 sweep 放行／准入重開的 IR（independent re-review）P1 | `lingerDebt`、gate 6（`classifyAdmissionLocked`） |
 | `Round-6 IR-P2` | 登記 brick（登記失敗且無法定位追蹤 ⇒ admission 永久拒絕；app 重啟恢復） | `registrationFailedSticky`、`Admission.REGISTRATION_FAILED`；brick ⇔ 登記失敗且無法定位追蹤（catch-all ＝ D-D10 無條件冗餘密封） |
-| `Round-6 D-A1..D-E7` | 子代碼複審發現編號（A=併發、B=提權執行安全、C=測試、D=架構/KDoc、E=scope/CI） | 本檔末 P1 段＋`pr167-review-aggregation.md`（repo 外彙整表，不入庫） |
+| `Round-6 D-A1..D-E7` | 子代碼複審發現編號（A=併發、B=提權執行安全、C=測試、D=架構/KDoc、E=scope/CI） | `pr167-review-aggregation.md`（repo 外彙整表，不入庫）；B3 待辦見本檔末節 |
 | `Round-6 PG-#` | PocketGuard bot 發現（BLOCK/WARN/SUGGESTION） | 同上 |
 | `drainFailClosedDrained` | drain 內部逃逸時的 catch-all 收斂臂：caller 零外部 process IPC（無 destroy／getter／waitFor）＋中斷 thread＋登記 quarantine＋計數；有界返回由構造保證；outstanding 不釋放（B3＝重啟恢復） | `ElevatedProcessIo.drainWithThreadStarter`／`drainFailClosedDrained` |
-| `Stage 1/2/3/4（本 PR 的 Round-6 提交階梯）` | 20af2877 linger-debt seal → ed1f8d81 sticky brick＋catch-all backstop → ff509999 遙測/文件 → 9d5ad1e7 有界 tearDown/本檔 | git log |
+| `Stage 1/2/3/4（本 PR 的 Round-6 提交階梯）` | 5dc23257 linger-debt seal → eb311aed sticky brick＋catch-all backstop → 6ffaca31 遙測/文件 → d37718f0 有界 tearDown/本檔 → 6b295e78 final fixups → 4f2a1f2e de-IPC catch-all → cdd78918 D-A5 claim hygiene → c1104d47 P3 doc/test batch | `git log --oneline origin/main..HEAD` |
 | `quarantine（閘）／QUARANTINE` | 未驗證死亡 handle 的持久登記，admission 末門 QUARANTINE（fail-closed） | `ElevatedCleanupTracker.quarantineUnverified` |
 | `sweep／verify-only sweep` | 以 `waitFor(0ms)` 有界驗證後才移除 quarantine 條目 | `verifyQuarantinedOneBounded` |
 | `AB1` | 呼叫級准入（activeCalls / tryEnterReserved），上限 MAX_CONCURRENT_CALLS=4 | `tryEnterReserved` |
 | `killTree` | PID-reuse 守門＋信號樹（descendants reflective seam＋本體 attest） | `ElevatedProcessKiller.kt` |
 
-## 四態／五態 state 詞彙（worker/heartbeat 三態修正歷史的注記）
+## 四態 state 詞彙（markLingering 四態）／cleanupSlotState 三態／custody 交接註記
 
 - `state==0` init、`1` held、`2` done-no-debt、`3` done-debt（Round-6 起 markLingering／cleanup cell）。
 - `outstanding` = cleanup 槽佔用；`lingerDebt` = 飽和無槽 worker 的密封債務（gate 6）。
 - `cleanupSlotState`（custody 狀態機）維持三態（0→1→2），與 markLingering 四態不同。
-- verify-stall Stage 3c 雙持有者交接期間 outstanding 可瞬態讀為 2（µs 級窗口），不得作為靜態斷言；穩定觀察點在 worker 退出後（worker finally 釋槽後，以 `pollOutstandingTo(0)` 有界收斂為準）。
+- `outstanding` 的穩態斷言不得寫死為 1：獨立的殘留（cleanup worker stall＋管線 gobbler/stdin markLingering 殘留）可能同 drain 並存，無並存上界次數斷言；觀測須以 `pollOutstandingTo(0)` 有界收斂為準（不得在中間時點靜態斷言具體 outstanding 值）。
 
 ## 復原與恢復政策（誠實邊界）
 
@@ -42,7 +42,7 @@
   ——含 D-D10 catch-all 無條件冗餘 brick（caller 側槽保留，restart-only））
   皆以**app 重啟**為恢復途徑；產品不自動清（`clearUnverified` 僅測試隔離可調）。
 - 告警／runbook／device-acceptance 全歸 `#136-B3`；本 PR 僅到遙測計數與 KDoc。
-- 裝置上 PID-reuse attestation 休眠（AOSP `toHandle()` UOE 樁）：`ElevatedProcessKiller`
+- 裝置上 PID-reuse attestation 不生效（AOSP `toHandle()` UOE 樁）：`ElevatedProcessKiller`
   承載幾個「Android 上不會生效」的註腳式機制（descendants 信號、本體 identity 重讀），
   見其 KDoc 與 #136-B3 gate。
 

@@ -1372,7 +1372,7 @@ class ElevatedRunnerP1B2Test {
             assertTrue("untrackedResidual must surface on the start-failure arm", d.untrackedResidual)
             // 槽保留（fail-closed，已佔槽）：admission 續拒。
             assertEquals(1, ElevatedCleanupTracker.outstanding())
-            // 隔離 gate 7（quarantine 空，登記雙失敗）：BACKLOG_FULL 必源於 gate 5 reservation。
+            // 隔離 gate 7（quarantine 空、second-chance 登記亦失敗）：BACKLOG_FULL 必源於 gate 5 reservation。
             assertEquals(quarantineBefore, ElevatedCleanupTracker.quarantinedCount())
             assertEquals(
                 ElevatedCleanupTracker.Admission.BACKLOG_FULL,

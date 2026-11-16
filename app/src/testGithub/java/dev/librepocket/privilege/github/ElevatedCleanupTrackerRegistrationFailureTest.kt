@@ -528,7 +528,7 @@ class ElevatedCleanupTrackerRegistrationFailureTest {
         ElevatedCleanupTracker.clearUnverified()
     }
 
-    // ---- (d2) Round-6（#136-B2 IR-P2／D-B3／D-A10）：登記雙失敗 brick — admission 永久密封 ----
+    // ---- (d2) Round-6（#136-B2 IR-P2／D-B3／D-A10）：second-chance 登記失敗 brick — admission 永久密封 ----
 
     /**
      * D-C1：releaseCleanupSlotAfterVerify 零追蹤 arm（verified=false、slotHeld=false、登記拋）

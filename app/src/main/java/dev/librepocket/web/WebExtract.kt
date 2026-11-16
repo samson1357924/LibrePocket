@@ -59,7 +59,9 @@ internal class DeadlineExceededException : RuntimeException()
  *   跨 origin 跳轉之 opt-in 不可逆降級為預設 `HTTPS_ONLY`（公網 https 仍允許；私有／明文一律拒）（見下介紹，與 WebFetch 對齊）。
  *   跳轉碼分類單一真相為 [NetworkPolicy.isRedirectStatus]（300..303／307／308，含 300）；
  *   304／305／306 及其餘非跳轉碼落到終端 `HTTP_xxx` 分支以 `Failed` 收場
- *   （fail-closed，絕不跟隨）。
+ *   （fail-closed，絕不跟隨）；
+ *   206 Partial Content 例外地在該分支之前即 fail-closed——本抽取器不發 Range、
+ *   不組裝分段（RFC 9110 §15.3.7），一律 `Failed(HTTP_206)`（絕不寫快取、絕不交付完整 Ok）。
  * - Response 位元組上限：預設 [DEFAULT_MAX_BYTES]（256 KiB），呼叫方可調，
  *   硬頂 [ABSOLUTE_MAX_BYTES]（1 MiB）；超過即 `Failed(TOO_LARGE)`
  *   fail-closed（不存部分、不寫快取），與 malformed（`BAD_RESPONSE`）區分；
@@ -336,7 +338,8 @@ object WebExtract {
      * 於任何 policy 評估或 cache key 建構之前 fail-closed 返回（不送請求、不查 DNS、不建 key）。
      * redirect hop 同理：`Location` 標頭原文過長、或 `resolveRedirect` 解析後之絕對 URL
      * 過長，一律於下一跳 DNS/HTTP/chain 處理之前 fail-closed（見 `extractUncachedInner`）。
-     * 單位為 UTF-16 code units（`String.length`），與 `rawUrl.isBlank()` 同層次、同時機。
+     * 單位為 UTF-16 code units（`String.length`），與 `rawUrl.isBlank()` 同層次；
+     * 本檢查**先於** `isBlank()`（O(1)，不讓超限空白字串先付 O(n) 掃描）。
      */
     const val DETAIL_URL_TOO_LONG = "URL_TOO_LONG"
 
@@ -1015,12 +1018,13 @@ class WebExtractService(
         maxBytes: Int = WebExtract.DEFAULT_MAX_BYTES,
         maxModelChars: Int = WebExtract.DEFAULT_MODEL_CHARS,
     ): WebExtractOutcome {
-        if (rawUrl.isBlank()) {
-            return WebExtractOutcome.Unavailable(WebExtract.DETAIL_EMPTY_URL, null)
-        }
-        // URL 長度硬上限：超限即 fail-closed（不做任何 policy 評估／key 建構／DNS）。
+        // URL 長度硬上限先於 blank 檢查：長度為 O(1)，超限即 fail-closed
+        //（不做任何 policy 評估／key 建構／DNS），並避免超長全空白字串先被 isBlank() 全掃。
         if (rawUrl.length > WebExtract.MAX_URL_CHARS) {
             return WebExtractOutcome.Unavailable(WebExtract.DETAIL_URL_TOO_LONG, null)
+        }
+        if (rawUrl.isBlank()) {
+            return WebExtractOutcome.Unavailable(WebExtract.DETAIL_EMPTY_URL, null)
         }
         val effBytes = maxBytes.coerceIn(1, WebExtract.ABSOLUTE_MAX_BYTES)
         val effModel = maxModelChars.coerceIn(1, WebExtract.MAX_MODEL_CHARS)
@@ -1540,6 +1544,11 @@ class WebExtractService(
                 continue
             }
 
+            if (response.code == 206) {
+                // RFC 9110 §15.3.7：206 Partial Content 為分段表示；本抽取器不發 Range、
+                // 不組裝分段——一律 fail-closed（Failed 絕不寫快取、絕不交付完整 Ok）。
+                return WebExtractOutcome.Failed("HTTP_206")
+            }
             if (response.code !in 200..299) {
                 return WebExtractOutcome.Failed("HTTP_${response.code}")
             }
@@ -2116,7 +2125,9 @@ internal object HtmlExtract {
      * （case-insensitive，tag-name 邊界檢查；**text context**：comment（`<!--`…`-->`／EOF）
      * 與引號屬性值（單／雙引號）內之偽標籤不構成候選；非候選 tag 以
      * [findTagEnd]（引號感知）整體跳過）。無對應關閉標籤者，
-     * 原則上自開始標籤剝至輸入結尾（未閉合開始標籤內嵌之 closeMark 除外，見候選分支註解）。
+     * 原則上自開始標籤剝至輸入結尾（`findTagEnd == -1` 之未閉合開始標籤**一律剝至輸入結尾，
+     * 內嵌之 `</script …>`／`</style …>` 不構成停點，刻意 fail-closed；見候選分支註解）；
+     * end-tag 辨識容忍 tag-name 與 `>` 之間之 ASCII 空白及單一可選 `/`，見 [findEndTagClose]）。
      * comment 本身原樣保留在文本流中（含 `<!--`…EOF
      * 的未閉合 comment——其內容一併原樣保留至輸入結尾）。
      * 以 StringBuilder 分段拼接（純文字／comment／非候選 tag 為「待取段」，遇結構性
@@ -2124,13 +2135,15 @@ internal object HtmlExtract {
      * 實作為**單一前向掃描**（游標單調不減、comment 狀態隨掃描推進）：`<` 處先判
      * comment（整塊原樣輸出並跳過，不掃描其內容），再判 tag-open，再判是否
      * script／style（tag-name 邊界）候選；非候選 tag 經 [findTagEnd]（引號感知）
-     * 整體跳過且原樣輸出。各子操作（[findTagEnd]、closeMark 之 indexOf）掃過的
-     * 區段互不重疊且只隨游標前進，故整體 O(n)（input cap 256k 下無二次方項；
-     * 不存在重新掃描尾段的情況）。`<` 結構性邊界（含候選／非候選分支）每迭代雙閘
+     * 整體跳過且原樣輸出。各子操作（[findTagEnd]、[findEndTagClose]）掃過的
+     * 區段至多常數倍重疊（≤2×；各候選之 WS run 與 indexOf 區間皆不相交）且只隨游標前進，
+     * 故整體 O(n)（input cap 256k 下無二次方項）。`<` 結構性邊界（含候選／非候選分支）每迭代雙閘
      * （[checking] 先、[deadlineNs] 後，同舊版）；純文字路徑以 512 code unit 節流雙閘，
-     * 並於段落 flush 點（待取段落入 sb 之前）雙閘；子掃描（[findTagEnd]）同樣雙閘。
-     * 內部 `lower.indexOf(closeMark)`／`lower.indexOf("-->")` 為原生掃描、不可 weave
-     *（線性、受 input cap 約束）。
+     * 並於段落 flush 點（待取段落入 sb 之前）雙閘；子掃描（[findTagEnd]／[findEndTagClose]）同樣雙閘。
+     * 內部 [findEndTagClose] 以 `"</tag"` 候選前進辨識 end-tag（tag-name 邊界＋
+     * ASCII 空白＋可選 `/`），各候選 indexOf 區間幾乎不相交、WS 跳掃各 run 不相交，
+     * 故 one-pass 仍為線性（見 [findEndTagClose] KDoc）；`lower.indexOf("-->")` 為
+     * 原生掃描、不可 weave（線性、受 input cap 約束）。
      */
     fun stripScriptAndStyle(input: String, lower: String, deadlineNs: Long = Long.MAX_VALUE, checking: () -> Unit = {}): String {
         val sb = StringBuilder(input.length)
@@ -2170,19 +2183,20 @@ internal object HtmlExtract {
                     if (tag != null) {
                         // 候選：先原樣輸出其前之待取段，再整體剝除（不輸出任何此元素之內容）。
                         flush()
-                        // 先以引號感知 findTagEnd 算出「開始標籤的結尾」，closeMark 搜尋必須從
-                        // open 標籤的 `>` 之後開始——引號屬性值內的 `</script>`/`</style>` 不得算收尾
-                        //（否則屬性內砂/假 closeMark 會把實際標籤 JS/CSS 本文剩餘漏進模型可見體）。
+                        // 先以引號感知 findTagEnd 算出「開始標籤的結尾」，end-tag 搜尋必須從
+                        // open 標籤的 `>` 之後開始——引號屬性值內的 `</script …>`/`</style …>` 不得算收尾
+                        //（否則屬性內假 end-tag 會把實際標籤 JS/CSS 本文剩餘漏進模型可見體）。
                         // findTagEnd == -1（開始標籤未閉合）時 searchFrom 退回 i（開始標籤之 `<`），
-                        // closeMark 搜尋涵蓋整個剩餘輸入；未閉合引號屬性內嵌之 `</script>`／`</style>`
-                        // 亦會命中，strip 停於該嵌入 closeMark；僅當全文亦無 closeMark 時，
-                        // 才剝至輸入結尾（既有行為，刻意保留；不更動 searchFrom 邏輯）。
+                        // 且 `i = if (openEnd < 0 || close < 0) n else close`——開始標籤未閉合時
+                        // **一律剝至輸入結尾**；內嵌之 `</script …>`／`</style …>` 不構成停點（刻意
+                        // fail-closed；不更動 searchFrom 邏輯）。僅當開始標籤閉合且全文找得到 end-tag
+                        // 時，strip 才停於該 end-tag 之後。
                         val openEnd = findTagEnd(lower, i, deadlineNs, checking)
                         val searchFrom = if (openEnd < 0) i else openEnd + 1
-                        val closeMark = "</$tag>"
-                        // indexOf 為原生掃描、不可 weave；線性且受 input cap 約束，接受此剩餘。
-                        val close = lower.indexOf(closeMark, searchFrom)
-                        i = if (openEnd < 0 || close < 0) n else close + closeMark.length
+                        // WHATWG 端標籤語義：容忍 tag-name 與 `>` 之間之 ASCII 空白及單一可選 `/`
+                        //（如 `</script >`、`</style\t/>`）；找不到／邊界不符回 -1 → 剝至輸入結尾。
+                        val close = findEndTagClose(lower, tag, searchFrom, deadlineNs, checking)
+                        i = if (openEnd < 0 || close < 0) n else close
                         segStart = i
                         continue
                     }
@@ -2199,6 +2213,57 @@ internal object HtmlExtract {
         }
         flush() // 尾端 flush：函式收尾之段落落點同樣雙閘（文本已被掃盡，gate 僅作取消探針）
         return sb.toString()
+    }
+
+    /**
+     * 閉合 end-tag 辨識（WHATWG 端標籤語義）：`</`＋ASCII 大小寫不敏感 tag 名，其後可
+     * 含任意 ASCII 空白（[isAsciiWs]），再為單一可選 `/` 與任意 ASCII 空白，最後為 `>`。
+     * 回傳 `>` 之後一位（整個閉合標籤之後）；找不到／邊界不符一律 -1（呼叫方剝至輸入結尾）。
+     * 候選以 `lower.indexOf("</tag", i)` 單調前進：每次失敗僅前進 2；各候選之 indexOf 掃描
+     * 區間幾乎不相交（累計 ≤ n），尾隨空白跳掃總量亦 ≤ n（各 run 不相交、受 input cap 約束）。
+     * checking／deadline 雙閘：每個候選一次、WS 跳掃每 512 code units 一次。
+     * 刻意偏離 WHATWG tokenizer 的 error-recovery：end-tag 上出現屬性（`</script x>`）或
+     * 重複 `/`（`</script//>`）一律不視為閉合（over-strip＝內容損失、絕非洩漏；fail-closed）；
+     * 僅接受 WHATWG 語法層之 `WS*` `/`? `WS*` `>` 形。NBSP 等非 ASCII 空白不接受（WHATWG 限 ASCII）。
+     * raw-text body 不做引號／comment 過濾：JS 字串內之 `</script …>` 即為閉合（WHATWG 忠實語義）。
+     */
+    private fun findEndTagClose(lower: String, tag: String, from: Int, deadlineNs: Long, checking: () -> Unit): Int {
+        var i = from
+        while (true) {
+            checking()
+            if (System.nanoTime() >= deadlineNs) throw DeadlineExceededException()
+            val p = lower.indexOf("</$tag", i)
+            if (p < 0) return -1
+            var j = p + tag.length + 2
+            // 拒 `</scripts>`、`</scriptx>`：tag-name 之後須為 tag-name 邊界（EOF 亦可）。
+            if (!isTagNameBoundary(lower, j)) {
+                i = p + 2
+                continue
+            }
+            // 跳過 tag-name 與 `/`／`>` 之間任意數量之 ASCII 空白（每 512 code units 雙閘）。
+            var scanned = 0
+            while (j < lower.length && isAsciiWs(lower[j])) {
+                if (++scanned and 511 == 0) {
+                    checking()
+                    if (System.nanoTime() >= deadlineNs) throw DeadlineExceededException()
+                }
+                j++
+            }
+            // 單一可選 `/`（self-closing 形態之 end-tag，如 `</script/>`），其後可再含 ASCII 空白。
+            if (j < lower.length && lower[j] == '/') {
+                j++
+                var scanned2 = 0
+                while (j < lower.length && isAsciiWs(lower[j])) {
+                    if (++scanned2 and 511 == 0) {
+                        checking()
+                        if (System.nanoTime() >= deadlineNs) throw DeadlineExceededException()
+                    }
+                    j++
+                }
+            }
+            if (j < lower.length && lower[j] == '>') return j + 1
+            i = p + 2
+        }
     }
 
     // ---- published metadata（單趟、前向游標；無 regex） ----
@@ -2385,7 +2450,8 @@ internal object HtmlExtract {
      * meta／time：候選**作廢並中止本趟掃描**（前向證明：findTagEnd==-1
      * 代表此候選之後已無任何 `>`（引號感知），之後不可能出現可閉合的
      * meta／time 候選 → 兩迴圈一律 break，整趟 O(n)）；
-     * script／style（見 [stripScriptAndStyle]）：原則上自開始標籤剝至輸入結尾（未閉合開始標籤內嵌之 closeMark 除外）。
+     * script／style（見 [stripScriptAndStyle]）：原則上自開始標籤剝至輸入結尾
+     * （`findTagEnd == -1` 之未閉合開始標籤一律剝至輸入結尾，內嵌之 end-tag 不停點）。
      *
      * 對抗性 `<meta a` 鏈（無 `>`）：首個候選作廢（-1）後 break；
      * metaPublishedLinearFixture 對 44,800 字元 < 10 秒上限穩定通過。

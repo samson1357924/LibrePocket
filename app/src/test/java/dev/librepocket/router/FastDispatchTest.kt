@@ -2932,7 +2932,7 @@ class FastDispatchTest {
             "查 Foo 符號等主管\u200B同意",
             // 精確 report 字串（無空白形式）：
             "查Foo符號等主管批准再做",
-            // #19 B3 stage-7.1（A1）：CJK possessor 槽放寬至 [\p{L}\p{N}]{0,64}（平坦、線性；stage-8.1 再放寬為上述平坦類），
+            // #19 B3 stage-7.1（A1）：CJK possessor 槽放寬至 [\p{L}\p{N}]{0,64}（平坦（最壞多項式有界）；stage-8.1 再放寬為上述平坦類），
             // consent 動詞與 後-family/再|才 之間夾半/全形分隔符與助詞 `了` 亦否決。
             // 原 `positionalCueGrammarPins` 之 FAST pins 翻轉為 DENIED：
             "查Foo符號等123456789批准",
@@ -2979,6 +2979,8 @@ class FastDispatchTest {
             "查Foo符號核准_甲乙丙再做",
             "查Foo符號同意甲-乙再做",
             "查Foo符號許可_甲再做",
+            // FLEX 動詞內插入（stage-8.1 鎳封域；審計 finding F4）：FLEX 於動詞內允許 ≤16 插入亦否決：
+            "查Foo符號等主管核1準再做",
             // spaced backstop：possessor 兩端單空白落在框架兩個分隔槽內，
             // arm D 仍匹配 ⇒ decide() DENIED、reasonCode=null（no-match fallback，verified；
             // 絕不以 NEED_CLARIFICATION 過度斷言）——絕不執行（never FAST）。
@@ -3313,4 +3315,75 @@ class FastDispatchTest {
             assertEquals(text, before, backend.invocations.get())
         }
     }
+
+    @Test fun enDelimitedClauseAndColonInteractionsArePinned() = runBlocking {
+        // #19 B3 stage-8.6（交互 pins；Re-review #8 release-gate required）：
+        // 釘住 EN-delimited verbatim carve-out（stage-8.3）× 尾綴/前導條件子句閘（stage-8.1）
+        // × leading colon（stage-8.4）× SLOW 後備（stage-8.5）的跨階段交互——皆已實測無誤，
+        // 僅缺 pin。准入判定在 raw 文本上跑 ⇒ enDelimited 不救 `…批准再做` 形態的子句 veto；
+        // EN-delimited 之 verbatim identifier 僅可能落成有界單 token LSP 查詢（READ-only、
+        // esc() JSON-escape、AFFIRM_…_gate 語義不變）。
+        val backend = CountingBackend()
+        val dispatcher = lspDispatcher(backend)
+        // FAST 交互 pins（EN-delimited × 前導冒號；及已接受 verbatim 殘餘類）：
+        // EN 消費（opener 或 `symbols?` cue）⇒ verbatim（Step A/C/B 發生順序與 raw 一致）；
+        // 未列示 consent 動詞／識別字內為 CJK 插入 >16 者為已接受 fail-OPEN 殘餘
+        // （READ-only；`查 Foo符號等審批再做` 為首例）。
+        for ((text, expectedQuery) in listOf(
+            "symbols ::Foo" to "::Foo",
+            "find symbol ::Foo" to "::Foo",
+            "查 symbols ::Foo" to "::Foo",
+            "symbols Foo::" to "Foo",
+            "查 symbols Foo::" to "Foo",
+            "查 Foo符號等審批再做" to "Foo符號等審批再做",
+            "查Foo符號等授權再做" to "Foo符號等授權再做",
+            "symbols 同意" to "同意",
+            "symbols 批准" to "批准",
+        )) {
+            val d = decide(text)
+            assertEquals(text, RouteKind.FAST, d.route)
+            assertEquals(text, "lsp.symbols", d.toolCall?.toolName)
+            assertNotNull(text, d.toolCall)
+            assertEquals(
+                text,
+                expectedQuery,
+                Json.parseToJsonElement(d.toolCall!!.argumentsJson).jsonObject["query"]!!.jsonPrimitive.content,
+            )
+            val before = backend.invocations.get()
+            val result = dispatcher.decideAndDispatch(text, lspOn, sessionId = "s1", turnIndex = 1)
+            assertEquals(text, RouteKind.FAST, result.decision.route)
+            val executed = result.outcome as? FastDispatchOutcome.Executed
+            assertNotNull("$text must execute against the fake backend (got ${result.outcome})", executed)
+            assertEquals(text, before + 1, backend.invocations.get())
+            assertTrue(
+                "executed body must echo the identifier verbatim: ${executed!!.result.resultJson}",
+                executed.result.resultJson.contains("\"name\":\"$expectedQuery:example\""),
+            )
+        }
+        // DENIED 交互 pins：raw text 命中條件子句閘（arm A/B/等）⇒ 准入否決
+        // （no-match DENIED；enDelimited/verbatim carve-out 救不了子句 veto）。
+        // `…符號呢` 尾疑問顆粒 ⇒ 准入否決 ⇒ 落 SLOW_HINTS（自動操作）→ FLAVOR_BLOCKED
+        // （PLAY flavor；絕不執行）。route DENIED + toolCall==null + backend 零增。
+        for (text in listOf(
+            "查 symbols Foo符號等批准再做",
+            "symbols Foo符號等批准再做",
+            "symbols Foo符號等資安/法務批准",
+            "查 symbols Foo符號等資安/法務批准",
+            "查 symbols 批准再做",
+            "查 symbols 批准 再做",
+            "查 自動操作 符號呢",
+        )) {
+            val d = decide(text)
+            assertEquals(text, RouteKind.DENIED, d.route)
+            assertNull(text, d.toolCall)
+            val before = backend.invocations.get()
+            val result = dispatcher.decideAndDispatch(text, lspOn, sessionId = "s1", turnIndex = 1)
+            assertEquals(text, RouteKind.DENIED, result.decision.route)
+            assertNull(text, result.decision.toolCall)
+            assertFalse(text, result.outcome is FastDispatchOutcome.Executed)
+            assertEquals(text, before, backend.invocations.get())
+        }
+        assertEquals(9, backend.invocations.get())
+    }
 }
+

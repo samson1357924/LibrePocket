@@ -1140,6 +1140,8 @@ class FastRouter(
          *   → FAST `Foo符號`；`symbols 符號`（目標名「符號」）→ FAST `符號`；
          *   `查 symbols Foo符號`（混合 opener）→ FAST `Foo符號`；
          *   `symbols Foo符號。` → Step D 剝 `。` → FAST `Foo符號`；
+         *   「verbatim」＝零 cue 處理（Step C／兩道守衛），不排除共用的 Step D 前緣剝離
+         *   （`symbols Foo::` → FAST `Foo`、`symbols Foo符號。` → FAST `Foo符號`，同類共用）。
          *   `symbols Foo符號 extra`／`symbols Foo 符號`／`symbols 符號 符號`
          *   → 空白 ⇒ Step E 澄清。CJK 分支逐位元不變（`查 Foo符號 符號`
          *   澄清、`查 符號` 澄清、`查 Foo 符號` → FAST `Foo`）。

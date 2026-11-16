@@ -169,6 +169,7 @@ class SafeToolSlice(
          */
         const val RAW_BACKEND_FIELD_MAX_CHARS = MAX_STRING_CHARS * 4
         /** Per-input cap for model-controlled `query` / `pathPrefix` (fail-closed). */
+        // Dual-tracked bound: FastRouter.kt's MAX_INTENT_CHARS pins the same 4096 here — keep both in sync.
         const val MAX_INPUT_CHARS = 4096
         /** Total cap for serialized tool result JSON (fail-closed continuation budget). */
         const val MAX_RESULT_CHARS = 20_000

@@ -123,6 +123,6 @@ class JevCache(
 internal fun sha256Hex(input: String): String {
     val digest = MessageDigest.getInstance("SHA-256").digest(input.toByteArray(Charsets.UTF_8))
     val sb = StringBuilder(digest.size * 2)
-    for (b in digest) sb.append(String.format("%02x", b))
+    for (b in digest) sb.append(String.format(java.util.Locale.ROOT, "%02x", b))
     return sb.toString()
 }

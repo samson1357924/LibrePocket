@@ -110,7 +110,7 @@
 
 ### 內建工具啟用前置清單（Built-in Tool Activation Prerequisites Checklist）
 
-所有內建工具目前在生產組合（`ChatViewModelFactory`）中皆未接線（`toolSlice = null`，經由 `ProductionChatCompositionTest` 釘死）。`ToolDef.executionReady` 為 registry readiness 旗標（表示 `ToolRegistry` 與 `SafeToolSlice` 中具備 schema 及 handlers），**不等於端到端生產可執行**。在任何工具轉為生產可用前，必須滿足以下前置條件清單：
+所有內建工具目前在生產組合（`ChatViewModelFactory`）中皆未接線（`toolSlice = null`，經由 `ProductionChatCompositionTest` 釘死）。`ToolDef.executionReady` 為 registry readiness 旗標（表示 `ToolRegistry` 與 `SafeToolSlice` 中具備 schema 及 handlers），**不等於端到端生產可執行**。**當前狀態：**`ToolRegistry` 恰 42 個 definitions；恰 1 個（`lsp.symbols`）`executionReady=true`；fast lane `internal`、records-only；production 維持 records-only（`toolSlice = null`，`ProductionChatCompositionTest` 釘死）直至本清單逐項完成；`lsp.symbols` 維持唯一 ready 工具。在任何工具轉為生產可用前，必須滿足以下前置條件清單：
 
 1. **Production Dispatcher 接線**：必須實作正式的生產分派器（production dispatcher），不可直接把測試 slice 迴圈當成生產接線；`ChatViewModelFactory` 必須有顯式、受控的接線路徑。
 2. **不可變確認快照管線（Immutable Confirmation Snapshot Pipeline）**：高風險或非 READ 操作必須經由確認對話框取得使用者授權；確認必須綁定當下的不可變快照 `(tool, identity, arguments)`，在執行副作用前重新評估授權（`ASK` 絕不默認為 `ALLOW`）。
@@ -120,6 +120,7 @@
 6. **負向控制與競態測試**：必須具備 schema 驗證失敗、Unicode FORMAT（Cf）碼點拒絕（`containsFormatCodePoint` 涵蓋 `query` 與 `pathPrefix`）、逾時、重複 call ID、權限拒絕及併發取消等負向路徑測試。
 7. **裝置端到端驗證（Device-verified E2E acceptance）**：必須在真實裝置或模擬器上完成端到端驗收測試，單純 JVM unit test 或 Fake 不能代替裝置驗證。
 8. **`voice.speak.openai` 接線前置**：`voice.speak.openai`（scaffold，`executionReady=false`）接線前須完成正式 dispatcher／confirmation／executor pipeline（不可直連測試 slice 迴圈），並完成 AI voice disclosure 端到端驗收（含 AI 生成語音揭露＋受限緩衝 25MB 文案的裝置 E2E）與 Realtime migration 決策（Legacy Bridge `POST /v1/audio/speech` 於 2027-01-06 退場後的 `gpt-realtime-2.1-mini` 遷移）；未完成前維持 `executionReady=false` 且不向 production 模型提供該工具定義。
+9. **`FastDispatcher` 啟用前置**：`router/FastDispatch.kt` 之 `internal` 執行面（`FastDispatcher`／`LspSymbolsExecutor`／`FastDispatchOutcome` 及巢狀類）於接線 PR 前須完成：每呼叫 fresh `ctxSupplier`（重建 `ProjectionContext`；不得捕捉接線時快照）；fresh `tool.exec` ALLOW-only 政策新鮮評估（不複用決策期 verdict）；fresh 投影重驗；不可變 confirmation 快照；Room `tool.exec` 審計寫入（audit failure ⇒ typed skip、零執行）；device E2E（單純 JVM/Fake 不能代替）；`toolSlice = null` 由 `ProductionChatCompositionTest` 釘死；`FastDispatchSurfaceArchitectureTest` 掃 main＋全部 flavor production 來源 fail-closed 阻擋接線；接線 PR 須單獨安全審計（同 `docs/THREAT_MODEL.md` 快通道 Current 條目）。未完成前不得出現任何非測試 `FastDispatcher` caller。
 
 ### MCP 啟用／接線 gate 清單
 

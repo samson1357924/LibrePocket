@@ -521,7 +521,7 @@ internal object McpWire {
         if (trimmed.isEmpty()) return false
         val schemeEnd = trimmed.indexOf("://")
         if (schemeEnd <= 0) return false
-        val scheme = trimmed.substring(0, schemeEnd).lowercase(Locale.US)
+        val scheme = trimmed.substring(0, schemeEnd).lowercase(Locale.ROOT)
         if (scheme != "http" && scheme != "https") return false
         val authority = trimmed.substring(schemeEnd + 3)
         val hostEnd = authority.indexOfFirst { it == '/' || it == '?' || it == '#' }

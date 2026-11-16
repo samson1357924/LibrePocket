@@ -327,7 +327,7 @@ class PrivilegeAuditLog {
         fun sha256HexBytes(bytes: ByteArray): String {
             val digest = MessageDigest.getInstance("SHA-256").digest(bytes)
             return buildString(digest.size * 2) {
-                for (b in digest) append("%02x".format(b))
+                for (b in digest) append("%02x".format(java.util.Locale.ROOT, b))
             }
         }
     }

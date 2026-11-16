@@ -430,6 +430,26 @@ class FastRouterDecisionTest {
         assertFalse(decide("幫我截圖", off).header.visibleTools.contains("lsp.symbols"))
     }
 
+    @Test fun fastLaneNegativeVerbsDenyZeroBackend() {
+        // Adversarial symbol-negation probes (plain decide(), no dispatcher):
+        // none of these may fabricate a template match, so each must be a
+        // DENIED decision with a null tool call — zero backend reach. The
+        // exact denial path (no-match vs clarification) is not pinned here;
+        // only the DENIED + toolCall == null contract is.
+        for (text in listOf(
+            "別查 Foo 符號",
+            "別查詢 Foo 符號",
+            "not symbols Foo",
+            "do not find symbol Foo",
+            "never search symbols Foo",
+            "別 tìm symbol Foo",
+        )) {
+            val d = decide(text)
+            assertEquals(text, RouteKind.DENIED, d.route)
+            assertNull("$text must not fabricate a tool call", d.toolCall)
+        }
+    }
+
     @Test fun phoneCandidateFirstMaxTieBreakIsDeterministic() {
         // (c) tie: two equal-digit candidates → same decision; maxByOrNull
         // keeps the FIRST max (stdlib tie-break, documented — both tie

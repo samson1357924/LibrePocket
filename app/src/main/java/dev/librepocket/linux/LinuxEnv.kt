@@ -169,7 +169,7 @@ object LinuxEnv {
     /** SHA256 驗證（位元組比對，下載後必走）。 */
     fun sha256Ok(bytes: ByteArray, expectedHex: String): Boolean {
         val actual = MessageDigest.getInstance("SHA-256").digest(bytes)
-            .joinToString("") { "%02x".format(it) }
+            .joinToString("") { "%02x".format(java.util.Locale.ROOT, it) }
         return actual.equals(expectedHex, ignoreCase = true)
     }
 

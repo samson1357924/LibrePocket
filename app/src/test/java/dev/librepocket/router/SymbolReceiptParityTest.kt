@@ -113,6 +113,19 @@ class SymbolReceiptParityTest {
         override suspend fun diagnostics(path: String): List<LspTools.Diagnostic> = emptyList()
     }
 
+    /** Backend whose invocation count is observable — drives the rejected-before-executor parity case. */
+    private class CountingBackend : LspTools.Backend {
+        var invocations: Int = 0
+            private set
+
+        override suspend fun symbols(query: String, pathPrefix: String?, limit: Int): List<LspTools.Symbol> {
+            invocations += 1
+            return emptyList()
+        }
+
+        override suspend fun diagnostics(path: String): List<LspTools.Diagnostic> = emptyList()
+    }
+
     /** Backend whose symbols list throws on `size` — projection-boundary crash, both pipelines. */
     private object IterationCrashingBackend : LspTools.Backend {
         override suspend fun symbols(query: String, pathPrefix: String?, limit: Int): List<LspTools.Symbol> =
@@ -400,6 +413,15 @@ class SymbolReceiptParityTest {
         assertTrue(slice.resultJson.length < SafeToolSlice.MAX_RESULT_CHARS)
         assertTrue(fast.resultJson.length < SafeToolSlice.MAX_RESULT_CHARS)
         assertOkParity("single max-size symbol", args, "call-ceil2", FixedBackend(listOf(maxed)))
+    }
+
+    @Test fun blankQueryParityIsTheSharedDenialSubset() {
+        // A whitespace-only `query` fails parseArgs on BOTH pipelines before
+        // policy/backend: slice -> deny(SCHEMA_INVALID); fast lane ->
+        // deniedResult("SCHEMA_INVALID"). Zero backend invocations both ways.
+        val backend = CountingBackend()
+        assertDeniedParity("blank query rejected before executor on both paths (SCHEMA_INVALID)", """{"query":"   "}""", "call-blank-query", backend, "SCHEMA_INVALID")
+        assertEquals("blank query must be rejected before any backend invocation (both paths)", 0, backend.invocations)
     }
 
     @Test fun backendCrashParityIsTheSharedDenialSubset() {

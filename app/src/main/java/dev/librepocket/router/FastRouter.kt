@@ -358,6 +358,7 @@ class FastRouter(
         private fun r(pattern: String): Regex = Regex(pattern, RegexOption.IGNORE_CASE)
 
         // Input length gate ([decide]): regex work below this bound only.
+        // Dual-tracked bound: SafeToolSlice.kt's MAX_INPUT_CHARS pins the same 4096 here — keep both in sync.
         private const val MAX_INTENT_CHARS = 4096
 
         // Process-wide callId source: kept in the companion (not the class

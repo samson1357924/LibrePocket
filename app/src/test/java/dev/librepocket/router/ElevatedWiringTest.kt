@@ -828,6 +828,128 @@ class ElevatedWiringTest {
         }
     }
 
+    @Test fun persistentRevokeFatalPrecedence() = runBlocking {
+        // #168 turn-8 獨立複審 P2：revokePersisted 兩腿 best-effort 清除先前僅第二腿用
+        // `primary?.apply { addSuppressed(t) } ?: t` 彙整；store=ISE＋scope=OOM 時致命
+        // OutOfMemoryError 被降級為 suppressed，MainScreen 的兩個 rethrow 分支
+        // （catch VirtualMachineError／catch ThreadDeath）永遠看不到致命，落入
+        // catch (Throwable) Log.w＋Toast 表面化，違反 KDoc 致命外洩契約。
+        // 本測試釘住：致命（VirtualMachineError ∪ ThreadDeath，與 MainScreen 兩個
+        // rethrow 分支同集合）無論哪一腿先拋、亦無論致命類型，皆成為唯一 primary；
+        // 致命先到者優先（致命＋致命時先到者留 primary），另一腿失敗以 suppressed
+        // 隨附；AssertionError 不屬致命集合，不提升 primary（matches MainScreen
+        // catch (Throwable)）。兩腿皆獨立嘗試（一敗不短路另一個）、記憶體已先收回、
+        // auditCount==0。
+        // storeIsPrimary=true → 預期 store 側失敗為 primary；false → scope 側為 primary
+        data class Spec(
+            val name: String,
+            val storeFailure: (() -> Throwable)?, // null＝store 成功
+            val scopeFailure: () -> Throwable,
+            val storeIsPrimary: Boolean,
+        )
+        val specs = listOf(
+            // 1. store=ISE → scope=OOM：後到致命升 primary，舊 primary 反向掛入
+            Spec("store=ISE, scope=OOM", { IllegalStateException("store boom") }, { OutOfMemoryError("scope oom") }, false),
+            // 2. store=ISE → scope=ThreadDeath：同上（致命集合含 ThreadDeath）
+            Spec("store=ISE, scope=ThreadDeath", { IllegalStateException("store boom") }, { ThreadDeath() }, false),
+            // 3. store=OOM → scope=ISE：致命留 primary，非致命掛 suppressed
+            Spec("store=OOM, scope=ISE", { OutOfMemoryError("store oom") }, { IllegalStateException("scope boom") }, true),
+            // 4. store=ThreadDeath → scope=ISE：同上（致命集合含 ThreadDeath）
+            Spec("store=ThreadDeath, scope=ISE", { ThreadDeath() }, { IllegalStateException("scope boom") }, true),
+            // 5. store=OOM → scope=ThreadDeath：致命＋致命，致命先到者優先（先到的 OOM 留 primary）
+            Spec("store=OOM, scope=ThreadDeath", { OutOfMemoryError("store oom") }, { ThreadDeath() }, true),
+            // 6. store=ThreadDeath → scope=OOM：致命＋致命，致命先到者優先（先到的 ThreadDeath 留 primary）
+            Spec("store=ThreadDeath, scope=OOM", { ThreadDeath() }, { OutOfMemoryError("scope oom") }, true),
+            // 7. store=ISE → scope=AssertionError：AssertionError 非致命，不提升 primary（普通彙整）
+            Spec("store=ISE, scope=AssertionError", { IllegalStateException("store boom") }, { AssertionError("scope assertion") }, true),
+            // 8. store 成功 → scope=OOM：僅跨域致命失敗，無 store suppressed
+            Spec("store ok, scope=OOM", null, { OutOfMemoryError("scope oom") }, false),
+            // 9. store=CE → scope=OOM：CE 非致命（primary≠fatal），後到致命升 primary，CE 反向掛入
+            Spec("store=CE, scope=OOM", { CancellationException("store cancelled") }, { OutOfMemoryError("scope oom") }, false),
+            // 10. store=OOM → scope=CE：已有致命 primary，CE 以 suppressed 掛入（致命先到者優先）
+            Spec("store=OOM, scope=CE", { OutOfMemoryError("store oom") }, { CancellationException("scope cancelled") }, true),
+        )
+        for (spec in specs) {
+            val state = PrivilegeBridgeState(
+                bridgeSwitchOn = true,
+                bridgeGranted = true,
+            )
+            state.audit.record(listOf("id"), "B3-x", "DENY")
+            var storeCalls = 0
+            var scopeCalls = 0
+            val storeT = spec.storeFailure?.invoke()
+            val scopeT = spec.scopeFailure()
+            val store = object : dev.librepocket.shell.PrivilegeRevokeStore {
+                override suspend fun clear() {
+                    storeCalls++
+                    storeT?.let { throw it }
+                }
+            }
+            val expectedPrimary = if (spec.storeIsPrimary) storeT!! else scopeT
+            val expectedSuppressed = if (spec.storeIsPrimary) {
+                listOf(scopeT)
+            } else {
+                listOfNotNull(storeT) // 致命升 primary 時，舊非致命 primary 反向掛入
+            }
+            try {
+                state.revoke(store) {
+                    scopeCalls++
+                    throw scopeT
+                }
+                assertTrue("must throw for ${spec.name}", false)
+            } catch (t: Throwable) {
+                assertSame("primary must be the fatal/first failure for ${spec.name}", expectedPrimary, t)
+                assertEquals(
+                    "suppressed must contain exactly the other failure(s) for ${spec.name}",
+                    expectedSuppressed,
+                    t.suppressed.toList(),
+                )
+                assertEquals("store must be attempted for ${spec.name}", 1, storeCalls)
+                assertEquals("scope must be attempted for ${spec.name}", 1, scopeCalls)
+                assertEquals(false, state.bridgeSwitchOn)
+                assertEquals(false, state.bridgeGranted)
+                assertEquals(0, state.auditCount())
+            }
+        }
+    }
+
+    @Test fun persistentRevokeSameThrowableInstanceDoesNotSelfSuppress() = runBlocking {
+        // 兩腿拋出「同一個」Throwable 實例（共享 singleton，Kotlin/Java 合法）：
+        // Throwable.addSuppressed 對自身會拋 IllegalArgumentException——不得因而
+        // 短路第二腿、劫持 interrupt 清旗、也不得把兩個真正的失敗一併吃掉。
+        // 兩腿皆須被嘗試（storeCalls==1、scopeCalls==1），實例本身照常重拋、
+        // suppressed 為空。
+        val state = PrivilegeBridgeState(
+            bridgeSwitchOn = true,
+            bridgeGranted = true,
+        )
+        state.audit.record(listOf("id"), "B3-x", "DENY")
+        val shared = IllegalStateException("shared singleton")
+        var storeCalls = 0
+        var scopeCalls = 0
+        val store = object : dev.librepocket.shell.PrivilegeRevokeStore {
+            override suspend fun clear() {
+                storeCalls++
+                throw shared
+            }
+        }
+        try {
+            state.revoke(store) {
+                scopeCalls++
+                throw shared
+            }
+            assertTrue("must throw", false)
+        } catch (t: Throwable) {
+            assertSame(shared, t)
+            assertEquals(emptyList<Throwable>(), t.suppressed.toList())
+            assertEquals(1, storeCalls)
+            assertEquals(1, scopeCalls)
+            assertEquals(false, state.bridgeSwitchOn)
+            assertEquals(false, state.bridgeGranted)
+            assertEquals(0, state.auditCount())
+        }
+    }
+
     @Test fun persistentRevokeSurvivesCallerCancellationNonCancellable() = runBlocking {
         // caller 協程在撤權期間被取消：NonCancellable 清理仍必須執行
         // （store.clear 與 withdrawScope 都被呼叫），不依賴 caller 存活。

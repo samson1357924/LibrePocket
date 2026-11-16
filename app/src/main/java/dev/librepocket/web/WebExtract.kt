@@ -1309,9 +1309,11 @@ class WebExtractService(
                     val replayChain = awaited.chain
                     // awaited.chain 即 chainSink 於終態（Ok 或非 Ok）統一交付之鏈；
                     // 非 Ok 終態現在亦攜帶 chain，故此處可判定 replay provenance。
-                    // 數字後綴硬閘：拒絕任何未來新生的非 origin 語義 "HTTP_*" 字串落入重放。
+                    // 數字後綴硬閘＋範圍：100–599 之 origin-fact status（涵蓋 206/304/4xx/5xx）——
+                    // 拒絕任何未來新生的非 origin 語義 "HTTP_*" 字串落入重放。
                     val replayable = failedOutcome != null &&
-                        failedOutcome.detail.removePrefix("HTTP_").toIntOrNull() != null &&
+                        (failedOutcome.detail.removePrefix("HTTP_").toIntOrNull()
+                            ?.let { it in 100..599 } == true) &&
                         !replayChain.isNullOrEmpty()
                     if (replayable) {
                         // Bound validation，鏡射 Ok arm 之 try/withTimeout 模式：以 follower

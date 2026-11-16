@@ -3658,6 +3658,192 @@ class WebExtractD4Test {
         assertEquals("leader hop-0＋follower hop-0＝2 次上游（雙方皆於 hop-Y 閘前拒）", 2, http.calls.get())
     }
 
+    // Round-6 P2：同 binding＋同 URL 之多 caller 一致 HTTP 404/429/500/206 → 皆得
+    // binding-validated 之 status verdict（重放），非假 TRANSPORT；upstream calls==1。
+    @Test fun httpFailureSameBindingStatusReplayForAllCallers() = runBlocking {
+        for (code in listOf(404, 429, 500, 206)) {
+            val freshDns = publicDns("down.example")
+            val release = CompletableDeferred<Unit>()
+            val http = FakeExtract(
+                pinnedHandler = { _, _ ->
+                    release.await()
+                    okResp(html(), code = code)
+                },
+                handler = { okResp(html(body = "UNREACHABLE_MARKER")) },
+            )
+            val svc = WebExtractService(http)
+            val optIn = EndpointNetworkOptIn(NetworkEgressPolicy.ALLOW_PRIVATE_DNS)
+            val url = "https://down.example/$code"
+            val leader = async { svc.extract(url, optIn = optIn, resolver = freshDns) }
+            withTimeout(5_000) { while (http.calls.get() < 1) delay(1) }
+            val followers = (1..4).map { async { svc.extract(url, optIn = optIn, resolver = freshDns) } }
+            // Q5(b) best-effort barrier：follower 須於 leader 完成前登記為 joiner；join 窗口內
+            // 兩種交錯皆收斂（重放→HTTP_code、re-elect→自己 fetch 出 HTTP_code）；判別點為 calls==1；
+            // 若 follower 於 leader 完成後才排程，caller 會自行 election、各 fetch 一次（calls==2）
+            // ——此為預期退化為 solo 路徑，本 fixture 假設窗口內交錯（與檔案內 Q5(b) 同一約定）。
+            delay(150)
+            release.complete(Unit)
+            val outs = listOf(withTimeout(5_000) { leader.await() }) + followers.map { withTimeout(5_000) { it.await() } }
+            for ((i, o) in outs.withIndex()) {
+                assertTrue("http/$code caller#$i expected Failed, got $o", o is WebExtractOutcome.Failed)
+                assertEquals("HTTP_$code", (o as WebExtractOutcome.Failed).detail)
+            }
+            assertEquals("http/$code status verdict 應由 binding-validated 重放分發（呼叫方皆得 typing detail）", 1, http.calls.get())
+        }
+    }
+
+    // Round-6：不同 binding 之 follower 不得 replay leader 之 provenance——hop-0 token
+    // 不符 → validation 失敗 → 有界重選舉 → 自己 refetch 自己的 verdict（HTTP_404）。
+    @Test fun crossResolverBindingMismatch404FollowerDoesNotReplayLeaderProvenance() = runBlocking {
+        val dnsA = fakeDns("down.example" to listOf("203.0.113.41"))
+        val dnsB = fakeDns("down.example" to listOf("203.0.113.42"))
+        val release = CompletableDeferred<Unit>()
+        val http = FakeExtract(
+            pinnedHandler = { _, pinned ->
+                when {
+                    pinned.any { it.hostAddress in setOf("203.0.113.41", "203.0.113.42") } -> {
+                        release.await()
+                        okResp(html(), code = 404)
+                    }
+                    else -> okResp(html(body = "UNEXPECTED_MARKER"), code = 404)
+                }
+            },
+            handler = { okResp(html(body = "UNREACHABLE_MARKER"), code = 404) },
+        )
+        val svc = WebExtractService(http)
+        val optIn = EndpointNetworkOptIn(NetworkEgressPolicy.ALLOW_PRIVATE_DNS)
+        val url = "https://down.example/"
+        val leader = async { svc.extract(url, optIn = optIn, resolver = dnsA) }
+        withTimeout(5_000) { while (http.calls.get() < 1) delay(1) }
+        val follower = async { svc.extract(url, optIn = optIn, resolver = dnsB) }
+        delay(150)
+        release.complete(Unit)
+        val leaderOut = withTimeout(5_000) { leader.await() }
+        val followerOut = withTimeout(5_000) { follower.await() }
+        assertEquals("HTTP_404", (leaderOut as WebExtractOutcome.Failed).detail)
+        assertEquals("HTTP_404", (followerOut as WebExtractOutcome.Failed).detail)
+        // 判別點：1＝replay；2＝re-elect＋自 fetch（預期）——不得 replay
+        assertEquals("不同 binding 之 follower 必須 re-fetch，不得 replay leader provenance", 2, http.calls.get())
+    }
+
+    // Round-6：redirect hop 之跨 binding——leader 於 hop-Y 取到 HTTP_404（binding 記錄含
+    // hop-1）；follower y 解析到不同位址（203.0.113.42），chain-face 重驗失敗 →
+    // 不得 replay leader 之 verdict → 有界重選舉 → 自 fetch → own verdict（HTTP_404）。
+    @Test fun crossResolverRedirectHop404FollowerDoesNotReplayProvenance() = runBlocking {
+        val dnsA = fakeDns(
+            "x.example.com" to listOf("10.0.0.30"),
+            "y.example.net" to listOf("203.0.113.41"),
+        )
+        val dnsB = fakeDns(
+            "x.example.com" to listOf("10.0.0.30"),
+            "y.example.net" to listOf("203.0.113.42"),
+        )
+        val release = CompletableDeferred<Unit>()
+        val http = FakeExtract(
+            pinnedHandler = { url, pinned ->
+                when {
+                    url == "https://x.example.com/start" ->
+                        release.await().let { WebExtractRawResponse(302, ByteArray(0), mapOf("Location" to "https://y.example.net/secret")) }
+                    pinned.any { it.hostAddress == "203.0.113.41" || it.hostAddress == "203.0.113.42" } ->
+                        okResp(html(), code = 404)
+                    else -> okResp(html(body = "UNEXPECTED_MARKER"), code = 404)
+                }
+            },
+            handler = { okResp(html(body = "UNREACHABLE_MARKER"), code = 404) },
+        )
+        val svc = WebExtractService(http)
+        val optIn = EndpointNetworkOptIn(NetworkEgressPolicy.ALLOW_PRIVATE_DNS)
+        val url = "https://x.example.com/start"
+        val leader = async { svc.extract(url, optIn = optIn, resolver = dnsA) }
+        withTimeout(5_000) { while (http.calls.get() < 1) delay(1) }
+        val follower = async { svc.extract(url, optIn = optIn, resolver = dnsB) }
+        // Q5(b)：leader 停於 hop-0 pinnedHandler 之 release.await()——follower 登記為 joiner；
+        // barrier 精確度不影響斷言（兩種交錯皆收斂：re-fetch→own HTTP_404、calls==3）。
+        delay(150)
+        release.complete(Unit)
+        val leaderOut = withTimeout(5_000) { leader.await() }
+        val followerOut = withTimeout(5_000) { follower.await() }
+        assertEquals("HTTP_404", (leaderOut as WebExtractOutcome.Failed).detail)
+        assertEquals("HTTP_404", (followerOut as WebExtractOutcome.Failed).detail)
+        // 判別點：replay ⇒ 0 次 re-fetch（calls==2：leader hop-0＋hop-Y）；
+        // 正確行為 ⇒ follower 對 hop-0/redirect-hop 皆自 fetch（calls==4：leader 2 + follower 2）。
+        assertEquals("不同 binding 之 redirect-hop follower 不得 replay，必自 fetch", 4, http.calls.get())
+    }
+
+    // Round-6：非 HTTP_ 之 Failed（此處 BAD_RESPONSE——上游 2xx 但 Content-Encoding 非支援集）
+    // 不可 replay——每個 caller 各自 fetch、各自得到自己的 BAD_RESPONSE。
+    @Test fun badResponseIsNotReplayableFollowerRefetches() = runBlocking {
+        val freshDns = publicDns("weird.example")
+        val release = CompletableDeferred<Unit>()
+        val http = FakeExtract(
+            pinnedHandler = { _, _ ->
+                release.await()
+                WebExtractRawResponse(200, byteArrayOf(9, 9, 9, 9), mapOf("Content-Type" to "text/html", "Content-Encoding" to "br"))
+            },
+            handler = { okResp(html(body = "UNREACHABLE_MARKER")) },
+        )
+        val svc = WebExtractService(http)
+        val url = "https://weird.example/"
+        val leader = async { svc.extract(url, optIn = EndpointNetworkOptIn(NetworkEgressPolicy.ALLOW_PRIVATE_DNS), resolver = freshDns) }
+        withTimeout(5_000) { while (http.calls.get() < 1) delay(1) }
+        val follower = async { svc.extract(url, optIn = EndpointNetworkOptIn(NetworkEgressPolicy.ALLOW_PRIVATE_DNS), resolver = freshDns) }
+        delay(150)
+        release.complete(Unit)
+        val leaderOut = withTimeout(5_000) { leader.await() }
+        val followerOut = withTimeout(5_000) { follower.await() }
+        assertEquals(WebExtract.DETAIL_BAD_RESPONSE, (leaderOut as WebExtractOutcome.Failed).detail)
+        assertEquals(WebExtract.DETAIL_BAD_RESPONSE, (followerOut as WebExtractOutcome.Failed).detail)
+        assertEquals("非 HTTP_ 之 Failed 不得 replay：leader＋follower 各 fetch 一次", 2, http.calls.get())
+    }
+
+    // Round-6：binding-validated HTTP status replay 之 epoch-drift arm——validation 通過
+    // 但撤權（invalidate()）於通過後、交付前完成 → 不重放（miss 語義，有界重選舉）→
+    // follower 自 fetch 自己的 verdict。
+    @Test fun followerEpochDriftBeforeHttpStatusReplaySuppressesReplay() = runBlocking {
+        val dnsA = fakeDns("down.example" to listOf("203.0.113.10"))
+        // follower 專用 resolver：hop-0 之**首次** resolve 阻斷於 gate（validateChain 之 chain-face 關卡）；
+        // 其餘（含之後 re-fetch 之 hop-0）直接放行至相同答案。
+        val h0GateSeen = AtomicBoolean(false)
+        val entered = CountDownLatch(1)
+        val releaseValidation = CountDownLatch(1)
+        val dnsFollower = HostResolver { host ->
+            if (host == "down.example" && h0GateSeen.compareAndSet(false, true)) {
+                entered.countDown()
+                // 2s 上限：避免 invalidate 路徑損壞時鎖死；逾時照樣放行（epoch re-check 大聲失敗）。
+                releaseValidation.await(2_000, TimeUnit.MILLISECONDS)
+                listOf(addr("203.0.113.10"))
+            } else {
+                dnsA.resolve(host)
+            }
+        }
+        val releaseHandler = CompletableDeferred<Unit>()
+        val http = FakeExtract(
+            pinnedHandler = { _, _ ->
+                releaseHandler.await()
+                okResp(html(), code = 404)
+            },
+            handler = { okResp(html(body = "UNREACHABLE_MARKER"), code = 404) },
+        )
+        val cache = WebExtractCache()
+        val svc = WebExtractService(http, cache = cache)
+        val optIn = EndpointNetworkOptIn(NetworkEgressPolicy.ALLOW_PRIVATE_DNS)
+        val url = "https://down.example/always404"
+        val leader = async { svc.extract(url, optIn = optIn, resolver = dnsA) }
+        withTimeout(5_000) { while (http.calls.get() < 1) delay(1) }
+        val follower = async { svc.extract(url, optIn = optIn, resolver = dnsFollower) }
+        delay(150)
+        releaseHandler.complete(Unit)
+        withTimeout(5_000) { entered.await() }
+        svc.invalidate()
+        releaseValidation.countDown()
+        val leaderOut = withTimeout(5_000) { leader.await() }
+        val followerOut = withTimeout(5_000) { follower.await() }
+        assertEquals("HTTP_404", (leaderOut as WebExtractOutcome.Failed).detail)
+        assertEquals("HTTP_404", (followerOut as WebExtractOutcome.Failed).detail)
+        // 重放被 epoch 漂移抑制：follower 必須自 fetch → calls==2（非重放之 calls==1）。
+        assertEquals("epoch 漂移抑制 replay：follower 自 fetch（非重放）", 2, http.calls.get())
+    }
+
     // P2#3（exact-output fixtures）：comment／引號屬性／裸 `<` 之 parseHtml snippet 精確輸出。
     @Test fun parseHtmlCommentQuoteExactOutputFixtures() {
         // (a) 引號屬性值內之 `>` 不構成 tag 結束（ATTR 保留、屬性內容不洩漏）。

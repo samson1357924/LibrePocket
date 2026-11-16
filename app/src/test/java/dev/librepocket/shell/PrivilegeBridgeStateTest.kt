@@ -587,6 +587,97 @@ class PrivilegeBridgeStateTest {
         assertNull("持久擦除由 grant epilogue compensation 有界完成（鎖外 best-effort clear 逾時），持久授權必已撤銷", store.load())
     }
 
+    @Test(timeout = 30_000L) fun revokeMutexTimeout_thenMutexBecomesUsableForNextGrant() = runBlocking {
+        // 回歸釘住（Re-review #7 Finding 1，P1/B1）：opMutex 取得路徑不得洩漏鎖持有。
+        // 舊路徑 withTimeoutOrNull { opMutex.lock(); true }：逾時事件可於 lock() 成功後、
+        // 結果移交前抵達 → acquired=null → 逾時分支不 unlock → opMutex 永久被佔，
+        // 後續 grant()／refresh()（opMutex 等待無 timeout）即永久吊掛。
+        // 釘住性質 = 可用性不變量：逾時 revoke 返回後 opMutex 必須可再取得。
+        // 注意：本測試的交錯（grant 全程持鎖）下舊實作並不會觸發該微競態——
+        // acquired-but-discarded 需要 mutex 在 deadline 瞬間恰為可取，屬調度相依的
+        // 納秒尺度窗口，無法以 latch 交錯確定性重現；真正的防線是取得路徑改為
+        // 非暫停 tryLock 輪詢（成功即同步可知，不存在「取了但結果被逾時丟棄」）。
+        // 本測試作為可用性 invariant 的回歸釘（註：此案為 availability-invariant 釘測，不判別舊新實作競態窗口）。
+        val backing = PreferenceDataStoreFactory.create(scope = scope) {
+            File(dir, "mutex_timeout_then_grant.preferences_pb")
+        }
+        val lockHoldStarted = java.util.concurrent.CountDownLatch(1)
+        val lockHoldRelease = java.util.concurrent.CountDownLatch(1)
+        val saveCalls = java.util.concurrent.atomic.AtomicInteger(0)
+        val slowDs = object : DataStore<Preferences> by backing {
+            override suspend fun updateData(transform: suspend (t: Preferences) -> Preferences): Preferences {
+                // 第一次 updateData 為 grant 落庫：countDown 後掛住（latch-gated，
+                // 帶 10s 上限，絕不裸 await）直到測試於 revoke 逾時後放行；
+                // 後續呼叫不延遲。
+                if (saveCalls.getAndIncrement() == 0) {
+                    lockHoldStarted.countDown()
+                    lockHoldRelease.await(10, TimeUnit.SECONDS)
+                }
+                return backing.updateData(transform)
+            }
+        }
+        val store = PrivilegeBridgeStore(slowDs)
+        val state = PrivilegeBridgeState(
+            bridgeSwitchOn = true,
+            bridgeGranted = true,
+            revokeOpTimeoutMs = 100L,
+        )
+        val grantJob = launch(Dispatchers.IO) {
+            try {
+                state.grant(store, "preset:openai", 1L)
+            } catch (_: Throwable) {
+                // 預期：revoke 推進 epoch → grant 收場拋 PRIVILEGE_GRANT_REVOKED_CONCURRENTLY
+            }
+        }
+        assertTrue("grant 落庫必已進入臨界區", lockHoldStarted.await(10, java.util.concurrent.TimeUnit.SECONDS))
+
+        val error = try {
+            assertThrows(IllegalStateException::class.java) {
+                runBlocking { state.revoke(store) }
+            }
+        } finally {
+            // assertThrows 返回（revoke 於 revokeOpTimeoutMs=100 逾時後拋出）即放行 grant 落庫；
+            // finally 保證放行。
+            lockHoldRelease.countDown()
+        }
+        grantJob.join()
+
+        assertEquals("PRIVILEGE_REVOKE_TIMEOUT", error.message)
+        assertFalse(state.bridgeSwitchOn)
+        assertFalse(state.bridgeGranted)
+        assertTrue("逾時 revoke 入口必已封存 seal（sticky，明確新授權解除）", state.isRevocationSealedForTest())
+
+        // 逾時路徑不得洩漏 opMutex：同一 state 的新 grant 必能取得 opMutex 並完成
+        //（seal 由此明確新授權 commit 解封）。
+        val issued = state.grant(store, "preset:openai", 1L)
+        assertEquals("preset:openai", issued.providerId)
+        assertTrue("逾時後 grant 必能完成並置 true（opMutex 未被洩漏佔用）", state.bridgeGranted)
+        assertFalse("新 grant commit 必解封 seal", state.isRevocationSealedForTest())
+    }
+
+    @Test(timeout = 30_000L) fun revokeAcquiresMutexFreely_completesAndNextGrantProceeds() = runBlocking {
+        // 釘住 opMutex unlock 契約：無競爭的 revoke 直接取得 opMutex，臨界區 finally 必須
+        // unlock；若 finally 的 unlock 被移除，revoke 自身仍正常返回（其殘留持鎖無人內部偵測），
+        // 但後續 grant（opMutex 等待無 timeout）會永久吊掛 → @Test 30s 上限判紅。
+        // 註：此案為 availability-invariant 釘測，不判別舊新實作競態窗口。
+        val store = PrivilegeBridgeStore(
+            PreferenceDataStoreFactory.create(scope = scope) {
+                File(dir, "revoke_acquires_mutex_freely.preferences_pb")
+            },
+        )
+        val state = PrivilegeBridgeState()
+
+        // 無競爭 revoke：必正常返回（不得以 unlock-guessing 或逾時路徑打轉），旗標與授權落 false。
+        state.revoke(store)
+        assertFalse(state.bridgeSwitchOn)
+        assertFalse(state.bridgeGranted)
+
+        // opMutex 必已於 revoke 臨界區 finally 釋放：新 grant 取得 opMutex 並完成（30s @Test 上限封頂）。
+        val issued = state.grant(store, "preset:openai", 1L)
+        assertEquals("preset:openai", issued.providerId)
+        assertTrue("revoke 釋放後 grant 必能完成並置 true（opMutex 未被洩漏佔用）", state.bridgeGranted)
+    }
+
     @Test(timeout = 30_000L) fun revokeMutexTimeout_bestEffortClearFailsFast_suppressedClearFailed() = runBlocking {
         // grant 落庫以 latch 持 opMutex（lockHoldRelease，grant 卡在 updateData 至 revoke 逾時）；clear()（含臨界區內
         // 與 best-effort）路徑的 updateData 直接拋 IOException（不 hang）。

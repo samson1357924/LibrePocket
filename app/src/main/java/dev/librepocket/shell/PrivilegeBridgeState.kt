@@ -6,6 +6,7 @@ import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -493,20 +494,22 @@ class PrivilegeBridgeState @VisibleForTesting internal constructor(
             val cleared = audit.revokeAll()
 
             withContext(NonCancellable) {
-            // 有界等待 opMutex：只包 acquisition，臨界區內各段另以 timeout 保護，
-            // 鎖取得超時 → fail-closed 抛錯（記憶體已關旗標，呼叫端可重試）。
-            val acquired = withTimeoutOrNull(revokeOpTimeoutMs) {
-                opMutex.lock()
-                true
+            // 有界等待 opMutex（tryLock 輪詢，單調時鐘）：tryLock 為非暫停的原子操作，
+            // 成功即同步可知，消除 withTimeoutOrNull 結果移交競態（鎖已取但結果被逾時丟棄）。
+            // 不猜測解鎖他協程的 mutex（unlock() 不做擁有者檢查）。
+            // 臨界區內各段另以 timeout 保護；鎖取得超時 → fail-closed 抛錯
+            // （記憶體已關旗標，呼叫端可重試）。
+            val startedAt = System.nanoTime()
+            var acquired = opMutex.tryLock()
+            while (!acquired && System.nanoTime() - startedAt < revokeOpTimeoutMs * 1_000_000L) {
+                delay(1)
+                acquired = opMutex.tryLock()
             }
             var primaryFailure: Throwable? = null
-            if (acquired == null) {
-                // kotlinx.coroutines 1.11.0：Mutex.lock() 文件保證——若等待期間
-                // 取得鎖後才遇 mid-wait 取消（如逾時），會先釋放鎖再傳播取消，
-                // 故逾時取得點不會殘留「已持鎖但以為失敗」的情形，無需補 unlock；
-                // 絕不 force-unlock 他協程持有的 mutex（unlock() 不做擁有者檢查）。
+            if (!acquired) {
                 // opMutex 被長臨界區佔用（grant/refresh 含 DataStore I/O）或
-                // DataStore 永久掛起 → 不再無界等待。
+                // DataStore 永久掛起 → 逾時放棄，不再無界等待；
+                // 未取到鎖，無需也不可 unlock（unlock() 不做擁有者檢查）。
                 primaryFailure = IllegalStateException(PrivilegeBridgeErrors.REVOKE_TIMEOUT)
                 // 鎖外同有界 best-effort durable 清除（與臨界區內的 clear 冪等）：
                 // journal/marker 任一落地即可使舊授權不復活；兩者皆失敗＝已知限制 (ii)。

@@ -13,6 +13,8 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import org.junit.After
+import org.junit.Before
 
 /**
  * AB1 回歸（owner 新 P1-A＋P1-B；串行契約下預填代理多 stall 疊加，真實多 drain 疊加由 P1Fix 混合測試覆蓋）：
@@ -26,12 +28,46 @@ import org.junit.Test
  *   Shizuku（close 阻塞）混合疊加，證跨 runner 共用同一全域計數；
  * - P1-B：8 執行緒 barrier，fake spawn 內 `entered` 計數後 latch 等待；
  *   斷言 spawn==1（恰好，另 7 被預留門拒，reason 含 "backlog full"）；
- *   釋放後 1 個走 timeout＋不可中斷 destroy → outstanding=1；後續 denied（backlog）。
- *   finally 全釋放＋輪詢歸零。
+ *   釋放後 1 個走 timeout＋不可中斷 destroy → Stage 3c stall-arm：cleanup worker
+ *   卡在 destroyLatch，custody 於 post-grace 線性化點移交 worker 本體；release
+ *   發生於 destroyLatch.countDown() 令 worker 退出、worker finally 恰好釋放一次
+ *   之時——其間 outstanding 續為 1、admission fail-closed（victim 改由 quarantine 封存）；
+ *   後續 denied（QUARANTINE）不變。finally 全釋放＋輪詢歸零。
  */
 class ElevatedRunnerAB1Test {
 
     private val privateRoot = "/data/data/files"
+    private var floorBefore: Int = 0
+
+    @Before fun setUpIsolation() {
+        assertFalse(
+            "#136-B3 gate must stay closed",
+            PrivilegeActivation.ELEVATED_RUNNERS_READY,
+        )
+        floorBefore = ElevatedCleanupTracker.releaseFloorHits()
+        ElevatedCleanupTracker.clearUnverified()
+        ElevatedCleanupTracker.noteClean()
+        pollOutstandingTo(0)
+        pollActiveTo(0)
+        ElevatedCleanupTracker.noteClean()
+    }
+
+    @After fun tearDownIsolation() {
+        // P1B2-mirror fail-closed teardown：先快照 leak（remediation 前），再補救，再斷言。
+        val leakedOutstanding = ElevatedCleanupTracker.outstanding()
+        val leakedActive = ElevatedCleanupTracker.activeCalls()
+        val leakedQuarantine = ElevatedCleanupTracker.quarantinedCount()
+        Thread.interrupted()
+        ElevatedCleanupTracker.clearUnverified()
+        pollPendingTo(0)
+        pollOutstandingTo(0)
+        awaitNoElevatedThreads()
+        ElevatedCleanupTracker.noteClean()
+        assertEquals("test leaked outstanding slots", 0, leakedOutstanding)
+        assertEquals("test leaked active calls", 0, leakedActive)
+        assertEquals("test leaked quarantined processes", 0, leakedQuarantine)
+        assertEquals("release floor must not be hit during this test", floorBefore, ElevatedCleanupTracker.releaseFloorHits())
+    }
 
     /** success-exit＋stdin getter 吞 interrupt 續等（latch 釋放前永不返回）。 */
     private class GetterLingerSuccessProcess(
@@ -165,8 +201,32 @@ class ElevatedRunnerAB1Test {
         }
     }
 
+    private fun pollPendingTo(expected: Int, boundMs: Long = 15_000L) {
+        val deadline = System.currentTimeMillis() + boundMs
+        while (ElevatedCleanupTracker.sweepPendingCount() != expected) {
+            if (System.currentTimeMillis() >= deadline) {
+                throw AssertionError(
+                    "pending=${ElevatedCleanupTracker.sweepPendingCount()} expected=$expected",
+                )
+            }
+            Thread.sleep(20L)
+        }
+    }
+
+    private fun pollActiveTo(expected: Int, boundMs: Long = 10_000L) {
+        val deadline = System.currentTimeMillis() + boundMs
+        while (ElevatedCleanupTracker.activeCalls() != expected) {
+            if (System.currentTimeMillis() >= deadline) {
+                throw AssertionError(
+                    "active=${ElevatedCleanupTracker.activeCalls()} expected=$expected",
+                )
+            }
+            Thread.sleep(20L)
+        }
+    }
+
     private fun awaitNoElevatedThreads(boundMs: Long = 10_000L) {
-        val names = setOf("elevated-stdout", "elevated-stderr", "elevated-stdin-close", "elevated-cleanup")
+        val names = setOf("elevated-stdout", "elevated-stderr", "elevated-stdin-close", "elevated-cleanup", "elevated-quarantine-sweep", "elevated-quarantine-verify")
         val deadline = System.currentTimeMillis() + boundMs
         while (true) {
             val alive = Thread.getAllStackTraces().keys.filter {
@@ -191,6 +251,8 @@ class ElevatedRunnerAB1Test {
         val latch = CountDownLatch(1)
         val rootSpawns = AtomicInteger(0)
         val shizukuSpawns = AtomicInteger(0)
+        // 預填計數器（finally 以實際取得的槽數釋放，避免 acquire 失敗即漏釋或多釋）。
+        var prefilled = 0
         // Root 側 getter 阻塞、Shizuku 側 close 阻塞：兩種 stdin 殘留形態。
         val root = makeRoot { rootSpawns.incrementAndGet(); GetterLingerSuccessProcess(latch) }
         val shizuku = makeShizuku { shizukuSpawns.incrementAndGet(); CloseLingerSuccessProcess(latch) }
@@ -207,7 +269,10 @@ class ElevatedRunnerAB1Test {
             assertTrue("$blocked", blocked is ElevatedBinaryResult.Denied)
             assertEquals(0, shizukuSpawns.get())
             // 預填 6 達飽和（1+6=7）。
-            repeat(6) { ElevatedCleanupTracker.acquireSlot() }
+            repeat(6) {
+                assertTrue("pre-fill acquireSlot #${prefilled + 1} must succeed", ElevatedCleanupTracker.acquireSlot())
+                prefilled++
+            }
             assertEquals(7, ElevatedCleanupTracker.outstanding())
             assertTrue(ElevatedCleanupTracker.isSaturated())
             // linger 成功走 noteUnclean：此處僅 1 次 drain（consecutive=1，未熔斷）；
@@ -238,8 +303,8 @@ class ElevatedRunnerAB1Test {
             assertEquals(0, ElevatedCleanupTracker.activeCalls())
         } finally {
             latch.countDown()
-            // 釋放預填 6 槽（latch 釋放還 1 linger 槽，併發收斂）。
-            repeat(6) { ElevatedCleanupTracker.releaseSlot() }
+            // 釋放預填槽（latch 釋放還 1 linger 槽，併發收斂）。
+            repeat(prefilled) { ElevatedCleanupTracker.releaseSlot() }
             pollOutstandingTo(0)
         }
         // late 完成只釋放 slot，不歸零 consecutive（fail-closed 閂鎖，AA1 同語義）。
@@ -327,7 +392,11 @@ class ElevatedRunnerAB1Test {
             }
             assertEquals(1, spawns.get())
             assertEquals(1, entered.get())
-            // 釋放 spawn 門 → 1 個走 timeout＋不可中斷 destroy → outstanding=1。
+            // 釋放 spawn 門 → 1 個走 timeout＋不可中斷 destroy → Stage 3c：cleanup worker
+            // 卡在 destroyLatch，custody 已移交 worker 本體，verified-false 亦不由
+            // caller 釋放（victim 改由 quarantine 封存追蹤，fail-closed 不變）；
+            // 釋放 destroyLatch 讓 worker 退出、finally 恰好釋放一次即 outstanding 歸 0；
+            // 後續 denied（QUARANTINE 封存）。
             spawnGate.countDown()
             threads.forEach { it.join(30_000L) }
             assertTrue(
@@ -345,16 +414,21 @@ class ElevatedRunnerAB1Test {
                 "denied msgs=${denied.map { it.message }}",
                 denied.all { it.message.contains("backlog full") },
             )
-            pollOutstandingTo(1)
+            // Stage 3c：cleanup worker 卡在 destroyLatch（custody 已移交 worker 本體，
+            // verified-false 亦不由 caller 釋放）；先釋放 destroyLatch 讓 worker 退出、
+            // finally 恰好釋放一次。victim 由 quarantine 封存，admission 密封。
+            destroyLatch.countDown()
+            pollOutstandingTo(0)
+            assertEquals(1, ElevatedCleanupTracker.quarantinedCount())
             assertFalse(ElevatedCleanupTracker.isSaturated())
-            // 後續呼叫仍被預留門拒（outstanding=1，1+7>7），零新增 spawn。
+            // 後續呼叫仍被門拒（QUARANTINE 封存；零 spawn），零新增 spawn。
             val extra = runner.runBinary(ElevatedRequest(listOf("id"), "AB1-B"), 300L)
             assertTrue("$extra", extra is ElevatedBinaryResult.Denied)
             extra as ElevatedBinaryResult.Denied
-            assertEquals(ShellDeny.QUOTA_EXCEEDED, extra.reason)
+            assertEquals(ShellDeny.QUARANTINE, extra.reason)
             assertTrue(
                 "msg=${extra.message}",
-                extra.message.contains("backlog full"),
+                extra.message.contains("quarantine held"),
             )
             assertEquals(1, spawns.get())
             assertEquals(0, ElevatedCleanupTracker.activeCalls())

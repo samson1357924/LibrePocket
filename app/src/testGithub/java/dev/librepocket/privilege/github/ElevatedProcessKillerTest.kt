@@ -2,7 +2,9 @@ package dev.librepocket.privilege.github
 
 import java.lang.reflect.InvocationTargetException
 import java.util.concurrent.TimeUnit
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Assert.fail
@@ -57,12 +59,30 @@ class ElevatedProcessKillerTest {
             doomed = descendantPids(root)
             assertTrue("expected >=1 descendant, got $doomed", doomed.isNotEmpty())
 
+            val unattestedBefore = ElevatedProcessKiller.bodyDestroyUnattestedCount()
             ElevatedProcessKiller.killTree(root)
 
             assertTrue("parent should exit after killTree", root.waitFor(5, TimeUnit.SECONDS))
             assertFalse("parent should not be alive", root.isAlive)
             val survivors = pollAlive(doomed, 5_000L)
             assertTrue("descendants should all be dead, survivors=$survivors", survivors.isEmpty())
+            // F3（host-capability gated positive-path pin）：本 JVM 可 attest 本體
+            // （toHandle 可 invoke 且回傳非 null）⇒ 本體兩信號一律經 attested arm
+            // 發出，未經 attest 計數不前進；反射失敗／回傳 null ⇒ assume 跳過。
+            val attestable = try {
+                Process::class.java.getMethod("toHandle").invoke(root) != null
+            } catch (_: Throwable) {
+                null
+            }
+            assumeTrue(
+                "host JVM cannot attest body handle; skip positive-path pin",
+                attestable == true,
+            )
+            assertEquals(
+                "attested body signals must not count as unattested",
+                unattestedBefore,
+                ElevatedProcessKiller.bodyDestroyUnattestedCount(),
+            )
         } finally {
             runCatching { root.destroyForcibly() }
             // 精準收尾：只處理本次子孫 pid，不碰無關進程。
@@ -97,11 +117,215 @@ class ElevatedProcessKillerTest {
         assertTrue("fallback must still destroy parent", stub.destroyed)
     }
 
+    @Test fun pidReuseSignalAllowedTruthTable() {
+        // Stage 2A（P1-A7）PID-reuse 守門判定表（killDescendantsReflective 的純函數 seam）。
+        // 接線（snapshot→recheck→skip＋計數）無法以假 ProcessHandle 直測：單元測試編譯
+        // 走 SDK 公開表面過濾，toHandle/descendants override 不可行（見本檔 KDoc），
+        // 而真實 PID 回收無法確定性誘發；故接線以真樹測試＋本判定表共同覆蓋，
+        // 殘餘歸 #136-B3 E2E。
+        val t0 = java.time.Instant.ofEpochMilli(1_700_000_000_000L)
+        val t1 = java.time.Instant.ofEpochMilli(1_800_000_000_000L)
+        // Happy path：存活＋快照一致 → 允許信號。
+        assertTrue(ElevatedProcessKiller.pidReuseSignalAllowed(true, t0, t0))
+        // PID 已回收（startInstant 不同）→ 跳過。
+        assertFalse(ElevatedProcessKiller.pidReuseSignalAllowed(true, t0, t1))
+        // handle 快照不可驗證（info 抛／startInstant 缺席）→ 跳過。
+        assertFalse(ElevatedProcessKiller.pidReuseSignalAllowed(true, null, t0))
+        // 信號前重讀不可驗證（info 抛／缺席）→ 跳過。
+        assertFalse(ElevatedProcessKiller.pidReuseSignalAllowed(true, t0, null))
+        // 兩者皆 null（完全不可驗證）→ 跳過。
+        assertFalse(ElevatedProcessKiller.pidReuseSignalAllowed(true, null, null))
+        // 已死 → 跳過（常規態，無信號可發）。
+        assertFalse(ElevatedProcessKiller.pidReuseSignalAllowed(false, t0, t0))
+        // 已死（PID 已重用，startInstant 不同）→ 跳過；釘死 alive&& 短路順序。
+        assertFalse(ElevatedProcessKiller.pidReuseSignalAllowed(false, t0, t1))
+        // 已死（快照不可驗證，current 讀得 t0）→ 跳過；短路順序同上。
+        assertFalse(ElevatedProcessKiller.pidReuseSignalAllowed(false, null, t0))
+        // 值語義等值：不同值即 mismatch，相同值即放行。
+        assertFalse(ElevatedProcessKiller.pidReuseSignalAllowed(true, "start-a", "start-b"))
+        assertTrue(ElevatedProcessKiller.pidReuseSignalAllowed(true, "start-a", "start-a"))
+    }
+
     @Test fun destroyForciblyReturnsThis() {
         // AB1 順手補（核實缺失後新增）：fake 契約——destroyForcibly 回同一實例
         //（drain／kill 流程依賴此語義；ShizukuRemoteProcess 包裝直通同理）。
         val stub = AospFallbackStub()
         assertSame(stub, stub.destroyForcibly())
+    }
+
+    /** pidReuseSignalAllowed 純判定表、非 killTree 時序斷言：下方僅釘 (alive, expectedStart, currentStart) 真值表；時序／接線（snapshot→recheck→skip＋計數）無法以假 ProcessHandle 直測（見測試體 KDoc）。 */
+    @Test fun bodyAttestCadencePredicateTruthTable() {
+        // Stage 4（本體 best-effort PID-reuse attestation）判定表式釘點：
+        // 下方 pidReuseSignalAllowed 的各次呼叫釘住的是子孫路徑——
+        // killDescendantsReflective 經 HandleAttest.signalAllowed 共用的同一純判定函數。
+        // 本體路徑（attestBodyDestroy／signalBody）自 Stage 4 review R1(a) 起不再經本
+        // 判定式：它 inline 重寫同一 raw 比較（alive＋startInstant 值相等判定式），
+        // 語義為 fail-toward-destruction——任何不可驗（alive==null／快照或重讀
+        // startInstant 為 null／isAlive 讀抛）一律退化為無條件 destroy＋
+        // bodyDestroyUnattested（kill 契約優先；不計 pidReuseSkipped——nothing was
+        // proven）；僅「兩讀皆成功且 startInstant 不符」（proven positive mismatch）
+        // 才跳過該信號＋計 pidReuseSkipped＋bodyPidReuseSkipped＋one-shot latch
+        // （剩餘本體信號無條件抑制——零重讀、零計數、destroyForcibly 不再評估）；
+        // alive==false（含 mid-window 兩讀之間死亡）⇒ 零信號、零計數。
+        //
+        // 接線（snapshot→recheck→skip＋計數）無法以假 ProcessHandle 直測：單元測試編譯
+        // 走 SDK 公開表面過濾，toHandle/descendants/ProcessHandle 之 override／
+        // 子類化皆不可行（見本檔 KDoc），真實 PID 回收亦無法確定性誘發；故本體
+        // cadence 以純判定表釘點——body 的 destroy/destroyForcibly 兩次獨立重驗與下方
+        // 判定表同一 (alive, expectedStart, currentStart) 比較式，惟落地路徑為 signalBody
+        // 的 inline 比較，而非 pidReuseSignalAllowed。
+        val t0 = java.time.Instant.ofEpochMilli(1_700_000_000_000L)
+        val t1 = java.time.Instant.ofEpochMilli(1_800_000_000_000L)
+        // destroy 信號第 1 次獨立重驗：alive＋快照一致 → 放行（attested ⇒ handle.destroy）。
+        assertTrue(ElevatedProcessKiller.pidReuseSignalAllowed(true, t0, t0))
+        // destroyForcibly 信號第 2 次獨立重驗：一致即放行。
+        assertTrue(ElevatedProcessKiller.pidReuseSignalAllowed(true, t0, t0))
+        // 任一次重驗鍵值不可驗／已回收 → 該判定式回 false（fail-closed；
+        // 子孫路徑＝跳過＋pidReuseSkipped）。本體路徑（Stage 4 review R1(a)）
+        // 不再以本判定式落地——不可驗一律退化為無條件 destroy＋bodyDestroyUnattested，
+        // 僅 proven mismatch（兩讀皆成功＋startInstant 不符）才跳過＋兩計數＋latch。
+        assertFalse(ElevatedProcessKiller.pidReuseSignalAllowed(true, t0, t1))
+        assertFalse(ElevatedProcessKiller.pidReuseSignalAllowed(true, null, t0))
+        assertFalse(ElevatedProcessKiller.pidReuseSignalAllowed(true, t0, null))
+        assertFalse(ElevatedProcessKiller.pidReuseSignalAllowed(true, null, null))
+        // 已死（destroy 已生效或自然退出，第二個信號前）→ 跳過、不計診斷。
+        assertFalse(ElevatedProcessKiller.pidReuseSignalAllowed(false, t0, t0))
+        // bodyDestroyUnattestedCount：未經 attest 的本體信號計數（cannot-attest-at-all
+        // 平台專屬；#136-B3 device-acceptance checklist 項）。具體讀數由
+        // killTreeOnNonAttestableFakeProcessDegradesToUnconditionalDestroyAndCounts
+        // 釘點（FakeProcess 兩信號 +2）；平台／測序相依不在此重複斷言。
+    }
+
+    // ---- HandleAttest seam 直測（Round-6 D-B7）：isAliveOf／startInstantOf 逐臂 ----
+
+    private interface FakeHandleIface {
+        fun info(): Any?
+        fun isAlive(): Boolean
+    }
+
+    private interface FakeInfoLike {
+        fun startInstant(): java.util.Optional<java.time.Instant>
+    }
+
+    private class TrueAliveHandle : FakeHandleIface {
+        override fun info(): Any? = null
+        override fun isAlive(): Boolean = true
+    }
+
+    private class FalseAliveHandle : FakeHandleIface {
+        override fun info(): Any? = null
+        override fun isAlive(): Boolean = false
+    }
+
+    private class BoomIsAliveHandle : FakeHandleIface {
+        override fun info(): Any? = null
+        override fun isAlive(): Boolean = throw RuntimeException("alive boom")
+    }
+
+    private class ThrowingInfoHandle : FakeHandleIface {
+        override fun info(): Nothing = throw RuntimeException("info boom")
+        override fun isAlive(): Boolean = true
+    }
+
+    private class StaticInfoHandle(private val info: Any?) : FakeHandleIface {
+        override fun info(): Any? = info
+        override fun isAlive(): Boolean = true
+    }
+
+    private class PresentInfo(private val t: java.time.Instant) : FakeInfoLike {
+        override fun startInstant(): java.util.Optional<java.time.Instant> =
+            java.util.Optional.of(t)
+    }
+
+    private class EmptyInfo : FakeInfoLike {
+        override fun startInstant(): java.util.Optional<java.time.Instant> =
+            java.util.Optional.empty()
+    }
+
+    private class BoomStartInstantInfo : FakeInfoLike {
+        override fun startInstant(): java.util.Optional<java.time.Instant> =
+            throw RuntimeException("startInstant boom")
+    }
+
+    private val iface = FakeHandleIface::class.java
+    private val aliveMethod = iface.getMethod("isAlive")
+    private val infoMethod = iface.getMethod("info")
+
+    @Test fun handleAttestIsAliveOfNullMethodReturnsNull() {
+        // 平台無 isAlive API（Method 缺席）⇒ 不可驗證（null），fail toward destruction 的輸入訊號。
+        val h = TrueAliveHandle()
+        val attest = ElevatedProcessKiller.HandleAttest(h, iface, null, null, null, null)
+        assertNull(attest.isAliveOf(h))
+    }
+
+    @Test fun handleAttestIsAliveOfThrowingMethodReturnsNull() {
+        // isAlive Method invoke 拋（如 binder death）⇒ 不可驗證（null），不外拋。
+        val h = BoomIsAliveHandle()
+        val attest = ElevatedProcessKiller.HandleAttest(h, iface, null, null, infoMethod, aliveMethod)
+        assertNull(attest.isAliveOf(h))
+    }
+
+    @Test fun handleAttestIsAliveOfTrueFalseNormal() {
+        val t = TrueAliveHandle()
+        val f = FalseAliveHandle()
+        val attest = ElevatedProcessKiller.HandleAttest(t, iface, null, null, infoMethod, aliveMethod)
+        assertEquals(true, attest.isAliveOf(t))
+        assertEquals(false, attest.isAliveOf(f))
+    }
+
+    @Test fun handleAttestStartInstantOfNullInfoMethodReturnsNull() {
+        // 平台無 info Method（Method 缺席）⇒ 不可驗證（null）。
+        val h = TrueAliveHandle()
+        val attest = ElevatedProcessKiller.HandleAttest(h, iface, null, null, null, aliveMethod)
+        assertNull(attest.startInstantOf(h))
+    }
+
+    @Test fun handleAttestStartInstantOfInfoInvokeThrowsReturnsNull() {
+        // info() invoke 拋（binder death／handles 無效）⇒ 不可驗證（null），不外拋。
+        val h = ThrowingInfoHandle()
+        val attest = ElevatedProcessKiller.HandleAttest(h, iface, null, null, infoMethod, aliveMethod)
+        assertNull(attest.startInstantOf(h))
+    }
+
+    @Test fun handleAttestStartInstantOfEmptyOptionalReturnsNull() {
+        // info.startInstant Optional.empty（PID 無 incarnation）⇒ 不可驗證（null）。
+        val h = StaticInfoHandle(EmptyInfo())
+        val attest = ElevatedProcessKiller.HandleAttest(h, iface, null, null, infoMethod, aliveMethod)
+        assertNull(attest.startInstantOf(h))
+    }
+
+    @Test fun handleAttestStartInstantOfInvokeThrowsReturnsNull() {
+        // startInstant() invoke 拋⇒ 不可驗證（null），不外拋。
+        val h = StaticInfoHandle(BoomStartInstantInfo())
+        val attest = ElevatedProcessKiller.HandleAttest(h, iface, null, null, infoMethod, aliveMethod)
+        assertNull(attest.startInstantOf(h))
+    }
+
+    @Test fun handleAttestStartInstantOfPresentReturnsValue() {
+        // info.startInstant Optional.of(v) ⇒ 回傳該值（可驗 incarnation）。
+        val t = java.time.Instant.ofEpochMilli(1_700_000_000_000L)
+        val h = StaticInfoHandle(PresentInfo(t))
+        val attest = ElevatedProcessKiller.HandleAttest(h, iface, null, null, infoMethod, aliveMethod)
+        assertEquals(t, attest.startInstantOf(h))
+    }
+
+    @Test fun killTreeOnNonAttestableFakeProcessDegradesToUnconditionalDestroyAndCounts() {
+        // Stage 4 review O1（strengthened）：FakeProcess（同包 ElevatedTestFakes；
+        // 未覆寫 toHandle；JDK 基類預設即抛 UOE，android.jar 樁同為 UOE）在任何
+        // 平台皆無法 attest ⇒ 本體兩個信號一律走 unattested 無條件 destroy 臂
+        // （kill 契約＝destroy＋destroyForcibly 必跑、不抛），且每個未經 attest
+        // 的信號計入 bodyDestroyUnattestedCount（once per SIGNAL）。
+        // deterministic：FakeProcess 不 override toHandle ⇒ reflectHandleAttest 收斂
+        // handle=null ⇒ attestBodyDestroy 退化 unattestedBodyDestroy（+2），與平台無關。
+        val fake = FakeProcess()
+        val before = ElevatedProcessKiller.bodyDestroyUnattestedCount()
+        ElevatedProcessKiller.killTree(fake) // 不抛即通過；有界返回（不 hang）。
+        assertEquals(
+            "FakeProcess cannot attest ⇒ both body signals route to the unattested arm",
+            before + 2, ElevatedProcessKiller.bodyDestroyUnattestedCount(),
+        )
+        assertTrue("destroy() must have run (kill contract)", fake.destroyed)
+        assertTrue("destroyForcibly() must have run (kill contract)", fake.forciblyDestroyed)
     }
 
     /**

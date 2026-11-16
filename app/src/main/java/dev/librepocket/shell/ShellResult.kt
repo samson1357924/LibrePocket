@@ -34,9 +34,18 @@ sealed interface ShellResult {
      *   由編譯器隨新欄自動更新——與提權側 `ByteArray` 承載不同，本型別全為
      *   `String`／ primitives，data class 語義即正確，無需手寫）：
      *   true＝飽和零 thread（全域 backlog 存在）／process 段 worker 在 grace 後仍
-     *   存活（linger daemon）／tail 未排空（would-be Ok 升級）；false＝entry 期滿
-     *   零 worker／spawn 前預檢期滿（未 spawn，無需清理）／runner 內 kill 已執行
-     *   且已收斂（殘留只剩有界 gobbler tail，見 `outputIncomplete` 升級路徑）。
+     *   存活（linger daemon）／tail 未排空（would-be Ok 升級）／linger 映射
+     *   （`hasLinger` 或 `outstanding()>0`，github flavor 准入前置判定，下同）；false＝僅在
+     *   `!expiredHasLinger && outstanding()==0` 時成立（blanket 規則；spawn 前 preflight 入口
+     *   零 budget 字面 `false`，零 worker／無殘留；其餘——含 quota 後顯式過期、
+     *   cancel 門 `Ok(true)`／中斷臂——皆經 github flavor 的 linger 映射（`hasLinger` 或
+     *   `outstanding()>0` 判定，`false` 要求全域無殘留）／runner 內 kill 已執行且已收斂（殘留只剩有界 gobbler
+     *   tail，見 `outputIncomplete` 升級路徑）。
+     *   blanket 例外列舉（`cleanupIncomplete=true` 而非上述 TimedOut 語境者）：
+     *   准入飽和臂 backlog-full 拒絕（Denied 變體）攜 `true`（github flavor 專屬，見該
+     *   flavor 的 backlog-full 拒絕字串）；breaker／concurrency 飽和臂不攜。
+     *   github flavor 的文字相容轉換僅穿透 TimedOut 分支的 `cleanupIncomplete`，
+     *   Failed 分支之旗標（與 Denied 分支）一併丟棄。
      * - 審計：[dev.librepocket.shell.PrivilegeAuditLog.verdictName] 仍映 `TIMEOUT`
      *  （verdict 不變；linger 細節不在審計表，見該表 B3 TODO）。
      */

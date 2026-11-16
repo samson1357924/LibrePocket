@@ -34,12 +34,26 @@ class ElevatedRunnerPhaseRTest {
     }
 
     @After fun tearDownIsolation() {
+        // snapshot-then-remediate-then-assert：先快照 leak（remediation 前），
+        // 有界補救，再斷言零殘留（不盲射 releaseSlot/leaveCall）。
+        val leakedOutstanding = ElevatedCleanupTracker.outstanding()
+        val leakedActive = ElevatedCleanupTracker.activeCalls()
+        val leakedQuarantine = ElevatedCleanupTracker.quarantinedCount()
         ElevatedCleanupTracker.clearUnverified()
-        repeat(8) { ElevatedCleanupTracker.releaseSlot() }
-        repeat(8) { ElevatedCleanupTracker.leaveCall() }
+        val forcedDeadline = System.currentTimeMillis() + 5_000L
+        while (ElevatedCleanupTracker.outstanding() > 0 && System.currentTimeMillis() < forcedDeadline) {
+            ElevatedCleanupTracker.releaseSlot()
+        }
+        val forcedActiveDeadline = System.currentTimeMillis() + 5_000L
+        while (ElevatedCleanupTracker.activeCalls() > 0 && System.currentTimeMillis() < forcedActiveDeadline) {
+            ElevatedCleanupTracker.leaveCall()
+        }
         pollOutstandingTo(0)
         pollActiveTo(0)
         ElevatedCleanupTracker.noteClean()
+        assertEquals("test leaked outstanding slots", 0, leakedOutstanding)
+        assertEquals("test leaked active calls", 0, leakedActive)
+        assertEquals("test leaked quarantined processes", 0, leakedQuarantine)
     }
 
     private fun pollOutstandingTo(expected: Int, boundMs: Long = 15_000L) {
@@ -142,6 +156,7 @@ class ElevatedRunnerPhaseRTest {
         pollActiveTo(0)
         val latch = CountDownLatch(1)
         val bound = ElevatedCleanupTracker.MAX_SWEEP_VERIFIERS
+        val skipsBefore = ElevatedCleanupTracker.sweepSaturationSkipsCount()
         try {
             repeat(12) { i ->
                 val p = StallSwallowProcess(latch)
@@ -177,6 +192,10 @@ class ElevatedRunnerPhaseRTest {
             assertTrue(
                 "final alive verify must stay <= bound=$bound",
                 aliveQuarantineVerifyCount() <= bound,
+            )
+            assertTrue(
+                "sweep saturation skip telemetry must have advanced (stalled verifiers force skips)",
+                ElevatedCleanupTracker.sweepSaturationSkipsCount() > skipsBefore,
             )
             // 新代驗證被飽和跳過即保持 QUARANTINE（安全方向，不翻轉放行）。
             val fresh = FastAliveProcess()

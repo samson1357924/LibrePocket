@@ -146,7 +146,7 @@ import rikka.shizuku.Shizuku
  *
  * Round-6（#136-B2）登記雙失敗 brick：admission 於「無槽且 quarantine 雙登記皆拋」
  * 臂（`ElevatedCleanupTracker.registrationFailedSticky` 置位——drain 三臂／`drainFailClosedDrained`／
- * `releaseCleanupSlotAfterVerify` 零追蹤臂）後永久拒絕
+ * `releaseCleanupSlotAfterVerify` 零追蹤臂；catch-all 臂無例外、無條件置位（D-D10 冗餘密封））後永久拒絕
  * `Denied(QUOTA_EXCEEDED, "elevated unverified-process registration failed (fail-closed, app restart required)")`；
  * 與上述五因同碼，訊息獨立可辨識；app 重啟方能恢復；
  * 審計 `DENY` 下須看拒絕訊息而非 verdict；#136-B3 必接 alert＋runbook（重啟）。

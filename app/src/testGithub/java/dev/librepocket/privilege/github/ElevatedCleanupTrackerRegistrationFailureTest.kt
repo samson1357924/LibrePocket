@@ -51,6 +51,7 @@ class ElevatedCleanupTrackerRegistrationFailureTest {
         ElevatedCleanupTracker.clearUnverified()
         ElevatedCleanupTracker.noteClean()
         ElevatedCleanupTracker.clearRegistrationFailedStickyForTest()
+        ElevatedCleanupTracker.forceAcquireSlotOrQuarantineThrow = false
         pollOutstandingTo(0)
         pollActiveTo(0)
         pollPendingTo(0)

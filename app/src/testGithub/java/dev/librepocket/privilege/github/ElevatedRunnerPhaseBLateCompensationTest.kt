@@ -50,6 +50,7 @@ class ElevatedRunnerPhaseBLateCompensationTest {
         )
         floorBefore = ElevatedCleanupTracker.releaseFloorHits()
         ElevatedProcessIo.quarantineRegistrar = { ElevatedCleanupTracker.quarantineUnverified(it) }
+        ElevatedCleanupTracker.forceAcquireSlotOrQuarantineThrow = false
         ElevatedCleanupTracker.clearUnverified()
         ElevatedCleanupTracker.clearRegistrationFailedStickyForTest()
         ElevatedCleanupTracker.noteClean()
@@ -895,6 +896,202 @@ class ElevatedRunnerPhaseBLateCompensationTest {
             cancelGate.countDown()
             spawnRelease.countDown()
             bg.join(10_000L)
+            pollOutstandingTo(0)
+            pollActiveTo(0)
+            ElevatedCleanupTracker.clearUnverified()
+            ElevatedCleanupTracker.noteClean()
+            awaitNoElevatedThreads()
+        }
+    }
+
+    /**
+     * (b3.6) startLateDaemon acquire-throw＋second-chance registrar 拋 ⇒ sticky brick 的
+     * F4 pin（harness 同 (b3.5)；`forceAcquireSlotOrQuarantineThrow` 注入＋registrar 拋，
+     * finally 還原兩者＋clear sticky）：caller CAS 認領成功後 `startLateDaemon` 進
+     * acquire 臂且 `acquireSlotOrQuarantine` 一律拋 ⇒ 首嘗
+     * `noteQuarantineRegistrationFailed`＋`noteKillNeverAttempted`；second-chance 登記
+     * 亦拋（OOM 注入）⇒ 再計一次＋`noteRegistrationFailedSticky()`、`lateIncomplete=true`；
+     * 本臂不佔槽、不 spawn daemon ⇒ outstanding 歸零、quarantine 登記不增（雙登記皆拋）；
+     * `releaseFloorHits()` 不動。Res.Expired(hasLinger=true) 即 lateIncomplete 的等價 verdict。
+     */
+    @Test fun startLateDaemonAcquireThrowWithSecondChanceFailureBricksAdmission() {
+        val spawnEntered = CountDownLatch(1)
+        val spawnRelease = CountDownLatch(1)
+        val cancelGate = CountDownLatch(1)
+        val cancelBlockEntered = CountDownLatch(1)
+        val killerLatch = CountDownLatch(1)
+        val lateRef = AtomicReference<LatchBlockedDestroyProcess?>()
+        val resultRef = AtomicReference<ElevatedCallSupervisor.Res<Process>?>()
+        val kills = AtomicInteger(0)
+        val quarantineBefore = ElevatedCleanupTracker.quarantinedCount()
+        val failuresBefore = ElevatedCleanupTracker.quarantineRegistrationFailedCount()
+        val killNeverBefore = ElevatedCleanupTracker.killNeverAttemptedCount()
+        val isCancelled: () -> Boolean = {
+            if (spawnEntered.count > 0) {
+                false
+            } else if (resultRef.get() != null) {
+                false
+            } else {
+                cancelBlockEntered.countDown()
+                stuckAwait(cancelGate)
+                true
+            }
+        }
+        ElevatedCleanupTracker.forceAcquireSlotOrQuarantineThrow = true
+        ElevatedProcessIo.quarantineRegistrar = {
+            throw OutOfMemoryError("simulated OOM in quarantine registrar (test seam)")
+        }
+        val bg = Thread {
+            resultRef.set(
+                ElevatedCallSupervisor.awaitSpawnWithThreadStarter(
+                    deadlineNanos = System.nanoTime() + TimeUnit.SECONDS.toNanos(60),
+                    isCancelled = isCancelled,
+                    killer = {
+                        kills.incrementAndGet()
+                        stuckAwait(killerLatch)
+                    },
+                    startThread = { t ->
+                        t.start()
+                    },
+                ) {
+                    spawnEntered.countDown()
+                    stuckAwait(spawnRelease)
+                    LatchBlockedDestroyProcess(killerLatch).also { lateRef.set(it) }
+                },
+            )
+        }.also { it.isDaemon = true; it.start() }
+        try {
+            assertTrue("spawn must enter", spawnEntered.await(10_000L, TimeUnit.MILLISECONDS))
+            assertTrue(
+                "caller watcher must block in cancel gate",
+                cancelBlockEntered.await(10_000L, TimeUnit.MILLISECONDS),
+            )
+            spawnRelease.countDown()
+            pollRefNonNull(lateRef, "late spawn")
+            pollTrue("exactly one elevated-supervisor remains (watch blocked in cancel gate)") {
+                countLive("elevated-supervisor") == 1
+            }
+            // 放行取消門→caller expireWorker→CAS 認領→startLateDaemon acquire-throw 臂（同步收斂）。
+            cancelGate.countDown()
+            val res = pollRefNonNull(resultRef, "caller result")
+            assertTrue("expected Res.Expired, got $res", res is ElevatedCallSupervisor.Res.Expired)
+            res as ElevatedCallSupervisor.Res.Expired
+            // lateIncomplete 由 acquire-throw 臂於 expireWorker 內同步置位——此處 hasLinger==true
+            // 與 lateProcess=true 同成立（exited worker 留 Val 供 caller 認領），兩路徑皆合法；
+            // 本 pin 不區分來源（與 (b3.5) 同一立場）。
+            assertTrue(
+                "acquire-throw arm must flag cleanupIncomplete, got $res",
+                res.hasLinger,
+            )
+            // acquire-throw 臂同步收斂：res 產生時 sticky 已置位。
+            assertTrue(
+                "double registration failure must brick admission",
+                ElevatedCleanupTracker.isRegistrationFailedSticky(),
+            )
+            assertEquals(
+                ElevatedCleanupTracker.Admission.REGISTRATION_FAILED,
+                ElevatedCleanupTracker.tryEnterReserved(),
+            )
+            assertEquals(0, ElevatedCleanupTracker.activeCalls())
+            assertEquals(0, ElevatedCleanupTracker.outstanding())
+            // 雙登記皆拋 ⇒ quarantine 不增。
+            assertEquals(quarantineBefore, ElevatedCleanupTracker.quarantinedCount())
+            // 首嘗＋second-chance，至多 2 次失敗計數（此臂無 helper 重試）。
+            assertEquals(
+                failuresBefore + 2,
+                ElevatedCleanupTracker.quarantineRegistrationFailedCount(),
+            )
+            assertEquals(killNeverBefore + 1, ElevatedCleanupTracker.killNeverAttemptedCount())
+            assertEquals(0, kills.get())
+            assertEquals(floorBefore, ElevatedCleanupTracker.releaseFloorHits())
+        } finally {
+            killerLatch.countDown()
+            cancelGate.countDown()
+            spawnRelease.countDown()
+            bg.join(10_000L)
+            ElevatedCleanupTracker.forceAcquireSlotOrQuarantineThrow = false
+            ElevatedProcessIo.quarantineRegistrar = { ElevatedCleanupTracker.quarantineUnverified(it) }
+            ElevatedCleanupTracker.clearRegistrationFailedStickyForTest()
+            pollOutstandingTo(0)
+            pollActiveTo(0)
+            ElevatedCleanupTracker.clearUnverified()
+            ElevatedCleanupTracker.noteClean()
+            awaitNoElevatedThreads()
+        }
+    }
+
+    /**
+     * (b4.6) compensateInline acquire-throw＋second-chance registrar 拋 ⇒ sticky brick 的
+     * F4 pin（harness 同 (b4)；`forceAcquireSlotOrQuarantineThrow` 注入＋registrar 拋，
+     * finally 還原兩者＋clear sticky）：caller 先過期（deadline 先行，interrupt 無效、
+     * grace 後 lingering 記 1 槽），worker 放行後 publish→CAS 認領→`compensateInline`
+     * ⇒ acquire 一律拋 ⇒ 首嘗 `noteQuarantineRegistrationFailed`＋`noteKillNeverAttempted`；
+     * second-chance 登記亦拋 ⇒ 再計一次＋ sticky brick、`lateIncomplete=true`；
+     * 補償不佔槽（acquire 拋）⇒ killer 不執行、lingering 槽由 worker finally 恰好釋放；
+     * quarantine 不增（雙登記皆拋）、`releaseFloorHits()` 不動。Res.Expired(hasLinger=true)
+     * 為 lateIncomplete 的等價 verdict（caller 端 lingering=true 先行成立，兩路徑不區分）。
+     */
+    @Test fun compensateInlineAcquireThrowWithSecondChanceFailureBricksAdmission() {
+        fun awaitUninterruptibly(latch: CountDownLatch) {
+            while (true) {
+                try {
+                    latch.await()
+                    break
+                } catch (_: InterruptedException) {
+                    // 吞中斷模擬不可中斷阻塞。
+                }
+            }
+        }
+        val before = ElevatedCleanupTracker.quarantineRegistrationFailedCount()
+        val quarantineBefore = ElevatedCleanupTracker.quarantinedCount()
+        val killNeverBefore = ElevatedCleanupTracker.killNeverAttemptedCount()
+        val spawnEntered = CountDownLatch(1)
+        val spawnRelease = CountDownLatch(1)
+        val kills = AtomicInteger(0)
+        ElevatedCleanupTracker.forceAcquireSlotOrQuarantineThrow = true
+        ElevatedProcessIo.quarantineRegistrar = {
+            throw OutOfMemoryError("simulated OOM in quarantine registrar (test seam)")
+        }
+        val res = ElevatedCallSupervisor.awaitSpawn(
+            deadlineNanos = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(100L),
+            isCancelled = { false },
+            killer = {
+                kills.incrementAndGet()
+                throw OutOfMemoryError("inline killer oom")
+            },
+        ) {
+            spawnEntered.countDown()
+            awaitUninterruptibly(spawnRelease)
+            LatchBlockedDestroyProcess(CountDownLatch(0))
+        }
+        try {
+            assertTrue(spawnEntered.await(10, TimeUnit.SECONDS))
+            assertTrue("expected Expired, got $res", res is ElevatedCallSupervisor.Res.Expired)
+            // caller 過期返回當下：lingering 槽已記（deadline 先行逾期）。
+            spawnRelease.countDown()
+            // barrier：worker publish→CAS 認領→compensateInline（acquire 一律拋）→收斂。
+            pollTrue("inline compensation must brick admission after double registration failure") {
+                ElevatedCleanupTracker.isRegistrationFailedSticky()
+            }
+            assertEquals(
+                ElevatedCleanupTracker.Admission.REGISTRATION_FAILED,
+                ElevatedCleanupTracker.tryEnterReserved(),
+            )
+            assertEquals(0, ElevatedCleanupTracker.activeCalls())
+            // lingering 槽由 worker finally 恰好釋放（補償不佔槽，acquire 拋）。
+            pollOutstandingTo(0)
+            // acquire 拋於 killer 之前 ⇒ killer 不執行、quarantine 不增（雙登記皆拋）。
+            assertEquals(0, kills.get())
+            assertEquals(quarantineBefore, ElevatedCleanupTracker.quarantinedCount())
+            // 首嘗＋second-chance，至多 2 次失敗計數（此臂無 helper 重試）。
+            assertEquals(before + 2, ElevatedCleanupTracker.quarantineRegistrationFailedCount())
+            assertEquals(killNeverBefore + 1, ElevatedCleanupTracker.killNeverAttemptedCount())
+            assertEquals(floorBefore, ElevatedCleanupTracker.releaseFloorHits())
+        } finally {
+            spawnRelease.countDown()
+            ElevatedCleanupTracker.forceAcquireSlotOrQuarantineThrow = false
+            ElevatedProcessIo.quarantineRegistrar = { ElevatedCleanupTracker.quarantineUnverified(it) }
+            ElevatedCleanupTracker.clearRegistrationFailedStickyForTest()
             pollOutstandingTo(0)
             pollActiveTo(0)
             ElevatedCleanupTracker.clearUnverified()

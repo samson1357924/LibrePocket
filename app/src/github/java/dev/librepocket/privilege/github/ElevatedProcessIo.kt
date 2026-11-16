@@ -290,9 +290,10 @@ internal object ElevatedCleanupTracker {
      * slot 常數 7 語義保持，quarantine 不佔槽、不計 consecutive）。
      *
      * Round-6（#136-B2 IR-P2 / D-B3 / D-A10）：新增 [REGISTRATION_FAILED]——
-     * 登記雙失敗（acquire 拋臂第二次登記／helper 登記重試／catch-all 臂登記）皆
-     * 失敗（VME 極角），handle 無槽且無登記，任何後續信號皆不安全：admission
-     * 永久密封（app 重啟恢復；#136-B3 必接 alert＋runbook）。
+     * 登記失敗且未能定位追蹤的 arms 置位——acquire-throw 臂（second-chance 亦拋）／
+     * helper 無槽且 quarantine 無登記臂／catch-all 臂（無狀態可知，無條件冗餘密封 D-D10）；
+     * slot 保留或 handle 已入 quarantine 者（gate 7 承載）不置位；handle 無槽且無登記，
+     * 任何後續信號皆不安全：admission 永久密封（app 重啟恢復；#136-B3 必接 alert＋runbook）。
      */
     enum class Admission {
         OK,
@@ -338,7 +339,7 @@ internal object ElevatedCleanupTracker {
      * Round-6（#136-B2 IR-P1）：sweep 不再是最後密封——sweep 驗證死亡只解除
      * quarantine 的 `waitFor(0)==true` 條目；無槽 lingering worker 債務
      * `lingerDebt>0` 時 admission 仍拒（見 [classifyAdmissionLocked] gate 6，
-     * end 入口三處：(i) markLingering 飽和臂 → 四態 finally 的 3 臂；(ii) cleanup worker cell-finally 之 acquired==false 臂（0→2）;(iii) 起線程失敗臂的 catch 經 cell 互斥收斂（前提：startThread「拋即未起」契約）。exactly-once 由同一 cell/state 鎖保證）。
+     * end 入口三處：(i) markLingering 飽和臂 → 四態 finally 的 3 臂；(ii) cleanup worker cell-finally 之 acquired==false 臂（0→2）;(iii) 起線程失敗臂的 catch 經 cell 互斥收斂（D-A5 claim 協議：worker 未認領才由 catch 臂收斂）。exactly-once 由同一 cell/state 鎖保證）。
      * 本 seal 與 Stage 3c verify-stall seal 同政策：#136-B3 落地前無 operator 可見性（不接 verdict、不接 prod telemetry）;B3 必接 alert＋runbook（重啟）；late-spawn daemon stall 同樣永久密封 outstanding≥1 且不計 cleanupWorkerStalledAfterVerify（該數僅覆蓋 runCleanupBounded）；#136-B3 runbook 須列舉此臂。
      */
     private val quarantine = ArrayList<Process>()
@@ -516,7 +517,7 @@ internal object ElevatedCleanupTracker {
      * - `beginLingerDebt()`：worker 起動前/拒絕當下記一筆；
      * - `endLingerDebt()`入口三處：(i) markLingering 飽和臂 → 四態 finally 的 3 臂；
      *   (ii) cleanup worker cell-finally 之 acquired==false 臂（0→2）;
-     *   (iii) 起線程失敗臂的 catch 經 cell 互斥收斂（前提：startThread「拋即未起」契約）；
+     *   (iii) 起線程失敗臂的 catch 經 cell 互斥收斂（D-A5 claim 協議：worker 未認領才由 catch 臂收斂）；
      *   exactly-once 由同一 cell/state 鎖保證；
      * - 准入：`tryEnterReserved`/`classifyAdmissionLocked` 見 `lingerDebt>0` 即
      *   拒絕（復用 BACKLOG_FULL；不新增 Admission enum，runners 訊息不變）；
@@ -574,11 +575,12 @@ internal object ElevatedCleanupTracker {
         quarantineRegistrationFailed.incrementAndGet()
     }
 
-    /** Round-6（#136-B2 IR-P2／D-B3／D-A10）登記雙失敗 brick：handle 無槽且 quarantine 雙登記皆抛（VME 極角）。
+    /** Round-6（#136-B2 IR-P2／D-B3／D-A10）登記 brick：登記失敗且未能定位追蹤的
+     *  arms 置位——acquire-throw 臂（second-chance 亦拋）／helper 無槽且 quarantine 無登記臂／
+     *  catch-all 臂（無狀態可知，無條件冗餘密封 D-D10）；slot 保留或 handle 已入 quarantine 者
+     *  （gate 7 承載）不置位。
      *  設立後 admission 永久拒絕（app 重啟方能解除；#136-B3 必接 alert＋runbook）。
-     *  單向（true→true），無產品清除路徑；僅測試隔離可經 [clearRegistrationFailedStickyForTest] 歸零。
-     *  brick 條件＝「無槽（acquire 拋／已失 slot custody）且登記失敗」；飽和無槽／起線程失敗等
-     *  「有追蹤」臂（slot 保留或登記成功）一律不置位。 */
+     *  單向（true→true），無產品清除路徑；僅測試隔離可經 [clearRegistrationFailedStickyForTest] 歸零。 */
     private val registrationFailedSticky = AtomicBoolean(false)
 
     /** 置位 sticky（登記雙失敗臂專用；冪等）。 */
@@ -744,6 +746,13 @@ internal object ElevatedCleanupTracker {
     /** quarantine 登記數快照（僅測試／診斷用）。 */
     @VisibleForTesting
     internal fun quarantinedCount(): Int = synchronized(lock) { quarantine.size }
+
+    /**
+     * handle 是否已登記於 quarantine（`===` 身分掃描；空集即 false）。
+     * 產品 helper（`releaseCleanupSlotAfterVerify`）讀取以區分「零追蹤」與「已登記」；
+     * 非 @VisibleForTesting（prod-read 成員，內部可見性即足）。
+     */
+    internal fun quarantineContains(process: Process): Boolean = synchronized(lock) { quarantine.any { it === process } }
 
     /**
      * Round-4 Phase M sweep 內層單條 join 上界（產品常數；呼叫側 join 本值，
@@ -918,8 +927,21 @@ internal object ElevatedCleanupTracker {
             lastSweepStartNanos = now
             snapshot = filtered
         }
+        // D-A5（Round-6 P2，boundary ownership）：sweep daemon 入口認領旗——
+        // worker 體首句 CAS 置位；catch 臂亦以同一 CAS 仲裁。
+        // 慣例說明（避免閱讀歧義）：CAS 成＝「本 caller 贏得認領」（對方尚未入體）；
+        // 故 catch 臂必須用 `!compareAndSet` 判「worker 已搶先」。worker 已贏 ⇒ 不還原
+        // prev／不清 lease（worker finally 釋放，exactly-once）；本臂贏 ⇒ worker 醒後
+        // 首句 CAS 必敗、直接退出（不跑 sweepEntries；lease 由本臂 rollback 的
+        // finally 釋放、gate 6 不提前 bypass）。兩臂互斥於同一 CAS，恰好一次收斂。
+        val sweepClaim = AtomicBoolean(false)
         try {
             val worker = Thread({
+                if (!sweepClaim.compareAndSet(false, true)) {
+                    // catch 臂已贏（daemon 未起）——本輪什麼都不做、直接退出
+                    // （不跑 sweepEntries、不碰 lease，恰好一次由 catch 臂 rollback 釋放）。
+                    return@Thread
+                }
                 try {
                     sweepEntries(snapshot, nowNanos)
                 } catch (_: Throwable) {
@@ -931,6 +953,15 @@ internal object ElevatedCleanupTracker {
             worker.isDaemon = true
             startThread(worker)
         } catch (_: Throwable) {
+            // D-A5（Round-6 P2）：starter 拋不再無條件復原 prev／清 lease。
+            // 歧義與收斂（見上 [sweepClaim] 註解）：本臂 CAS 敗 ⇒ worker 已起（或排程中）
+            // ⇒ daemon 可能在跑——不還原 [hasLastSweepStart]／[lastSweepStartNanos]、
+            // 不清 [sweepLease]（worker finally 釋放，exactly-once）；本臂 CAS 成 ⇒
+            // daemon 未入體 ⇒ 維持今日 exact rollback（lock 內 generation 檢查後還原
+            // prev、finally 清 lease）；兩臂皆回 false（本次 kick 失敗，quarantine 保持）。
+            if (!sweepClaim.compareAndSet(false, true)) {
+                return false
+            }
             synchronized(lock) {
                 try {
                     if (sweepGeneration == claimedGeneration) {
@@ -1177,7 +1208,7 @@ internal object ElevatedCleanupTracker {
      * 5. `outstanding + (active+1) * SLOTS_PER_CALL > MAX` → [Admission.BACKLOG_FULL]
      *   （預留超額，視為 backlog 壓力）；
      * 6. `lingerDebt > 0` → [Admission.BACKLOG_FULL]（Round-6 IR-P1，無槽 lingering
-     *   worker 債務門；多門同成立時 BACKLOG_FULL 訊息不變；end 入口三處：(i) markLingering 飽和臂 → 四態 finally 的 3 臂；(ii) cleanup worker cell-finally 之 acquired==false 臂（0→2）;(iii) 起線程失敗臂的 catch 經 cell 互斥收斂（前提：startThread「拋即未起」契約）。exactly-once 由同一 cell/state 鎖保證，
+     *   worker 債務門；多門同成立時 BACKLOG_FULL 訊息不變；end 入口三處：(i) markLingering 飽和臂 → 四態 finally 的 3 臂；(ii) cleanup worker cell-finally 之 acquired==false 臂（0→2）;(iii) 起線程失敗臂的 catch 經 cell 互斥收斂（D-A5 claim 協議：worker 未認領才由 catch 臂收斂）。exactly-once 由同一 cell/state 鎖保證，
      *   見 [classifyAdmissionLocked]／`ElevatedCleanupTracker.beginLingerDebt`）；
      * 7. `quarantine 非空` → [Admission.QUARANTINE]（Round-3 Phase E 末門，
      *   見 [quarantine]；不與 backlog／breaker 混碼）；
@@ -2107,6 +2138,14 @@ internal object ElevatedCallSupervisor {
         val expired = AtomicBoolean(false)
         val holder = AtomicReference<Any?>()
         val state = AtomicInteger(0)
+        // D-A5（Round-6 P2，boundary ownership）：spawn worker 入口認領旗。
+        // worker 體首句 CAS 置位；catch 臂亦以同一 CAS 仲裁「worker 是否已入體」：
+        // worker 贏（CAS 敗）⇒ 回 Expired(hasLinger = true)（誠實的 pending-live-child 訊號：
+        // worker 可能晚到發佈 live Process，無人 kill/quarantine，但 cleanupIncomplete 旗標
+        // 會帶入终審）；catch 贏（CAS 成）⇒ worker 醒後首句 CAS 必敗、直接退出
+        // （不跑 block()、不發佈——caller 已過期返回，亦無 holder），hasLinger = false
+        // （與舊行為 byte-for-byte 一致，零 live child）。兩臂互斥於同一 CAS，恰好一次。
+        val spawnClaimed = AtomicBoolean(false)
         // R2-PhaseB（P1-2 late 缺口）：worker 內聯補償結果回傳旗標。
         // worker 認領並補償後若未驗證（no-op kill／waitFor=false／verify=false／
         // 無槽／daemon 起失敗），置 true，caller expireWorker 即使見 holder==null
@@ -2229,6 +2268,13 @@ internal object ElevatedCallSupervisor {
         }
         val worker = try {
             Thread({
+                // D-A5（Round-6 P2）：worker 入口先認領——與 catch 臂的 CAS 仲裁互斥。
+                // catch 臂已贏（CAS 敗）⇒ worker 直接退出：不跑 block()（不建立 live
+                // child）、不 publish（holder 永不收到 Val）、不置 state、不 return any
+                // handoff——caller 已以 Expired(hasLinger = false) 返回，雙方殘局一致。
+                if (!spawnClaimed.compareAndSet(false, true)) {
+                    return@Thread
+                }
                 try {
                     val p = block()
                     val published: Any = Val(p)
@@ -2307,7 +2353,26 @@ internal object ElevatedCallSupervisor {
                 startThread(it)
             }
         } catch (_: Throwable) {
-            return Res.Expired(hasLinger = false)
+            // D-A5（Round-6 P2）：起線程失敗不再無條件回 Expired(hasLinger = false)。
+            // CAS 仲裁（與 worker 入口同一 spawnClaimed 旗）：
+            // - 本臂贏得（CAS 成）⇒ worker 從未入體（或早已排程醒來亦退出於上方首句
+            //   CAS 敗）⇒ 無 live child、holder 永不被寫 ⇒ hasLinger = false
+            //   （與舊行為 byte-for-byte 一致）；
+            // - worker 贏（CAS 敗）⇒ honest pending-live-child 訊號：worker 可能正阻塞於
+            //   block()（如 Binder stall 的 spawn），晚到發佈的 Process 無人 kill／
+            //   quarantine——回 Expired(hasLinger = true)，讓 runner 把此 call 計入
+            //   cleanupIncomplete（fail toward linger）。
+            // 已接受的殘留競態（誠實記錄；threat model 與 D-A5 不變）：本臂 CAS 成立
+            // 只能證明 worker「尚未入體」，不能證明 child 必不存在——已起 OS 但尚未
+            // 被排程的 worker 醒後於上方首句 CAS 敗、退出於 block() 之前
+            // （claim-lost ⇒ 無 block、無 publish、無 live child），hasLinger = false
+            // 與此極角一致；本臂與舊 catch-all 一致不嘗試任何外部 IPC（handle 若已
+            // 存在，其 seal 無人承載——cleanupIncomplete 穿透至 verdict（TimedOut(cleanupIncomplete=true)）；
+            // admission 不封、breaker 不計——B3 決策（是否 expired.set(true) 令 worker 自補償））。
+            if (spawnClaimed.compareAndSet(false, true)) {
+                return Res.Expired(hasLinger = false)
+            }
+            return Res.Expired(hasLinger = true)
         }
         // R3-PhaseF P2-1：慢輪詢 hook 觀察者（惰性：首片後 block 仍存活才啟動；
         // 快路徑零 hook 求值）。caller 只看自身中斷＋deadline＋緩存 bit，
@@ -3997,10 +4062,14 @@ internal object ElevatedProcessIo {
         val registered = try { quarantineRegistrar(process); true } catch (_: Throwable) { false }
         if (registered) { if (slotHeld) ElevatedCleanupTracker.releaseSlot() } else {
             ElevatedCleanupTracker.noteQuarantineRegistrationFailed()
-            if (!slotHeld) ElevatedCleanupTracker.noteRegistrationFailedSticky()
+            // membership 判定須 fail-closed：quarantineContains 拋（如 VME）即無法證明 handle 已追蹤
+            // ⇒ 視為非成員 ⇒ brick（brick ⇔ 不可驗證，而非 ⇔ 已證零追蹤）。
+            val tracked = runCatching { ElevatedCleanupTracker.quarantineContains(process) }.getOrDefault(false)
+            if (!slotHeld && !tracked) ElevatedCleanupTracker.noteRegistrationFailedSticky()
         }
-        // !slotHeld && !registered：acquire 期 OOM 且登記再失敗，仍無任何追蹤；breaker＋診斷可見；#136-B3 恢復待辦
-        // Round-6（#136-B2 IR-P2）：零追蹤 ⇒ brick admission（REGISTRATION_FAILED，app 重啟恢復）。
+        // Round-6（#136-B2 IR-P2）：零追蹤 ⇒ brick；已 quarantine 登記者（acquireSlotOrQuarantine 同鎖登記／
+        // 先前 dedup no-op）由 gate 7 密封，不置 brick；slotHeld 者槽保留。
+        // harness remark: helper 不能區分『acquire-time 登記』與『helper 首次登記』，故以 membership 判定。
         // slotHeld==true 者槽保留、admission 以 BACKLOG_FULL 續拒（仍有追蹤），不置 brick。
     }
 
@@ -4057,20 +4126,40 @@ internal object ElevatedProcessIo {
      *   本 PR 未實作**，不得據此誤讀為已接線。
      * 飽和（未佔槽）路徑 `slotHeldOut` 保持 false（呼叫方零釋放義務）。
      * 起線程失敗 arm（`start()` 抛）：登記成功當下即釋放已佔槽並置
-     * `slotHeldOut=false`（呼叫方不重複釋放）；登記拋出（罕見，如 OOM）時槽**保留**
-     * （fail-closed，admission 續拒）、`slotHeldOut=true`（已佔槽時），交給呼叫方
-     * verify 臂以 `releaseCleanupSlotAfterVerify` 冪等重試登記後釋放。
+     * `slotHeldOut=false`（呼叫方不重複釋放）；登記拋出（罕見，如 OOM）時（已佔槽）槽**保留**
+     * （fail-closed，admission 續拒）、`slotHeldOut=true`，交給呼叫方
+     * verify 臂以 `releaseCleanupSlotAfterVerify` 冪等重試登記後釋放；
+     * 登記拋出且未佔槽 ⇒ handle 已於 acquireSlotOrQuarantine 同鎖登記（gate 7 密封），catch 臂
+     * 二次登記僅 `===`-dedup 冪等，失敗僅計遙測，不置 brick（brick 保留給零追蹤臂）。
      *
-     * P1-4 `start()` 抛收斂：`Thread.start()` 抛（`IllegalThreadState`／
-     * `SecurityException` 等）即先無條件登記 quarantine（恰好一次計數以「startThread
-     * 拋即未起」契約為前提——自訂 starter 已起執行緒後再拋之極角下，debt 可於仍阻塞的
-     * worker 退出前提前收斂，該極角之 fail-closed backstop 為 gate 7（本臂 quarantine
-     * 登記）而非 linger debt；見 catch 臂註解。即使進程稍後驗證為亡；
+     * P1-4 `start()` 抛收斂（D-A5，Round-6 P2）：`Thread.start()` 抛（`IllegalThreadState`／
+     * `SecurityException` 等）即先登記 quarantine（登記嚴格先於債務收斂／釋槽——
+     * quarantine-first，見下；即使進程稍後驗證為亡；
      * 解除密封專屬 verify-only sweep，讀者不得從「已登記」反推「驗證失敗」），
      * 登記僅由 verify-only sweep 解封（進程自然死亡後）; QUARANTINE 密封直至 sweep 成功。
-     * 登記成功即釋放已佔槽；登記拋出則槽保留並交呼叫方 verify 臂重試，
-     * [ElevatedCleanupTracker.noteQuarantineRegistrationFailed] 計數
-     * （fail-closed 記數，app 重啟前不可自清、應告警）。回 false（呼叫方置
+     * 恰好一次收斂改經 D-A5 claim 協議：[workerClaimed] 於 worker 入口同鎖置位——
+     * 本臂僅於「state==0 且 worker 未認領」收斂（0→2 ＋ endLingerDebt；無 worker
+     * 接管時本臂一次收掉）；worker 已認領則 state==0 保留、債務收斂權交 worker
+     * finally（0→2 ＋ endLingerDebt，恰好一次）——zombie worker 殘留期間 gate 6
+     * 續封 admission，不提早洩。兩臂亙斥於同鎖，恰好一次。
+     * 已接受殘留競態（誠實記錄）：starter `{ t.start(); throw }` 極角下，本臂可能在
+     * OS 執行緒已起、worker 尚未入體（workerClaimed 仍 false）時贏得認領競態——
+     * 本臂 0→2 並 endLingerDebt 後 worker 仍會執行 `block()`（kill 嘗試不 gated 於
+     * 任何狀態檢查），其 finally 見 state==2 即 no-op——debt 提早結束而 seal 由 gate 7
+     * 承載：!acquired 之飽和 handle 早於起 worker 即由 acquireSlotOrQuarantine 同鎖
+     * 原子登記（gate 7 自彼時密封；本臂登記成功＝ gate 7 亦封；本臂登記失敗（!acquired）
+     * 僅 `===`-dedup 冪等遙測——handle 無法被「取消登記」，gate 7 仍封，不置 brick；
+     * security LOW-1/LOW-2，brick 保留給零追蹤臂：acquire-throw／helper 無槽／
+     * catch-all）——任一皆 fail-closed，debt 提早結束不構成 admission fail-open；
+     * RELEASE 層正確性由既有三態狀態機保證（worker finally／本臂互斥於 state==0→2，
+     * exactly-once）。
+     * 登記成功即釋放已佔槽（registration 先於釋 slot，順序不變）；登記拋出則槽保留
+     * 並交呼叫方 verify 臂重試，[ElevatedCleanupTracker.noteQuarantineRegistrationFailed] 計數
+     * （fail-closed 記數，app 重啟前不可自清、應告警）。!acquired 且登記拋出＝
+     * handle 已於 acquireSlotOrQuarantine 同鎖登記（gate 7 密封），catch 臂二次登記僅
+     * `===`-dedup 冪等，失敗僅計遙測（`noteQuarantineRegistrationFailed`），不置 brick
+     * （security LOW-1/LOW-2；brick 保留給零追蹤臂：acquire-throw／helper 無槽／catch-all；
+     * 本臂首嘗＋second-chance 至多 2 次失敗計數）。回 false（呼叫方置
      * `cleanupIncomplete=true` 統一進終審），不抛穿透 drain（drain 全路徑有界
      * 返回契約：任何內部建線程失敗皆收斂為旗標，不把異常抛給呼叫方）。
      * Stage 2A（P1-A3）：起線程失敗即 [ElevatedCleanupTracker.noteKillNeverAttempted]，
@@ -4099,8 +4188,9 @@ internal object ElevatedProcessIo {
      * 呼叫方零釋放義務（[slotHeldOut] 保持 false；僅已佔槽才有釋放責任，
      * 見 `releaseSlot` floor 語義）。Round-6 IR-P1：飽和臂另於起 worker 前
      * [ElevatedCleanupTracker.beginLingerDebt] 記一筆無槽 lingering 債務，由 worker
-     * 本體 finally 恰好歸零一次（起線程失敗臂由 catch 臂經 cell 收斂，與 worker
-     * finally 互斥、恰好一次）。
+     * 本體 finally 恰好歸零一次（起線程失敗臂由 catch 臂經 D-A5 claim 協議與 worker
+     * finally 亙斥收斂——僅 worker 未認領時由 catch 臂收斂、已認領時歸 worker finally、
+     * 恰好一次；見上段）。
      * Stage 2A（P1-A2）：飽和起 worker 未佔槽＝untracked `elevated-cleanup`
      * worker（worker 本身不受准入阻擋、不佔槽；若其永久卡住即無界 untracked；
      * handle 已隨飽和登記 quarantine，見 M1 段）：
@@ -4135,7 +4225,8 @@ internal object ElevatedProcessIo {
      *   app 重啟，admission 續拒 fail-closed）。
      * @param startThread Stage 2A（P1-A3）可注入的線程啟動方式（測試注入用）：
      *   drain 層的 `startThread` seam 一併穿入，使 elevated-cleanup 起線程失敗
-     *   可注入（「抛即未起」契約同 drain 其他執行緒；預設 `{ it.start() }`）。
+     *   可注入（D-A5 claim 協議同 `startLateDaemon`：starter 已起 OS 線程後再拋之極角，
+     *    由 worker 入口認領旗仲裁收斂；「抛即未起」不再為無條件前提；預設 `{ it.start() }`）。
      * @param slotHeldOut Stage 3b／3c 必傳 out：本次呼叫若取得並持有清理槽
      *   （acquire 成功且走正常返回路徑——無 stall custody 轉移——，或起線程失敗臂登記拋出）
      *   即置 true；此旗標僅於正常返回／no-stall-transfer 點置位；
@@ -4175,6 +4266,11 @@ internal object ElevatedProcessIo {
         // 提前於 slot 取得前建立（Stage 1 review）：線程體／post-grace 轉移段始終
         // 引用同一 cell，且 slot 取得與 try 之間不存在可令 custody 歧義的語句。
         val cleanupSlotState = AtomicInteger(0)
+        // D-A5（Round-6 P2，boundary ownership 同 startLateDaemon 之 daemonClaimed）：
+        // worker 入口認領旗——與 [cleanupSlotState] 同鎖（synchronized）線性化；
+        // 起線程失敗臂據此判定「worker 是否可能已接管」，worker 已認領即把債務收斂權
+        // 交給 worker finally；未認領（catch 臂贏得競態）才由 catch 臂 0→2＋endLingerDebt。
+        val workerClaimed = AtomicBoolean(false)
         // 入口拒絕由兩 runner 資源門承擔，此處不拒絕 killer 嘗試，只記賬；
         // 無槽（acquireSlotOrQuarantine 回 false）仍嘗試，但回 false 保守記不完整
         // （見本函數 P1-4 段）。
@@ -4218,6 +4314,13 @@ internal object ElevatedProcessIo {
         if (!acquired) ElevatedCleanupTracker.beginLingerDebt()
         val t = try {
             Thread({
+                // D-A5（Round-6 P2）：worker 入口於同一鎖內認領——與 catch 臂的
+                // 缺省收斂判斷互斥（線性化點＝synchronized(cleanupSlotState)）。
+                // 認領成立即代表 worker 可能已起；worker 存在的當下 kill 嘗試必須發生
+                // （block() 不 gated 於任何狀態檢查）；債務收斂權移交本體 finally。
+                synchronized(cleanupSlotState) {
+                    workerClaimed.set(true)
+                }
                 try {
                     block()
                 } catch (_: Throwable) {
@@ -4249,34 +4352,35 @@ internal object ElevatedProcessIo {
                 startThread(it)
             }
         } catch (_: Throwable) {
-            // Stage 1（IR-P1）：起線程失敗＝交給 cell 收斂（worker finally 與此互斥，恰好一次）。
-            // 恰好一次計數以「startThread 拋即未起」契約為前提（production 預設
-            // `{ it.start() }`）：自訂 starter 若已起動 OS 執行緒後再拋（或 JVM
-            // OOME-inside-start 競態），本臂可能在仍阻塞的 worker 退出前先收斂債務
-            // （debt 生命週期被縮短）——該極角下 fail-closed backstop 是 gate 7
-            // （本 arm 內 quarantine 登記），而非 linger debt 本身。
+            // Stage 1（IR-P1）：起線程失敗＝登記先行收斂。
+            // D-A5（Round-6 P2，boundary ownership，同 [startLateDaemon] 之 daemonClaimed）：
+            // 「startThread 拋即未起」不再為無條件成立——自訂 starter 可已起 OS 執行緒後
+            // 再拋（或 `{ t.start(); throw OutOfMemoryError() }`；production 預設
+            // `{ it.start() }` 無此 artifact）。本臂以 [workerClaimed]（與三態同鎖）
+            // 仲裁債務收斂：worker 已認領 ⇒ 本臂保留 state==0、完全不動債務，收斂權
+            // 交 worker finally；worker 未認領（本臂贏得競態）⇒ 本臂 0→2 ＋
+            // endLingerDebt，與 worker finally 亙斥於同鎖，恰好一次。
             // 刻意不加 waitFor(0) 守衛（Binder 0ms waitFor 可能 stall 有界臂）。
-            if (!acquired) {
-                val debtEnded = synchronized(cleanupSlotState) {
-                    if (cleanupSlotState.get() == 0) {
-                        cleanupSlotState.set(2)
-                        true
-                    } else {
-                        false
-                    }
-                }
-                if (debtEnded) ElevatedCleanupTracker.endLingerDebt()
-            }
+            //
+            // (1) 登記先行（F1 ordering）：quarantine 登記嚴格先於任何債務收斂／釋槽——
+            // 「被 kill 前先密封 admission」之 fail-closed 順序，堵住 registered-but-no-
+            // transition 的 admission fail-open 窗口（本臂內無並發窗口，登記與收斂／
+            // 釋槽皆在同一次同步呼叫串內，順序即由程式序決定）：
+            // - 登記成功 ⇒ 與先前一致的釋放語義（已佔槽即 releaseSlot、slotHeldOut=false、
+            //   admission 自此以 gate 7 密封，直到 verify-only sweep 驗證自然死亡）；
+            // - 登記失敗且已佔槽 ⇒ 槽保留（admission 以 reservation 門續拒）＋交 caller
+            //   verify 臂重試登記（冪等），既有語義不變（不置 sticky；
+            //   [noteQuarantineRegistrationFailed] 計數，slotHeld=true 之 helper 不置磚）；
+            // - 登記失敗且未佔槽 ⇒ 槽無可保留（`!acquired` 飽和分支——飽和回 false
+            //   代表 acquisition-time 已於 acquireSlotOrQuarantine 同鎖登記
+            //   quarantine 成功，gate 7 自彼時密封；VME 於 acquire 內拋則改進
+            //   acquire-throw 臂 brick，不達本臂）；catch 臂二次登記僅 `===`-dedup
+            //   冪等，失敗僅計遙測（`noteQuarantineRegistrationFailed`），不置 brick
+            //   （brick 保留給零追蹤臂：acquire-throw／helper 無槽／catch-all）。
             // 不變量：quarantine 一律先於 slot 釋放——`quarantineUnverified` 與 `releaseSlot`
             // 為兩次依序取 [ElevatedCleanupTracker.lock] 的 synchronized 區塊（非同一鎖之原子段）；
             // 中間態（已登記 quarantine、尚未遞減 outstanding）fail-closed 安全：此時 admission 見
             // quarantine 非空即 QUARANTINE 拒，無 admitted 觀察者可旁觀 quarantine.isEmpty() 的窗口。
-            // Stage 2A（P1）：worker 從未起動＝killer 從未信號、handle 可能仍存活且無人追蹤——
-            // 此 arm 無條件登記 quarantine（即使進程稍後驗證為亡）；登記僅由 verify-only sweep 解封
-            // （進程自然死亡後），解除密封專屬 verify-only sweep，讀者不得從「已登記」反推「驗證失敗」。
-            // 飽和臂已由 acquireSlotOrQuarantine 同鎖登記，`===` 去重冪等；此處無條件登記涵蓋
-            // acquired==true 分支；登記成功即先釋槽，mission-critical fail-closed，admission 自此密封直至
-            // verify-only sweep 證死。
             val registered = try { quarantineRegistrar(process); true } catch (_: Throwable) { false }
             if (registered) {
                 if (acquired) ElevatedCleanupTracker.releaseSlot()
@@ -4285,17 +4389,68 @@ internal object ElevatedProcessIo {
                 // fail-closed: 登記失敗＝槽保留且交給 caller verify 臂重試登記（冪等）
                 slotHeldOut.set(acquired)        // 讓 caller verify 臂在登記成功後釋放
                 ElevatedCleanupTracker.noteQuarantineRegistrationFailed()
+                // Round-6 P2（security LOW-1/LOW-2）：!acquired 臂【不】置 sticky brick——
+                // !acquired 代表 acquireSlotOrQuarantine 已於【其自身 lock 內】原子
+                // 登記 process 入 quarantine 後才回 false（飽和 ⇒ gate 7 自彼時密封）；
+                // 本臂 registrar 呼叫僅為 `===`-dedup 的冪等重登（test seam／VME in
+                // dedup scan 可拋），拋出即無法「取消登記」——verified death 為唯一
+                // sweep 解除路徑，live child 的 seal 由 gate 7 承載、與 registrar 成敗
+                // 無關 ⇒ 本臂 handle 永非零追蹤，debt-free brick 契約（brick ⇔ 零追蹤：
+                // acquire-throw 臂／helper 無槽臂／catch-all 臂）不適用。登記失敗僅計
+                // 遙測（`noteQuarantineRegistrationFailed`），sweep 恢復（gate 7 可離封），
+                // 不把 sweep-recoverable 狀態永久降級為 restart-only。
             }
-            // Stage 2A（P1-A3）：worker 從未起動＝killer 從未信號——獨立計數
+            // (2) 恰好一次債務收斂（D-A5 claim；[workerClaimed] 與三態同鎖線性化）：
+            //     - state==0 且 worker 未認領 ⇒ 本臂 0→2 ＋ endLingerDebt（無 worker
+            //       接管、debt 無人可收，本臂一次收掉；與 worker finally 恰好一次）；
+            //     - worker 已認領 ⇒ 保留 state==0、完全不動債務——worker 存在即 kill
+            //       嘗試必發（block() 不 gated），債務收斂權交 worker finally
+            //       （0→2 ＋ endLingerDebt，恰好一次；gate 6 密封新 spawn 直至彼時，
+            //       zombie worker 殘留不提早開 admission）；
+            //     - state!=0（worker finally 已跑／post-grace 已轉移）⇒ 不動（既有語義）。
+            //     已接受的殘留競態（誠實記錄）：starter `{ t.start(); throw }` 極角下，
+            //     本臂可能在 OS 執行緒已起、worker 尚未入體（workerClaimed 仍 false）
+            //     時贏得認領競態——本臂 0→2 並 endLingerDebt 後，worker 仍會執行
+            //     block()（kill 嘗試必發、不以任何狀態檢查 gated），其 finally
+            //     見 state==2（終態）即 no-op——債務於殘留 worker 退出前即結束。
+            //     此刻 admission 的密封由 quarantine／gate 7 承載而非 debt（!acquired 之
+            //     飽和 handle 早於起 worker 即由 acquireSlotOrQuarantine 同鎖原子登記、
+            //     gate 7 自彼時密封；本臂登記成功＝ gate 7 亦封；本臂登記失敗（!acquired）
+            //     僅 `===`-dedup 冪等遙測——handle 無法被「取消登記」，gate 7 仍封，不置
+            //     brick（security LOW-1/LOW-2；brick 保留給零追蹤臂：acquire-throw／helper
+            //     無槽／catch-all））——任一皆 fail-closed，debt 提早結束不構成 admission
+            //     fail-open。兩臂在 RELEASE 層仍由既有三態狀態機保證 exactly-once
+            //     （worker finally／本臂互斥於 state==0→2，飽和未佔槽本無 release、
+            //     佔槽 release 由 caller 或 worker 恰好一次）。
+            //     `acquired==true` 子例無 debt 可言（debt 僅 `!acquired` 記帳）；其 seal
+            //     由 outstanding 佔槽（reservation gate 5）承載，與「已佔槽永不釋放」的
+            //     caller-leg 語義一致——registrar 失敗時槽同經 helper 保留至 caller
+            //     verify 臂。
+            if (!acquired) {
+                val debtEnded = synchronized(cleanupSlotState) {
+                    if (cleanupSlotState.get() == 0 && !workerClaimed.get()) {
+                        cleanupSlotState.set(2)
+                        true
+                    } else {
+                        false
+                    }
+                }
+                if (debtEnded) ElevatedCleanupTracker.endLingerDebt()
+            }
+            // Stage 2A（P1-A3）：起線程失敗＝獨立計數 killNeverAttempted（與 quarantine
+            // release 語義分離；D-A5 註記：start-then-throw 極角下 worker 可能已認領並
+            // 阻塞於 killer（killer 可能已被信號），本計數按「此臂無法判定 killer 是否
+            // 被信號」之保守上界記帳——不替代 worker 側的完成度觀測，見上殘留競態段）。
             // （不佔 untracked 殘留：無 worker 即無殘留；不計 cleanupIncomplete 之外
             // 的新旗標，呼叫方既有 incomplete／breaker 語義不變）。
             // Stage 3（drain/verdict hardening，admitted residual surfacing）：Drained
-            // 歸因同置 `untrackedOut`（此臂無 worker／killer 未信號——quarantine 以無條件
-            // 登記另行涵蓋，登記拋出即計 count，caller verify 臂 helper 不論 slotHeld
-            // 皆再嘗試登記；登記拋出則槽經 caller verify 臂保留，admission 續拒
-            // fail-closed；handle 不入 quarantine，outstanding 追蹤持續——僅 acquire
-            // 拋臂在雙登記皆拋時方無任何追蹤接管；tracker `noteUntrackedResidual`
-            // 計數不變，與 kill-never-attempted 互斥語義不變）。
+            // 歸因同置 `untrackedOut`（此臂無 worker／killer 未信號——登記拋出即計 count，
+            // caller verify 臂 helper 不論 slotHeld 皆再嘗試登記；登記拋出則槽經 caller verify
+            // 臂保留，admission 續拒 fail-closed）：
+            // 起線程失敗臂登記拋出：handle 不入 quarantine，outstanding 追蹤持續（acquired==true）；
+            // 或 !acquired 時 handle 已於 acquireSlotOrQuarantine 同鎖登記 quarantine（gate 7 密封）、
+            // outstanding==0；僅 acquire 拋臂在雙登記皆拋時方無任何追蹤接管；
+            // tracker `noteUntrackedResidual` 計數不變，與 kill-never-attempted 互斥語義不變。
             ElevatedCleanupTracker.noteKillNeverAttempted()
             untrackedOut?.set(true)
             return false

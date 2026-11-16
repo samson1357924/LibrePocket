@@ -26,7 +26,10 @@ data class WebHttpResponse(
     val code: Int,
     val body: String,
     val headers: Map<String, String> = emptyMap(),
-)
+) {
+    /** 不含 body／headers 內容——避免 log 洩漏 key／回應資料；equals／hashCode／copy 不受影響。 */
+    override fun toString(): String = "WebHttpResponse(code=$code, bodyChars=${body.length}, headerCount=${headers.size})"
+}
 
 /** 單次 GET（SearXNG JSON／DDG HTML 皆為 GET；D4 的 extract 另行定義）。 */
 fun interface WebHttpGet {

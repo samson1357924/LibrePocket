@@ -16,8 +16,8 @@ class WebSearchRegistry(providers: List<WebSearchProvider>) {
     private val byId: Map<String, WebSearchProvider> = run {
         val seen = LinkedHashMap<String, WebSearchProvider>(ordered.size)
         for (p in ordered) {
-            require(p.id.isNotBlank() && '\u0001' !in p.id) { "INVALID_PROVIDER_ID:${p.id}" }
-            require(!seen.containsKey(p.id)) { "DUPLICATE_PROVIDER_ID:${p.id}" }
+            require(p.id.isNotBlank() && '\u0001' !in p.id) { "INVALID_PROVIDER_ID:len=${p.id.length}" }
+            require(!seen.containsKey(p.id)) { "DUPLICATE_PROVIDER_ID:len=${p.id.length}" }
             seen[p.id] = p
         }
         seen

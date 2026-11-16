@@ -115,6 +115,15 @@ object ShellExecutables {
         "/product",
         "/system_ext",
         "/apex",
+        // ubuntu-26.04：GNU→rust coreutils（uutils）。/bin、/usr/bin 下多數 coreutils 改為 symlink
+        // 至此 root-owned 755 的 real 落點（如 /usr/bin/id -> ../lib/cargo/bin/coreutils/id），
+        // 該檔與 /usr/bin/coreutils 共用同一 inode —— 115+ applet 共用一個以
+        // argv[0] basename 派發的 multicall 分派器。MULTICALL_BINARIES
+        //（toybox/toolbox/busybox）為 argv[1] 形，不含此形；插入 applet 反而會讓
+        // [real, "id"] 解析失敗（uutils 會把 "id" 當 username）。applet=null 為必要；
+        // 本項為新增一個受信任 real-prefix（ubuntu-26.04 uutils multicall dispatcher），
+        // 受 writability 閘保護，非僅文件、非放寬；表內全為系統分區 real 落點，不在表內一律 fail-closed。
+        "/usr/lib/cargo/bin/coreutils",
     )
 
     /** 直接通道固定 `PATH`（[TRUSTED_BIN_DIRS] 串接，不取宿主 `PATH`）。 */

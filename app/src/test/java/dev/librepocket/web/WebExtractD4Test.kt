@@ -2562,6 +2562,40 @@ class WebExtractD4Test {
         assertTrue("8192 邊界應通過 gate（expected Ok, got $ok）", ok is WebExtractOutcome.Ok)
     }
 
+    // B3 — 超限全空白字串：長度 gate 為 O(1)，先於 isBlank()（全掃 O(n)）生效（P3 #3）。
+    // 8193 個空白 → Unavailable(URL_TOO_LONG, denyCode=null)，resolver／upstream 皆零喚起；
+    // 8192 個空白 → length gate 放行、isBlank() 收場 → Unavailable(EMPTY_URL)（同樣零 upstream）。
+    @Test fun oversizedBlankUrlChecksLengthBeforeBlank() = runBlocking {
+        var resolverInvoked = false
+        val recordingDns = HostResolver { _ ->
+            resolverInvoked = true
+            listOf(addr("203.0.113.10"))
+        }
+        val http = FakeExtract { okResp(html()) }
+        val svc = WebExtractService(http)
+        // 8192 + 1 個空白：length gate 先於 isBlank()  fail-closed——不得退化為 EMPTY_URL，
+        // 亦不得先付 isBlank() 的 O(n) 掃描（超長全空白字串之攻擊面 / DoS 抑制）。
+        val oversizedBlank = " ".repeat(8193)
+        assertEquals(WebExtract.MAX_URL_CHARS + 1, oversizedBlank.length)
+        val out = svc.extract(oversizedBlank, resolver = recordingDns)
+        assertTrue("expected Unavailable, got $out", out is WebExtractOutcome.Unavailable)
+        val u = out as WebExtractOutcome.Unavailable
+        assertEquals(WebExtract.DETAIL_URL_TOO_LONG, u.detail)
+        assertEquals(null, u.denyCode)
+        assertFalse("resolver 絕不得被喚起（length gate 先於 policy／DNS）", resolverInvoked)
+        assertEquals(0, http.calls.get())
+        // 邊界 8192：length gate 放行 → isBlank() 收場（EMPTY_URL）
+        val atLimitBlank = " ".repeat(8192)
+        assertEquals(WebExtract.MAX_URL_CHARS, atLimitBlank.length)
+        val outLimit = svc.extract(atLimitBlank, resolver = recordingDns)
+        assertTrue("expected Unavailable, got $outLimit", outLimit is WebExtractOutcome.Unavailable)
+        val uLimit = outLimit as WebExtractOutcome.Unavailable
+        assertEquals(WebExtract.DETAIL_EMPTY_URL, uLimit.detail)
+        assertEquals(null, uLimit.denyCode)
+        assertFalse("resolver 絕不得被喚起（isBlank 亦先於 policy／DNS）", resolverInvoked)
+        assertEquals(0, http.calls.get())
+    }
+
     // R5 — stripScriptAndStyle Phase A rewrite 回填案例（findTagEnd==-1／全大寫候選）；L4 併案
     @Test fun stripScriptAndStyleRewriteBackfillsUnterminatedAndUppercase() {
         // (a) 未閉合引號屬性之 <script data-x="unterminated：findTagEnd == -1 且全文無 closeMark
@@ -2579,6 +2613,122 @@ class WebExtractD4Test {
         assertEquals("A", bare!!.content.snippet)
     }
 
+    // B2 — end-tag 恰閉合語義（stripScriptAndStyle Phase A [findEndTagClose]）：
+    // WHATWG end-tag 語法容許 tag-name 與 `>` 之間出現 ASCII 空白及單一可選 `/`
+    //（如 `</script >`、`</style\t/>`），大小寫不敏感；
+    // 不在此語法層之 end-tag（tag-name 邊界不符／重複 `/`／屬性／NBSP）一律不視為閉合
+    // → 剝至輸入結尾（fail-closed）。over-strip＝內容損失、絕非洩漏（fail-safe）；
+    // NBSP 等非 ASCII 空白不接受（WHATWG 空白限 ASCII）。
+    // 正規化：stripText 之空白收斂＋trim——`<p>` 之 tag 轉為單一空格後 collapse。
+    @Test fun stripScriptAndStyleWhitespaceAndSlashEndTags() {
+        // ---- 恰閉合之 script end-tag → 僅剝 script 元素本體 → snippet == "BEFORE AFTER" ----
+        val acceptedScriptEndTags = listOf(
+            "</script >",
+            "</script\t>",
+            "</script\n\r >",
+            "</SCRIPT \t >", // 大小寫混合（ASCII fold 後候選一致）＋WS
+            "</script/>",
+            "</script / >",
+            "</script   /   >",
+        )
+        for (endTag in acceptedScriptEndTags) {
+            val doc = "<p>BEFORE</p><script>var x=1;" + endTag + "<p>AFTER</p>"
+            val parsed = parseHtml(doc, "https://example.com/")
+            assertTrue("parseHtml 應成功，got null（endTag=[$endTag]）", parsed != null)
+            // 觀測之正規形：stripText 空白收斂＋trim → "BEFORE AFTER"
+            assertEquals(
+                "endTag=[$endTag] 恰閉合 → script 本體應被剝除，snippet 應為『BEFORE AFTER』",
+                "BEFORE AFTER",
+                parsed!!.content.snippet,
+            )
+            assertFalse(
+                "var x=1 絕不得出現（endTag=[$endTag]），got ${parsed.content.snippet}",
+                parsed.content.snippet.contains("var x=1"),
+            )
+        }
+        // ---- 恰閉合之 style end-tag（含 VT／FF 等 ASCII 空白）→ CSS 本體絕不得出現 ----
+        val acceptedStyleEndTags = listOf(
+            "</style \n\r >",
+            "</style\u000B>", // VT（vertical tab）：ASCII 空白 → 恰閉合
+            "</style\u000C>", // FF（form feed）：ASCII 空白 → 恰閉合
+            "</STYLE \t >", // 大小寫混合
+        )
+        for (endTag in acceptedStyleEndTags) {
+            val doc = "<p>BEFORE</p><style>.a{color:red}/*CSS_SECRET*/" + endTag + "<p>AFTER</p>"
+            val parsed = parseHtml(doc, "https://example.com/")
+            assertTrue("parseHtml 應成功，got null（endTag=[$endTag]）", parsed != null)
+            assertEquals(
+                "endTag=[$endTag] 恰閉合 → style 本體應被剝除，snippet 應為『BEFORE AFTER』",
+                "BEFORE AFTER",
+                parsed!!.content.snippet,
+            )
+            assertFalse(
+                "CSS_SECRET 絕不得出現（endTag=[$endTag]），got ${parsed.content.snippet}",
+                parsed.content.snippet.contains("CSS_SECRET"),
+            )
+        }
+        // ---- 被拒之 end-tag：邊界不符／重複 `/`／屬性／NBSP → 不視為閉合 → 剝至 EOF（fail-closed）----
+        // snippet 僅保留開始標籤之前之內容（"BEFORE"）；AFTER 與 JS 本體皆不得出現。
+        val rejectedScriptEndTags = listOf(
+            "</scripts>", // tag-name 邊界不符（'s' 非邊界）
+            "</scriptx>", // tag-name 邊界不符（'x' 非邊界）
+            "</script//>", // 重複 `/`（WHATWG 僅容許單一可選 `/`）
+            "</script x>", // end-tag 上出現屬性
+            "</script\u00A0>", // NBSP 非 ASCII 空白 → 邊界不符
+        )
+        for (endTag in rejectedScriptEndTags) {
+            val doc = "<p>BEFORE</p><script>var x=1;" + endTag + "<p>AFTER</p>"
+            val parsed = parseHtml(doc, "https://example.com/")
+            assertTrue("parseHtml 應成功，got null（endTag=[$endTag]）", parsed != null)
+            assertEquals(
+                "endTag=[$endTag] 不視為閉合 → 剝至 EOF，snippet 應僅剩『BEFORE』",
+                "BEFORE",
+                parsed!!.content.snippet,
+            )
+            assertFalse(
+                "var x=1 絕不得出現（endTag=[$endTag]），got ${parsed.content.snippet}",
+                parsed.content.snippet.contains("var x=1"),
+            )
+            assertFalse(
+                "AFTER 絕不得出現（endTag=[$endTag]，剝至 EOF），got ${parsed.content.snippet}",
+                parsed.content.snippet.contains("AFTER"),
+            )
+        }
+        // ---- 殘缺 end-tag 於輸入結尾（無 `>`）→ 不構成閉合 → 剝至 EOF ----
+        val truncatedEndTags = listOf(
+            "</script   ", // 尾隨空白後即 EOF（無 `>`）
+            "</script//", // 重複 `/` 後即 EOF（無 `>`）
+        )
+        for (endTag in truncatedEndTags) {
+            val doc = "<p>BEFORE</p><script>var x=1;" + endTag
+            val parsed = parseHtml(doc, "https://example.com/")
+            assertTrue("parseHtml 應成功，got null（endTag=[$endTag]）", parsed != null)
+            assertEquals(
+                "endTag=[$endTag] 殘缺無 `>` → 剝至 EOF，snippet 應僅剩『BEFORE』",
+                "BEFORE",
+                parsed!!.content.snippet,
+            )
+            assertFalse(
+                "var x=1 絕不得出現（endTag=[$endTag]），got ${parsed.content.snippet}",
+                parsed.content.snippet.contains("var x=1"),
+            )
+        }
+    }
+
+    // B4 — unterminated 開始標籤內嵌之 `</script …>` 絕不構成停點（Phase A fail-closed 決定）：
+    // `findTagEnd == -1`（自開始標籤起掃至 EOF 亦無 `>`，如未閉合引號屬性）→ 一律剝至輸入結尾；
+    // 內嵌之 `</script >` 不構成 end-tag 停點（否則 attacker 得於未閉合屬性內植入假 end-tag，
+    // 使 JS 本文溢入模型可見體）。內嵌 WS 變體一致處理——引號屬性值內之 `</script >` 不是閉合。
+    @Test fun unterminatedScriptWithEmbeddedWhitespaceEndTagStripsToEof() {
+        val parsed = parseHtml("""A<script data-x="unterminated </script >TAIL""", "https://example.com/")
+        assertTrue("parseHtml 應成功，got null", parsed != null)
+        assertEquals("A", parsed!!.content.snippet)
+        assertFalse(
+            "TAIL 絕不得出現（unterminated 開始標籤剝至 EOF），got ${parsed.content.snippet}",
+            parsed.content.snippet.contains("TAIL"),
+        )
+    }
+
     // H1 — 非 2xx 終端：Failed("HTTP_<code>")；不寫快取（重打必 miss、upstream 重發）
     @Test fun nonTwoXxTerminalsFailWithHttpCodeDetailAndNeverCached() = runBlocking {
         val dns = publicDns("example.com")
@@ -2594,6 +2744,31 @@ class WebExtractD4Test {
             svc.extract("https://example.com/status-$code", resolver = dns)
             assertEquals("code=$code：重打必再發 upstream（calls==2）", 2, http.calls.get())
         }
+    }
+
+    // B1 — 206 Partial Content：RFC 9110 §15.3.7（Partial Content 為分段表示）。
+    // 本抽取器不發 Range、不組裝分段——206 一律於非 2xx 終端分支之前 fail-closed，
+    // Failed("HTTP_206")，絕不寫快取、絕不交付（即便 body 本身看似完整亦然）。
+    @Test fun http206PartialContentFailsClosedAndIsNeverCached() = runBlocking {
+        val dns = publicDns("example.com")
+        val http = FakeExtract { _ ->
+            WebExtractRawResponse(
+                206,
+                html().toByteArray(Charsets.UTF_8),
+                mapOf(
+                    "Content-Type" to "text/html; charset=utf-8",
+                    "Content-Range" to "bytes 0-99/500",
+                ),
+            )
+        }
+        val cache = WebExtractCache()
+        val svc = WebExtractService(http, cache = cache)
+        val out = svc.extract("https://example.com/partial", resolver = dns)
+        assertTrue("expected Failed, got $out", out is WebExtractOutcome.Failed)
+        assertEquals("HTTP_206", (out as WebExtractOutcome.Failed).detail)
+        assertEquals("206 絕不得寫快取", 0, cache.size)
+        svc.extract("https://example.com/partial", resolver = dns)
+        assertEquals("206 重打必再發 upstream（calls==2，絕非命中快取）", 2, http.calls.get())
     }
 
     // H2 — 請求 headers 契約：Accept 恰為 WebExtract.kt 之字面值；無 credentials 類 header

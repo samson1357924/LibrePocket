@@ -461,7 +461,7 @@ class FastRouter(
         private val INTERROGATIVE_ENDINGS = charArrayOf('?', '？', '嗎', '吗', '呢')
 
         // 此集為刻意的最小 NFKC 閉子集；漏網之終止符形態（如 U+301C〜、U+3030〰、U+22EF⋯）皆由
-        // extraction C′（remainder 含 嗎|吗|呢 ⇒ 澄清）與 whitespace 閘背擋——安全機制不依賴此集完備。
+        // extraction particles rule（remainder 含 嗎|吗|呢 ⇒ 澄清）與 whitespace 閘背擋——安全機制不依賴此集完備。
         // #19 B3 stage-6.1（疑問尾標加固）：中性句末終止符封閉集（半形＋全形）。
         // 疑問尾標探針在判讀尾碼前會重複剝離此集的句尾 run，再判讀剩餘最後碼點——
         // 疑問顆粒後接一串終止符（`查 Foo 符號呢。`、`查 Foo 符號呢!!!`、
@@ -532,7 +532,7 @@ class FastRouter(
          * interrogative particles (NOT in the terminator set), so a run like
          * `嗎？。` still classifies as interrogative after the `。` drop;
          * The terminator set is closed and deliberately minimal; gaps are
-         * backstopped by the Step C′ reject (a particle anywhere in the
+         * backstopped by the extraction particles rule (a particle anywhere in the
          * remainder denies) and the whitespace gate — never by execution.
          *
          * Any gate failure falls through to the RULES loop, then to no-match
@@ -584,7 +584,7 @@ class FastRouter(
             var tailEnd = tailProbe.length
             while (tailEnd > 0 && tailProbe[tailEnd - 1] in NEUTRAL_SENTENCE_TERMINATORS) tailEnd--
             // 終止符 run 可能夾著空白（`呢 。`）；剝 run 後再 trim，使尾部的疑問顆粒
-            // 於閘層即被辨識（多 token 夾空白的補救顯性見 extraction C′ backstop）。
+            // 於閘層即被辨識（多 token 夾空白的補救顯性見 extraction particles rule backstop）。
             return tailProbe.substring(0, tailEnd).trim().lastOrNull()?.let { it !in INTERROGATIVE_ENDINGS } ?: true
         }
         private val SLOW_HINTS = listOf(
@@ -659,21 +659,22 @@ class FastRouter(
          *       ——皆過度澄清 fail-safe 方向，接受並記錄；
          *   (d) 全形-only 符號 hint 不會路由（SYMBOL_HINTS 比對原始文本，安全方向）；
          *   (e) `符號是Foo嗎` → no-match（無准入 ⇒ 不進模板，reasonCode null）；
-         *       `特別找` 現為 no-match（非命令式句首 ⇒ 不進模板，reasonCode null）；`查理`→`理` 過度剝離（pinned）；
+         *       `特別找` 現為 no-match（非命令式句首 ⇒ 不進模板，reasonCode null）；`查 查理 符號` → FAST `查理`（stage-6.3 位置語法，pinned）；
          *       `意思是符號` → no-match（無准入 ⇒ reasonCode null）；
          *   (f) CJK 異體字碼點（查 vs 査）未涵蓋。
          * - 命令式肯定語句帶否定顆粒者（如 `查 Foo 符號 不要` 型）才會進模板後閘轉澄清；
          *   非命令式句首者（如 `別問 Foo 符號`、`not symbols`、`我不想查 Foo 符號`）直接
          *   no-match DENIED——皆為 DENIED、絕不執行。
-         * - `查 是 符號` → clarify；`查 要 用 符號` → clarify（命令式句首命中，
-         *   剝離後無有意義殘餘）。非命令式句首者一律 no-match：
+         * - `查 是 符號` → FAST `是`（#19 B3 stage-6.3：CJK 填充詞不再剝離——單一 L* token 殘餘保有；
+         *   舊行為（→ clarify）為全域填充詞剝空所致，已隨該步驟退役，pinned）；
+         *   `查 要 用 符號` → clarify（殘餘 `要 用` 含空白 ⇒ 澄清）。非命令式句首者一律 no-match：
          *   `什麼是符號`、`為什麼要用符號`、`符號是什麼`、`符號的意思`、
          *   `符號有哪些種類`、bare `symbols`、`What is a symbol?`、`Explain symbols`
          *   （無命令式准入 ⇒ 不進 symbol 模板；否定閘不介入）。
          * - `查 find 符號`/`查 search 符號` 等：EN lookup 動詞在 cue 位置
          *   （Step A，句首錨定）為剝離詞，符號名恰為 find/search/lookup/locate
          *   者剝空 → clarify（pinned by `englishLookupMarkerStripped`）；
-         *   非 cue 位置的動詞不再剝離（見 SYMBOL_OPENER 系列 KDoc）。
+         *   非 cue 位置的動詞不再剝離（見 extraction KDoc）。
          */
         private val NEGATION_HINTS = listOf(
             r("不要"), r("不用"), r("不需要"), r("不必"), r("不需"), r("勿"),
@@ -938,11 +939,16 @@ class FastRouter(
         }
 
         /**
-         * B3 symbol-query extraction (#19 stage-2, A3/A4 fix): positional,
-         * lossless remainder extraction for the symbol template. The intent is
-         * NOT regex-replaced globally; instead the pipeline strips only what is
-         * anchored at position 0 or at the edge, and preserves everything
-         * intra-token verbatim. Steps, in fixed order:
+         * B3 symbol-query extraction (#19 stage-6.3, positional cue grammar):
+         * remainder extraction for the symbol template. The pipeline is
+         * **cue-position only** — it strips exactly what is anchored at
+         * position 0 (openers, one leading EN keyword cue, the leading-EN
+         * connective run) and exactly one trailing CJK keyword-suffix run,
+         * and PRESERVES everything intra-token verbatim. No identifier content
+         * is ever rewritten: a remainder that does not reduce to a single,
+         * allow-listed, L/N-anchored token is REJECTED (extraction fails ⇒
+         * NEED_CLARIFICATION) — never silently rewritten into a different
+         * query and executed. Steps, in application (code) order:
          *
          * Step A — anchored openers (each at most once, start-anchored):
          *   EN: `^(?:please[\s,]+)?(?:find|search|lookup|locate)\b[\s,]*`
@@ -954,30 +960,36 @@ class FastRouter(
          *   command form A: `^symbols?\b[\s]*` — `symbols Foo` → `Foo`.
          *   Applied sequentially (CJK → EN → command), so `查 find 符號` still
          *   reduces to empty and clarifies.
-         * Step B — `symbol(s)` keyword tokens removed wherever they appear as
-         *   words (`\bsymbols?\b`, IGNORE_CASE), and CJK hint substrings
-         *   （符號|符号|函式|函数）removed wherever they occur (substring, as
-         *   before). `SymbolTable`/`getSymbol`/`LSPClient` have no word
-         *   boundary at the hint, so they survive intact.
-         * Step C — CJK prose fillers removed as substrings (same class as the
-         *   accepted CJK over-strip residuals): 幫我|這個|那個|一下|請|查|找|
-         *   尋|搜|詢|什麼|什么|何|是|的|要|用|如何|怎麼|怎么|意思|
-         *   為什麼|为什么|說明|説明|講解|讲解|介紹|介绍|教程.
-         *   #19 B3 stage-6.1：疑問顆粒（嗎|吗|呢）不再列入本步的剝離集——
-         *   疑問顆粒出現在殘餘中 anywhere 即解析失敗（見下一步）。
-         * Step C′ — CJK interrogative particles （嗎|吗|呢） are NEVER stripped
-         *   anywhere in the remainder; a remainder that still contains one
-         *   anywhere fails extraction (empty) ⇒ NEED_CLARIFICATION (fail-closed;
-         *   those particles are implausible inside a real symbol name).
-         *   (`查 呢 符號`-class input now also fails here — same clarification
-         *   outcome as before, reached fail-closed instead of via stripping.)
-         * Step D — leading EN connectives stripped, REPEATEDLY, but only when
+         * Step B — ONE leading EN `symbol(s)` cue (`^symbols?\b[\s,]*`,
+         *   IGNORE_CASE, word-anchored), stripped at most once:
+         *   `symbols Foo` → `Foo`, `Symbol Foo.` → `Foo.`,
+         *   `find symbol named Foo` → `named Foo`. Carries the EN keyword
+         *   semantics for "symbol named X". Nothing later in the remainder
+         *   is touched (never a global `\bsymbols?\b` delete —
+         *   `查 Foo.symbols 符號` keeps `Foo.symbols` verbatim).
+         * Step C — trailing CJK keyword-SUFFIX cue run, END-anchored, one
+         *   occurrence per iteration (repeated): each iteration removes ONE
+         *   suffix of the form `[\s，,]*(?:這個|这个|一下)?[\s，,]*(?:符號|符号)[\s，,]*$`
+         *   — e.g. ` 這個符號`, ` 这个符號`, `一下符號`, ` 符號` suffixes:
+         *   `查 AlarmManager 這個符號` → `AlarmManager`,
+         *   `查 AlarmManager 这个符號` → `AlarmManager`,
+         *   `查 使用者 符號` → `使用者`, `查 符號表 符號` → `符號表`.
+         *   `函式|函数` are NO LONGER strip words (neither globally nor as
+         *   suffix cues): `查 函式 符號` → `函式` (intended FAST),
+         *   `查 Foo 函式 符號` → multi-token ⇒ NEED_CLARIFICATION.
+         *   Do NOT strip anything intra-remainder.
+         * Step B′ — leading EN connectives stripped, REPEATEDLY, but only when
          *   another token remains after the connective
-         *   (`^(?:for|the|a|an|named|called|of|to)\s+(?=\S)`, IGNORE_CASE).
-         *   `locate symbol named Foo` → `Foo`; a bare `a` / `to` / `for` at the
-         *   start of the remainder with NOTHING after it is NOT stripped (a
-         *   single-letter identifier stands: `查 a 符號` → `a`).
-         * Step E — edge trim ONLY: leading/trailing runs of
+         *   (`^(?:for|the|a|an|named|called|of|to)\s+(?=\S)`, IGNORE_CASE; the
+         *   `named|called` alternative is identical to the old Step D rule —
+         *   merged, one loop). `locate symbol named Foo` → `Foo`; a bare
+         *   `a` / `to` / `for` at the start of the remainder with NOTHING
+         *   after it is NOT stripped (a single-letter identifier stands:
+         *   `查 a 符號` → `a`). Applied AFTER the trailing suffix run (step C
+         *   runs first, THEN this loop — prose order matches application
+         *   order) so the suffix cue cannot mask the "another token remains"
+         *   guard.
+         * Step D — edge trim ONLY: leading/trailing runs of
          *   `[\s，。、？?：:「」『』“”"'（）]` stripped repeatedly. Nothing
          *   intra-token is ever removed by this step. NOTE: halfwidth `!` and
          *   the halfwidth parens are deliberately NOT in the edge class —
@@ -988,24 +1000,32 @@ class FastRouter(
          *   class either — `查 -main 符號` FASTs with query `-main` verbatim
          *   (Clojure-family identifiers). `.` is NOT in the edge class:
          *   `查 .bar 符號` FASTs with query `.bar` — recorded as accepted.
-         *   `查 Foo. 符號` FASTs with query `Foo.` — recorded as accepted.
-         * Step F — empty remainder, or ANY remaining whitespace, or ANY
-         *   Format/control char (Cf/Cc, and any unassigned/surrogate code
-         *   point rejected by the charset below) ⇒ extraction FAILS (returns
-         *   "") ⇒ [hasSymbolQuery] false ⇒ NEED_CLARIFICATION. The tool is a
-         *   single-identifier tool: a multi-token remainder is never a valid
-         *   query — `查 SymbolTable Foo 符號` clarifies rather than collapsing
-         *   into `SymbolTableFoo`.
-         * Step G — charset allow-list: every code point must be Unicode
-         *   letter (L*) or number (N*), or one of `. _ - $ # @ / ( ) : , ; + = ~`.
-         *   Anything else (e.g. `!`, `。`, emoji, unpaired surrogates) ⇒
-         *   extraction FAILS ⇒ clarification. The remainder must ALSO carry at
-         *   least one letter/digit code point.
+         *   `查 Foo. 符號` NO LONGER FASTs with query `Foo.` — see step E.
+         * Step E — immutable remainder validation (replacing the old
+         *   global-deletion aftermath): after steps A–D the remainder is
+         *   NEVER rewritten, only admitted or rejected —
+         *   (i) an EMPTY remainder fails; (ii) ANY remaining whitespace fails;
+         *   (iii) a remainder ending in `.` `,` `;` fails
+         *   (sentence-final natural-punctuation hazard; a trailing `:` is
+         *   already eaten by step D's edge class, so no `:` check is kept
+         *   here; `Foo.bar` / `3,14` / `std::vector` / `get(id)` / `-main`
+         *   keep verbatim because they do
+         *   not end there and pass the anchor check); (iv) every code point
+         *   must be Unicode letter (L*) or number (N*), or one of
+         *   `. _ - $ # @ / ( ) : , ; + = ~` — else fails (incl. Format/Cf and
+         *   control chars); (v) the remainder must carry at least one
+         *   letter-or-number code point. Failing ⇒ extraction returns "" ⇒
+         *   [hasSymbolQuery] false ⇒ [missingQuestionFor] ⇒
+         *   NEED_CLARIFICATION (never a rewritten query).
+         *   Additional standing rule (stage-6.1, unchanged): a remainder
+         *   containing 嗎|吗|呢 ANYWHERE fails extraction (fail-closed).
          *
          * The extracted remainder is used intra-token verbatim (esc-escaped)
          * as the query argument — qualified names pass through losslessly:
-         * `查 Foo.bar 符號` → `Foo.bar`, `查 std::vector 符號` / `查 Foo::Bar
-         * 符號` → `::` preserved, `查 foo/bar.kt 符號` → `/` preserved,
+         * `查 Foo.bar 符號` → `Foo.bar`, `查 Foo.symbol.bar 符號` →
+         * `Foo.symbol.bar`, `查 foo/symbol.kt 符號` → `foo/symbol.kt`,
+         * `查 Foo::symbol 符號` / `查 std::vector 符號` → `::` preserved,
+         * `查 Foo.symbols 符號` → `Foo.symbols` (intra-`symbols` survives),
          * `查 get(id) 符號` → `get(id)`, `查 3.14 符號` → `3.14`,
          * `查 3,14 符號` → `3,14`, `查 中文變數 符號` → `中文變數`.
          * Intra-token `(`/`)` are admitted without balance checking
@@ -1018,27 +1038,66 @@ class FastRouter(
          * `查 3.14 符號` / `查 42 符號` — both FAST, accepted).
          *
          * Accepted residuals (recorded, safe direction, pinned by tests):
-         * - CJK over-strip: 查理 → 理 (the leading 查 is the lookup verb, the
-         *   remainder 理 looks like a symbol name) — accepted, fail-safe
-         *   direction (a mis-query, never a wrong execution).
+         * - `查 查理 符號` → FAST `查理` (stage-6.3; the old global
+         *   `SYMBOL_CJK_FILLER` delete rewrote it to `理` — removed).
+         *   `查理 符號` (UNspaced) still FASTs with `理` — the lookup verb `查`
+         *   is the start-anchored opener, a positional strip, pinned.
          * - 「特別」 is not an opener (starts with 特) ⇒ no-match DENIED;
          *   「特別找」likewise never reaches this path.
-         * - `查Symbol`-class over-strips (e.g. a symbol literally named with a
-         *   hint substring) remain accepted — CJK hints are substring-stripped
-         *   by design.
+         * - `查Symbol`-class shapes: `查 SymbolTable 符號` keeps the
+         *   identifier verbatim; no word boundary ⇒ survived even before.
          * - Intra-comma is preserved: `查 3,14 符號` → `3,14` — the comma is a
          *   legal intra-token character now (never edge-stripped mid-token).
-         * - Anything not matching the allow-list (step G) or still carrying
-         *   whitespace (step F) ⇒ clarification, never a rewritten query.
+         * - Anything not matching the allow-list, or a remainder ending in
+         *   `. , ;` (the comma only for cue-less remainders — a glued
+         *   halfwidth comma at the suffix cue is absorbed by step C), or
+         *   still carrying whitespace (steps E) ⇒ clarification, never a
+         *   rewritten query.
+         * - `查 Foo. 符號` ⇒ NEED_CLARIFICATION (stage-6.3; previously FAST
+         *   with `Foo.` — retired residual). `search symbol Foo.` /
+         *   `search symbol Foo,` / `search symbol Foo;` — same clarification
+         *   (step E (iii)).
          * - `3.14`-class names keep their `.`; `get(id)` keeps `( )`;
          *   `foo/bar.kt` keeps `/`; `std::vector` keeps `::`.
          * - `查 a b 符號` strips the leading connective `a ` (another token
          *   follows) leaving `b` — article-stripping at a cue position, the
-         *   same mechanic as `a Foo` → `Foo`; the two tokens are indistinguishable
-         *   at this position and the rewrite is deterministic (pinned).
+         *   same mechanic as `a Foo` → `Foo`; the two tokens are
+         *   indistinguishable at this position and the rewrite is
+         *   deterministic (pinned).
+         * - `查 函式 符號` → FAST `函式` (stage-6.3; `函式`/`函数` are no longer
+         *   strip words — intended behavior change, pinned).
+         * - `查 是 符號` → FAST `是` (stage-6.3; CJK filler substrings are no
+         *   longer deleted — the single-token remainder stands on its own;
+         *   the old strip-to-empty → clarify behavior is retired, pinned).
+         * - `查 符號表 符號` → FAST `符號表`; `查 使用者 符號` → FAST `使用者`
+         *   (stage-6.3; filler-substrings no longer deleted, pinned).
+         * - Halfwidth `:` IS in the edge class (step D): `查 Foo: 符號` edge-
+         *   trims to FAST `Foo` (unchanged stage-2 semantics); `.` `;` are
+         *   NOT in the edge class (`查 Foo. 符號` / `查 Foo; 符號` fail
+         *   step E). A halfwidth comma glued to an identifier at cue
+         *   position is absorbed by the step-C suffix cue (`查 Foo, 符號` →
+         *   FAST `Foo`; `查 Foo， 符號` / `查 Foo，符號` → FAST `Foo`), so
+         *   step E's `endsWith(',')` is reachable only for cue-less
+         *   remainders (e.g. `search symbol Foo,` — clarifies, pinned).
+         * - Glued simplified keyword-cue consumption (stage-6.3 pin):
+         *   `查 Foo符号 符號` → FAST `Foo` — the trailing `符號` cue strips
+         *   first, then the residual `符号` is consumed as a SECOND step-C
+         *   suffix cue (simplified `符号` is in the suffix-cue table).
+         *   Cue-absorbed, recorded, not fixed; the tool is READ-only.
+         *   (A chimera `这個符號` — simplified 这 U+8FD9 + traditional
+         *   個 U+500B — matches NEITHER `這個` nor `这个` suffix alternative,
+         *   so the remainder stays multi-token and clarifies:
+         *   `查 AlarmManager 这個符號` → NEED_CLARIFICATION, pinned.)
+         * - EN keyword-inline comma (stage-6.3 pin, documented-residual route):
+         *   `find symbol,Foo` → FAST `,Foo` — step A's command-form opener
+         *   (`^symbols?\b[\s]*`) eats the keyword but NOT the inline comma,
+         *   so the comma survives as the leading query character (step E admits
+         *   intra-token `,`; its `endsWith(',')` hazard is not in play).
+         *   Recorded, not fixed; the tool is READ-only. (`find symbol, Foo`
+         *   clarifies — residual carries whitespace after the keyword.)
          *
-         * Invalid-charset / multi-token remainders never execute: they fail
-         * extraction (empty) and route NEED_CLARIFICATION via
+         * Invalid-charset / multi-token / cue-less remainders never execute:
+         * they fail extraction (empty) and route NEED_CLARIFICATION via
          * [missingQuestionFor] ("請問要查哪個符號？").
          */
         private val SYMBOL_OPENER_CJK = Regex(
@@ -1049,10 +1108,19 @@ class FastRouter(
             RegexOption.IGNORE_CASE,
         )
         private val SYMBOL_OPENER_CMD = Regex("^symbols?\\b[\\s]*", RegexOption.IGNORE_CASE)
-        private val SYMBOL_KEYWORD = Regex("\\bsymbols?\\b", RegexOption.IGNORE_CASE)
-        private val SYMBOL_CJK_HINT = Regex("符號|符号|函式|函数")
-        private val SYMBOL_CJK_FILLER = Regex(
-            "幫我|這個|那個|一下|請|查|找|尋|搜|詢|什麼|什么|何|是|的|要|用|如何|怎麼|怎么|意思|為什麼|为什么|說明|説明|講解|讲解|介紹|介绍|教程",
+        // #19 B3 stage-6.3 (positional cue grammar) — Step B keeps exactly ONE
+        // leading EN `symbol(s)` cue, word-anchored, stripped at most once
+        // (e.g. `symbols Foo` → `Foo`, `Symbol Foo.` → `Foo.`); it never
+        // touches anything later in the remainder.
+        private val SYMBOL_LEADING_SYMBOLS = Regex("^symbols?\\b[\\s,]*", RegexOption.IGNORE_CASE)
+        // #19 B3 stage-6.3 — Step C: trailing CJK keyword-suffix cue,
+        // END-anchored, ONE occurrence per iteration (`這個符號`、`这个符號`、
+        // `一下符號`、`符號` suffixes). `函式|函数` are deliberately NOT suffix
+        // cues here: they are identifier content, never strip words —
+        // `查 函式 符號` routes FAST with query `函式`, and
+        // `查 Foo 函式 符號` clarifies (multi-token).
+        private val SYMBOL_CJK_KEYWORD_SUFFIX = Regex(
+            "[\\s，,]*(?:這個|这个|一下)?[\\s，,]*(?:符號|符号)[\\s，,]*$",
         )
         private val SYMBOL_LEADING_CONNECTIVE = Regex(
             "^(?:for|the|a|an|named|called|of|to)\\s+(?=\\S)",
@@ -1083,13 +1151,24 @@ class FastRouter(
             s = SYMBOL_OPENER_CJK.replaceFirst(s, "").trim()
             s = SYMBOL_OPENER_EN.replaceFirst(s, "").trim()
             s = SYMBOL_OPENER_CMD.replaceFirst(s, "").trim()
-            // Step B — symbol keyword tokens and CJK hint substrings (global).
-            s = SYMBOL_KEYWORD.replace(s, "")
-            s = SYMBOL_CJK_HINT.replace(s, "")
-            // Step C — CJK prose fillers (substring, as accepted before).
-            s = SYMBOL_CJK_FILLER.replace(s, "")
-            // Step D — leading EN connectives, repeatedly, only when another
-            // token remains after the connective.
+            // Step B — ONE leading EN `symbol(s)` cue (word-anchored, at most
+            // once). No other part of the remainder is touched here.
+            s = SYMBOL_LEADING_SYMBOLS.replaceFirst(s, "").trim()
+            // Step C — trailing CJK keyword-suffix cue run, end-anchored:
+            // each iteration strips ONE occurrence (e.g. ` 這個符號`,
+            // ` 这个符號`, `一下符號`, ` 符號`); nothing intra-remainder is
+            // ever removed.
+            while (true) {
+                val m = SYMBOL_CJK_KEYWORD_SUFFIX.find(s) ?: break
+                val kept = s.substring(0, m.range.first).trimEnd()
+                if (kept.length == s.length) break
+                s = kept
+            }
+            // Step B′ — leading EN connectives, repeatedly, only when another
+            // token remains after the connective. Applied AFTER the trailing
+            // suffix cue run so `查 a 符號` keeps its single-letter identifier:
+            // the suffix strip leaves `a` with nothing after it, and a bare
+            // connective at the end of the remainder is NOT stripped.
             while (true) {
                 val t = s.trim()
                 val m = SYMBOL_LEADING_CONNECTIVE.find(t)
@@ -1099,7 +1178,7 @@ class FastRouter(
                 }
                 s = t.substring(m.range.last + 1)
             }
-            // Step E — edge trim only, repeatedly.
+            // Step D — edge trim only, repeatedly.
             while (true) {
                 val t = s.trim()
                 val u = SYMBOL_EDGE.replace(t, "")
@@ -1109,13 +1188,21 @@ class FastRouter(
                 }
                 s = u
             }
-            // Step C′ — CJK interrogative particles （嗎|吗|呢） anywhere in the
-            // remainder ⇒ extraction FAILS (empty) ⇒ NEED_CLARIFICATION
-            // (fail-closed; never stripped, never part of a plausible query).
+            // Particles rule (stage-6.1, unchanged) — CJK interrogative
+            // particles （嗎|吗|呢） anywhere in the remainder ⇒ extraction
+            // FAILS (empty) ⇒ NEED_CLARIFICATION (fail-closed; never
+            // stripped, never part of a plausible query).
             if (s.contains('嗎') || s.contains('吗') || s.contains('呢')) return ""
-            // Step F — empty / whitespace / Cf / Cc (and anything the charset
-            // rejects) ⇒ invalid ⇒ return "" so the clarification gate fires.
+            // Step E — immutable remainder validation. After steps A–D the
+            // remainder is NEVER rewritten; it is only admitted or rejected:
+            // empty ⇒ fail; ANY remaining whitespace ⇒ fail; sentence-final
+            // `. , ;` ⇒ fail (natural-punctuation hazard; a trailing `:` is
+            // unreachable — step D's edge class already strips it, so no
+            // `:` disjunct is kept, defense-in-depth noted); any code point
+            // outside {Unicode L*, N*} ∪ `. _ - $ # @ / ( ) : , ; + = ~` ⇒
+            // fail (incl. Format/control); at least one L/N anchor required.
             if (s.isEmpty()) return ""
+            if (s.endsWith('.') || s.endsWith(',') || s.endsWith(';')) return ""
             var hasLetterOrDigit = false
             var i = 0
             while (i < s.length) {
@@ -1130,7 +1217,7 @@ class FastRouter(
                 if (isQueryLetterOrNumberType(type)) hasLetterOrDigit = true
                 i += Character.charCount(cp)
             }
-            // Step G — at least one letter/digit must anchor the query.
+            // …and at least one letter/digit must anchor the query.
             return if (hasLetterOrDigit) s else ""
         }
 
@@ -1146,7 +1233,7 @@ class FastRouter(
          * paired astral letter embedded in a BMP-letter token instead (a
          * multi-token remainder would clarify before reaching here).
          *
-         * This predicate is intentionally stricter than Step G's code-point
+         * This predicate is intentionally stricter than Step E's code-point
          * letters/numbers test inside [extractSymbolQuery] (it rejects
          * No-category glyphs and astral letters/digits, e.g. ① U+2460, U+1D7D8);
          * the stricter of the two decides — fail-safe direction, pinned by

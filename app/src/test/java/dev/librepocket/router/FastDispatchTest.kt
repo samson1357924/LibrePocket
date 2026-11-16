@@ -336,11 +336,16 @@ class FastDispatchTest {
         assertEquals(RouteKind.FAST, t2.route)
         assertTrue(t2.toolCall!!.argumentsJson.contains("\"query\": \"getSymbol\""))
 
-        // 已記錄並接受的 CJK 過度剝離殘餘：「查理」剝成「理」（fail-safe 方向）。
-        // Documented CJK over-strip residual: 「查理」 strips to 「理」.
-        val t3 = decide("查理 符號")
+        // 已記錄並接受：空格分隔的動詞 + 識別字。「查 查理 符號」剝成「查理」
+        // （stage-6.3 位置語法：動詞 cue 在句首，`查理` 為象徵識別字名，完整保留
+        // ——不再全域刪填充詞）。
+        // Documented (stage-6.3): the spaced verb cue no longer eats `查理`;
+        // previously the global filler delete rewrote `查 查理 符號` to `理`.
+        // (The UNspaced `查理 符號` remains a positional-opener strip to `理` —
+        // pinned separately in `positionalCueGrammarPins`.)
+        val t3 = decide("查 查理 符號")
         assertEquals(RouteKind.FAST, t3.route)
-        assertTrue(t3.toolCall!!.argumentsJson.contains("\"query\": \"理\""))
+        assertEquals("查理", Json.parseToJsonElement(t3.toolCall!!.argumentsJson).jsonObject["query"]!!.jsonPrimitive.content)
 
         // Meta-question token-only utterances now route no-match (A2: no
         // lookup marker ⇒ symbol template does not match) — DENIED, no
@@ -529,6 +534,125 @@ class FastDispatchTest {
         assertTrue(
             "executor must receive the exact query `lsp`: ${executed2!!.result.resultJson}",
             executed2.result.resultJson.contains("lsp:example"),
+        )
+    }
+
+    @Test fun positionalCueGrammarPins() {
+        // #19 B3 stage-6.3：positional cue grammar — every pin asserts the
+        // parsed query character-exactly (jsonPrimitive content), not a
+        // substring match. Identifier content is never rewritten: intra-
+        // token punctuation (`.`, `::`, `/`, `-`) and CJK identifiers survive
+        // verbatim; cue strips happen only at position 0 / at the trailing
+        // suffix edge.
+        for ((text, expectedQuery) in listOf(
+            // The four reviewer-reported silent rewrites, now verbatim:
+            "查 Foo.symbol.bar 符號" to "Foo.symbol.bar",
+            "查 foo/symbol.kt 符號" to "foo/symbol.kt",
+            "查 Foo::symbol 符號" to "Foo::symbol",
+            // More qualified-name round-trips:
+            "查 Foo.symbol 符號" to "Foo.symbol",
+            "查 Foo.symbols 符號" to "Foo.symbols",
+            "查 foo.symbols 符號" to "foo.symbols",
+            // CJK filler-substring deletion is gone (identifiers survive):
+            "查 使用者 符號" to "使用者",
+            "查 符號表 符號" to "符號表",
+            "查 查理 符號" to "查理",
+            "查 用例 符號" to "用例",
+            "查 中文變數 符號" to "中文變數",
+            "查 AlarmManager 這個符號" to "AlarmManager",
+            // Simplified 这个 suffix cue (stage-6.3 suffix-cue table fix,
+            // canonical U+8FD9 U+4E2A):
+            "查 AlarmManager 这个符號" to "AlarmManager",
+            // Two trailing suffix cues are all stripped — the cue run is
+            // end-anchored and repeated (recorded residual):
+            "查 Foo 符号 符號" to "Foo",
+            // Stage-6.3 reviewer pins (F6): a halfwidth/fullwidth `,` glued to
+            // the identifier at cue position is absorbed by the step-C suffix
+            // cue (the edge class has no halfwidth comma; see KDoc):
+            "查 Foo, 符號" to "Foo",
+            "查 Foo， 符號" to "Foo",
+            "查 Foo，符號" to "Foo",
+            // Glued simplified keyword-cue consumption (F6, recorded residual):
+            // the trailing `符號` cue strips first, then the residual `符号`
+            // is consumed as a second suffix cue — cue-absorbed, recorded,
+            // not fixed (READ-only):
+            "查 Foo符号 符號" to "Foo",
+            // EN keyword-inline comma (F7, recorded residual — documented-
+            // residual route): step A's command-form opener (`^symbols?\b[\s]*`)
+            // eats the keyword but not the inline comma, so `,Foo` stands as
+            // the query verbatim (READ-only):
+            "find symbol,Foo" to ",Foo",
+            // Unspaced 這個符號 glued to the identifier (recorded residual):
+            "查 AlarmManager這個符號" to "AlarmManager",
+            // `函式`/`函数` are identifiers, never strip words:
+            "查 函式 符號" to "函式",
+            // Single-letter-token shapes stand (was: CJK filler delete):
+            "查 是 符號" to "是",
+            // 保留：Implicit plain identifier still routes FAST.
+            "查 Foo 符號" to "Foo",
+            // 無空格形態：句首 lookup 動詞「查」仍是位置 cue（positional opener，
+            // spec Step A）——殘餘 `理` 乃位置剝離，非全域填充詞刪除。
+            "查理 符號" to "理",
+        )) {
+            val d = decide(text)
+            assertEquals(text, RouteKind.FAST, d.route)
+            assertNotNull(text, d.toolCall)
+            assertEquals(text, "lsp.symbols", d.toolCall?.toolName)
+            val obj = Json.parseToJsonElement(d.toolCall!!.argumentsJson).jsonObject
+            assertEquals(text, expectedQuery, obj["query"]!!.jsonPrimitive.content)
+            assertEquals(text, LspTools.DEFAULT_LIMIT, obj["limit"]!!.jsonPrimitive.content.toInt())
+        }
+    }
+
+    @Test fun cueFinalNaturalPunctuationClarifies() = runBlocking {
+        // #19 B3 stage-6.3：殘餘以 `. , ; :` 結尾 ⇒ 句末自然標點 hazard ⇒
+        // NEED_CLARIFICATION（絕不執行）——`.` `,` `;` 不在 edge 類，`:` 雖在
+        // edge（舊語義保留），半形 `.` `,` `;` 殘留即被 step E 拒絕。
+        val backend = CountingBackend()
+        val dispatcher = lspDispatcher(backend)
+        for (text in listOf(
+            // `查 Foo. 符號`：舊版 FAST query=`Foo.`（已退役 residual）。
+            "查 Foo. 符號",
+            "search symbol Foo.",
+            "search symbol Foo,",
+            "search symbol Foo;",
+            // `函式` 已非剝離詞：多 token 殘餘 ⇒ 澄清（絕不接合）。
+            "查 Foo 函式 符號",
+            // Chimera cue（簡化「这」U+8FD9 + 繁體「個」U+500B）：既非 `這個` 也非
+            // `这个`，匹配不到 step C 的任何後綴 cue alternative ⇒ 殘餘仍帶空白
+            // ⇒ step E 拒絕 ⇒ NEED_CLARIFICATION（絕不執行）。
+            // 非句末自然標點情形，per stage-6.3 reviewer pin 放本 clarify 測試記錄。
+            "查 AlarmManager 这個符號",
+        )) {
+            val d = decide(text)
+            assertEquals(text, RouteKind.DENIED, d.route)
+            assertEquals(text, DenyReason.NEED_CLARIFICATION, d.reasonCode)
+            assertNull(text, d.toolCall)
+            skippedOf(dispatcher.dispatch(d, lspOn), text)
+        }
+        assertEquals(0, backend.invocations.get())
+    }
+
+    @Test fun dispatchQualifiedDottedNameExecutesVerbatim() = runBlocking {
+        // #19 B3 stage-6.3：dispatch-level pin — `查 Foo.symbol.bar 符號`
+        // executes exactly once and the executor receives exactly
+        // `Foo.symbol.bar` as the query (surfaced via the fake backend's
+        // `${query}:example` symbol name).
+        val backend = CountingBackend()
+        val r = lspDispatcher(backend).decideAndDispatch(
+            "查 Foo.symbol.bar 符號", lspOn, sessionId = "s-dotted", turnIndex = 5,
+        )
+        assertEquals(RouteKind.FAST, r.decision.route)
+        assertEquals(1, backend.invocations.get())
+        assertEquals(
+            """{"query": "Foo.symbol.bar", "limit": ${LspTools.DEFAULT_LIMIT}}""",
+            r.decision.toolCall!!.argumentsJson,
+        )
+        val executed = r.outcome as? FastDispatchOutcome.Executed
+        assertNotNull("Foo.symbol.bar must execute: ${r.outcome}", executed)
+        assertTrue(
+            "executor must receive the exact dotted query: ${executed!!.result.resultJson}",
+            executed.result.resultJson.contains("Foo.symbol.bar:example"),
         )
     }
 
@@ -1205,9 +1329,11 @@ class FastDispatchTest {
             assertNull(text, d.toolCall)
         }
         for (text in listOf(
-            "查 是 符號",
+            // stage-6.3：CJK 填充詞（是/要/用…）不再全域剝離——「查 是 符號」
+            // 殘餘 `是` 為合法單一 L* token ⇒ FAST query=`是`（不是澄清）；
+            // 見 positionalCueGrammarPins。「查 要 用 符號」殘餘 `要 用` 含空白 ⇒ 澄清。
             "查 要 用 符號",
-            // `Symbol`/`symbols` 是 keyword token，剝空後無有意義殘餘 ⇒ 澄清。
+            // `Symbol`/`symbols` 是 cue 詞，剝空後無有意義殘餘 ⇒ 澄清。
             "查 Symbol 符號",
             "查 symbols 符號",
             // astral-only remainder：hasSymbolQuery 以 BMP char 錨定，𠮷 的兩個

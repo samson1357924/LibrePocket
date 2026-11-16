@@ -1381,7 +1381,7 @@ class ElevatedRunnerP1B2Test {
                 d.untrackedResidual,
             )
             // 槽保留（fail-closed，custody 已於 post-grace 轉移給 stalled worker）：admission 續拒（gate 5 預留）。
-            assertEquals(1, ElevatedCleanupTracker.outstanding())
+            pollOutstandingTo(1)
             // acquisition-time 不登記 quarantine（unsaturated acquire）；
             // verified==false ⇒ drain-end helper 於 drain 內登記 victim（default registrar 成功）⇒ quarantine +1。
             assertEquals(quarantineBefore + 1, ElevatedCleanupTracker.quarantinedCount())

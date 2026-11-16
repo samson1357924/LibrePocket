@@ -1210,6 +1210,76 @@ class ElevatedRunnerPhaseBLateCompensationTest {
     }
 
     /**
+     * (R1) Round-8 pin：spawn block 於 OS 線程已起後立即拋（非 start-then-throw、default
+     * starter）——spawn worker catch 臂現標 `lateIncomplete`＋`countUncleanOnce()`
+     * （fail-toward：歧義 arm 視為 incomplete，不永久 seal）：
+     * caller 側 Thr 消費臂（`Res.Err(h.t, watchLingering || lateIncomplete.get())`）透傳
+     * `hasLinger=true` ⇒ runner 映射 `Failed(… cleanupIncomplete = preSpawnLinger(true))`。
+     * 確定性（無 latch；block 即刻拋、worker 先入體，caller 見 worker 死亡⇒h==Thr⇒Err 臂）；
+     * breaker 恰好 +1（worker catch 臂先 `countUncleanOnce`，caller handoff 臂經
+     * `uncleanCounted` CAS 敗 ⇒ 不雙計）；sticky 不置；outstanding／debt／quarantine／
+     * registrar-failure／killNever 全不動；admission 不自動密封（歧義 arm 非 permanent
+     * seal——見 docs/REVIEW_TAGS.md B3 ledger），本測不斷 admission。
+     */
+    @Test fun spawnBlockThrowSurfacesCleanupIncompleteAndCountsBreakerOnce() {
+        ElevatedCleanupTracker.clearUnverified()
+        ElevatedCleanupTracker.noteClean()
+        pollOutstandingTo(0)
+        pollActiveTo(0)
+        ElevatedCleanupTracker.resetPeak()
+        val outstandingBefore = ElevatedCleanupTracker.outstanding()
+        val breakerBefore = ElevatedCleanupTracker.consecutiveCount()
+        val debtBefore = ElevatedCleanupTracker.lingerDebtCount()
+        val killNeverBefore = ElevatedCleanupTracker.killNeverAttemptedCount()
+        val failuresBefore = ElevatedCleanupTracker.quarantineRegistrationFailedCount()
+        val quarantineBefore = ElevatedCleanupTracker.quarantinedCount()
+        val res = ElevatedCallSupervisor.awaitSpawnWithThreadStarter(
+            deadlineNanos = System.nanoTime() + TimeUnit.SECONDS.toNanos(60),
+            // block 即刻拋 ⇒ caller 入輪詢迴圈；恆 false 排除 expireWorker／cancel 干擾。
+            isCancelled = { false },
+            // block-throw 臂零補償 ⇒ killer 不會被呼叫（計數由計數器承載，無 latch）。
+            killer = { p -> p.destroy() },
+            startThread = { t -> t.start() },
+        ) {
+            throw IllegalStateException("spawn boom (test seam)")
+        }
+        try {
+            assertTrue(
+                "expected Res.Err(hasLinger=true), got $res",
+                res is ElevatedCallSupervisor.Res.Err && res.hasLinger,
+            )
+            pollOutstandingTo(outstandingBefore)
+            pollActiveTo(0)
+            awaitNoElevatedThreads()
+            assertEquals(
+                "breaker must count exactly one incomplete cleanup (worker catch arm)",
+                breakerBefore + 1,
+                ElevatedCleanupTracker.consecutiveCount(),
+            )
+            assertFalse(ElevatedCleanupTracker.isRegistrationFailedSticky())
+            assertEquals(outstandingBefore, ElevatedCleanupTracker.outstanding())
+            assertEquals(debtBefore, ElevatedCleanupTracker.lingerDebtCount())
+            assertEquals(
+                failuresBefore,
+                ElevatedCleanupTracker.quarantineRegistrationFailedCount(),
+            )
+            assertEquals(
+                "ambiguous spawn arm must not quarantine the (possibly nonexistent) child",
+                quarantineBefore,
+                ElevatedCleanupTracker.quarantinedCount(),
+            )
+            assertEquals(killNeverBefore, ElevatedCleanupTracker.killNeverAttemptedCount())
+        } finally {
+            pollOutstandingTo(0)
+            pollActiveTo(0)
+            ElevatedProcessIo.quarantineRegistrar = { ElevatedCleanupTracker.quarantineUnverified(it) }
+            ElevatedCleanupTracker.clearUnverified()
+            ElevatedCleanupTracker.noteClean()
+            awaitNoElevatedThreads()
+        }
+    }
+
+    /**
      * (b3.6) startLateDaemon acquire-throw＋second-chance registrar 拋 ⇒ sticky brick 的
      * F4 pin（harness 同 (b3.5)；`forceAcquireSlotOrQuarantineThrow` 注入＋registrar 拋，
      * finally 還原兩者＋clear sticky）：caller CAS 認領成功後 `startLateDaemon` 進

@@ -23,7 +23,7 @@
 | `Round-6 D-A1..D-E7` | 子代碼複審發現編號（A=併發、B=提權執行安全、C=測試、D=架構/KDoc、E=scope/CI） | `pr167-review-aggregation.md`（repo 外彙整表，不入庫）；B3 待辦見本檔末節 |
 | `Round-6 PG-#` | PocketGuard bot 發現（BLOCK/WARN/SUGGESTION） | 同上 |
 | `drainFailClosedDrained` | drain 內部逃逸時的 catch-all 收斂臂：caller 零外部 process IPC（無 destroy／getter／waitFor）＋中斷 thread＋登記 quarantine＋計數；有界返回由構造保證；outstanding 不釋放（B3＝重啟恢復） | `ElevatedProcessIo.drainWithThreadStarter`／`drainFailClosedDrained` |
-| `Stage 1/2/3/4（本 PR 的 Round-6 提交階梯）` | 5dc23257 linger-debt seal → eb311aed sticky brick＋catch-all backstop → 6ffaca31 遙測/文件 → d37718f0 有界 tearDown/本檔 → 6b295e78 final fixups → 4f2a1f2e de-IPC catch-all → cdd78918 D-A5 claim hygiene → c1104d47 P3 doc/test batch | `git log --oneline origin/main..HEAD` |
+| `Stage 1/2/3/4（本 PR 的 Round-6 提交階梯）` | 5dc23257 linger-debt seal → eb311aed sticky brick＋catch-all backstop → 6ffaca31 遙測/文件 → d37718f0 有界 tearDown/本檔 → 6b295e78 final fixups → 4f2a1f2e de-IPC catch-all → cdd78918 D-A5 claim hygiene → c1104d47 P3 doc/test batch → a4ee4765 final-gate doc fixups（honesty pass）→ 7c75c074 Round-7 claim protocol convergence（start-then-throw 三臂收斂） | `git log --oneline origin/main..HEAD` |
 | `quarantine（閘）／QUARANTINE` | 未驗證死亡 handle 的持久登記，admission 末門 QUARANTINE（fail-closed） | `ElevatedCleanupTracker.quarantineUnverified` |
 | `sweep／verify-only sweep` | 以 `waitFor(0ms)` 有界驗證後才移除 quarantine 條目 | `verifyQuarantinedOneBounded` |
 | `AB1` | 呼叫級准入（activeCalls / tryEnterReserved），上限 MAX_CONCURRENT_CALLS=4 | `tryEnterReserved` |
@@ -57,7 +57,6 @@
 5. `run()` 文字路徑 Denied/Failed 丟棄 `cleanupIncomplete`（`runBinary` 為準）。
 6. late-spawn daemon stall／`drainFailClosedDrained` catch-all 佔住的槽（無計數、
    無 protocol-level 恢復；app 重啟恢復）；spawnClaimed 贏家（catch 臂喪失 CAS）的活子進程：
-   cleanupIncomplete 僅穿透 verdict，admission 不封、breaker 不計、無人 kill——
-   B3 必決策（是否 `expired.set(true)` 令 worker 自補償，或接線 seal）
+   Round-7（`7c75c074`）已收口——caller 置 `expired.set(true)`，publish 過 Val 之 child 由三者恰贏其一接管（worker 內聯補償／late daemon 搶 Val／未發佈則 worker 發佈時自路由）；admission 於 handoff 起由 `markLingering(worker, state)` 密封至 worker 退出；breaker 經 `countUncleanOnce` 恰好計一次。**殘留（B3）**：late-spawn daemon stall 與 catch-all 佔槽之協議層恢復（restart-only）；expired-handoff 之裝置端驗收（Binder stall 下 `worker.isAlive`/`markLingering` 時序）；`quarantineRegistrar` 預設實作僅以 KDoc 約束 "must remain local-only"（`@VisibleForTesting internal var`，`ElevatedProcessIo.kt:4088`）——重綁為會 IPC 之實作者會靜默破壞 catch-all 臂的有界返回保證；B3 必接 eager identity/assert 或 lint 規則（或將預設實作提升為具名 `internal val` 並 fail-fast）。
 7. 在 `preSpawnLinger` 跨 request 依賴串行准入契約外增加型別級保證（可選）。
 8. `docs/REVIEW_TAGS.md`（本檔）的維護責任歸 B3 維護者。

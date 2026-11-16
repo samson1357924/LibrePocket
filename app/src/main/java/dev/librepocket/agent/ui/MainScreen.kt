@@ -7,7 +7,6 @@ import kotlinx.coroutines.CancellationException
 import androidx.compose.material3.DrawerState
 import androidx.compose.material3.DrawerValue
 import androidx.compose.material3.rememberDrawerState
-import kotlinx.coroutines.isActive
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.SideEffect
@@ -49,7 +48,6 @@ import dev.librepocket.entry.EntryDispatch
 import dev.librepocket.entry.EntryRoute
 import dev.librepocket.shell.FlavorPrivilegeScope
 import dev.librepocket.shell.PrivilegeBridgeState
-import dev.librepocket.shell.PrivilegeBridgeStore
 import dev.librepocket.voice.VoiceSwitchStore
 import dev.librepocket.voice.VoiceSwitchSnapshot
 import dev.librepocket.voice.VoiceTools
@@ -170,10 +168,7 @@ internal fun MainScreen(
     // 橋接授權三位一體；一鍵收回原子清表、關開關、撤授權（見 PrivilegeBridgeState）。
     // #136-B1 行程單例：跨 composition／Activity 唯一持有者，審計計數不因重組丟失。
     val privilegeState = remember { PrivilegeBridgeState.process() }
-    val privilegeStore = remember(app) { PrivilegeBridgeStore(app) }
     val privilegeAuditCount by privilegeState.auditCountFlow.collectAsStateWithLifecycle()
-    var privilegeRevokeInFlight by remember { mutableStateOf(false) }
-    var privilegeRevokeError by remember { mutableStateOf(false) }
 
     // C1 系統預設助理（Issue #137 C1b，三 flavor 共用 main 接線）：
     // RoleManager 快照＋一鍵要求＋fallback launcher（見 rememberAssistantRole）。
@@ -370,144 +365,100 @@ internal fun MainScreen(
                 pendingTeardown = pendingTeardown,
                 logoutInFlight = setupForm.logoutInFlight,
             )
-            SettingsScreen(
-                padding = padding,
-                gate = gate,
-                onEditEndpoint = { goSetupForEdit() },
-                onLogout = {
-                    setupViewModel.logout { success ->
-                        if (success) {
-                            chatViewModel.newChat()
-                            sessionListViewModel.refresh()
+            // Re-review #7 Finding 3（P2，#136-B1）：撤權 inFlight／error 改由
+            // [PrivilegeRevokeWiring]／PrivilegeRevokeViewModel（viewModelScope）持有，
+            // 存活配置變更；重建後的 UI 收集同一 VM 真相，不再出現「按鈕可點、無進度、
+            // 失敗 banner 遺失」與 per-composition 雙擊窗口。SettingsScreen API 不變。
+            PrivilegeRevokeWiring(
+                app = app,
+                withdraw = { FlavorPrivilegeScope.withdraw(app) },
+            ) { onRevokePrivilege, privilegeRevokeInFlight, privilegeRevokeError ->
+                SettingsScreen(
+                    padding = padding,
+                    gate = gate,
+                    onEditEndpoint = { goSetupForEdit() },
+                    onLogout = {
+                        setupViewModel.logout { success ->
+                            if (success) {
+                                chatViewModel.newChat()
+                                sessionListViewModel.refresh()
+                            }
                         }
-                    }
-                },
-                onRevokePrivilege = {
-                    // 同步先落 inFlight（composition 主執行緒），消除同幅雙擊窗口：
-                    // 兩次點擊在 launch 實際執行前都會看到 inFlight == true。
-                    // consumer-side pin: SettingsScreenTest.privilegeRevoke_inFlightStateDisablesButtonAndShowsProgress（同步落位消除同幅雙擊窗口）
-                    if (!privilegeRevokeInFlight) {
-                        privilegeRevokeInFlight = true
-                        privilegeRevokeError = false
+                    },
+                    onRevokePrivilege = onRevokePrivilege,
+                    privilegeAuditCount = privilegeAuditCount,
+                    privilegeRevokeInFlight = privilegeRevokeInFlight,
+                    privilegeRevokeError = privilegeRevokeError,
+                    voiceInputEnabled = VoiceTools.inputEnabled(voiceEffectiveSnapshot),
+                    voiceOutputEnabled = VoiceTools.outputEnabled(voiceEffectiveSnapshot),
+                    openAiTtsEnabled = VoiceTools.openAiTtsEnabled(voiceEffectiveSnapshot),
+                    voiceSwitchesEnabled = voiceEffectiveSnapshot.loaded && !voiceEffectiveSnapshot.loadFailed,
+                    voiceLoadFailed = voiceEffectiveSnapshot.loadFailed,
+                    onVoiceInputSwitch = { enabled ->
                         scope.launch {
                             try {
-                                privilegeRevokeError = executePrivilegeRevoke(
-                                    privilegeState = privilegeState,
-                                    privilegeStore = privilegeStore,
-                                    withdraw = { FlavorPrivilegeScope.withdraw(app) },
-                                    isScopeActive = { scope.isActive },
-                                )
-                            } catch (t: Throwable) {
-                                privilegeRevokeError = true
-                                throw t
-                            } finally {
-                                // WARN-1：即使存活的 UI Job 在此刻已消亡，也要先把 banner 置位再同一路線上拋
-                                privilegeRevokeInFlight = false
+                                voiceStore.setInputEnabled(enabled)
+                            } catch (e: CancellationException) {
+                                throw e
+                            } catch (e: Exception) {
+                                Log.w(TAG, "voice input switch persist failed", e)
                             }
                         }
-                    }
-                },
-                privilegeAuditCount = privilegeAuditCount,
-                privilegeRevokeInFlight = privilegeRevokeInFlight,
-                privilegeRevokeError = privilegeRevokeError,
-                voiceInputEnabled = VoiceTools.inputEnabled(voiceEffectiveSnapshot),
-                voiceOutputEnabled = VoiceTools.outputEnabled(voiceEffectiveSnapshot),
-                openAiTtsEnabled = VoiceTools.openAiTtsEnabled(voiceEffectiveSnapshot),
-                voiceSwitchesEnabled = voiceEffectiveSnapshot.loaded && !voiceEffectiveSnapshot.loadFailed,
-                voiceLoadFailed = voiceEffectiveSnapshot.loadFailed,
-                onVoiceInputSwitch = { enabled ->
-                    scope.launch {
-                        try {
-                            voiceStore.setInputEnabled(enabled)
-                        } catch (e: CancellationException) {
-                            throw e
-                        } catch (e: Exception) {
-                            Log.w(TAG, "voice input switch persist failed", e)
-                        }
-                    }
-                },
-                onVoiceOutputSwitch = { enabled ->
-                    scope.launch {
-                        try {
-                            voiceStore.setOutputEnabled(enabled)
-                        } catch (e: CancellationException) {
-                            throw e
-                        } catch (e: Exception) {
-                            Log.w(TAG, "voice output switch persist failed", e)
-                        }
-                    }
-                },
-                onOpenAiTtsSwitch = { enabled ->
-                    scope.launch {
-                        try {
-                            voiceStore.setOpenAiTtsEnabled(enabled)
-                        } catch (e: CancellationException) {
-                            throw e
-                        } catch (e: Exception) {
-                            Log.w(TAG, "openai tts switch persist failed", e)
-                        }
-                    }
-                },
-                // Stage E 四態派生恢復態（與 host 同一純函數單一來源）：無碼＋KnownPending
-                // ＋非執行中 → LOGOUT_UNKNOWN（NoEndpoint 顯示 UNKNOWN 卡＋重試清除，
-                // 無 dismiss）；無碼＋Unknown／Malformed＋非執行中 → LOGOUT_READ_RETRY
-                // （重試讀取 only）；有碼沿用不動。Stage F 四參抑制 stale 回落
-                // （同源沿用、Absent／異源 J_C 隱藏、未確認保留舊碼；STALE 恆顯；
-                // 真正清卡靠 retry 終端，見 NavGuard 真值表）。
-                // Stage G F1：派生攜帶有效身份——有效碼＋重試目標同源計算
-                // （`effectiveLogoutRecovery`）：同源 `(code, J)`、異源 `J_C` 攜
-                // `("LOGOUT_UNKNOWN", J_C)`（碼固定中性，不沿用舊 DELETE_FAILED）、
-                // Absent 抑制 `(null, null)`、未確認保留 `(code, null)`、STALE 恆顯
-                // `(STALE, null)`；`SettingsScreen` 收已派生值（有效碼＋重試身份顯示），
-                // 重試 targeting 用顯示身份、提交仍快照比對（禁盲 replay）。
-                // Safe reconcile 走重試清除入口（`retryPendingDelete`，同一
-                // `runPendingDeleteLocked` 核心）；全新登出確認仍走 `onLogout`
-                // fresh-only。
-                logoutErrorCode = displayedRecovery.effectiveCode,
-                logoutRetryJournal = displayedRecovery.retryJournal?.format(),
-                logoutInFlight = setupForm.logoutInFlight,
-                onDismissLogoutError = { setupViewModel.clearLogoutError() },
-                // Stage G F1 重試 targeting（兩顆：Ready retained＋NoEndpoint retained）讀
-                // 派生的 `retryJournal`（非 form tag）：`J`／`J_C` 非 null → 直接
-                // `retryPendingDelete(target)`（顯示身份即提交身份，終端仍快照比對，
-                // 漂移即 `StaleGone`，禁盲 replay）；`null`＋有碼 → 今日分流
-                // （`form.tag.parse`：tag null／毀損 → 重試讀取；`ReadUnknown` 亦轉
-                // 重試讀取）；`null`＋無碼 fresh → 不到此分支（新鮮確認鍵走 `onLogout`
-                // 不變，見 `SettingsScreen` 按鍵分流）。
-                // `Replayed(COMMITTED)` 比照登出成功清會話。
-                onRetryLogout = {
-                    // 讀顯示快照的 `retryJournal`（非 form tag；漂移後仍為顯示的 `J_C`）。
-                    val target = displayedRecovery.retryJournal
-                    if (target != null) {
-                        setupViewModel.retryPendingDelete(target) { result ->
-                            when (result) {
-                                is SetupViewModel.RetryResult.Replayed -> {
-                                    if (result.outcome == SetupViewModel.PendingDeleteOutcome.COMMITTED) {
-                                        chatViewModel.newChat()
-                                        sessionListViewModel.refresh()
-                                    }
-                                }
-                                is SetupViewModel.RetryResult.StaleGone -> Unit
-                                is SetupViewModel.RetryResult.ReadUnknown -> {
-                                    setupViewModel.retryStartupReconcile { outcome, journal ->
-                                        setupViewModel.onStartupReconcile(outcome, journal)
-                                    }
-                                }
+                    },
+                    onVoiceOutputSwitch = { enabled ->
+                        scope.launch {
+                            try {
+                                voiceStore.setOutputEnabled(enabled)
+                            } catch (e: CancellationException) {
+                                throw e
+                            } catch (e: Exception) {
+                                Log.w(TAG, "voice output switch persist failed", e)
                             }
                         }
-                    } else if (displayedRecovery.effectiveCode != null) {
-                        val tagRaw = setupViewModel.form.value.logoutErrorSourceJournal
-                        val expected: PendingDelete? = try {
-                            tagRaw?.let { PendingDelete.parse(it) }
-                        } catch (_: Exception) {
-                            null
-                        }
-                        if (expected == null) {
-                            setupViewModel.retryStartupReconcile { outcome, journal ->
-                                setupViewModel.onStartupReconcile(outcome, journal)
+                    },
+                    onOpenAiTtsSwitch = { enabled ->
+                        scope.launch {
+                            try {
+                                voiceStore.setOpenAiTtsEnabled(enabled)
+                            } catch (e: CancellationException) {
+                                throw e
+                            } catch (e: Exception) {
+                                Log.w(TAG, "openai tts switch persist failed", e)
                             }
-                        } else {
-                            setupViewModel.retryPendingDelete(expected) { result ->
+                        }
+                    },
+                    // Stage E 四態派生恢復態（與 host 同一純函數單一來源）：無碼＋KnownPending
+                    // ＋非執行中 → LOGOUT_UNKNOWN（NoEndpoint 顯示 UNKNOWN 卡＋重試清除，
+                    // 無 dismiss）；無碼＋Unknown／Malformed＋非執行中 → LOGOUT_READ_RETRY
+                    // （重試讀取 only）；有碼沿用不動。Stage F 四參抑制 stale 回落
+                    // （同源沿用、Absent／異源 J_C 隱藏、未確認保留舊碼；STALE 恆顯；
+                    // 真正清卡靠 retry 終端，見 NavGuard 真值表）。
+                    // Stage G F1：派生攜帶有效身份——有效碼＋重試目標同源計算
+                    // （`effectiveLogoutRecovery`）：同源 `(code, J)`、異源 `J_C` 攜
+                    // `("LOGOUT_UNKNOWN", J_C)`（碼固定中性，不沿用舊 DELETE_FAILED）、
+                    // Absent 抑制 `(null, null)`、未確認保留 `(code, null)`、STALE 恆顯
+                    // `(STALE, null)`；`SettingsScreen` 收已派生值（有效碼＋重試身份顯示），
+                    // 重試 targeting 用顯示身份、提交仍快照比對（禁盲 replay）。
+                    // Safe reconcile 走重試清除入口（`retryPendingDelete`，同一
+                    // `runPendingDeleteLocked` 核心）；全新登出確認仍走 `onLogout`
+                    // fresh-only。
+                    logoutErrorCode = displayedRecovery.effectiveCode,
+                    logoutRetryJournal = displayedRecovery.retryJournal?.format(),
+                    logoutInFlight = setupForm.logoutInFlight,
+                    onDismissLogoutError = { setupViewModel.clearLogoutError() },
+                    // Stage G F1 重試 targeting（兩顆：Ready retained＋NoEndpoint retained）讀
+                    // 派生的 `retryJournal`（非 form tag）：`J`／`J_C` 非 null → 直接
+                    // `retryPendingDelete(target)`（顯示身份即提交身份，終端仍快照比對，
+                    // 漂移即 `StaleGone`，禁盲 replay）；`null`＋有碼 → 今日分流
+                    // （`form.tag.parse`：tag null／毀損 → 重試讀取；`ReadUnknown` 亦轉
+                    // 重試讀取）；`null`＋無碼 fresh → 不到此分支（新鮮確認鍵走 `onLogout`
+                    // 不變，見 `SettingsScreen` 按鍵分流）。
+                    // `Replayed(COMMITTED)` 比照登出成功清會話。
+                    onRetryLogout = {
+                        // 讀顯示快照的 `retryJournal`（非 form tag；漂移後仍為顯示的 `J_C`）。
+                        val target = displayedRecovery.retryJournal
+                        if (target != null) {
+                            setupViewModel.retryPendingDelete(target) { result ->
                                 when (result) {
                                     is SetupViewModel.RetryResult.Replayed -> {
                                         if (result.outcome == SetupViewModel.PendingDeleteOutcome.COMMITTED) {
@@ -523,43 +474,72 @@ internal fun MainScreen(
                                     }
                                 }
                             }
+                        } else if (displayedRecovery.effectiveCode != null) {
+                            val tagRaw = setupViewModel.form.value.logoutErrorSourceJournal
+                            val expected: PendingDelete? = try {
+                                tagRaw?.let { PendingDelete.parse(it) }
+                            } catch (_: Exception) {
+                                null
+                            }
+                            if (expected == null) {
+                                setupViewModel.retryStartupReconcile { outcome, journal ->
+                                    setupViewModel.onStartupReconcile(outcome, journal)
+                                }
+                            } else {
+                                setupViewModel.retryPendingDelete(expected) { result ->
+                                    when (result) {
+                                        is SetupViewModel.RetryResult.Replayed -> {
+                                            if (result.outcome == SetupViewModel.PendingDeleteOutcome.COMMITTED) {
+                                                chatViewModel.newChat()
+                                                sessionListViewModel.refresh()
+                                            }
+                                        }
+                                        is SetupViewModel.RetryResult.StaleGone -> Unit
+                                        is SetupViewModel.RetryResult.ReadUnknown -> {
+                                            setupViewModel.retryStartupReconcile { outcome, journal ->
+                                                setupViewModel.onStartupReconcile(outcome, journal)
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        } else {
+                            // fresh（Absent 抑制等派生 null）：重試鍵不可達（新鮮確認鍵走
+                            // onLogout），此分支不觸任何副作用，防盲目回退全新 logout。
                         }
-                    } else {
-                        // fresh（Absent 抑制等派生 null）：重試鍵不可達（新鮮確認鍵走
-                        // onLogout），此分支不觸任何副作用，防盲目回退全新 logout。
-                    }
-                },
-                // Stage D1：中性碼重試讀取（reconcile-only，絕不調 logout；
-                // enabled 綁 startupReconcilePending，見 SettingsScreen）。
-                onRetryStartupRead = {
-                    setupViewModel.retryStartupReconcile { outcome, journal ->
-                        setupViewModel.onStartupReconcile(outcome, journal)
-                    }
-                },
-                startupReconcilePending = startupReconcilePending,
-                currentSessionId = currentSessionId,
-                exportState = exportState,
-                importState = importState,
-                pickers = pickers,
-                onViewTranscript = { sessionId ->
-                    viewedSessionId = sessionId
-                },
-                onDismissExportState = { sessionListViewModel.resetExportState() },
-                onDismissImportState = { sessionListViewModel.resetImportState() },
-                assistant = assistantRole.state,
-                onRequestAssistantRole = assistantRole.request,
-                onRecheckAssistantRole = assistantRole.recheck,
-                onOpenVoiceInputSettings = assistantRole.openFallback,
-                web = webSettingsState,
-                onWebMasterSwitch = webViewModel::onMasterSwitch,
-                onWebDdgsSwitch = webViewModel::onDdgsSwitch,
-                onWebSearxngUrlChange = webViewModel::onSearxngUrlChange,
-                onWebProbe = webViewModel::onProbe,
-                onWebConsentConfirm = webViewModel::onConsentConfirm,
-                onWebConsentDismiss = webViewModel::onConsentDismiss,
-                onWebRetryLoad = webViewModel::retryLoad,
-                onWebResetSettings = webViewModel::onResetSettings,
-            )
+                    },
+                    // Stage D1：中性碼重試讀取（reconcile-only，絕不調 logout；
+                    // enabled 綁 startupReconcilePending，見 SettingsScreen）。
+                    onRetryStartupRead = {
+                        setupViewModel.retryStartupReconcile { outcome, journal ->
+                            setupViewModel.onStartupReconcile(outcome, journal)
+                        }
+                    },
+                    startupReconcilePending = startupReconcilePending,
+                    currentSessionId = currentSessionId,
+                    exportState = exportState,
+                    importState = importState,
+                    pickers = pickers,
+                    onViewTranscript = { sessionId ->
+                        viewedSessionId = sessionId
+                    },
+                    onDismissExportState = { sessionListViewModel.resetExportState() },
+                    onDismissImportState = { sessionListViewModel.resetImportState() },
+                    assistant = assistantRole.state,
+                    onRequestAssistantRole = assistantRole.request,
+                    onRecheckAssistantRole = assistantRole.recheck,
+                    onOpenVoiceInputSettings = assistantRole.openFallback,
+                    web = webSettingsState,
+                    onWebMasterSwitch = webViewModel::onMasterSwitch,
+                    onWebDdgsSwitch = webViewModel::onDdgsSwitch,
+                    onWebSearxngUrlChange = webViewModel::onSearxngUrlChange,
+                    onWebProbe = webViewModel::onProbe,
+                    onWebConsentConfirm = webViewModel::onConsentConfirm,
+                    onWebConsentDismiss = webViewModel::onConsentDismiss,
+                    onWebRetryLoad = webViewModel::retryLoad,
+                    onWebResetSettings = webViewModel::onResetSettings,
+                )
+            }
         },
         setupContent = { padding, isFirstRun ->
             SetupScreen(

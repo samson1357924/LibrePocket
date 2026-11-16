@@ -593,15 +593,6 @@ class FastDispatchTest {
             // 無空格形態：句首 lookup 動詞「查」仍是位置 cue（positional opener，
             // spec Step A）——殘餘 `理` 乃位置剝離，非全域填充詞刪除。
             "查理 符號" to "理",
-            // KDoc accepted residual（stage-6.2）：>8 L/N-char possessor 槽超界，
-            // consent 框架不匹配 ⇒ 單 token 命令形 FAST（READ-only garbage query）。
-            // 句中 `符號` 為 infix——step C 後綴 cue 僅 end-anchored，殘餘原樣保留。
-            // Recorded, not fixed.
-            "查Foo符號等123456789批准" to "Foo符號等123456789批准",
-            // KDoc accepted residual（stage-6.2）：consent 動詞與 再|才 之間夾半形
-            // `,` 不視為連接符 ⇒ 單 token 命令形 FAST（READ-only garbage query）。
-            // 句中 `符號` 為 infix，殘餘原樣保留。Recorded, not fixed.
-            "查Foo符號批准,再做" to "Foo符號批准,再做",
         )) {
             val d = decide(text)
             assertEquals(text, RouteKind.FAST, d.route)
@@ -2684,10 +2675,11 @@ class FastDispatchTest {
             "只有我核准才查",
             "只許我確認才查",
             "只允他確認才查",
-            // #19 B3 stage-6.2（F1 修正後語意）：CJK possessor 槽（[\p{L}\p{N}]{1,8}，不限封閉代名詞表——
-            // 主管/老闆/經理/董事會/工廠 等未列 possessor 皆收）＋雙臂 consent 框架：
-            // A＝動詞＋必填後-family（再|才 可選，`同意後`／`批准後` 否決）；
-            // B＝動詞＋必填再|才（`批准再做`／`批准才做` 否決）；
+            // #19 B3 stage-6.2（F1 修正後語意）：CJK possessor 槽（[\p{L}\p{N}]{0,64}，不限封閉代名詞表——
+            // 主管/老闆/經理/董事會/工廠 等未列 possessor、長組織名與數字 possessor 皆收）＋雙臂 consent 框架：
+            // A＝動詞＋可選分隔符（半/全形空白、`,` `，` `.` `。` `;` `；` `:` `：` `、` `！` `？` `!` `?`、助詞 `了` `過`）
+            //   ＋必填後-family（再|才 可選、其前亦可夾分隔符，`同意後`／`批准後`／`同意後，再查` 皆否決）；
+            // B＝動詞＋可選分隔符（同上）＋必填再|才（`批准再做`／`批准才做`／`批准,再做`／`批准了再做` 皆否決）；
             // 無 `再|才` 亦無後-family ⇒ 不匹配（裸 `批准` 仍 FAST 見下方正向測試）。
             "查 Foo 符號等主管批准再做",
             "查 Foo 符號等老闆同意",
@@ -2706,6 +2698,33 @@ class FastDispatchTest {
             "查 Foo 符號等主管\u200B同意",
             // 精確 report 字串（無空白形式）：
             "查Foo符號等主管批准再做",
+            // #19 B3 stage-7.1（A1）：CJK possessor 槽放寬至 [\p{L}\p{N}]{0,64}（平坦、線性），
+            // consent 動詞與 後-family/再|才 之間夾半/全形分隔符與助詞 `了` 亦否決。
+            // 原 `positionalCueGrammarPins` 之 FAST pins 翻轉為 DENIED：
+            "查Foo符號等123456789批准",
+            "查Foo符號批准,再做",
+            // 新增 pins：
+            "查Foo符號等123456789012批准",
+            "查Foo符號等安全審核委員會主席批准",
+            "查Foo符號等國家安全委員會批准",
+            "查Foo符號批准，再做",
+            "查Foo符號批准;再做",
+            "查Foo符號批准:再做",
+            "查Foo符號批准了再做",
+            "查Foo符號批准。再做",
+            "查Foo符號同意後，再查",
+            "查Foo符號批准，才做",
+            // 七個 U+FF0E/U+2025/U+2026/下劃線 U+005F（審計 finding：同類 bypass）——arm A/B 分隔符涵蓋：
+            "查Foo符號批准_再做",
+            "查Foo符號同意_後再做",
+            "查Foo符號點頭．再做", // U+FF0E fullwidth full stop
+            "查Foo符號批准‥再做", // U+2025 two-dot leader
+            "查Foo符號批准…再做", // U+2026 horizontal ellipsis
+            "查Foo符號等\u200B主管批准",
+            // spaced backstop：possessor 兩端單空白落在框架兩個分隔槽內，
+            // arm D 仍匹配 ⇒ decide() DENIED、reasonCode=null（no-match fallback，verified；
+            // 絕不以 NEED_CLARIFICATION 過度斷言）——絕不執行（never FAST）。
+            "查Foo符號等 安全審核委員會主席 批准",
         )) {
             // decide()：decision is DENIED, toolCall == null。
             val d = decide(text)

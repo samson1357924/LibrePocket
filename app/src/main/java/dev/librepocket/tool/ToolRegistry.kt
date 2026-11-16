@@ -229,7 +229,7 @@ object ToolRegistry {
         // Schema 只收 argv / reasonCode / timeoutMs 三鍵（無字串形式的執行鍵）。
         ToolDef(
             name = "shell.elevated",
-            description = "Elevated exec via the Shizuku/Root bridge (self-install only, default off): argv vector direct to the bridge, reasonCode required for audit. SCAFFOLD: wiring shape only (test-only; no product Chat dispatcher/executor wiring yet, see TurnController records-only). Production runner + grant/confirm flow lands after device E2E + #166 (tracked in #136-B3); executionReady stays false until then.",
+            description = "Elevated exec via the Shizuku/Root bridge (self-install only, default off): argv vector direct to the bridge, reasonCode required for audit. SCAFFOLD: wiring shape only (test-only; no product Chat dispatcher/executor wiring yet, see TurnController records-only). Production runner + grant/confirm flow lands after device E2E + #166 (tracked in #136-B3); executionReady stays false until then. 仍為接線形狀（executionReady=false、ELEVATED_RUNNERS_READY=false）；timeoutMs 上限 60s（MAX_ELEVATED_TIMEOUT_MS），僅 wiring 使用；其他 flavor 無此 reference。",
             jsonSchema = schema(
                 prop("argv", "array", "Argument vector; argv[0] is the binary basename, never a single string"),
                 prop("reasonCode", "string", "Why elevated execution is needed (written to the audit log as a hash)"),

@@ -51,25 +51,94 @@ import java.util.concurrent.atomic.AtomicBoolean
  */
 class ElevatedWiringTest {
 
-    // ---- T4 pin：四個 gate-bearing internal 成員皆編譯為 JVM synthetic（@JvmSynthetic）----
+    // ---- T5-1 pin：ElevatedDispatch／ShellExecTool 的 @JvmSynthetic internal 成員「完整 diff 驗證」----
     // （外部（如 Java 透過 mangled 名稱 `execute$app`）呼叫面在編譯期封死；
-    //  反射驗證 ACC_SYNTHETIC——防註解被靜默移除而不觸發任何測試）
+    //  反射驗證 ACC_SYNTHETIC——防註解被靜默移除而不觸發任何測試。
+    //  T5-1 將舊 pin（各類≥4 個、皆 synthetic、target 非空）強化為「完整集合」斷言：
+    //  掃描兩個類別**所有**宣告的公開方法（instance＋static、含 `$default` bridges），
+    //  證明整個 diff 沒有任何非 synthetic 公開成員從這兩個類別逃逸——不只四個被點名的
+    //  gate 成員受檢，任何新增的公開成員（無論名稱）都會讓本測試失敗並點名。
+    //  既有 shell.exec 公開 API（`ShellExecTool.execute`、`ShellExecTool.checkSwitch`）
+    //  為刻意保留、非提權面的非 synthetic 公開成員，以具名允許清單固定；除此之外
+    //  一律要求 synthetic（ElevatedDispatch 零外部 API）。）
+
+    /** 方法簽名（宣告類名＋方法名＋參數簡名），供失敗訊息精確點名。 */
+    private fun publicMethodSignature(method: java.lang.reflect.Method): String =
+        "${method.declaringClass.simpleName}.${method.name}(" +
+            method.parameterTypes.joinToString(",") { it.simpleName } + ")"
 
     @Test fun internalGateMembersAreJvmSynthetic() {
-        val dispatchMethods = dev.librepocket.router.ElevatedDispatch::class.java.declaredMethods
-        val execToolMethods = dev.librepocket.shell.ShellExecTool::class.java.declaredMethods
-        val gateMethods = listOf(
-            dispatchMethods.filter { it.name.startsWith("execute") },
-            execToolMethods.filter { it.name.startsWith("executeElevated") },
+        val dispatch = dev.librepocket.router.ElevatedDispatch::class.java.declaredMethods
+            .filter { java.lang.reflect.Modifier.isPublic(it.modifiers) }
+        val execTool = dev.librepocket.shell.ShellExecTool::class.java.declaredMethods
+            .filter { java.lang.reflect.Modifier.isPublic(it.modifiers) }
+        // shell.exec 的既有公開 API（刻意保留、非提權面）：非 synthetic；其餘一律須 synthetic。
+        val allowedNonSynthetic = setOf(
+            "ShellExecTool.execute",   // shell.exec 受限執行入口（公開 API）
+            "ShellExecTool.checkSwitch", // shell.exec 開關檢查（公開 API）
         )
-        // 對四個 mangled 名稱（$<module>）＋可能的 $default bridges 皆須 synthetic；
-        // Kotlin 側 internal 成員對測試源集可見，但 JVM ACC_SYNTHETIC 阻擋 Java 編譯。
-        val targets = gateMethods.flatten()
-        assertTrue("gate methods must exist in class files: ${targets.map { it.name }}", targets.isNotEmpty())
-        val nonSynthetic = targets.filter { !it.isSynthetic }
-        assertTrue("all gate-bearing members must be JVM synthetic: ${nonSynthetic.map { it.name }}", nonSynthetic.isEmpty())
-        // 且至少包含四個目標（execute/executeWithFrozen/executeElevated/executeElevatedFrozen 各一）。
-        assertTrue("must have >=4 gate members", targets.size >= 4)
+
+        // 1) 完整集合斷言（名字全集、精確到簽名）：兩類別宣告的公開方法名稱集合就是此 pin 的
+        //    期望值——任何新增／移除的公開成員都會在此失敗並點名（含未來新增的 `$default` bridge）。
+        val observedNames = (dispatch + execTool).map { publicMethodSignature(it) }.toSet()
+        val expectedNames = setOf(
+            "ElevatedDispatch.execute\$app(ToolDef,boolean,Projection,ElevatedRequest,ElevatedShellRunner,PrivilegeAuditLog,long)",
+            "ElevatedDispatch.execute\$app\$default(ElevatedDispatch,ToolDef,boolean,Projection,ElevatedRequest,ElevatedShellRunner,PrivilegeAuditLog,long,int,Object)",
+            "ElevatedDispatch.executeWithFrozen\$app(ToolDef,ElevatedRequest,ElevatedShellRunner,PrivilegeAuditLog,long)",
+            "ElevatedDispatch.executeWithFrozen\$app\$default(ElevatedDispatch,ToolDef,ElevatedRequest,ElevatedShellRunner,PrivilegeAuditLog,long,int,Object)",
+            "ShellExecTool.checkSwitch(boolean)",
+            "ShellExecTool.execute(List,RestrictedShell,boolean,long)",
+            "ShellExecTool.execute\$default(ShellExecTool,List,RestrictedShell,boolean,long,int,Object)",
+            "ShellExecTool.executeElevated\$app(ElevatedRequest,ElevatedShellRunner,PrivilegeAuditLog,long)",
+            "ShellExecTool.executeElevated\$app\$default(ShellExecTool,ElevatedRequest,ElevatedShellRunner,PrivilegeAuditLog,long,int,Object)",
+            "ShellExecTool.executeElevatedFrozen\$app(ElevatedRequest,ElevatedShellRunner,PrivilegeAuditLog,long)",
+            "ShellExecTool.executeElevatedFrozen\$app\$default(ShellExecTool,ElevatedRequest,ElevatedShellRunner,PrivilegeAuditLog,long,int,Object)",
+        )
+        val missing = expectedNames - observedNames
+        val unexpected = observedNames - expectedNames
+        assertTrue(
+            "declared public methods must be exactly the pinned set; missing: $missing; unexpected: $unexpected",
+            missing.isEmpty() && unexpected.isEmpty(),
+        )
+
+        // 2) 除具名允許清單外，所有公開成員一律 JVM synthetic（Member.isSynthetic ≡ ACC_SYNTHETIC）。
+        val nonSynthetic = (dispatch + execTool)
+            .filter { !it.isSynthetic && publicMethodSignature(it).substringBefore('(') !in allowedNonSynthetic }
+            .map { publicMethodSignature(it) }
+        assertTrue(
+            "every public method outside the shell.exec allowlist must be JVM synthetic; escaped: $nonSynthetic",
+            nonSynthetic.isEmpty(),
+        )
+
+        // 3) 名稱形狀：所有公開成員名稱（去掉 $<module>／$default 後綴）必須對應 gate 路徑
+        //    （execute 開頭）或具名允許清單（checkSwitch）；不允許任何意外名稱。
+        val shapeViolations = (dispatch + execTool)
+            .map { it.name }
+            .filter { name -> name.substringBefore('$').let { root ->
+                !root.startsWith("execute") && root != "checkSwitch"
+            } }
+        assertTrue(
+            "unexpected public member names (must map to gate paths 'execute*' or the allowlist): $shapeViolations",
+            shapeViolations.isEmpty(),
+        )
+
+        // 4) 四個 gate 名稱必須存在（含 `$<module>`／`$default` 後綴），且其本體與 bridge 皆 synthetic。
+        val gateRoots = listOf("execute", "executeWithFrozen", "executeElevated", "executeElevatedFrozen")
+        val strippedRoots = (dispatch + execTool).map { it.name.substringBefore('$') }
+        for (gate in gateRoots) {
+            assertTrue(
+                "missing gate member '$gate' among declared public methods: ${(dispatch + execTool).map { it.name }.sorted()}",
+                gate in strippedRoots,
+            )
+        }
+        val gateMembers = (dispatch + execTool)
+            .filter { it.name.substringBefore('$') in gateRoots }
+            .filter { !(it.declaringClass.simpleName == "ShellExecTool" && it.name == "execute") } // shell.exec 公開 API，非提權 gate
+        val nonSyntheticGates = gateMembers.filter { !it.isSynthetic }.map { publicMethodSignature(it) }
+        assertTrue(
+            "all gate-bearing members must be JVM synthetic: $nonSyntheticGates",
+            nonSyntheticGates.isEmpty(),
+        )
     }
 
     private companion object {
@@ -1227,6 +1296,100 @@ class ElevatedWiringTest {
         }
     }
 
+    @Test fun cancelledCallerDuringPoolSaturationThrowsCancellationNotDenial() = runBlocking {
+        // 池飽和＋已取消 caller 的確定性 pin：兩個 parked supplier 佔滿有界池（同 supplierPoolSaturationFailsClosedFast 骨架），
+        // 第三個 caller 於 execute() 內即確認 context 已取消（入口 ensureActive 重拋 CE，不是 Denied、零審計、零 spawn）。
+        // 誠實盤點（為何是這個 pin 而非虛構交錯）：boundedSupplierCall 進池是非掛起的原子 trySubmit
+        // （accept 或 reject 原子生效、池滿即 null），「取消與進池賽跑」沒有可觀測中間態；
+        // 池滿拒絕路徑本身無掛起點，CE 只可能在 ensureActive（入口）或供應者面顯現。
+        // body 內自取消保證進入 execute 時 context 已取消：ensureActive 首行確定性重拋 CE。
+        val entered = CountDownLatch(2)
+        val stop = AtomicBoolean(false)
+        val stuckCtx: () -> ProjectionContext = {
+            entered.countDown()
+            val end = System.nanoTime() + TimeUnit.SECONDS.toNanos(30)
+            // 非協作：吞掉 interrupt（pool shutdown cancel(true)），只認 stop 旗標。
+            while (!stop.get() && System.nanoTime() < end) {
+                try {
+                    Thread.sleep(1)
+                } catch (_: InterruptedException) { /* non-cooperative: ignore */ }
+            }
+            elevatedCtx()
+        }
+        val auditA = PrivilegeAuditLog()
+        val auditB = PrivilegeAuditLog()
+        val auditC = PrivilegeAuditLog()
+        val runnerA = SpawnCounter()
+        val runnerB = SpawnCounter()
+        val runnerC = SpawnCounter()
+        try {
+            val deferredA = async {
+                ElevatedWiring.execute(
+                    argv = listOf("id"),
+                    reasonCode = "B3-T",
+                    confirmed = true,
+                    ctxSupplier = stuckCtx,
+                    policyStore = allowPolicy(),
+                    runner = runnerA,
+                    audit = auditA,
+                    grantCheck = { validGrant() },
+                    bridgeGranted = { true },
+                )
+            }
+            val deferredB = async {
+                ElevatedWiring.execute(
+                    argv = listOf("id"),
+                    reasonCode = "B3-T",
+                    confirmed = true,
+                    ctxSupplier = stuckCtx,
+                    policyStore = allowPolicy(),
+                    runner = runnerB,
+                    audit = auditB,
+                    grantCheck = { validGrant() },
+                    bridgeGranted = { true },
+                )
+            }
+            // 兩個 parked worker 都已進入世代（bounded 12s；blocking await 移至 IO 緒）。
+            val enteredOk = withContext(Dispatchers.IO) {
+                entered.await(12_000L, TimeUnit.MILLISECONDS)
+            }
+            assertTrue("both parked suppliers must enter pool workers", enteredOk)
+            // 第三個 caller：池飽和下，入口 ensureActive 即重拋 CE（不是 Denied）。
+            // 形：先進 async 再於 body 內取消自己的 job → resume 到 execute() 時 dispatch 檢查必拋；
+            // execute() 首行 coroutineContext.ensureActive() 亦因 job 已取消而重拋 CE。
+            val cancelledJob = kotlinx.coroutines.Job()
+            val third = async(cancelledJob) {
+                cancelledJob.cancel()
+                ElevatedWiring.execute(
+                    argv = listOf("id"),
+                    reasonCode = "B3-T",
+                    confirmed = true,
+                    ctxSupplier = { elevatedCtx() },
+                    policyStore = allowPolicy(),
+                    runner = runnerC,
+                    audit = auditC,
+                    grantCheck = { validGrant() },
+                    bridgeGranted = { true },
+                )
+            }
+            try {
+                third.await()
+                assertTrue("cancelled caller must throw CancellationException, not not return", false)
+            } catch (_: CancellationException) {
+                // 預期：CE 重拋（不是 Denied）；零 spawn、零審計。
+            }
+            assertEquals(0, runnerC.calls)
+            assertEquals(0, auditC.size())
+            // 前兩個 parked caller 逾時於 1s 即 fail-closed（與第三個無關）。
+            val resultA = withTimeoutOrNull(12_000L) { deferredA.await() }
+            val resultB = withTimeoutOrNull(12_000L) { deferredB.await() }
+            assertTrue("A must fail closed (Denied), got $resultA", resultA is ShellResult.Denied)
+            assertTrue("B must fail closed (Denied), got $resultB", resultB is ShellResult.Denied)
+        } finally {
+            stop.set(true)
+        }
+    }
+
     @Test fun freezeSwitchesOverLimitDenied() = runBlocking {
         // userSwitches 65 筆 > MAX_FROZEN_SWITCHES(64) → freeze null → Denied＋DENY、零 spawn。
         val runner = SpawnCounter()
@@ -2318,6 +2481,45 @@ class ElevatedWiringTest {
         )
         assertTrue("$r", r is ShellResult.Failed)
         assertTrue("$r", (r as ShellResult.Failed).message.contains("CancellationException"))
+        assertEquals(1, runner.calls) // 已 spawn（門禁已過）
+        assertEquals(1, audit.size())
+        assertEquals(mapOf("FAILED" to 1), audit.countByVerdict())
+        val row = audit.snapshot().single()
+        assertEquals(PrivilegeAuditLog.argvHash(listOf("id")), row.argvHash)
+    }
+
+    @Test fun runnerVirtualMachineErrorPropagatesWithSingleFailedAudit() = runBlocking {
+        // runner 拋 VirtualMachineError（OOM）：executeElevatedFrozen 的 catch (t: Throwable)
+        // 收斂路徑先建 Failed＋記一筆 FAILED 審計，隨後 `t is VirtualMachineError` →
+        // 原樣重拋——VM 錯誤不得被包成 Denied、不得被吞、不得被映 FAILED 返回。
+        // 經 runInterruptible/withContext 透傳 unwrapped（Error 不被協程機制攔截），
+        // 由本測試 pin：OOM 外洩至 caller、恰一筆 FAILED 審計、runner 恰一次。
+        val runner = object : ElevatedShellRunner {
+            var calls = 0
+            override fun run(request: ElevatedRequest, timeoutMs: Long): ShellResult {
+                calls++
+                throw OutOfMemoryError("simulated")
+            }
+        }
+        val audit = PrivilegeAuditLog()
+        var caught: Throwable? = null
+        try {
+            ElevatedWiring.execute(
+                argv = listOf("id"),
+                reasonCode = "B3-T",
+                confirmed = true,
+                ctxSupplier = { elevatedCtx() },
+                policyStore = allowPolicy(),
+                runner = runner,
+                audit = audit,
+                grantCheck = { validGrant() },
+                bridgeGranted = { true },
+            )
+        } catch (t: Throwable) {
+            caught = t
+        }
+        assertTrue("OOM must propagate out of execute() unwrapped, got $caught", caught is OutOfMemoryError)
+        assertEquals("simulated", (caught as OutOfMemoryError).message)
         assertEquals(1, runner.calls) // 已 spawn（門禁已過）
         assertEquals(1, audit.size())
         assertEquals(mapOf("FAILED" to 1), audit.countByVerdict())

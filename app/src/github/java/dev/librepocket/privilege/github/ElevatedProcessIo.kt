@@ -4131,7 +4131,7 @@ internal object ElevatedProcessIo {
      *  no-op（同 handle 已在登記表內）、仍冪等安全——登記路徑不假設「首登」。
      *  注意：對 late-compensation 兩臂（startLateDaemon／compensateInline 的起線程失敗 arm），本 helper『登記拋出則槽保留』的下游重試臂不存在（無 drain verify 階段可回）——此處登記失敗的槽只有 app 重啟可恢復；此為刻意 accept 的 restart-only 殘局（brick 條件仍在 `!slotHeld && !quarantineContains` 分支中）。 */
     internal fun releaseCleanupSlotAfterVerify(process: Process, verified: Boolean, slotHeld: Boolean) {
-        // VME 極角：helper 內釋槽若再拋，worker finally 三態 1→2 或 catch 臂（state==0）仍恰好釋槽；包一層避免直接撕裂 future VME 收斂。
+        // VME 極角：helper 內釋槽若再拋，此 arm 無第二釋槽方（相容臂不在場）——退化為永久槽保留、admission 密封（app 重啟恢復，與 registered==false arm 同一 restart-only 終局）；包一層 runCatching 保至多釋放零次＋onFailure(noteUnclean) 保 breaker 不線默；worker 若再進入 helper 亦僅觸發同一不翻轉之終局。
         if (verified) { if (slotHeld) runCatching { ElevatedCleanupTracker.releaseSlot() }.onFailure { runCatching { ElevatedCleanupTracker.noteUnclean() } }; return }
         val registered = try { quarantineRegistrar(process); true } catch (_: Throwable) { false }
         if (registered) { if (slotHeld) runCatching { ElevatedCleanupTracker.releaseSlot() }.onFailure { runCatching { ElevatedCleanupTracker.noteUnclean() } } } else {

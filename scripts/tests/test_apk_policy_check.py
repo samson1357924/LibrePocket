@@ -307,7 +307,7 @@ class ApkPolicyHarness(unittest.TestCase):
             "esac\n"
             "case \"${1:-} ${2:-}\" in\n"
             "  'dump permissions')\n"
-            "    printf '%s\\n' 'package:dev.librepocket.agent'\n"
+            "    printf '%s\\n' \"package:${FAKE_AAPT_PACKAGE:-dev.librepocket.agent.github}\"\n"
             "    # FAKE_AAPT_PERMISSIONS: comma-separated uses-permission token\n"
             "    # names appended in the measured aapt dump spelling, used by the\n"
             "    # common/play permission-policy negative fixtures only.\n"
@@ -1103,7 +1103,10 @@ class ApkPolicyHarness(unittest.TestCase):
             "          # Realistic github manifest excerpt: benign integer attrs\n"
             "          # (type 0x10), InitializationProvider, Shizuku meta-data,\n"
             "          # and ShizukuProvider guarded by INTERACT_ACROSS_USERS_FULL.\n"
+            "          # The manifest root carries the plain package attribute aapt\n"
+            "          # prints on the real github APK.\n"
             "          printf '%s\\n' 'E: manifest' \\\n"
+            "            '  A: package=\"dev.librepocket.agent.github\"' \\\n"
             "            '  A: android:versionCode(0x0101021b)=(type 0x10)0x1' \\\n"
             "            '  E: application' \\\n"
             "            '    A: android:fullBackupContent(0x010104eb)=@0x7f010000' \\\n"
@@ -1170,6 +1173,7 @@ class ApkPolicyHarness(unittest.TestCase):
             "          # Same injection declared with the .-relative spelling\n"
             "          # (resolves inside the package); still no permission.\n"
             "          printf '%s\\n' 'E: manifest' \\\n"
+            "            '  A: package=\"dev.librepocket.agent.github\" (Raw: \"dev.librepocket.agent.github\")' \\\n"
             "            '  E: application' \\\n"
             "            '    A: android:fullBackupContent(0x010104eb)=@0x7f010000' \\\n"
             "            '    A: android:dataExtractionRules(0x0101063e)=@0x7f010001' \\\n"
@@ -1177,6 +1181,24 @@ class ApkPolicyHarness(unittest.TestCase):
             "            '    E: provider (line=4)' \\\n"
             "            '      A: android:name(0x01010003)=\".Bridge\" (Raw: \".Bridge\")' \\\n"
             "            '      A: android:exported(0x01010010)=(type 0x12)0xffffffff' \\\n"
+            "            '      A: android:authorities(0x01010018)=\"dev.librepocket.agent.github.bridge\" (Raw: \"dev.librepocket.agent.github.bridge\")' ;;\n"
+            "        shizuku-bridge-relative-positive)\n"
+            "          # Positive leading-dot control: the SAME .Bridge spelling\n"
+            "          # but WITH the full attribute contract, and a DEX\n"
+            "          # Ldev/librepocket/agent/github/Bridge; subclass: canonical\n"
+            "          # '.Bridge' resolves inside the merged package and\n"
+            "          # matches the exact FQN -> exactly one compliant surface.\n"
+            "          printf '%s\\n' 'E: manifest' \\\n"
+            "            '  A: package=\"dev.librepocket.agent.github\" (Raw: \"dev.librepocket.agent.github\")' \\\n"
+            "            '  E: application' \\\n"
+            "            '    A: android:fullBackupContent(0x010104eb)=@0x7f010000' \\\n"
+            "            '    A: android:dataExtractionRules(0x0101063e)=@0x7f010001' \\\n"
+            "            '    A: android:networkSecurityConfig(0x01010527)=@0x7f010002' \\\n"
+            "            '    E: provider (line=4)' \\\n"
+            "            '      A: android:name(0x01010003)=\".Bridge\" (Raw: \".Bridge\")' \\\n"
+            "            '      A: android:permission(0x01010006)=\"android.permission.INTERACT_ACROSS_USERS_FULL\" (Raw: \"android.permission.INTERACT_ACROSS_USERS_FULL\")' \\\n"
+            "            '      A: android:exported(0x01010010)=(type 0x12)0xffffffff' \\\n"
+            "            '      A: android:multiprocess(0x01010013)=(type 0x12)0x0' \\\n"
             "            '      A: android:authorities(0x01010018)=\"dev.librepocket.agent.github.bridge\" (Raw: \"dev.librepocket.agent.github.bridge\")' ;;\n"
             "        shizuku-bridge-compliant)\n"
             "          # The same renamed subclass declared WITH the full\n"
@@ -1613,6 +1635,7 @@ class ApkPolicyHarness(unittest.TestCase):
         rules_mode: str = "ok",
         permissions: str = "",
         resources_count_file: Path | None = None,
+        aapt_package: str | None = None,
     ) -> dict[str, str]:
         env = os.environ.copy()
         env.update(
@@ -1633,6 +1656,8 @@ class ApkPolicyHarness(unittest.TestCase):
         )
         if resources_count_file is not None:
             env["FAKE_AAPT_RESOURCES_COUNT_FILE"] = str(resources_count_file)
+        if aapt_package is not None:
+            env["FAKE_AAPT_PACKAGE"] = aapt_package
         return env
 
     def run_policy(
@@ -1652,6 +1677,7 @@ class ApkPolicyHarness(unittest.TestCase):
         path: str | None = None,
         permissions: str = "",
         resources_count_file: Path | None = None,
+        aapt_package: str | None = None,
     ) -> subprocess.CompletedProcess[str]:
         command = ["sh", str(POLICY_CHECK)]
         if foss:
@@ -1676,6 +1702,7 @@ class ApkPolicyHarness(unittest.TestCase):
                 rules_mode=rules_mode,
                 permissions=permissions,
                 resources_count_file=resources_count_file,
+                aapt_package=aapt_package,
             ),
             text=True,
             stdout=subprocess.PIPE,
@@ -2793,6 +2820,7 @@ class ApkPolicyHarness(unittest.TestCase):
         permissions: str = "",
         aapt2_mode: str = "ok",
         expect_provider: str | None = None,
+        aapt_package: str | None = None,
     ) -> subprocess.CompletedProcess[str]:
         env = self._env(
             rules_mode=rules_mode,
@@ -2801,6 +2829,7 @@ class ApkPolicyHarness(unittest.TestCase):
             nsc_mode=nsc_mode,
             permissions=permissions,
             aapt2_mode=aapt2_mode,
+            aapt_package=aapt_package,
         )
         command = [
             sys.executable,
@@ -3646,12 +3675,18 @@ class ApkPolicyHarness(unittest.TestCase):
             expect_provider="required",
         )
         self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
-        # ... including the partial (no leading dot) suffix spelling.
+        # ... but the partial (no leading dot) "internal.Bridge" spelling is
+        # NOT an alias for com.librepocket.internal.Bridge under canonical
+        # component-name resolution: "internal.Bridge" contains a dot, so it
+        # is already fully qualified and can never stand for the DEX-evidenced
+        # class. The subclass is therefore NOT declared in the merged manifest
+        # => RED (previously this spelling passed via arbitrary suffix match).
         result = self._run_scanner_cli(
             apk, "github", xmltree_mode="shizuku-bridge-partial",
             expect_provider="required",
         )
-        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        self.assertNotEqual(result.returncode, 0, result.stderr + result.stdout)
+        self.assertIn("is not declared in the merged manifest", result.stderr)
 
         # (4) DEX-evidenced subclass NOT declared in the merged manifest =>
         # RED in both required and optional modes.
@@ -3739,10 +3774,12 @@ class ApkPolicyHarness(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
 
         # (8) #166-D mechanism B: the evidenced java name merely
-        # suffix-matches the official block (com.evil.rikka.shizuku.
-        # ShizukuProvider vs rikka.shizuku.ShizukuProvider) - a non-exact
-        # match, so it must NOT consume the detected official block:
-        # detected=1 consumed=0 total=2 => RED.
+        # suffix-resembles the official block (com.evil.rikka.shizuku.
+        # ShizukuProvider vs rikka.shizuku.ShizukuProvider) - under canonical
+        # component-name resolution it is NOT an alias for it, so the rogue
+        # subclass is NOT declared in the merged manifest => RED in the
+        # declaration check (never reaches the counting rule; the official
+        # block can no longer smuggle as the rogue's declaration).
         rogue_dex = minimal_dex(
             class_definitions=(
                 (
@@ -3759,7 +3796,7 @@ class ApkPolicyHarness(unittest.TestCase):
             expect_provider="required",
         )
         self.assertNotEqual(result.returncode, 0, result.stderr + result.stdout)
-        self.assertIn("found 2", result.stderr)
+        self.assertIn("is not declared in the merged manifest", result.stderr)
 
         # (9) #166-D duplicate-name fail: TWO detected ShizukuProvider
         # blocks carrying the same android:name must go RED with the named
@@ -3779,6 +3816,269 @@ class ApkPolicyHarness(unittest.TestCase):
             "identical android:name: rikka.shizuku.ShizukuProvider",
             result.stderr,
         )
+
+    def test_github_canonical_component_name_resolution(self) -> None:
+        # Re-review #10 Finding 1: android:name must resolve with Android's
+        # canonical component-name rules against the MERGED MANIFEST PACKAGE
+        # (leading-dot concat, dot-free bare-name concat, full-FQN as-is) and
+        # the resolved FQN must EXACTLY equal the DEX-evidenced java name.
+        # Arbitrary suffix matching is never an alias for a class.
+        bridge_dex = minimal_dex(
+            class_definitions=(
+                (
+                    "Lcom/librepocket/internal/Bridge;",
+                    "Lrikka/shizuku/ShizukuProvider;",
+                ),
+            )
+        )
+        apk = complete_apk(self.tmp / "github-canonical-name.apk", bridge_dex)
+
+        # (1) Leading-dot spelling resolves against the manifest package
+        # (dev.librepocket.agent.github.Bridge), NOT against the DEX-evidenced
+        # com.librepocket.internal.Bridge => RED via the DEX declaration gate.
+        result = self._run_scanner_cli(
+            apk, "github", xmltree_mode="shizuku-bridge-weak-relative",
+            expect_provider="required",
+        )
+        self.assertNotEqual(result.returncode, 0, result.stderr + result.stdout)
+        self.assertIn("com.librepocket.internal.Bridge", result.stderr)
+        self.assertIn("is not declared in the merged manifest", result.stderr)
+
+        # (2) Partial (no leading dot) spelling contains a dot, so it is
+        # already fully qualified and can never alias the DEX-evidenced
+        # class => RED via the same declaration gate.
+        result = self._run_scanner_cli(
+            apk, "github", xmltree_mode="shizuku-bridge-partial",
+            expect_provider="required",
+        )
+        self.assertNotEqual(result.returncode, 0, result.stderr + result.stdout)
+        self.assertIn("com.librepocket.internal.Bridge", result.stderr)
+        self.assertIn("is not declared in the merged manifest", result.stderr)
+
+        # (3) Positive leading-dot control: the DEX class lives INSIDE the
+        # merged package; '.Bridge' resolves to dev.librepocket.agent.github.
+        # Bridge and matches the exact FQN; the fixture carries the FULL
+        # attribute contract => exit 0.
+        in_package_dex = minimal_dex(
+            class_definitions=(
+                (
+                    "Ldev/librepocket/agent/github/Bridge;",
+                    "Lrikka/shizuku/ShizukuProvider;",
+                ),
+            )
+        )
+        in_package_apk = complete_apk(
+            self.tmp / "github-canonical-relative.apk", in_package_dex
+        )
+        result = self._run_scanner_cli(
+            in_package_apk, "github",
+            xmltree_mode="shizuku-bridge-relative-positive",
+            expect_provider="required",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+
+        # (4) Positive FQN control: reuse the existing compliant FQN fixture
+        # => already green; pinned here to document the exact-FQN path.
+        result = self._run_scanner_cli(
+            apk, "github", xmltree_mode="shizuku-bridge-compliant",
+            expect_provider="required",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+
+        # (5) Package disagreement between the two aapt sources => RED with
+        # the named PolicyError: the gate fails closed rather than attributing
+        # component names on top of a contested base package.
+        mismatch_apk = complete_apk(
+            self.tmp / "github-canonical-mismatch.apk",
+            minimal_dex(type_descriptors=("Ljava/lang/Object;",)),
+        )
+        result = self._run_scanner_cli(
+            mismatch_apk, "github", xmltree_mode="shizuku-ok",
+            aapt_package="other.pkg",
+        )
+        self.assertNotEqual(result.returncode, 0, result.stderr + result.stdout)
+        # FAIL reporting goes to stderr.
+        self.assertIn("merged manifest package disagrees", result.stderr)
+
+        # Direct unit coverage of the merged-package resolution helpers.
+        permissions = "package:dev.librepocket.agent.github\n"
+        xmltree_with_pkg = (
+            "E: manifest\n"
+            '  A: package="dev.librepocket.agent.github" '
+            '(Raw: "dev.librepocket.agent.github")\n'
+            "  E: application\n"
+        )
+        # Both sources present and equal => that package.
+        self.assertEqual(
+            policy_inspect._merged_manifest_package(xmltree_with_pkg, permissions),
+            "dev.librepocket.agent.github",
+        )
+        # xmltree-only => the manifest source wins by absence of contest.
+        self.assertEqual(
+            policy_inspect._merged_manifest_package(
+                xmltree_with_pkg,
+                "uses-permission: android.permission.INTERNET\n",
+            ),
+            "dev.librepocket.agent.github",
+        )
+        # permissions-only => falls back to the permissions source.
+        self.assertEqual(
+            policy_inspect._merged_manifest_package(
+                "E: manifest\n  E: application\n", permissions
+            ),
+            "dev.librepocket.agent.github",
+        )
+        # Both present and unequal => PolicyError naming the disagreement.
+        mismatch_tree = (
+            "E: manifest\n"
+            '  A: package="other.pkg" (Raw: "other.pkg")\n'
+            "  E: application\n"
+        )
+        with self.assertRaisesRegex(policy_inspect.PolicyError, "disagrees"):
+            policy_inspect._merged_manifest_package(mismatch_tree, permissions)
+        # Neither source => PolicyError (no package, no name matching).
+        with self.assertRaisesRegex(policy_inspect.PolicyError, "cannot determine"):
+            policy_inspect._merged_manifest_package(
+                "E: manifest\n  E: application\n", ""
+            )
+        # Remaining fail-closed branches of _manifest_package_from_xmltree,
+        # exercised through _merged_manifest_package: the raise fires before
+        # any comparison with the permissions source.
+        for case, tree, pattern in (
+            (
+                # Namespaced package attribute (qualified-namespace prefix):
+                # a package the gate cannot attribute is never guessed.
+                "namespaced package attribute",
+                "E: manifest\n"
+                '  A: android:package="dev.librepocket.agent.github" '
+                '(Raw: "dev.librepocket.agent.github")\n'
+                "  E: application\n",
+                "package attribute is namespaced",
+            ),
+            (
+                # Duplicate plain package attribute at the manifest element's
+                # own attribute level.
+                "duplicate plain package attribute",
+                "E: manifest\n"
+                '  A: package="dev.librepocket.agent.github" '
+                '(Raw: "dev.librepocket.agent.github")\n'
+                '  A: package="other.pkg" (Raw: "other.pkg")\n'
+                "  E: application\n",
+                "duplicate plain package attribute",
+            ),
+            (
+                # Typed boolean encoding: a boolean is not a package name;
+                # the raw value never reaches the string decoder.
+                "typed boolean package encoding",
+                "E: manifest\n"
+                "  A: package=(type 0x12)0xffffffff\n"
+                "  E: application\n",
+                r"merged manifest <manifest> package: unrecognized compiled attribute encoding",
+            ),
+            (
+                # Resource-reference encoding: a reference is not a package
+                # name; fail closed naming the encoding kind.
+                "resource reference package encoding",
+                "E: manifest\n"
+                "  A: package=@0x7f010000\n"
+                "  E: application\n",
+                r"merged manifest <manifest> package: unrecognized compiled attribute encoding",
+            ),
+            (
+                # Integer-typed encoding: fail closed, never guessed into a
+                # string (this branch raised before; the message is pinned).
+                "int-typed package encoding",
+                "E: manifest\n"
+                "  A: package=(type 0x10)0x1\n"
+                "  E: application\n",
+                r"merged manifest <manifest> package: unrecognized compiled attribute encoding",
+            ),
+            (
+                # Decoded-empty package attribute: rejected, not treated as
+                # absent (absence would fall back to the permissions source).
+                "empty package attribute",
+                "E: manifest\n"
+                '  A: package="" (Raw: "")\n'
+                "  E: application\n",
+                "empty package attribute",
+            ),
+            (
+                # Attribute-shaped line with no '=' at the manifest's own
+                # attribute level: malformed, not skipped past.
+                "malformed package attribute line",
+                "E: manifest\n"
+                "  A: package\n"
+                "  E: application\n",
+                "malformed attribute line",
+            ),
+        ):
+            with self.subTest(case=case):
+                with self.assertRaisesRegex(policy_inspect.PolicyError, pattern):
+                    policy_inspect._merged_manifest_package(tree, permissions)
+        # Child-decoy isolation: a `package` attribute on a CHILD element
+        # (here <application>) is never read as the manifest package - the
+        # scan stops at the child element line, so no error fires from the
+        # manifest attribute scan and the permissions fallback wins.
+        decoy_tree = (
+            "E: manifest\n"
+            "  E: application\n"
+            '    A: package="decoy.pkg" (Raw: "decoy.pkg")\n'
+        )
+        with self.subTest(case="child decoy package is not picked up"):
+            self.assertEqual(
+                policy_inspect._merged_manifest_package(decoy_tree, permissions),
+                "dev.librepocket.agent.github",
+            )
+        # Package-name validation (O4): a FINAL package value from the
+        # permissions source that fails the package-name grammar fails
+        # closed instead of being used as a component-name base.
+        with self.subTest(case="package-name validation reject"):
+            with self.assertRaisesRegex(
+                policy_inspect.PolicyError, "package-name validation"
+            ):
+                policy_inspect._merged_manifest_package(
+                    "E: manifest\n  E: application\n", "package: EVIL||\n"
+                )
+
+        # _canonicalize_component_name table.
+        pkg = "dev.librepocket.agent.github"
+        for raw, expected in (
+            (".Bridge", f"{pkg}.Bridge"),
+            ("Internal.Bridge", "Internal.Bridge"),
+            ("Bridge", f"{pkg}.Bridge"),
+            ("", ""),
+            ("   ", ""),
+            (" com.example.Bridge ", "com.example.Bridge"),
+        ):
+            with self.subTest(name=raw):
+                self.assertEqual(
+                    policy_inspect._canonicalize_component_name(raw, pkg),
+                    expected,
+                )
+
+        # _provider_name_matches_dex_class: exact-FQN-only table.
+        for present, java_name, expected in (
+            (".Bridge", f"{pkg}.Bridge", True),
+            ("Bridge", f"{pkg}.Bridge", True),
+            (".Bridge", "com.librepocket.internal.Bridge", False),
+            ("internal.Bridge", "com.librepocket.internal.Bridge", False),
+            ("Internal.Bridge", "Internal.Bridge", True),
+            ("evil.Bridge", "com.evil.Bridge", False),
+            (
+                "com.librepocket.internal.Bridge",
+                "com.librepocket.internal.Bridge",
+                True,
+            ),
+            ("", "com.librepocket.internal.Bridge", False),
+            ("   ", f"{pkg}.Bridge", False),
+        ):
+            with self.subTest(name=present, java_name=java_name):
+                self.assertEqual(
+                    policy_inspect._provider_name_matches_dex_class(
+                        present, java_name, pkg
+                    ),
+                    expected,
+                )
 
     def test_foss_expect_provider_required_rejected(self) -> None:
         # §--expect-provider required is a github-mode-only contract; any

@@ -2292,7 +2292,13 @@ def _check_github_shizuku_provider(xmltree: str) -> None:
     Whenever a Shizuku provider appears in the merged manifest xmltree (by
     name/authority heuristic), the full attribute contract enforced by
     ``_check_provider_attrs`` is pinned on it. DEX-evidenced renamed
-    subclasses are enforced separately by ``_check_github_dex_shizuku_providers``.
+    subclasses are enforced separately by ``_check_github_dex_shizuku_providers``
+    (canonical component-name resolution against the merged manifest
+    ``package`` - arbitrary suffix is never an alias, and only a canonical
+    exact-FQN match consumes a detected block in the counting path).
+
+    The signature is UNCHANGED in this stage: authorities/exact-authority
+    work (Stage 10B) threads ``package`` through here as well.
     """
     for attrs, child_tags in _iter_application_providers(xmltree):
         if not _is_shizuku_provider(
@@ -2353,26 +2359,225 @@ def _dex_shizuku_provider_java_names(parsed_dexes: list[ParsedDex]) -> set[str]:
     return names
 
 
-def _provider_name_matches_dex_class(name: str, java_name: str) -> bool:
+# Package-name shape for the FINAL merged-manifest package value: at
+# least one dot, letter/underscore-led identifier segments. The artifact
+# gate refuses a package it cannot attribute as a component-name base.
+_PACKAGE_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)+$")
+
+
+def _permissions_package(permissions: str) -> str | None:
+    """Package record from ``aapt dump permissions`` output, or ``None``.
+
+    Measured aapt prints exactly one ``package: <name>`` line
+    (``package: dev.librepocket.agent.github``). A line that is not a
+    package record is not treated as one: ``None`` lets the caller fall
+    back to the merged-manifest source (or fail closed when it too is
+    absent).
+    """
+    # Real aapt prints exactly one `package:` line; the first match is deterministic, and the downstream cross-check with the xmltree package catches divergence.
+    match = re.search(r"(?m)^package:\s*(\S+)", permissions)
+    if match is None:
+        return None
+    return match.group(1).strip()
+
+
+def _manifest_package_from_xmltree(xmltree: str) -> str | None:
+    """Package declared on the merged manifest's ``<manifest>`` element.
+
+    ``aapt dump xmltree`` prints the merged package as a PLAIN
+    (non-namespaced) ``A: package="..."`` attribute line directly under
+    ``E: manifest`` (the ``... (Raw: "...")`` spelling is tolerated). Parsing
+    is anchored at the manifest element's OWN attribute level (``indent + 2``,
+    aapt's two-space hierarchy step) and stops at the next element line at
+    that level or shallower (or EOF): attribute lines belonging to child
+    elements print deeper and are never read as the package.
+
+    ONLY quoted-string encodings are accepted for the package; the raw
+    value's shape is checked BEFORE the generic attribute decoder runs.
+    Typed encodings (``(type 0x12)0xffffffff``, ``(type 0x10)0x1``, ...)
+    and resource references (``@0x...``, ``?0x...``) fail closed with a
+    PolicyError naming the encoding kind instead of being guessed into a
+    string. A decoded value that is empty/whitespace is rejected too.
+
+    Fail closed with a PolicyError when the manifest element carries a
+    NAMESPACED ``package`` attribute (e.g. ``android:package``), a
+    malformed ``A:`` line at its own attribute level, a non-quoted value
+    encoding, or a value that decodes to empty - a package the gate
+    cannot attribute is never guessed. Returns ``None`` when the manifest
+    element or the attribute itself is absent (the caller falls back to
+    the permissions source / errors).
+    """
+    lines = xmltree.splitlines()
+    manifest_index: int | None = None
+    manifest_indent = 0
+    for index, line in enumerate(lines):
+        elem = _XMLTREE_ELEMENT_LINE_RE.match(line)
+        if elem is None:
+            continue
+        if elem.group(2) == "manifest":
+            manifest_index = index
+            manifest_indent = len(elem.group(1))
+            break
+    if manifest_index is None:
+        return None
+    attr_indent = manifest_indent + 2
+    package: str | None = None
+    for line in lines[manifest_index + 1 :]:
+        elem = _XMLTREE_ELEMENT_LINE_RE.match(line)
+        if elem is not None and len(elem.group(1)) <= attr_indent:
+            # Next element at same/higher indent than the attribute level:
+            # the manifest element's own attribute block is over.
+            break
+        a_match = _PROVIDER_ATTR_LINE_RE.match(line)
+        if a_match is not None:
+            if len(a_match.group(1)) != attr_indent:
+                # Not a DIRECT attribute line of <manifest> (belongs to a
+                # deeper descendant): never the package; skip.
+                continue
+            attr_lhs = a_match.group(2).strip()
+            attr_id_match = re.search(r"\(\s*0x[0-9a-fA-F]+\s*\)\s*$", attr_lhs)
+            attr_qname = (
+                attr_lhs[: attr_id_match.start()].strip()
+                if attr_id_match is not None
+                else attr_lhs
+            )
+            if ":" in attr_qname:
+                ns_prefix, attr_local = attr_qname.rsplit(":", 1)
+            else:
+                ns_prefix, attr_local = "", attr_qname
+            if attr_local != "package":
+                continue
+            if ns_prefix:
+                raise PolicyError(
+                    f"merged manifest <manifest> package attribute is namespaced "
+                    f"({attr_qname!r}) - expected a plain package attribute"
+                )
+            raw_value = a_match.group(3).strip()
+            # ONLY quoted-string encodings (plain "value" or
+            # "value" (Raw: "value")) may become the package: check the raw
+            # value's shape BEFORE the generic attribute decoder runs.
+            # Typed encodings and resource references never decode into a
+            # package string here - fail closed naming the encoding kind.
+            quoted = re.match(
+                r'^"((?:[^"\\]|\\.)*)"\s*'
+                r'(?:\(Raw:\s*"((?:[^"\\]|\\.)*)"\s*\))?(?:\s*)?$',
+                raw_value,
+            )
+            if quoted is None:
+                if raw_value.startswith("(type"):
+                    kind = "typed"
+                elif raw_value.startswith("@") or raw_value.startswith("?"):
+                    kind = "resource-reference"
+                else:
+                    kind = "unquoted"
+                raise PolicyError(
+                    f"merged manifest <manifest> package: unrecognized "
+                    f"compiled attribute encoding {raw_value!r} "
+                    f"({kind} encoding)"
+                )
+            decoded = _xmltree_attr_value(
+                raw_value, "merged manifest <manifest> package"
+            )
+            if decoded.strip() == "":
+                raise PolicyError(
+                    f"merged manifest <manifest> package: empty package "
+                    f"attribute (decoded from {raw_value!r})"
+                )
+            if package is not None:
+                raise PolicyError(
+                    "merged manifest <manifest> declares a duplicate plain "
+                    f"package attribute ({package!r} vs {decoded!r})"
+                )
+            package = decoded
+            continue
+        if line.lstrip().startswith("A:") and len(line) - len(line.lstrip()) == attr_indent:
+            # An attribute-shaped line at the manifest's OWN attribute level
+            # that does not parse: fail closed rather than skip past it.
+            raise PolicyError(
+                f"merged manifest <manifest> has malformed attribute line: "
+                f"{line.strip()!r}"
+            )
+    return package
+
+
+def _merged_manifest_package(xmltree: str, permissions: str) -> str:
+    """Resolve the merged manifest package from both aapt sources.
+
+    Both sources present and equal -> that package. Both present and
+    UNEQUAL -> PolicyError: the artifact disagrees with itself, and the
+    gate refuses to attribute component names on top of a contested base.
+    Only one source present -> use it. Neither -> PolicyError: the artifact
+    gate refuses to match provider names against DEX evidence without a
+    package. Whatever path produced the FINAL package value, it must
+    match the package-name grammar (at least one dot, letter/underscore-led
+    segments) or PolicyError.
+    """
+    permissions_package = _permissions_package(permissions)
+    manifest_package = _manifest_package_from_xmltree(xmltree)
+    if (
+        permissions_package is not None
+        and manifest_package is not None
+        and permissions_package != manifest_package
+    ):
+        raise PolicyError(
+            f"merged manifest package disagrees: permissions {permissions_package!r} "
+            f"vs manifest {manifest_package!r}"
+        )
+    final_package = (
+        permissions_package if permissions_package is not None else manifest_package
+    )
+    if final_package is None:
+        raise PolicyError(
+            "cannot determine the merged manifest package - the artifact gate "
+            "refuses to match provider names against DEX evidence without it"
+        )
+    if _PACKAGE_NAME_RE.match(final_package) is None:
+        raise PolicyError(
+            f"merged manifest package {final_package!r} fails package-name "
+            "validation - the artifact gate refuses a package it cannot attribute"
+        )
+    return final_package
+
+
+def _canonicalize_component_name(name: str, package: str) -> str:
+    """Resolve an ``android:name`` component string to its canonical FQN.
+
+    Android component-name resolution: a leading-dot name (``.Bridge``)
+    resolves inside the package (``<package>.Bridge``); a name with no dot
+    anywhere resolves inside the package too (``Bridge`` ->
+    ``<package>.Bridge``); anything containing a dot is already fully
+    qualified and stays as-is. Callers guarantee a non-empty package.
+    Empty/blank input resolves to ``""`` (never a class).
+    """
+    stripped = name.strip()
+    if not stripped:
+        return ""
+    if stripped.startswith("."):
+        return package + stripped
+    if "." not in stripped:
+        return package + "." + stripped
+    return stripped
+
+
+def _provider_name_matches_dex_class(name: str, java_name: str, package: str) -> bool:
     """Manifest ``android:name`` match against a DEX-evidenced java name.
 
-    Exact fully-qualified match, or the Android component-name relative
-    spellings: ``.Bridge`` (leading dot) resolves inside the package and
-    matches when ``java_name`` ends with ``.Bridge``; a name with no leading
-    dot likewise matches when ``java_name`` ends with ``.`` + name (covers
-    the ``internal.Bridge`` partial spelling). An empty name never matches.
+    Canonical component-name resolution only: the ``android:name`` string
+    is resolved against the merged manifest ``package`` (leading dot or a
+    dot-free name resolve inside the package; anything with a dot is
+    already fully qualified) and compared by EXACT equality with the
+    evidenced java name. Arbitrary suffix matching is never an alias:
+    ``.Bridge`` is ``<package>.Bridge`` and ``internal.Bridge`` is the
+    literal ``internal.Bridge`` - neither can stand for a DEX class such
+    as ``com.evil.Bridge``. An empty name never matches.
     """
-    if not name:
-        return False
-    if name == java_name:
-        return True
-    if name.startswith("."):
-        return java_name.endswith("." + name[1:])
-    return java_name.endswith("." + name)
+    return bool(name.strip()) and (
+        _canonicalize_component_name(name, package) == java_name
+    )
 
 
 def _check_github_dex_shizuku_providers(
-    xmltree: str, parsed_dexes: list[ParsedDex]
+    xmltree: str, parsed_dexes: list[ParsedDex], package: str
 ) -> set[str]:
     """Enforce the attribute contract on DEX-evidenced renamed subclasses.
 
@@ -2383,12 +2588,22 @@ def _check_github_dex_shizuku_providers(
     A matched provider must carry the FULL attribute contract of
     ``_check_provider_attrs`` - the contract is the permission, not the name.
 
+    ``android:name`` values are resolved against the merged manifest
+    ``package`` with Android's canonical component-name rules (``.X`` and a
+    dot-free ``X`` resolve inside the package; anything containing a dot is
+    already fully qualified) and compared by EXACT equality against the
+    evidenced java name. Arbitrary suffix matching is never an alias for a
+    class: ``.Bridge`` is ``<package>.Bridge`` and ``internal.Bridge`` is
+    the literal ``internal.Bridge`` - neither stands for
+    ``com.evil.Bridge`` (canonical FQN exact match or no match at all).
+
     Returns the java names of the DEX-evidenced subclasses that matched a
     merged-manifest provider, for the caller's ``--expect-provider
     required`` accounting. A provider that is both manifest-detected and
-    DEX-evidenced is ONE surface: in the counting redesign only an exact
-    fully-qualified ``android:name`` match against an evidenced java name
-    consumes a detected block (suffix-spelled matches never consume).
+    DEX-evidenced is ONE surface: only a canonical exact-FQN match against
+    an evidenced java name consumes a detected block; suffix-spelled names
+    never consume, because under canonical resolution there is no suffix
+    matching at all.
 
     Semantic note (exact): a single compliant provider that happens to be a
     renamed DEX-evidenced ShizukuProvider subclass is allowed through ONLY if
@@ -2409,7 +2624,9 @@ def _check_github_dex_shizuku_providers(
         matches = [
             (decoded, child_tags)
             for decoded, child_tags in providers
-            if _provider_name_matches_dex_class(decoded.get("name", ""), java_name)
+            if _provider_name_matches_dex_class(
+                decoded.get("name", ""), java_name, package
+            )
         ]
         if not matches:
             raise PolicyError(
@@ -2429,6 +2646,7 @@ def _check_github_dex_shizuku_providers(
 def _github_required_provider_total(
     xmltree: str,
     dex_java_names: set[str],
+    package: str,
 ) -> int:
     """Distinct ShizukuProvider surfaces for ``--expect-provider required``.
 
@@ -2440,20 +2658,23 @@ def _github_required_provider_total(
     ``android:name`` fail closed as a PolicyError, so merger accidents and
     name-padding attacks go red instead of silently deduping to one.
 
-    An exact fully-qualified ``android:name`` match against an evidenced
-    java name consumes (one) detected block; a provider that is both
-    manifest-detected and DEX-evidenced is therefore ONE surface. Non-exact
-    (suffix-spelled) matches never consume: a detected block whose name
-    merely suffix-matches an evidenced class still counts (the suffix match
-    is an attribution convenience, not an identity proof).
+    A canonical component-name match against an evidenced java name consumes
+    (one) detected block; a provider that is both manifest-detected and
+    DEX-evidenced is therefore ONE surface. ``android:name`` values are
+    resolved against the merged manifest ``package`` with Android's
+    canonical component-name rules (``.X`` / dot-free ``X`` resolve inside
+    the package; anything with a dot is already fully qualified) before the
+    exact-equality comparison against the evidenced java name - an
+    arbitrary suffix match is never an alias and never consumes.
     Example: a manifest block spelled ``android:name=".Bridge"`` whose
     authority is ``${applicationId}.shizuku``, with an evidenced java name
-    ``com.example.Bridge`` - the suffix-matching block never consumes the
-    evidenced name (exact-FQN-only), so this assembly counts as "found 2"
-    (fail-closed).
+    ``com.example.Bridge`` from a manifest package other than
+    ``com.example`` - the block is ``<package>.Bridge``, not
+    ``com.example.Bridge``, so it never consumes the evidenced name and
+    this assembly counts as "found 2" (fail-closed).
 
-    ``total = |{detected blocks NOT consumed by an exact evidenced match}|
-    + |evidenced java names|``.
+    ``total = |{detected blocks NOT consumed by a canonical exact-FQN
+    evidenced match}| + |evidenced java names|``.
 
     Semantic note (exact): a single compliant provider that happens to be a
     renamed DEX-evidenced ShizukuProvider subclass is allowed through ONLY if
@@ -2481,7 +2702,7 @@ def _github_required_provider_total(
     consumed: set[int] = set()
     for java_name in dex_java_names:
         for index, name in detected_blocks:
-            if name == java_name:
+            if _provider_name_matches_dex_class(name, java_name, package):
                 consumed.add(index)
     return (len(detected_blocks) - len(consumed)) + len(dex_java_names)
 
@@ -2596,11 +2817,14 @@ def inspect_apk(apk: Path, mode: str, aapt: str, dexdump: str, expect_provider: 
         # is still enforced above, so a wrong tool invocation cannot silently
         # degrade the mode.
         parsed_dexes = _parse_root_dexes(apk, dex_infos, dexdump)
+        merged_package = _merged_manifest_package(xmltree, permissions)
         dex_java_names = _check_github_dex_shizuku_providers(
-            xmltree, parsed_dexes
+            xmltree, parsed_dexes, merged_package
         )
         if expect_provider == "required":
-            total = _github_required_provider_total(xmltree, dex_java_names)
+            total = _github_required_provider_total(
+                xmltree, dex_java_names, merged_package
+            )
             if total != 1:
                 raise PolicyError(
                     "github APK must declare exactly one ShizukuProvider "
@@ -2645,8 +2869,8 @@ def main(argv: list[str] | None = None) -> int:
             "github mode: 'required' demands exactly one ShizukuProvider "
             "surface (manifest-detected or DEX-evidenced; block-identity "
             "multiset counting - duplicate android:name among detected "
-            "blocks fails closed; suffix matches never consume; exact FQN "
-            "consumption); 'optional' (default) checks provider attributes "
+            "blocks fails closed; suffix matches never consume; canonical "
+            "exact-FQN consumption); 'optional' (default) checks provider attributes "
             "only when a ShizukuProvider is present (including "
             "DEX-evidenced renamed subclasses)"
         ),

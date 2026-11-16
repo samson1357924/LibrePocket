@@ -33,7 +33,7 @@
 | B9 | 骨幹測試門禁 | P1–P3 測試策略 | `ProviderAdapterTest / TranscriptRedactorTest / CapabilityProjectionTest / ChatBudgetTest / FastRouterDecisionTest / SystemIntentMappingTest / PrivilegeGateTest / SlowBudgetTest / ArbitrationTest / SteeringSemanticsTest / PauseResumeTest` 全綠；AndroidWorld `smoke_chat_stop.py` + `slow_checkout_demo.py`（2 基準 App，含暫停恢復 + steering + 超限轉指引）通過 |
 
 > 註：上表 `ARCH §5/§6/§8/§9` 等編號指歷史 ARCH 草案章節（`ca5a666` 重寫前），現行 `docs/ARCHITECTURE.md` 已改為非編號 `Current/Target/Proposed` 節；對應目標語義以現行 `Target` 節與 `docs/specs/P1_SPEC.md` 為準。
-> 啟用前置：before any non-test FastDispatcher caller: fresh ctxSupplier + fresh tool.exec ALLOW-only policy + immutable confirmation snapshot + Room audit + device E2E. 詳見 docs/CAPABILITY_MATRIX.md §內建工具啟用前置清單 第 9 項；B3（FastRouter 完成標準）亦受此前置約束；未完成前不得翻任何接線旗標。
+> 啟用前置：before any non-test FastDispatcher caller: fresh ctxSupplier + fresh tool.exec ALLOW-only policy + immutable confirmation snapshot + Room audit + device E2E + memoized extraction（`extractSymbolQuery` 每 decision 僅計算一次） + an explicit decision-time CPU budget or guard anchors（記入 CAPABILITY_MATRIX §9 第 9 項可用性收斂硬閘）. 詳見 docs/CAPABILITY_MATRIX.md §內建工具啟用前置清單 第 9 項；B3（FastRouter 完成標準）亦受此前置約束；未完成前不得翻任何接線旗標。
 
 ### 1.2 骨幹非目標（明確不做）
 

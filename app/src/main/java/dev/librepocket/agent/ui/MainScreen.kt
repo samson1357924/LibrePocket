@@ -250,8 +250,10 @@ internal fun MainScreen(
     // C2 retrigger 過期/無法投遞收斂：token 超過 TTL 或端點落定後仍不可投遞 → 清除，避免日後 CHAT 進入時補彈 STT。
     // Convergence twin (AssistVoiceRetriggerCoordinator) handles live, non-expired tokens; this
     // stale-clear only drops expired/undeliverable entries.
-    // Both instances (normal task + voice task) observe the same flow; only the owning
-    // (identity-matched) instance may converge/clear its own token.
+    // Stale/undeliverable retrigger convergence. Expiry is enforced at gate/consume/currentPending
+    // time and on the next state change — there is no background timer.
+    // 過期 entries converge regardless of identity (undeliverable by definition); live entries
+    // remain identity-gated — never cleared across instances. Fail-closed.
     RetriggerStaleClearEffect(
         pending = pendingVoiceRetrigger,
         identity = voiceTaskIdentity,

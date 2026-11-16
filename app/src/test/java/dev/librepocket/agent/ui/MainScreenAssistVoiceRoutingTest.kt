@@ -1639,7 +1639,7 @@ class MainScreenAssistVoiceRoutingTest {
         }
         composeRule.waitUntil(timeoutMillis = 10_000) { h.drawerState.isOpen }
         composeRule.waitForIdle()
-        Thread.sleep(300) // settle: any erroneously re-keyed effect gets a chance to fire
+        composeRule.mainClock.advanceTimeBy(301L) // settle: any erroneously re-keyed effect gets a chance to fire (Compose test clock)
         composeRule.waitForIdle()
 
         assertTrue(h.drawerState.isOpen)

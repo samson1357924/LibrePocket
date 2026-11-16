@@ -145,7 +145,7 @@ class FastDispatchTest {
         // NotificationManager⊃notification、CalendarProvider⊃calendar、
         // ScreenshotController⊃screenshot、EmailClient⊃e-?mail、
         // VolumeController⊃volume——舊 RULES 順序會被這些工具搶走；
-        // symbol 前閘（SLOW 之後、RULES 之前）獨占 symbol 匹配，
+        // symbol 前閘（stage-8.5 最先：SLOW_HINTS 之前、RULES 之前）獨占 symbol 匹配，
         // `查 X 符號` 必綁 lsp.symbols 而非 keyword 工具。
         // 每個 case 各自 decide → dispatch（[lspDispatcher] + [CountingBackend]
         // 計數），逐 case 斷言 invocations +1，最終累計恰 6。
@@ -180,6 +180,45 @@ class FastDispatchTest {
             assertEquals(text, before + 1, backend.invocations.get())
         }
         assertEquals("backend must be invoked exactly once per case", 6, backend.invocations.get())
+    }
+
+    @Test fun symbolQueryBeatsSlowHints() = runBlocking {
+        // stage-8.5（Re-review #8 A4）：SLOW_HINTS 以 bare substring 命中 `自動操作`／
+        // `自動填表` 不得搶先——`查 X 符號` 是 explicit code-symbol 查詢；
+        // symbol 前閘（stage-8.5 最先）命中 ⇒ lsp.symbols；SLOW 僅在前閘不成立時先領。
+        // 逐 case decide → decideAndDispatch（同一 CountingBackend），invocations +1，
+        // receipt body 原樣回顯識別字（"name":"$expectedQuery:example"）。
+        val backend = CountingBackend()
+        val dispatcher = lspDispatcher(backend)
+        for ((text, expectedQuery) in listOf(
+            "查 自動操作 符號" to "自動操作",
+            "查 自動填表 符號" to "自動填表",
+            // 識別字本身即中文自動化片語（記錄已接受殘餘：內容而非權限；fast lane 不執行自動化）：
+            "symbols 幫我自動填表" to "幫我自動填表",
+            "查 幫我點 符號" to "幫我點",
+        )) {
+            val d = decide(text)
+            assertEquals(text, RouteKind.FAST, d.route)
+            assertEquals(text, "lsp.symbols", d.toolCall?.toolName)
+            assertNotNull(text, d.toolCall)
+            assertEquals(
+                text,
+                expectedQuery,
+                Json.parseToJsonElement(d.toolCall!!.argumentsJson).jsonObject["query"]!!.jsonPrimitive.content,
+            )
+            val before = backend.invocations.get()
+            val result = dispatcher.decideAndDispatch(text, lspOn, sessionId = "s-slow", turnIndex = 6)
+            assertEquals(text, RouteKind.FAST, result.decision.route)
+            assertEquals(text, "lsp.symbols", result.decision.toolCall?.toolName)
+            val executed = result.outcome as? FastDispatchOutcome.Executed
+            assertNotNull("$text must execute against the fake backend (got ${result.outcome})", executed)
+            assertEquals(text, before + 1, backend.invocations.get())
+            assertTrue(
+                "executed body must echo the identifier verbatim: ${executed!!.result.resultJson}",
+                executed.result.resultJson.contains("\"name\":\"$expectedQuery:example\""),
+            )
+        }
+        assertEquals("backend must be invoked exactly once per case", 4, backend.invocations.get())
     }
 
     @Test fun symbolQueryBeatsKeywordHints() {

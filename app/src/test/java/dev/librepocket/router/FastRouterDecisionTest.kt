@@ -95,6 +95,28 @@ class FastRouterDecisionTest {
         assertTrue(d.fallbackMessage!!.contains("FLAVOR_BLOCKED"))
     }
 
+    // stage-8.5（Re-review #8 A4）反向 pin：bare `自動操作`／`自動填表` 無 symbol
+    // hint、非命令式 symbol 查詢 ⇒ symbol 前閘不成立 ⇒ SLOW automation descriptor ⇒
+    // play 投影 FLAVOR_BLOCKED（接線前 play 上絕不執行）；header.toolName 綁
+    // SLOW_TOOL_NAME、toolCall 為 null——不得綁 lsp.symbols、不得 FAST。
+    @Test fun bareAutoOperationSlowHintDeniedFlavorBlocked() {
+        val d = decide("自動操作")
+        assertEquals(RouteKind.DENIED, d.route)
+        assertEquals(DenyReason.FLAVOR_BLOCKED, d.reasonCode)
+        assertNull(d.toolCall)
+        assertEquals(ToolRegistry.SLOW_TOOL_NAME, d.header.toolName)
+        assertTrue(d.fallbackMessage!!.contains(ToolRegistry.SLOW_TOOL_NAME))
+    }
+
+    @Test fun bareAutoFillFormSlowHintDeniedFlavorBlocked() {
+        val d = decide("自動填表")
+        assertEquals(RouteKind.DENIED, d.route)
+        assertEquals(DenyReason.FLAVOR_BLOCKED, d.reasonCode)
+        assertNull(d.toolCall)
+        assertEquals(ToolRegistry.SLOW_TOOL_NAME, d.header.toolName)
+        assertTrue(d.fallbackMessage!!.contains(ToolRegistry.SLOW_TOOL_NAME))
+    }
+
     @Test fun slowIntentOnSelfInstallWithAutomationDeniedUntilWired() {
         for (flavor in listOf(Flavor.FOSS, Flavor.GITHUB)) {
             val ctx = ProjectionContext(

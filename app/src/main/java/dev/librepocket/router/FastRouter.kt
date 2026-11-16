@@ -50,8 +50,8 @@ import java.util.concurrent.atomic.AtomicLong
  * sampling, not the full table:
  * `FastDispatchTest.newToolMustExpandVerbTableBeforeReady` probes the
  * sampled negated intents to deny the ready tool before FAST, not just
- * RULES membership. 路由順序見下方「matchTemplate 路由順序」段：symbol 前閘介於
- * SLOW_HINTS 與 RULES 之間，`查 AlarmManager 符號` 綁 lsp.symbols——由
+ * RULES membership. 路由順序見下方「matchTemplate 路由順序」段：symbol 前閘最先
+ * （stage-8.5）；SLOW_HINTS 次之；RULES 最後，`查 AlarmManager 符號` 綁 lsp.symbols——由
  * `FastDispatchTest.codeIdentifierSymbolNamesRouteToLspSymbols` 釘住。
  *
  * A1/A2/stage-1 routing hardening (fail-opens closed, conservatively): the
@@ -192,17 +192,18 @@ import java.util.concurrent.atomic.AtomicLong
  *   亦因結構性詞幹 `review` 否決——為預期結果。
  *
  * matchTemplate 路由順序（B3 re-review pin；依序，fail-safe）：
- * 1. SLOW_HINTS（自動化描述 → SLOW automation descriptor，由 projection
- *    誠實拒絕，play 上 FLAVOR_BLOCKED）先於一切；
- * 2. code-symbol lookup 前閘第二：containsAny(SYMBOL_HINTS) 且
+ * 1. code-symbol lookup 前閘最先（stage-8.5）：containsAny(SYMBOL_HINTS) 且
  *    [isAffirmativeSymbolCommand] 命中（命令式肯定語句准入，見上段）才回
- *    `lsp.symbols`——在任何關鍵詞工具之前。
+ *    `lsp.symbols`——在一切關鍵詞工具與 SLOW 之前。
  *    識別字如 `AlarmManager`／`NotificationManager`／`CalendarProvider`／
  *    `ScreenshotController`／`EmailClient`／`VolumeController` 內含其他工具的
  *    無錨點 hint 子串（`alarm`、`notification`、`calendar`、`screenshot`、
  *    `e-?mail`、`volume`），若仍走 RULES 順序會被這些工具先搶走
  *    （`查 AlarmManager 符號` 會落到 alarm.create 的缺時間澄清）。
  *    前閘保證 `查 AlarmManager 符號` 綁 lsp.symbols 而非 alarm.create；
+ *    stage-8.5：識別字內含慢速 hint 子串（如 `自動操作`、`自動填表`）的
+ *    准入之 `查 X 符號` 形亦必綁 lsp.symbols（疑問尾標／條件授權子句先被否決、再落 SLOW），
+ *    不落 SLOW automation descriptor；
  *    #4（B3 re-review）/stage-1：問句/知識/教學（how-to）語句與含授權/條件授權
  *    子句或教學/說明標記的語句一律不滿足 symbol 前閘——
  *    但句首（可選 EN please／CJK 請|麻煩|帮我|幫我|给我|給我|请 前綴）必須是查詢動詞
@@ -220,11 +221,15 @@ import java.util.concurrent.atomic.AtomicLong
  *    命中 keyword 規則時落到該規則原有的 fail-closed 語意（例如查 AlarmManager
  *    符號呢 → alarm.create 缺時間澄清），絕不執行（pinned by
  *    `FastDispatchTest.interrogativeSymbolUtterancesDenyZeroBackend`）。
+ * 2. SLOW_HINTS（非查詢自動化語句仍先轉 automation descriptor，projection/play
+ *    FLAVOR_BLOCKED）——僅在 symbol 前閘不成立時先領（stage-8.5）：
+ *    containsAny(SLOW_HINTS) 命中即回 SLOW automation descriptor，由 projection
+ *    誠實拒絕，play 上 FLAVOR_BLOCKED；
  * 3. RULES 關鍵詞工具最後（SYMBOLS 已自 RULES 移除，symbol 匹配由前閘獨占；
  *    [templateToolNames] 顯式補入 lsp.symbols 維持 expansion-rule oracle）。
  * 前閘要求命令式肯定語句准入（僅有 hint 不足；查詢動詞出現在句中——如
  * `I want to find symbol Foo`——同樣不足）；
- * SLOW 命中不受前閘影響（自動化語句仍先轉 automation descriptor）。
+ * SLOW 僅在 symbol 前閘不成立時先領（非查詢自動化語句照常路由）；准入之 `查 X 符號` 形則必綁 lsp.symbols（含疑問尾標／條件授權子句者先被否決、再落 SLOW）。
  * 由 `FastDispatchTest.codeIdentifierSymbolNamesRouteToLspSymbols`（六個識別字
  * 端到端 FAST＋invocation==1）與 `FastDispatchTest.symbolQueryBeatsKeywordHints`
  * （非 symbol 意圖照常落 keyword 工具、無准入者 no-match）釘住。
@@ -376,12 +381,9 @@ class FastRouter(
 
     private fun matchTemplate(text: String): TemplateMatch? {
         if (text.isEmpty()) return null
-        // Slow-lane intents resolve to the automation descriptor so projection
-        // can deny them honestly (FLAVOR_BLOCKED on play) instead of NO_MATCH.
-        if (containsAny(text, SLOW_HINTS)) {
-            return TemplateMatch(ToolRegistry.SLOW_TOOL_NAME, jsonText(text))
-        }
-        // Symbol-naming lookup is checked before keyword-matched tools:
+        // Symbol-naming lookup is checked FIRST (stage-8.5; before SLOW_HINTS):
+        // identifiers may embed slow-lane substrings (`自動操作`、`自動填表`), but
+        // `查 自動操作 符號` is a code-symbol query, not an automation ask.
         // identifiers like `AlarmManager` contain other tools' hint words, but
         // `查 AlarmManager 符號` is a code-symbol query, not an alarm/call/mail ask.
         // Affirmative-command admission (#19 B3 stage-1): the gate matches ONLY an
@@ -390,6 +392,14 @@ class FastRouter(
         // with a lookup verb no longer qualifies (#4).
         if (containsAny(text, SYMBOL_HINTS) && isAffirmativeSymbolCommand(text)) {
             return TemplateMatch(LspTools.SYMBOLS_NAME, symbolArgs(text))
+        }
+        // Slow-lane intents resolve to the automation descriptor so projection
+        // can deny them honestly (FLAVOR_BLOCKED on play) instead of NO_MATCH.
+        // Checked AFTER the affirmative-command symbol gate (stage-8.5), still
+        // before RULES: a non-query automation statement (e.g. bare `自動操作`)
+        // routes slow as before.
+        if (containsAny(text, SLOW_HINTS)) {
+            return TemplateMatch(ToolRegistry.SLOW_TOOL_NAME, jsonText(text))
         }
         for ((toolName, hints, args) in RULES) {
             if (containsAny(text, hints)) {
@@ -514,7 +524,8 @@ class FastRouter(
         //    後無有意義殘餘（無 Unicode 字母/數字）時轉 NEED_CLARIFICATION，
         //    FAST 與否皆不可能（與先前行為一致）。
         // `where` 仍不是准入依據（`where is symbol Foo` 不滿足句首動詞條件）。
-        // 命中准入 ⇒ 前閘成立；未命中 ⇒ 落入 RULES 迴圈，無規則命中則 no-match
+        // 命中准入 ⇒ 前閘成立；未命中 ⇒ SLOW_HINTS 次之（非查詢自動化語句，
+        // stage-8.5），再落入 RULES 迴圈——無規則命中則 no-match
         // DENIED（reasonCode null）；命中 keyword 規則者落其原有 fail-closed
         // 語意（如 `查 AlarmManager 符號呢` → alarm.create 缺時間澄清）——絕不執行。
         // EN 開放詞彙一律 open-world deny-by-default：非命令式一律 no-match。
@@ -1319,6 +1330,13 @@ class FastRouter(
          *   `查 :;Foo 符號` ⇒ FAST `:;Foo`（單 token、無空白、字母/數字字符類＋allow-list 標點、
          *   JSON-escaped、READ-only、LSP opaque match、executor 端 parseArgs 二次把關）。
          *   與 `.bar`／`-main` 同一已接受殘餘類；絕不因此放寬 Step E。
+         * - Automation-phrase-identifier residual (stage-8.5, accepted): affirmative symbol
+         *   query 之識別字本身可以是中文自動化片語——`symbols 幫我自動填表` ⇒ FAST
+         *   query=`幫我自動填表`；`查 幫我點 符號` ⇒ FAST query=`幫我點`；
+         *   `查 自動操作 符號` ⇒ FAST query=`自動操作`（本檔 stage-8.5 前因 SLOW_HINTS
+         *   substring 搶先而被錯配 gui.automate／FLAVOR_BLOCKED——已翻轉）。
+         *   識別字內容一律視為 LSP 內容（不透明），非自動化權限；fast lane 不執行任何
+         *   自動化動作（自動化語句仍落 SLOW，未接線把關）。
          * - EN-delimited glued-cue residual (stage-8.3, accepted verbatim-
          *   preservation rule): `symbols 符號符號` → FAST `符號符號`（EN grammar
          *   劃定之 identifier——glued cue 原樣保留為查詢字串 `符號符號`；

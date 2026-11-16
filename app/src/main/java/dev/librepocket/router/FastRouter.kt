@@ -122,7 +122,7 @@ import java.util.concurrent.atomic.AtomicLong
  *   則無論 possessor 長度皆否決；有界 {1,8} 槽與 consent 動詞集不巢狀量化，無災難性回溯；記錄，不修
  *   （單 token 命令形 end-to-end FAST；帶空白則落 whitespace 澄清——兩者皆不執行）。
  * - 已知殘餘（accepted, not fixed this round）：consent 動詞與 再|才 之間夾半形 `,` `;` `:` 不視為連接符——
- *   單 token 形態（如 `查Foo符號批准,再做`）→ FAST query=`Foo批准,再做`（`;` `:` 同形；帶空白版本經 whitespace 閘澄清）——READ-only、identifier 形狀 garbage；記錄、接受、不修。
+ *   單 token 形態（如 `查Foo符號批准,再做`）→ FAST query=`Foo符號批准,再做`（`;` `:` 同形；符號之間非與 suffix-cue 鄰接故仍 verbatim 保留；帶空白版本經 whitespace 閘澄清）——READ-only、identifier 形狀 garbage；記錄、接受、不修。同樣地，>8 L/N-char possessor 的單 token 形態（如 `查Foo符號等123456789批准`）→ FAST query=`Foo符號等123456789批准`。
  * - 已知殘餘（accepted, frame-local, not fixed；audit F7）：CJK 框架內部的
  *   空白相鄰在 clause 閘仍可通過——如 `同意 後再查`（CJK run 之間僅一個空白）clause gate 放行、
  *   但 extraction 的 whitespace 閘仍會拒絕（multi-token → clarification），永不執行；僅記錄。

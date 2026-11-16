@@ -12,7 +12,8 @@ import org.junit.Test
  * pinned by `ProductionChatCompositionTest`) and nothing outside
  * `dev/librepocket/router/` may reference the fast-lane symbols — including
  * flavor-specific production source sets compiled into the foss/github APKs
- * (app/src/{foss,github}/java).
+ * (app/src/{foss,github}/java). All Kotlin+Java production sources are
+ * scanned.
  *
  * Wiring (any non-test caller outside the router package) must come only
  * with the full activation prerequisites: fresh ctxSupplier, fresh
@@ -36,8 +37,8 @@ class FastDispatchSurfaceArchitectureTest {
         // Test cwd differs by harness (module dir vs repo root); accept both
         // layouts. Scan ALL production source sets (main + every flavor), so
         // flavor wiring into the foss/github APKs also trips this pin.
-        // At least one root must exist, and zero scanned Kotlin files is a
-        // hard failure — the pin must never pass vacuously.
+        // At least one root must exist, and zero scanned Kotlin+Java files is
+        // a hard failure — the pin must never pass vacuously.
         val sourceRoots = listOf(
             "src/main/java", "app/src/main/java",
             "src/foss/java", "app/src/foss/java",
@@ -46,13 +47,13 @@ class FastDispatchSurfaceArchitectureTest {
             "src/debug/java", "app/src/debug/java",
         ).map { File(it) }.filter { it.isDirectory }
         assertTrue(
-            "no Kotlin source root found (tried main + foss/github/play/debug flavors)",
+            "no source root found (tried main + foss/github/play/debug flavors)",
             sourceRoots.isNotEmpty(),
         )
 
-        val kotlinFiles = sourceRoots.flatMap { root ->
+        val sourceFiles = sourceRoots.flatMap { root ->
             root.walkTopDown()
-                .filter { it.isFile && it.extension == "kt" }
+                .filter { it.isFile && (it.extension == "kt" || it.extension == "java") }
                 .filterNot { file ->
                     val normalized = file.path.replace(File.separatorChar, '/')
                     normalized.contains("/dev/librepocket/router/") ||
@@ -62,13 +63,13 @@ class FastDispatchSurfaceArchitectureTest {
                 .toList()
         }
         assertTrue(
-            "zero Kotlin production files found outside dev/librepocket/router/; " +
+            "zero Kotlin+Java production files found outside dev/librepocket/router/; " +
                 "the pin cannot pass vacuously",
-            kotlinFiles.isNotEmpty(),
+            sourceFiles.isNotEmpty(),
         )
 
         val violations = mutableListOf<String>()
-        for (file in kotlinFiles) {
+        for (file in sourceFiles) {
             val text = file.readText(Charsets.UTF_8)
             for (token in forbiddenTokens) {
                 if (text.contains(token)) {

@@ -593,6 +593,15 @@ class FastDispatchTest {
             // 無空格形態：句首 lookup 動詞「查」仍是位置 cue（positional opener，
             // spec Step A）——殘餘 `理` 乃位置剝離，非全域填充詞刪除。
             "查理 符號" to "理",
+            // KDoc accepted residual（stage-6.2）：>8 L/N-char possessor 槽超界，
+            // consent 框架不匹配 ⇒ 單 token 命令形 FAST（READ-only garbage query）。
+            // 句中 `符號` 為 infix——step C 後綴 cue 僅 end-anchored，殘餘原樣保留。
+            // Recorded, not fixed.
+            "查Foo符號等123456789批准" to "Foo符號等123456789批准",
+            // KDoc accepted residual（stage-6.2）：consent 動詞與 再|才 之間夾半形
+            // `,` 不視為連接符 ⇒ 單 token 命令形 FAST（READ-only garbage query）。
+            // 句中 `符號` 為 infix，殘餘原樣保留。Recorded, not fixed.
+            "查Foo符號批准,再做" to "Foo符號批准,再做",
         )) {
             val d = decide(text)
             assertEquals(text, RouteKind.FAST, d.route)
@@ -2804,5 +2813,34 @@ class FastDispatchTest {
                 Json.parseToJsonElement(d.toolCall!!.argumentsJson).jsonObject["query"]!!.jsonPrimitive.content,
             )
         }
+    }
+
+    @Test fun particlesInRemainderClarifyAndNeverExecute() = runBlocking {
+        // #19 B3 stage-6.1（particle rule）：殘餘中含疑問顆粒（嗎|吗|呢）⇒
+        // extractSymbolQuery 硬失敗 ⇒ NEED_CLARIFICATION（fail-closed；顆粒絕不
+        // 剝離、絕不進 query）——包含無空格黏合形態 `查 Foo呢符號`（step C 後綴
+        // cue 剝離 `符號` 後殘餘 `Foo呢` 仍含顆粒）。絕不執行。
+        val backend = CountingBackend()
+        val dispatcher = lspDispatcher(backend)
+        for (text in listOf(
+            "查 Foo呢 符號",
+            "查 Foo嗎 符號",
+            "查 Foo吗 符號",
+            "查 Foo呢符號",
+        )) {
+            // decide()：DENIED + toolCall == null + reasonCode NEED_CLARIFICATION。
+            val d = decide(text)
+            assertEquals(text, RouteKind.DENIED, d.route)
+            assertEquals(text, DenyReason.NEED_CLARIFICATION, d.reasonCode)
+            assertNull(text, d.toolCall)
+            // decideAndDispatch：decision DENIED、outcome 非 Executed、backend.invocations 不增。
+            val before = backend.invocations.get()
+            val result = dispatcher.decideAndDispatch(text, lspOn, sessionId = "s1", turnIndex = 1)
+            assertEquals(text, RouteKind.DENIED, result.decision.route)
+            assertNull(text, result.decision.toolCall)
+            assertFalse(text, result.outcome is FastDispatchOutcome.Executed)
+            assertEquals(text, before, backend.invocations.get())
+        }
+        assertEquals(0, backend.invocations.get())
     }
 }

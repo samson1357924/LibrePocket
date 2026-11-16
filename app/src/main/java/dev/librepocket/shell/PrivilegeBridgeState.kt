@@ -440,7 +440,7 @@ class PrivilegeBridgeState @VisibleForTesting internal constructor(
 
     /**
      * 一鍵收回（持久版）：記憶體旗標先落 false（關開關＋撤橋接授權，fail-closed）→ 清審計表 →
-     * false，fail-closed）→ 有界清持久授權 → 鎖外有界執行可選跨域
+     * 有界清持久授權 → 鎖外有界執行可選跨域
      * `withdrawScope`（如 github 側 Shizuku 授權 Store 的 `clear()`，
      * 由 #136-B3 產品接線傳入，本檔不跨源集引用）。
      * 審計表於持久耐久性結果未知前先行清除（既有行為，明文登錄：失敗撤權亦清審計，與『盡量撤銷』政策一致；見 THREAT_MODEL item 1）。

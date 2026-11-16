@@ -66,7 +66,7 @@ import java.util.concurrent.atomic.AtomicLong
  * provided|upon|following|pending|with|subject to|prior to|given|on 後接可選受詞/限定詞（0–3 個）再接
  * approve/agree/consent/confirm/say/allow/release/permit/ok/ready/permission/
  * review 等詞幹（gerund 與過去式一併涵蓋）、wait for/until/till、hold on/off、
- * not yet、CJK 結構性條件句（等…同意、同意後再/才、只有…才等有界框架）等），
+ * not yet、CJK 結構性條件句（等…（有界 possessor）同意、（後）再/才、只有…才等有界框架）等），
  * 或任意教學/說明標記（命令式 opener + 教學標記否決：explain|teach|tutorial|
  * how-to|howto|mean|describe|demonstrate 等屈折形式，或 CJK 說明|説明|講解|
  * 讲解|介紹|介绍|討論|讨论|教程|方法（是）?|意思|名稱|名称|如何|怎麼|怎么|
@@ -97,7 +97,9 @@ import java.util.concurrent.atomic.AtomicLong
  * - 過度澄清為受控 fail-safe：帶教學標記的命令式語句（如 `查 Foo 符號的方法是`）
  *   一律不成立前閘——寧可 no-match/澄清，絕不把非查詢命令綁到 lsp.symbols 執行。
  * - Cf/default-ignorable-split normalization 已納（本輪）：授權子句/教學標記在
- *   raw 文本與兩個正規化探針（NFKC + Cf 摺空白；NFKC + Cf 刪除）上取聯集測試。
+ *   raw 文本與兩個正規化探針（NFKC + Cf 摺空白；NFKC + Cf 刪除）上取聯集測試；
+ *   CJK 條件框架（等…possessor…consent 動詞）亦同樣以三文本取聯集測試——
+ *   字內部 Cf 拆分（如 `等\u200B主管批准再做`）亦否決。
  * - noun-form/inflected consent clauses 已納結構性錨定（本輪）：連接詞集
  *   （含 since|whenever|as|while|because|provided|upon|following|pending|with|subject to|prior to|given|on）
  *   + 0–3 個可選受詞/限定詞 + 動詞/詞幹槽（gerund/過去式/第三人稱涵蓋）。
@@ -105,10 +107,22 @@ import java.util.concurrent.atomic.AtomicLong
  *   on Foo approve）亦不收——anchor-or-nothing。
  * - 已知殘餘（accepted, anchor-or-nothing 一致性）：`with readiness`／`readiness\b`
  *   與 bare `pending`／`review` 之類 identifier 形態一致性接受。
- * - 殘餘：CJK 結構性條件句僅覆蓋所列框架（等…同意/核准/核準、同意/核準後（再/才）、
+ * - 殘餘：CJK 結構性條件句僅覆蓋所列框架（`等` ＋ 可選 possessor 槽 [\p{L}\p{N}]{1,8}
+ *   （空白/半全形逗號可夾其前後；未列 possessor 皆收——`等主管批准`／`等老闆同意`／
+ *   `等經理核准`／`等董事會點頭`／`等董老闆批准` 皆否決）＋ consent 動詞集
+ *   同意|核准|核準|批准|確認|确认|許可|许可|點頭|点头、
+ *   consent 動詞（同集）＋ 必填 後-family 後綴（之後|之后|以后|以後|後|后）＋ 可選 再|才 尾標（arm A），
+ *   或 consent 動詞 ＋ 必填 再|才 尾標（arm B），
  *   只有/只許/只许/只允…才之有界缺口）；EN 開放詞彙不宣稱完備；`\bban\w*\b` 之類（如 `symbols Foo banana` → NEED_CLARIFICATION）、`特別找`
  *   之類普通詞仍收為否定系副作用（recorded, fail-safe）；裸名詞絕不單獨收錄（anchor-or-nothing）；EN 連接詞詞幹槽已納 CJK 許可詞幹
  *   （許可|许可|同意|核准|核準|批准|確認|确认|點頭|点头）——錨定於 EN 連接詞之後者否決；EN/CJK 交集其餘仍 open-world recorded。
+ * - 已知殘餘（accepted, frame-local）：`等` 與 consent 動詞之間的 possessor 超過 8 個
+ *   \p{L}/\p{N} 字元時框架不匹配（如 `等超出八個字以上的主管同意`、`等123456789批准`／
+ *   `等123456789012批准`——9/12 位數字 possessor）→ fail-open；consent 動詞後接 再|才
+ *   則無論 possessor 長度皆否決；有界 {1,8} 槽與 consent 動詞集不巢狀量化，無災難性回溯；記錄，不修
+ *   （單 token 命令形 end-to-end FAST；帶空白則落 whitespace 澄清——兩者皆不執行）。
+ * - 已知殘餘（accepted, not fixed this round）：consent 動詞與 再|才 之間夾半形 `,` `;` `:` 不視為連接符——
+ *   單 token 形態（如 `查Foo符號批准,再做`）→ FAST query=`Foo批准,再做`（`;` `:` 同形；帶空白版本經 whitespace 閘澄清）——READ-only、identifier 形狀 garbage；記錄、接受、不修。
  * - 已知殘餘（accepted, frame-local, not fixed；audit F7）：CJK 框架內部的
  *   空白相鄰在 clause 閘仍可通過——如 `同意 後再查`（CJK run 之間僅一個空白）clause gate 放行、
  *   但 extraction 的 whitespace 閘仍會拒絕（multi-token → clarification），永不執行；僅記錄。
@@ -381,9 +395,21 @@ class FastRouter(
         //       `once it is approved`、`since I approved`、`after my approval`）；
         //       裸 `\b(?:approval|approved|consent|pending)\b` 絕不單獨收錄；
         //    C. `\bwait\s+(?:for|until|till)\b`、`\bhold\s+(?:on|off)\b`、`\bnot\s+yet\b`；
-        //    D. CJK 結構性條件句僅覆蓋所列框架：`等\s*(我|我們|我们|你|他|她)?\s*(同意|核准|核準|批准|確認|确认|許可|许可|點頭|点头)`、
-        //       `(同意|核准|核準|批准|確認|确认|許可|许可)(之後|之后|以後|以后|後|后)(?:再|才)?`、
+        //    D. CJK 結構性條件句僅覆蓋所列框架：`等[\s，,]*(?:[\p{L}\p{N}]{1,8}[\s，,]*)?(?:同意|核准|核準|批准|確認|确认|許可|许可|點頭|点头)`
+        //       （possessor 槽：1–8 個 \p{L}/\p{N} 字母/數字，其前後可夾空白與半/全形逗號；
+        //        不再限封閉代名詞表——未列 possessor 皆收（`等主管批准`／`等老闆同意`／`等經理核准`／
+        //        `等董事會點頭`／`等董老闆批准` 皆否決；`等我們同意`／`等你點頭` 仍匹配）；
+        //        槽為有界 {1,8} 與 consent 動詞集不巢狀量化，無災難性回溯）、
+        //       `(?:同意|核准|核準|批准|確認|确认|許可|许可|點頭|点头)(?:之後|之后|以後|以后|後|后)(?:再|才)?`／
+        //       `(?:同意|核准|核準|批准|確認|确认|許可|许可|點頭|点头)(?:再|才)`（兩臂：A＝動詞＋必填後-family（再|才 可選），
+        //       `同意後`／`批准後`／`批准後再做` 皆否決；B＝動詞＋必填再|才（無後-family），`批准再做`／`批准才做` 皆否決；
+        //        無 `再|才` 亦不匹配——`查 批准 符號` 保持 FAST）、
         //       以及有界缺口 `只有.{0,8}才`／`只許.{0,8}才|只许.{0,8}才`／`只允.{0,8}才`（無裸名詞 CJK 匹配）；
+        //       已知殘餘（accepted, frame-local）：`等` 與 consent 動詞之間的 possessor 超過 8 個
+        //       L/N 字元（如 `等超出八個字以上的主管同意`／`等123456789批准`／`等123456789012批准`——
+        //       9/12 位數字 possessor）不匹配 → fail-open；consent 動詞後接 再|才 則無論 possessor 長度皆否決（arm B）；記錄，不修
+        //       （單 token 命令形 end-to-end FAST；帶空白則落 whitespace 澄清——兩者皆不執行）；
+        //       Cf-split 拆分（如 `等\u200B主管批准`）由 spaced/joined 探針還原覆蓋（兩探針與 raw 取聯集）。
         //    探針：NFKC → 剝 Cf/格式符 → 非字母/數字 run 摺成單一空白（`_` 保留——after_approval
         //    之類識別字不得被拆），以及 NFKC → Cf 直接刪除 → 同樣摺疊（`after I ap\u200Bprove` 這種
         //    字內部拆分才會還原）。兩探針與 raw 取聯集，`_` 以外的連接符不造成誤FAST。
@@ -419,8 +445,9 @@ class FastRouter(
                 "|\\bwait\\s+(?:for|until|till)\\b" +
                 "|\\bhold\\s+(?:on|off)\\b" +
                 "|\\bnot\\s+yet\\b" +
-                "|等\\s*(?:我|我們|我们|你|他|她)?\\s*(?:同意|核准|核準|批准|確認|确认|許可|许可|點頭|点头)" +
-                "|(?:同意|核准|核準|批准|確認|确认|許可|许可)(?:之後|之后|以後|以后|後|后)(?:再|才)?" +
+                "|等[\\s，,]*(?:[\\p{L}\\p{N}]{1,8}[\\s，,]*)?(?:同意|核准|核準|批准|確認|确认|許可|许可|點頭|点头)" +
+                "|(?:同意|核准|核準|批准|確認|确认|許可|许可|點頭|点头)(?:之後|之后|以後|以后|後|后)(?:再|才)?" +
+                "|(?:同意|核准|核準|批准|確認|确认|許可|许可|點頭|点头)(?:再|才)" +
                 "|只有.{0,8}才" +
                 "|只許.{0,8}才|只许.{0,8}才" +
                 "|只允.{0,8}才",

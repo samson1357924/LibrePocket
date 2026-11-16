@@ -2549,6 +2549,28 @@ class FastDispatchTest {
             "只有我核准才查",
             "只許我確認才查",
             "只允他確認才查",
+            // #19 B3 stage-6.2（F1 修正後語意）：CJK possessor 槽（[\p{L}\p{N}]{1,8}，不限封閉代名詞表——
+            // 主管/老闆/經理/董事會/工廠 等未列 possessor 皆收）＋雙臂 consent 框架：
+            // A＝動詞＋必填後-family（再|才 可選，`同意後`／`批准後` 否決）；
+            // B＝動詞＋必填再|才（`批准再做`／`批准才做` 否決）；
+            // 無 `再|才` 亦無後-family ⇒ 不匹配（裸 `批准` 仍 FAST 見下方正向測試）。
+            "查 Foo 符號等主管批准再做",
+            "查 Foo 符號等老闆同意",
+            "查 Foo 符號等經理核准",
+            "查 Foo 符號等董事會點頭",
+            "查 Foo 符號等工廠批准",
+            "查 Foo 符號批准再做",
+            "查 Foo 符號批准才做",
+            // #19 B3 stage-6.2 fix（F1）：arm A 還原——動詞＋必填後-family（無再|才）亦否決。
+            "查 Foo 符號同意後",
+            "查Foo符號批准後",
+            // #19 B3 stage-6.2 fix（F3）：raw 文本帶 zero-width space（U+200B）的 CJK 條件框架——
+            // spaced/joined 探針還原後命中框架（unicode escape 寫法，見既有 `呢\u200B` 先例）。
+            "查Foo符號等\u200B主管同意",
+            "查 Foo 符號批准\u200B再做",
+            "查 Foo 符號等主管\u200B同意",
+            // 精確 report 字串（無空白形式）：
+            "查Foo符號等主管批准再做",
         )) {
             // decide()：decision is DENIED, toolCall == null。
             val d = decide(text)

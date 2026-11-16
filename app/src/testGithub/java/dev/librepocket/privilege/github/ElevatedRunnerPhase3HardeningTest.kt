@@ -30,7 +30,7 @@ import org.junit.Test
  *   verified=false → 呼叫方先登記 quarantine，再行（可能的）釋放；
  *   實際同持槽鎖點現為 6（wait＋verify＋stdout＋stderr＋stdin＋cleanup，
  *   test body 斷言 outstanding==6）；保留「六點／SixPoint」名稱與計數註解；
- *   同步峰值 `peakOutstanding() <= MAX_OUTSTANDING_CLEANUPS`（替代 sleep 採樣，
+ *   同步峰值 `peakOutstanding() == 6`（六點同卡確定性；替代 sleep 採樣，
  *   `acquireSlot` 同鎖內同步更新，無遺漏）；終止後 slot 全釋、verdict
  *   `TimedOut(cleanupIncomplete=true)`、breaker 只計 1（不熔斷）、殘留期間新
  *   call 即預留拒；
@@ -41,7 +41,9 @@ import org.junit.Test
  * - wait 殘留歸因：他 call 殘留（prefill）下本 call 無殘留超時不置旗、不計 breaker；
  * - exitValue：tail 期間呼叫執行緒被中斷，健康進程仍取回真 exit（非 -1 誤報）。
  * - acquireSlot 飽和即拒：填滿至 MAX 後再佔即 false、不增計數（`outstanding`
- *   封頂不超 MAX）；飽和下 kill 路徑 drain 仍嘗試 killer（永不跳過）但 verdict
+ *   封頂不超 MAX）；預填恰好 MAX 且全程持有 ⇒ 同步峰值恰為 MAX
+ *   （`peakOutstanding()` 確定性 == MAX，非 `<=` 上界 tautology）；飽和下
+ *   kill 路徑 drain 仍嘗試 killer（永不跳過）但 verdict
  *   保守記 `cleanupIncomplete=true`（無法記槽即無法自證有界完成）。
  *
  * 全 fake，零真機、零 su、零 binder。阻塞體一律吞 interrupt 續等（模擬不可靠
@@ -359,10 +361,14 @@ class ElevatedRunnerPhase3HardeningTest {
                 ElevatedCleanupTracker.outstanding(),
             )
             assertEquals(1, ElevatedCleanupTracker.quarantinedCount())
+            // 六 stuck 點全程持有至 finally（resetPeak 已於測試開頭呼叫；
+            // acquireSlot/markLingering 同鎖內同步更新峰值，無遺漏、無第二來源槽位）
+            // ⇒ 確定性峰值恰為 6——peak ≥ outstanding==6（見上），且無第 7 個分配點。
             val peak = ElevatedCleanupTracker.peakOutstanding()
-            assertTrue(
-                "peak=$peak must stay within MAX=${ElevatedCleanupTracker.MAX_OUTSTANDING_CLEANUPS}",
-                peak <= ElevatedCleanupTracker.MAX_OUTSTANDING_CLEANUPS,
+            assertEquals(
+                "peak must reach exactly 6 (the six simultaneous stuck lock points)",
+                6,
+                peak,
             )
             // 終審：單次不清創計 1，不熔斷。
             assertEquals(1, ElevatedCleanupTracker.consecutiveCount())
@@ -441,10 +447,14 @@ class ElevatedRunnerPhase3HardeningTest {
                 ElevatedCleanupTracker.outstanding(),
             )
             assertEquals(1, ElevatedCleanupTracker.quarantinedCount())
+            // 六 stuck 點全程持有至 finally（resetPeak 已於測試開頭呼叫；
+            // acquireSlot/markLingering 同鎖內同步更新峰值，無遺漏、無第二來源槽位）
+            // ⇒ 確定性峰值恰為 6——peak ≥ outstanding==6（見上），且無第 7 個分配點。
             val peak = ElevatedCleanupTracker.peakOutstanding()
-            assertTrue(
-                "peak=$peak must stay within MAX=${ElevatedCleanupTracker.MAX_OUTSTANDING_CLEANUPS}",
-                peak <= ElevatedCleanupTracker.MAX_OUTSTANDING_CLEANUPS,
+            assertEquals(
+                "peak must reach exactly 6 (the six simultaneous stuck lock points)",
+                6,
+                peak,
             )
             assertEquals(1, ElevatedCleanupTracker.consecutiveCount())
             assertFalse(ElevatedCleanupTracker.isBreakerOpen())
@@ -828,10 +838,12 @@ class ElevatedRunnerPhase3HardeningTest {
                 ElevatedCleanupTracker.MAX_OUTSTANDING_CLEANUPS,
                 ElevatedCleanupTracker.outstanding(),
             )
-            val peak = ElevatedCleanupTracker.peakOutstanding()
-            assertTrue(
-                "peak=$peak must stay within MAX=${ElevatedCleanupTracker.MAX_OUTSTANDING_CLEANUPS}",
-                peak <= ElevatedCleanupTracker.MAX_OUTSTANDING_CLEANUPS,
+            // 預填恰好 MAX 且全程持有 ⇒ 確定性峰值（resetPeak 已於測試開頭呼叫；
+            // acquireSlot 同鎖內同步更新峰值，飽和拒不動峰值）。
+            assertEquals(
+                "peak must reach exactly MAX (prefilled MAX and held)",
+                ElevatedCleanupTracker.MAX_OUTSTANDING_CLEANUPS,
+                ElevatedCleanupTracker.peakOutstanding(),
             )
         } finally {
             repeat(prefilled) {

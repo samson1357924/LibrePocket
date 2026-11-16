@@ -532,10 +532,31 @@ class ElevatedRunnerP1FixTest {
             repeat(2) { ElevatedCleanupTracker.noteUnclean() }
             assertTrue(ElevatedCleanupTracker.isBreakerOpen())
         } finally {
-            repeat(8) { ElevatedCleanupTracker.releaseSlot() }
+            // 本測試有意持有 3 個預佔槽（stage-2 重新佔位，drain 不釋放呼叫方槽）——
+            // 先恰好歸還本測自身持有之槽（minOf 防 body 提前失敗時盲射），再以
+            // snapshot-then-remediate-then-assert 收斂 body 意外殘留。
+            repeat(minOf(3, ElevatedCleanupTracker.outstanding())) {
+                ElevatedCleanupTracker.releaseSlot()
+            }
+            // 快照先於任何補救——body 意外殘留（≠ known 3）會被記在此處而非靜默回收。
+            val leakedOutstanding = ElevatedCleanupTracker.outstanding()
+            val leakedActive = ElevatedCleanupTracker.activeCalls()
+            val leakedQuarantine = ElevatedCleanupTracker.quarantinedCount()
+            val forcedDeadline = System.currentTimeMillis() + 5_000L
+            while (ElevatedCleanupTracker.outstanding() > 0 && System.currentTimeMillis() < forcedDeadline) {
+                ElevatedCleanupTracker.releaseSlot()
+            }
+            val forcedActiveDeadline = System.currentTimeMillis() + 5_000L
+            while (ElevatedCleanupTracker.activeCalls() > 0 && System.currentTimeMillis() < forcedActiveDeadline) {
+                ElevatedCleanupTracker.leaveCall()
+            }
             pollOutstandingTo(0)
+            pollActiveTo(0)
             ElevatedCleanupTracker.noteClean()
             awaitNoElevatedThreads()
+            assertEquals("cleanDuringBacklogDoesNotResetBreaker leaked outstanding slots", 0, leakedOutstanding)
+            assertEquals("cleanDuringBacklogDoesNotResetBreaker leaked active calls", 0, leakedActive)
+            assertEquals("cleanDuringBacklogDoesNotResetBreaker leaked quarantined processes", 0, leakedQuarantine)
         }
         assertEquals(0, ElevatedCleanupTracker.consecutiveCount())
     }

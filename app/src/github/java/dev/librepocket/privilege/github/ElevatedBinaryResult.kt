@@ -183,8 +183,10 @@ interface BinaryElevatedRunner : ElevatedShellRunner {
  *   （`cleanupBacklogFull`；backlog full 之 Denied 攜 `cleanupIncomplete=true`，
  *   breaker／concurrency 不攜）／
  *   連續不清創熔斷（`cleanupBreakerOpen`）／
- *   併發上限（`concurrencyFull`）／登記雙失敗 brick（`registrationFailed`，
- *   無槽且 quarantine 雙登記皆抛之極角，app 重啟方能恢復，#136-B3 必接 alert）。
+ *   併發上限（`concurrencyFull`）／登記 brick（`registrationFailed`，
+ *   登記失敗且未能定位追蹤 ⇒ brick；槽保留或 handle 已入 quarantine 者不置位（catch-all 臂除外，見 D-D10）；
+ *   catch-all 臂無例外、
+ *   無條件冗餘密封（D-D10），app 重啟方能恢復，#136-B3 必接 alert）。
  *   審計 `DENY` 下五因不可區分，排障須看拒絕訊息
  *   （`quota exceeded`／`backlog full`／`breaker open`／`concurrency full`／
  *   `registration failed`），不得僅看 verdict；

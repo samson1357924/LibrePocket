@@ -3687,9 +3687,10 @@ class ElevatedRunnerP1B2Test {
             assertTrue("cleanupIncomplete must be true", d.cleanupIncomplete)
             // Worker stuck behind the uninterruptible latch is definitely still
             // alive at drain return → the B3 telemetry counter must have moved.
-            assertTrue(
-                "cleanupWorkerStalledAfterVerifyCount must increase by >= 1 for a stuck slot-carrying worker",
-                ElevatedCleanupTracker.cleanupWorkerStalledAfterVerifyCount() - stalledBefore >= 1,
+            assertEquals(
+                "cleanupWorkerStalledAfterVerifyCount must increase by exactly 1 for a stuck slot-carrying worker",
+                stalledBefore + 1,
+                ElevatedCleanupTracker.cleanupWorkerStalledAfterVerifyCount(),
             )
             // hang=true 的 FakeProcess 從未被 destroy（killer 永久阻塞，destroy 未執行），
             // post-kill verify（waitFor=false）必敗 → handle 轉入 quarantine。

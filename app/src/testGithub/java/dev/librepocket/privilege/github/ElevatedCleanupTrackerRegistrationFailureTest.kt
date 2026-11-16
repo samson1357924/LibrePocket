@@ -557,6 +557,93 @@ class ElevatedCleanupTrackerRegistrationFailureTest {
         }
     }
 
+    /**
+     * Round-6（IR-P2）gate-1 多門優先釘：sticky brick 置位後，其餘密封門
+     * （gate 2/5 backlog＋gate 6 linger debt＋gate 7 quarantine）同立時，
+     * `tryEnterReserved()` 仍須回 [Admission.REGISTRATION_FAILED]——brick 嚴格優先。
+     * 隔離：sticky 經 registrar 雙失敗 helper 路徑置位（同
+     * [releaseCleanupSlotAfterVerifyDoubleFailureBricksAdmission] 機制）；debt 由
+     * 飽和 `markLingering`（state=3）持有至 worker 本體 finally 歸零。
+     * finally 收斂：放行 worker→恰好釋放預填槽→還原 registrar／sticky／quarantine。
+     */
+    @Test fun registrationFailedStickyWinsOverAllOtherGates() {
+        val p = FakeProcess("ok".toByteArray())
+        val latch = CountDownLatch(1)
+        val state = AtomicInteger(0)
+        var prefilled = 0
+        val debtBefore = ElevatedCleanupTracker.lingerDebtCount()
+        val worker = Thread({
+            try {
+                latch.await()
+            } catch (_: InterruptedException) {
+                Thread.currentThread().interrupt()
+            } finally {
+                // 四態收斂：3（飽和無槽＋債務）→2＋endLingerDebt（恰好歸債一次）；
+                // 若 mark 從未發生（state==0，理論不可達——body 必先 mark）→2 無動作。
+                synchronized(state) {
+                    if (state.get() == 3) {
+                        state.set(2)
+                        ElevatedCleanupTracker.endLingerDebt()
+                    } else if (state.get() == 1) {
+                        state.set(2)
+                        ElevatedCleanupTracker.releaseSlot()
+                    } else if (state.get() == 0) {
+                        state.set(2)
+                    }
+                }
+            }
+        })
+        worker.isDaemon = true
+        try {
+            ElevatedCleanupTracker.clearRegistrationFailedStickyForTest()
+            // gate 1：registrar 拋 ⇒ releaseCleanupSlotAfterVerify 零追蹤臂雙失敗 ⇒ sticky。
+            ElevatedProcessIo.quarantineRegistrar = { throw RuntimeException("registrar boom") }
+            ElevatedProcessIo.releaseCleanupSlotAfterVerify(p, verified = false, slotHeld = false)
+            assertTrue(
+                "double registration failure must brick admission",
+                ElevatedCleanupTracker.isRegistrationFailedSticky(),
+            )
+            // gate 2/5：預填至 MAX（backlog／預留超額，同一 outstanding 來源）。
+            repeat(ElevatedCleanupTracker.MAX_OUTSTANDING_CLEANUPS) {
+                assertTrue("slot $it must grant below MAX", ElevatedCleanupTracker.acquireSlot())
+                prefilled++
+            }
+            // gate 7：quarantine 登記非空。
+            ElevatedCleanupTracker.quarantineUnverified(NoOpHangProcess())
+            // gate 6：飽和無槽 blocked worker——markLingering 飽和臂置 state=3＋linger debt。
+            worker.start()
+            val d = System.currentTimeMillis() + 5_000L
+            while (!worker.isAlive && System.currentTimeMillis() < d) Thread.sleep(5L)
+            assertTrue(worker.isAlive)
+            ElevatedCleanupTracker.markLingering(worker, state)
+            assertEquals(3, state.get())
+            assertEquals(debtBefore + 1, ElevatedCleanupTracker.lingerDebtCount())
+            assertEquals(ElevatedCleanupTracker.MAX_OUTSTANDING_CLEANUPS, ElevatedCleanupTracker.outstanding())
+            assertTrue(ElevatedCleanupTracker.isQuarantined())
+            // 三門同立（backlog＋quarantine＋debt）⇒ 首門 brick 仍勝出。
+            assertEquals(
+                "sticky brick must win over backlog/quarantine/debt gates",
+                ElevatedCleanupTracker.Admission.REGISTRATION_FAILED,
+                ElevatedCleanupTracker.tryEnterReserved(),
+            )
+            assertEquals(0, ElevatedCleanupTracker.activeCalls())
+        } finally {
+            latch.countDown()
+            worker.join(5_000L)
+            assertTrue("worker must exit within 5s", !worker.isAlive)
+            // 恰好釋放本測持有的槽 → debt 歸零 → 清 quarantine／sticky／還原 registrar。
+            repeat(prefilled) {
+                ElevatedCleanupTracker.releaseSlot()
+            }
+            pollOutstandingTo(0)
+            assertEquals(debtBefore, ElevatedCleanupTracker.lingerDebtCount())
+            ElevatedProcessIo.quarantineRegistrar = { ElevatedCleanupTracker.quarantineUnverified(it) }
+            ElevatedCleanupTracker.clearRegistrationFailedStickyForTest()
+            ElevatedCleanupTracker.clearUnverified()
+            ElevatedCleanupTracker.noteClean()
+        }
+    }
+
     /** D-C1 對照臂：同一 call 但 registrar 成功（dedup 登記）⇒ 不置 brick、sticky 保持 false、
      *  admission 以 QUARANTINE 拒（gate 7），非 REGISTRATION_FAILED。 */
     @Test fun releaseCleanupSlotAfterVerifySucceedingRegistrarDoesNotBrick() {

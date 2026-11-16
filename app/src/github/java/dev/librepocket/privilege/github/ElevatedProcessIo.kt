@@ -149,7 +149,10 @@ import java.util.concurrent.TimeUnit
  *   verify 結果已知後於 [releaseCleanupSlotAfterVerify] 釋放一次；stall 路徑——
  *   post-grace 線性化點把 custody 轉移給 worker 本體，worker finally 釋放
  *   （admission 於彼時前 fail-closed）。詳見 [runCleanupBounded] KDoc AA1-slot
- *   段及 [releaseCleanupSlotAfterVerify]（唯一 caller 側釋放點））；
+ *   段及 [releaseCleanupSlotAfterVerify]）；
+ *   直線釋放點共三處（限 cleanupSlotState 三態／AA1-slot custody；markLingering 四態 family 的 supervisor／gobbler finally 釋槽屬另一 rule、另計）：起線程失敗臂登記成功臂（`releaseSlot()`）、worker finally
+ *   於三態 1 釋放、[releaseCleanupSlotAfterVerify]（post-verify 唯一 caller 側釋放點）；
+ *   不變量是「每槽恰好釋放一次」，非「僅一個釋放點」）；
  * - linger 成功走 [ElevatedCleanupTracker.noteUnclean]（finished／kill 統一終審
  *   `if (cleanupIncomplete) noteUnclean() else if (outstanding()==0) noteClean()`；
  *   cleanupIncomplete 含殘留 gobbler／stdin；正常完成且全域無殘留仍 noteClean，
@@ -292,7 +295,7 @@ internal object ElevatedCleanupTracker {
      * Round-6（#136-B2 IR-P2 / D-B3 / D-A10）：新增 [REGISTRATION_FAILED]——
      * 登記失敗且未能定位追蹤的 arms 置位——acquire-throw 臂（second-chance 亦拋）／
      * helper 無槽且 quarantine 無登記臂／catch-all 臂（無狀態可知，無條件冗餘密封 D-D10）；
-     * slot 保留或 handle 已入 quarantine 者（gate 7 承載）不置位；handle 無槽且無登記，
+     * slot 保留或 handle 已入 quarantine 者（gate 7 承載）不置位（catch-all 臂除外，見 D-D10）；handle 無槽且無登記，
      * 任何後續信號皆不安全：admission 永久密封（app 重啟恢復；#136-B3 必接 alert＋runbook）。
      */
     enum class Admission {
@@ -477,7 +480,8 @@ internal object ElevatedCleanupTracker {
      *    cleanupOnThreadStartFailure 收斂臂；late 三臂：late daemon 本體／
      *    late-daemon 起線程失敗收斂臂／compensateInline 本體）及所有 helper 冪等重試）；
      * 5. `drainFailClosedDrained()`（catch-all 總包裝）的 onFailure 臂——catch-all 臂登記
-     *    失敗（此臂不經 verify／runCleanupBounded，無槽可留，登記失敗僅 note＋brick 兜底）。
+     *    失敗（此臂不經 verify／runCleanupBounded，無槽可留；catch-all 無條件冗餘密封 D-D10，
+     *    登記失敗無例外置 brick，僅 note＋brick 兜底）。
      * `lateCompensateSpawn` 內層 guarded attempt 不計數（N5 已單站點化）。
      * 語義見 [noteQuarantineRegistrationFailed]：每次拋出的登記嘗試計數一次；單一 incident
      * 上限：drain acquire-throw 臂至多 3 次（臂內首嘗＋second-chance＋caller verify 臂
@@ -485,11 +489,15 @@ internal object ElevatedCleanupTracker {
      * 臂 helper 重試）；兩晚補償臂至多 2 次（臂內首嘗＋second-chance，無 helper 重試）；
      * 上界皆為保守上限，非字面嘗試次數統計（⊆經 cleanupOnThreadStartFailure 總包裝／
      * Inner 異常臂轉入 `drainFailClosedDrained()` onFailure 臂時可再加 1；
-     * `drainFailClosedDrained()` 登記失敗本臂另含 noteRegistrationFailedSticky——經此臂再 +1 屬設計，>0 ⇒ brick 語義保持）；
+     * `drainFailClosedDrained()` 登記失敗本臂另含 noteRegistrationFailedSticky——經此臂再 +1 屬設計；
+     * brick 置位點僅 acquire-throw 臂（雙登記皆拋）／helper 無槽且 quarantine 無登記臂／
+     * catch-all 無條件臂（D-D10）——其餘皆不置 brick）；
      * 告警接線一律以 `>0` 判定，禁止當作唯一失敗計數。
      * 登記失敗＝槽保留（admission 續拒）之 fail-closed 記數；app 重啟前不可自清、應告警。
-     * 零消費方（僅診斷可見）：非零即 fail-closed brick 需 app 重啟恢復；告警/上報接線歸 #136-B3
-     * （double-failure brick：admission 以 [Admission.REGISTRATION_FAILED] 永久密封；
+     * 零消費方（僅診斷可見）：非零不必然 brick——僅 acquire-throw 臂（雙登記皆拋）／
+     * helper 無槽且 quarantine 無登記臂／catch-all 無條件臂（D-D10）置 brick，其餘皆僅計數；
+     * brick 需 app 重啟恢復；告警/上報接線歸 #136-B3
+     * （admission 以 [Admission.REGISTRATION_FAILED] 永久密封；
      * #136-B3 必同步接 alert，參考本計數同款）。
      */
     private val quarantineRegistrationFailed = AtomicInteger(0)
@@ -568,7 +576,7 @@ internal object ElevatedCleanupTracker {
      * `drainFailClosedDrained()` 的 onFailure 臂時可再加 1）；drain start-failure 臂
      * 至多 2 次（臂內登記失敗 note＋caller verify 臂 helper 重試）；兩晚補償臂至多
      * 2 次（臂內首嘗＋second-chance，無 helper 重試）。`drainFailClosedDrained()`
-     * onFailure 臂再 +1 屬設計（brick 語義 >0 保持，不雙釋）。
+     * onFailure 臂再 +1 屬設計（catch-all 無條件冗餘密封 D-D10、brick 置位，不雙釋）。
      * 告警接線一律以 `>0` 判定，禁止當作唯一失敗計數（亦不得據此反推殘留 handle 數）。
      */
     internal fun noteQuarantineRegistrationFailed() {
@@ -578,12 +586,12 @@ internal object ElevatedCleanupTracker {
     /** Round-6（#136-B2 IR-P2／D-B3／D-A10）登記 brick：登記失敗且未能定位追蹤的
      *  arms 置位——acquire-throw 臂（second-chance 亦拋）／helper 無槽且 quarantine 無登記臂／
      *  catch-all 臂（無狀態可知，無條件冗餘密封 D-D10）；slot 保留或 handle 已入 quarantine 者
-     *  （gate 7 承載）不置位。
+     *  （gate 7 承載）不置位（catch-all 臂除外，見 D-D10）。
      *  設立後 admission 永久拒絕（app 重啟方能解除；#136-B3 必接 alert＋runbook）。
      *  單向（true→true），無產品清除路徑；僅測試隔離可經 [clearRegistrationFailedStickyForTest] 歸零。 */
     private val registrationFailedSticky = AtomicBoolean(false)
 
-    /** 置位 sticky（登記雙失敗臂專用；冪等）。 */
+    /** 置位 sticky（登記失敗 arms 專用，含 catch-all D-D10 無條件冗餘密封；冪等）。 */
     internal fun noteRegistrationFailedSticky() {
         registrationFailedSticky.set(true)
     }
@@ -597,7 +605,7 @@ internal object ElevatedCleanupTracker {
     }
 
     /**
-     * 僅供測試：[acquireSlotOrQuarantine] 一律拋（OutOfMemoryError 模擬 VME），釘雙失敗 brick 臂。
+     * 僅供測試：[acquireSlotOrQuarantine] 一律拋（OutOfMemoryError 模擬 VME），釘登記 brick 臂。
      * 不接產品路徑；測試須於 finally 還原為 false。
      */
     @VisibleForTesting
@@ -687,7 +695,6 @@ internal object ElevatedCleanupTracker {
      * 測試意圖：單測 setUp／tearDown／首尾呼叫皆屬測試隔離重置，非 #136-B3 修復驗證；
      * 產品 #136-B3 介入重置亦經此（見 [PrivilegeActivation]），單測僅借其歸零語義做隔離。
      */
-    @VisibleForTesting
     internal fun noteClean() {
         synchronized(lock) {
             if (outstandingCount.get() == 0) consecutiveUnclean.set(0)
@@ -1160,16 +1167,19 @@ internal object ElevatedCleanupTracker {
      * 不做三段 CAS）。判定順序同 [tryEnterReserved]（brick／backlog／breaker／併發／預留／debt／quarantine）。
      *
      * Round-6（#136-B2 IR-P2）首門 brick：[registrationFailedSticky] >0 即
-     * [Admission.REGISTRATION_FAILED]。優先級：多門同成立時 brick 原因碼優先
-     * （登記雙失敗＝零追蹤，訊息最嚴重）；復原＝app 重啟（無產品清除路徑）。
+     * [Admission.REGISTRATION_FAILED]。登記失敗且未能定位追蹤 ⇒ brick；槽保留或 handle 已入 quarantine 者不置位（catch-all 臂除外，見 D-D10）；
+     * catch-all 臂無例外、無條件冗餘密封（D-D10）。
+     * 優先級：多門同成立時 brick 原因碼優先（訊息最嚴重）；復原＝app 重啟（無產品清除路徑）。
      * Round-6（#136-B2 IR-P1）gate 6：無槽 lingering worker 債務 >0 即
      * [Admission.BACKLOG_FULL]。原因優先級：多門同成立時 BACKLOG_FULL 訊息不變；
      * 復原＝debt 歸零（end 入口三處，見 beginLingerDebt KDoc）或 app 重啟。
-     * 多門同成立時既有門 reason 優先，QUARANTINE 恆居末門、diagnostics 應讀
-     * `quarantinedCount` 而非 reason code。
+     * 多門同成立時既有門 reason 優先，QUARANTINE 恆居末門。
+     * debt 門（gate 6）與 quarantine 門（gate 7）不互斥——debt 先遮蔽 QUARANTINE
+     * 故觀測者見 BACKLOG_FULL；brick（gate 1）獨立且嚴格優先於二者；diagnostics
+     * 應讀 counters（`lingerDebtCount()`／`quarantinedCount`）而非 reason code。
      */
     private fun classifyAdmissionLocked(): Admission {
-        // Round-6（#136-B2）：登記雙失敗 brick — admission 永久密封（app 重啟恢復）。
+        // Round-6（#136-B2）：登記 brick — admission 永久密封（app 重啟恢復）。
         if (registrationFailedSticky.get()) return Admission.REGISTRATION_FAILED
         // Round-3 Phase E（P1-1）：quarantine 末門（既有門相對順序不動，Phase F 範圍；
         // quarantine 只補 P1-1 缺口——outstanding==0、consecutive==1、預留通過時，
@@ -1198,9 +1208,9 @@ internal object ElevatedCleanupTracker {
      * 檢查順序（拒絕原因優先級，僅供訊息區分，准入決定單一原子點；
      * Round-3 Phase E（P1-1）：既有 1-4 相對順序不動，quarantine 只為末門；
      * Round-6 IR-P1：lingering worker 債務門順延 quarantine；
-     * Round-6 IR-P2：登記雙失敗 brick 為首門，其餘門順延一號）：
+     * Round-6 IR-P2：登記 brick 為首門，其餘門順延一號）：
      * 1. `registrationFailedSticky` 置位 → [Admission.REGISTRATION_FAILED]
-     *    （Round-6 IR-P2，登記雙失敗永久密封，app 重啟恢復；無產品清除路徑，
+     *    （Round-6 IR-P2，登記 brick 永久密封，app 重啟恢復；無產品清除路徑，
      *    僅 [clearRegistrationFailedStickyForTest] 供測試隔離）；
      * 2. `outstanding >= MAX` → [Admission.BACKLOG_FULL]；
      * 3. `consecutive >= MAX_CONSECUTIVE_UNCLEAN` → [Admission.BREAKER_OPEN]；
@@ -2214,6 +2224,9 @@ internal object ElevatedCallSupervisor {
                 countUncleanOnce()
                 return
             }
+            // 不變量（exactly-once 前提）：此處 acquired==true（!acquired 已於上方返回）；
+            // daemon 體內僅當 daemonClaimed CAS 勝出且 acquired==true 方達 releaseCleanupSlotAfterVerify。
+            val handedOff = acquired
             // Round-6（#136-B2 D-A5）：daemon 體入口 CAS 取得釋槽權——boundary ownership：
             // 要麼 daemon 先 CAS（catch 臂 observe 即 benignly no-op，daemon 續行收斂），要麼
             // catch 臂先 CAS（daemon 醒後 observe 即直接退出，不做任何登記／釋放／計數）。
@@ -2240,7 +2253,7 @@ internal object ElevatedCallSupervisor {
                     // （clean→release；未驗證＋登記成功→release；登記拋出→槽保留
                     // fail-closed＋noteQuarantineRegistrationFailed）。
                     // quarantine 登記為 `===`-dedup 冪等；slot release 由 slotHeld 單次釋放（caller 保有 ownership）。
-                    ElevatedProcessIo.releaseCleanupSlotAfterVerify(v, clean, slotHeld = true)
+                    ElevatedProcessIo.releaseCleanupSlotAfterVerify(v, clean, slotHeld = handedOff)
                     if (!clean) countUncleanOnce()
                 }, "elevated-late-spawn")
                 t.isDaemon = true
@@ -3132,10 +3145,10 @@ internal object ElevatedProcessIo {
             runCatching { ElevatedProcessIo.quarantineRegistrar(process) }
                 .onFailure {
                     runCatching { ElevatedCleanupTracker.noteQuarantineRegistrationFailed() }
-                    // Round-6（#136-B2 IR-P2）：catch-all 臂登記失敗 ⇒ 登記雙失敗 brick。
+                    // Round-6（#136-B2 IR-P2）：catch-all 臂登記失敗 ⇒ 無條件冗餘 brick（D-D10）。
                     // 註：kill 臂路徑此臂之前 runCleanupBounded 已 acquired==true 者，本臂 note
                     // 後 outstanding 仍 ≥1（槽具 fail-closed 密封，見 D-D10）——brick 為冪等冗餘密封、
-                    // 不雙釋、不互斥；零追蹤（drain preflight／零槽路徑）者則為唯一接管 arm。
+                    // 不雙釋、不互斥；無法定位追蹤（drain preflight／零槽路徑）者則為唯一接管 arm。
                     runCatching { ElevatedCleanupTracker.noteRegistrationFailedSticky() }
                 }
             runCatching { ElevatedCleanupTracker.noteUntrackedResidual() }
@@ -4395,8 +4408,8 @@ internal object ElevatedProcessIo {
                 // 本臂 registrar 呼叫僅為 `===`-dedup 的冪等重登（test seam／VME in
                 // dedup scan 可拋），拋出即無法「取消登記」——verified death 為唯一
                 // sweep 解除路徑，live child 的 seal 由 gate 7 承載、與 registrar 成敗
-                // 無關 ⇒ 本臂 handle 永非零追蹤，debt-free brick 契約（brick ⇔ 零追蹤：
-                // acquire-throw 臂／helper 無槽臂／catch-all 臂）不適用。登記失敗僅計
+                // 無關 ⇒ 本臂 handle 永非零追蹤，debt-free brick 契約（brick ⇔ 登記失敗且無法定位追蹤，
+                // catch-all ＝ D-D10 無條件冗餘密封；acquire-throw 臂／helper 無槽臂／catch-all 臂）不適用。登記失敗僅計
                 // 遙測（`noteQuarantineRegistrationFailed`），sweep 恢復（gate 7 可離封），
                 // 不把 sweep-recoverable 狀態永久降級為 restart-only。
             }
@@ -4601,7 +4614,7 @@ internal object ElevatedProcessIo {
  * Round-3 Phase E（P1-1）：未驗證 quarantine 持有（[quarantineHeld]）拒絕亦收斂至此，
  * 與 quota 同級（零 spawn、不耗配額），但原因碼獨立（`QUARANTINE`，不與上兩因混碼）。
  *
- * Round-6（#136-B2 IR-P2）：登記雙失敗 brick（[registrationFailed]，admission 以
+ * Round-6（#136-B2 IR-P2）：登記 brick（[registrationFailed]，admission 以
  * [ElevatedCleanupTracker.Admission.REGISTRATION_FAILED] 永久密封）拒絕亦收斂至此，
  * 與 quota 同級（零 spawn、不耗配額）；原因碼文案獨立（reason code 復用 `QUOTA_EXCEEDED`，
  * operator 依 message 辨識）；`cleanupIncomplete=true`；app 重啟恢復；#136-B3 必接 alert＋runbook。
@@ -4687,7 +4700,7 @@ internal object ElevatedRunnerCommon {
         ElevatedBinaryResult.Denied(ShellDeny.QUARANTINE, QUARANTINE_HELD_MESSAGE, true)
 
     /**
-     * Round-6（#136-B2）登記雙失敗 fail-closed brick 訊息（獨立原因碼文案；reason code 復用
+     * Round-6（#136-B2）登記 fail-closed brick 訊息（獨立原因碼文案；reason code 復用
      * `QUOTA_EXCEEDED` —— 與資源門同級，與 permit 語義有別，operator 可依 message 辨識；
      * B3 可改專用 ShellDeny code）。
      */
@@ -4695,9 +4708,10 @@ internal object ElevatedRunnerCommon {
         "elevated unverified-process registration failed (fail-closed, app restart required)"
 
     /**
-     * Round-6（#136-B2）登記雙失敗 brick 時的 typed 拒絕：`QUOTA_EXCEEDED`，不建子進程。
-     * `cleanupIncomplete=true`（登記雙失敗＝handle 無槽且無登記，殘留未追蹤中——
-     * fail-closed 信號經 verdict 帶出；app 重啟恢復；admission 以
+     * Round-6（#136-B2）登記 brick 時的 typed 拒絕：`QUOTA_EXCEEDED`，不建子進程。
+     * `cleanupIncomplete=true`（登記失敗且未能定位追蹤 ⇒ brick；槽保留或 handle 已入 quarantine 者不置位（catch-all 臂除外，見 D-D10）；
+     * catch-all 臂無例外、無條件冗餘密封（D-D10）；fail-closed 信號經 verdict 帶出；
+     * app 重啟恢復；admission 以
      * [ElevatedCleanupTracker.Admission.REGISTRATION_FAILED] 永久密封）。
      */
     fun registrationFailed(): ElevatedBinaryResult.Denied =

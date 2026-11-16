@@ -332,6 +332,10 @@ class ElevatedRunnerPhaseBLateCompensationTest {
             assertEquals(0, ElevatedCleanupTracker.activeCalls())
             pollTrue("elevated-late-spawn must stay alive") { countLive("elevated-late-spawn") == 1 }
             assertEquals(0, countLive("elevated-supervisor"))
+            // 非確定性上界：lingering mark 與 spawn worker 退出競爭——worker 先退出則
+            // mark 落既終態（不佔槽，daemon 槽 1），否則 mark 先佔（瞬態 2 槽），
+            // 然後 worker 退出釋 lingering 槽（仍 1）；daemon 槽恆在、MAX 恆不超——
+            // 故只釘 lower bound 1＋upper bound MAX，不猜確定性峰值。
             val peak = ElevatedCleanupTracker.peakOutstanding()
             assertTrue(
                 "peak=$peak must stay within MAX=${ElevatedCleanupTracker.MAX_OUTSTANDING_CLEANUPS}",
@@ -486,10 +490,11 @@ class ElevatedRunnerPhaseBLateCompensationTest {
                 ElevatedCleanupTracker.consecutiveCount(),
             )
             assertFalse(ElevatedCleanupTracker.isBreakerOpen())
-            val peak = ElevatedCleanupTracker.peakOutstanding()
-            assertTrue(
-                "peak=$peak must stay within MAX=${ElevatedCleanupTracker.MAX_OUTSTANDING_CLEANUPS}",
-                peak <= ElevatedCleanupTracker.MAX_OUTSTANDING_CLEANUPS,
+            // lingering 1＋預填 MAX-1＝確定性峰值 MAX（setUp 已 resetPeak；worker 逾期交付前持槽）。
+            assertEquals(
+                "peak must reach exactly MAX (lingering 1 + pre-filled MAX-1)",
+                ElevatedCleanupTracker.MAX_OUTSTANDING_CLEANUPS,
+                ElevatedCleanupTracker.peakOutstanding(),
             )
         } finally {
             release.countDown()
@@ -536,6 +541,8 @@ class ElevatedRunnerPhaseBLateCompensationTest {
         ElevatedCleanupTracker.resetPeak()
         // PG-8：late-spawn quarantine delta——登記數須恰為 before＋1（additive-only）。
         val quarantineBefore = ElevatedCleanupTracker.quarantinedCount()
+        // T6：飽和臂永不進入 start-failure 路徑 ⇒ killNeverAttempted 計數器不得動（stability 釘）。
+        val killNeverBefore = ElevatedCleanupTracker.killNeverAttemptedCount()
         // 釋放 spawn 使 worker 發佈逾期 Process（latch barrier，非 sleep 時序）。
         val release = CountDownLatch(1)
         // killer／destroyForcibly 阻塞門：teardown 才放，期間任何調用皆會被記數。
@@ -612,6 +619,11 @@ class ElevatedRunnerPhaseBLateCompensationTest {
                 "destroyForcibly() must never run on the saturation path",
                 0,
                 late.destroyForciblyCalls.get(),
+            )
+            assertEquals(
+                "killNeverAttemptedCount must not move on the saturation path (never reaches start-failure)",
+                killNeverBefore,
+                ElevatedCleanupTracker.killNeverAttemptedCount(),
             )
             assertEquals(
                 "saturation untouched by caller (pre-filled slots retained)",
@@ -1377,6 +1389,8 @@ class ElevatedRunnerPhaseBLateCompensationTest {
             }
         }
         val before = ElevatedCleanupTracker.quarantineRegistrationFailedCount()
+        // PG-8：inline 補償臂 quarantine delta（additive-only，baseline-relative）。
+        val quarantineBefore = ElevatedCleanupTracker.quarantinedCount()
         val spawnEntered = CountDownLatch(1)
         val spawnRelease = CountDownLatch(1)
         val kills = AtomicInteger(0)
@@ -1413,7 +1427,11 @@ class ElevatedRunnerPhaseBLateCompensationTest {
             // 內層直呼 quarantineUnverified 落地（不走 registrar）；外層 helper 拋出僅計數、不落地。
             assertEquals(before + 1, ElevatedCleanupTracker.quarantineRegistrationFailedCount())
             assertEquals(1, ElevatedCleanupTracker.outstanding())
-            assertEquals(1, ElevatedCleanupTracker.quarantinedCount())
+            assertEquals(
+                "PG-8: inline compensation arm must add exactly one quarantine entry over the pre-test baseline",
+                quarantineBefore + 1,
+                ElevatedCleanupTracker.quarantinedCount(),
+            )
             assertEquals(1, kills.get())
             val admission = ElevatedCleanupTracker.tryEnterReserved()
             if (admission == ElevatedCleanupTracker.Admission.OK) {
@@ -1433,7 +1451,11 @@ class ElevatedRunnerPhaseBLateCompensationTest {
             ElevatedProcessIo.quarantineRegistrar = { ElevatedCleanupTracker.quarantineUnverified(it) }
             ElevatedProcessIo.releaseCleanupSlotAfterVerify(proc, verified = false, slotHeld = true)
             assertEquals(0, ElevatedCleanupTracker.outstanding())
-            assertEquals(1, ElevatedCleanupTracker.quarantinedCount())
+            assertEquals(
+                "PG-8: retry must not double-register (quarantine stays at baseline+1)",
+                quarantineBefore + 1,
+                ElevatedCleanupTracker.quarantinedCount(),
+            )
             assertEquals(before + 1, ElevatedCleanupTracker.quarantineRegistrationFailedCount())
             assertEquals(floorBefore, ElevatedCleanupTracker.releaseFloorHits())
         } finally {
@@ -1470,6 +1492,10 @@ class ElevatedRunnerPhaseBLateCompensationTest {
         pollOutstandingTo(0)
         pollActiveTo(0)
         ElevatedCleanupTracker.resetPeak()
+        // PG-8：caller-side saturation claim quarantine delta（additive-only，baseline-relative）。
+        val quarantineBefore = ElevatedCleanupTracker.quarantinedCount()
+        // T6：caller-side 飽和認領永不進入 start-failure 路徑 ⇒ 計數器不得動（killNeverAttempted 穩定性釘）。
+        val killNeverBefore = ElevatedCleanupTracker.killNeverAttemptedCount()
         val spawnEntered = CountDownLatch(1)
         val spawnRelease = CountDownLatch(1)
         val cancelGate = CountDownLatch(1)
@@ -1557,8 +1583,17 @@ class ElevatedRunnerPhaseBLateCompensationTest {
             val late = pollRefNonNull(lateRef, "late spawn")!!
             // 限制：ElevatedCleanupTracker 無 identity probe，不能斷言 quarantine
             // 條目即 late handle——只斷登記數；誤歸因不在本用例斷言範圍。
-            assertEquals(1, ElevatedCleanupTracker.quarantinedCount())
+            assertEquals(
+                "PG-8: caller-side saturation claim must add exactly one quarantine entry over the pre-test baseline",
+                quarantineBefore + 1,
+                ElevatedCleanupTracker.quarantinedCount(),
+            )
             assertEquals("killer must never run on the saturation claim path", 0, kills.get())
+            assertEquals(
+                "killNeverAttemptedCount must not move on the saturation claim path (never reaches start-failure)",
+                killNeverBefore,
+                ElevatedCleanupTracker.killNeverAttemptedCount(),
+            )
             assertEquals(
                 "destroy() must never run on the saturation claim path",
                 0,

@@ -172,9 +172,10 @@ import java.util.concurrent.TimeUnit
  * 不耗配額；成功後整個剩餘 runBinary 包 `try { ... } finally { leaveCall() }`
  * （配額拒、spawn 抛、drain 全路徑釋放）。
  *
- * Round-6（#136-B2）登記雙失敗 brick：admission 於「無槽且 quarantine 雙登記皆拋」
- * 臂（`ElevatedCleanupTracker.registrationFailedSticky` 置位——drain 三臂／`drainFailClosedDrained`／
- * `releaseCleanupSlotAfterVerify` 零追蹤臂；catch-all 臂無例外、無條件置位（D-D10 冗餘密封））後永久拒絕
+ * Round-6（#136-B2）登記 brick：登記失敗且未能定位追蹤 ⇒ brick；槽保留或 handle 已入 quarantine 者不置位（catch-all 臂除外，見 D-D10）；
+ * catch-all 臂無例外、無條件冗餘密封（D-D10）——`ElevatedCleanupTracker.registrationFailedSticky`
+ * 置位——acquire-throw 臂（雙登記皆拋）／`releaseCleanupSlotAfterVerify` 無槽且 quarantine 無登記臂／
+ * `drainFailClosedDrained` catch-all 無條件臂（D-D10）後永久拒絕
  * `Denied(QUOTA_EXCEEDED, "elevated unverified-process registration failed (fail-closed, app restart required)")`；
  * 與上述五因同碼，訊息獨立可辨識；app 重啟方能恢復；
  * 審計 `DENY` 下須看拒絕訊息而非 verdict；#136-B3 必接 alert＋runbook（重啟）。

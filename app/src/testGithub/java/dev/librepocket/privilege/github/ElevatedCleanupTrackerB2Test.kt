@@ -247,9 +247,12 @@ class ElevatedCleanupTrackerB2Test {
                 ElevatedCleanupTracker.MAX_OUTSTANDING_CLEANUPS,
                 ElevatedCleanupTracker.outstanding(),
             )
-            assertTrue(
-                "peak=${ElevatedCleanupTracker.peakOutstanding()} must stay <= MAX",
-                ElevatedCleanupTracker.peakOutstanding() <= ElevatedCleanupTracker.MAX_OUTSTANDING_CLEANUPS,
+            // 預填恰好 MAX 且全程持有 ⇒ 確定性峰值（resetPeak 已於測試開頭呼叫；
+            // acquireSlot 同鎖內同步更新峰值，無遺漏）。
+            assertEquals(
+                "peak must reach exactly MAX (prefilled MAX and held)",
+                ElevatedCleanupTracker.MAX_OUTSTANDING_CLEANUPS,
+                ElevatedCleanupTracker.peakOutstanding(),
             )
             // 飽和不佔 active（准入層職責，此處只斷 tracker 計數正交）。
             assertEquals(0, ElevatedCleanupTracker.activeCalls())
@@ -316,10 +319,43 @@ class ElevatedCleanupTrackerB2Test {
                 ElevatedCleanupTracker.MAX_OUTSTANDING_CLEANUPS,
                 ElevatedCleanupTracker.outstanding(),
             )
+            // 先把 7 個預佔槽全數歸還、outstanding 歸零：此時 quarantine 空、
+            // breaker 未開、預留通過——admission 仍被密封即債務門（gate 6）獨力封死。
+            repeat(prefilled) {
+                ElevatedCleanupTracker.releaseSlot()
+            }
+            prefilled = 0
+            pollOutstandingTo(0)
+            assertEquals(
+                "linger debt must seal admission by itself once slots drain (gate 6)",
+                ElevatedCleanupTracker.Admission.BACKLOG_FULL,
+                ElevatedCleanupTracker.tryEnterReserved(),
+            )
+            assertEquals(0, ElevatedCleanupTracker.activeCalls())
+            // quarantine 保持空：證明 gate 6 為唯一密封來源（isolation）。
+            assertEquals(0, ElevatedCleanupTracker.quarantinedCount())
+            // 放行 worker：本體 finally 見 3 即置 2＋endLingerDebt，debt 恰好歸零一次。
+            latch.countDown()
+            pollTrue("linger debt must unwind to baseline once the worker exits", 10_000L) {
+                ElevatedCleanupTracker.lingerDebtCount() == debtBefore
+            }
+            worker.join(5_000L)
+            assertTrue("worker must exit within 5s", !worker.isAlive)
+            val admission = ElevatedCleanupTracker.tryEnterReserved()
+            if (admission == ElevatedCleanupTracker.Admission.OK) {
+                ElevatedCleanupTracker.leaveCall()
+            }
+            assertEquals(
+                "admission must recover to OK once the debt unwinds",
+                ElevatedCleanupTracker.Admission.OK,
+                admission,
+            )
+            assertEquals(0, ElevatedCleanupTracker.activeCalls())
         } finally {
             latch.countDown()
             worker.join(5_000L)
             assertTrue("worker must exit within 5s", !worker.isAlive)
+            // 恰好釋放 body 未釋的槽（body 已釋則 0）——絕不同超過 acquire 數。
             // 先釋槽＋清零 outstanding，再斷言 debt baseline——fail-fast 斷言不得阻止共享狀態清理。
             repeat(prefilled) {
                 ElevatedCleanupTracker.releaseSlot()
@@ -1262,6 +1298,90 @@ class ElevatedCleanupTrackerB2Test {
                 ElevatedCleanupTracker.kickSweepAsync { t2 },
             )
             pollTrue("rollback retry sweep must finish", 15_000L) {
+                !ElevatedCleanupTracker.isSweepInFlight()
+            }
+        } finally {
+            ElevatedCleanupTracker.clearUnverified()
+            ElevatedCleanupTracker.noteClean()
+            pollOutstandingTo(0)
+            pollPendingTo(0)
+            awaitNoQuarantineThreads()
+        }
+    }
+
+    /**
+     * D-A5 對偶釘（start-then-throw）：starter 先 `t.start()` 再拋 ⇒ worker
+     * 極可能已 CAS 認領（`sweepClaim`）——catch 臂以同一 CAS 仲裁：已認領則**不**
+     * 還原 `prevHasStart`／`prevStart`、**不**清 `sweepLease`（worker finally
+     * 釋放恰好一次）；兩 gate 以可觀測行為釘：認領後 worker finally 釋放 lease
+     * （`isSweepInFlight()` 歸 false）、且 `lastSweepStartNanos` 未被還原為 t1
+     * （t2+0.5s 的 retry 仍落在 t2 的 SWEEP_COOLDOWN_MS 冷卻窗內，回 false；
+     * 若被還原為 t1＝10s，2.5s 冷卻已過，retry 會發起——deterministic 區分）。
+     * 確定性：starter 在拋出前自旋等待 fresh handle 的內層 verify worker
+     * 進入 `waitFor(0)`（≈waitCalls 遞增）——該調用鏈 CAS→sweepEntries→waitFor(0)
+     * 先行序保證此時認領必已完成（非 sleep 猜調度）。kick 恆回 false（catch 臂），
+     * 例外不外逃。
+     */
+    @Test fun kickSweepAsyncWithThreadStarterStartThenThrowDoesNotRollbackOrClearLeaseWhileWorkerAlive() {
+        try {
+            // 1. Seed a previous sweep at t1 = 10s (prevHasStart=true, prevStart=t1).
+            val t1 = TimeUnit.SECONDS.toNanos(10L)
+            val seed = CountingAliveProcess()
+            ElevatedCleanupTracker.quarantineUnverified(seed)
+            assertTrue(ElevatedCleanupTracker.kickSweepAsync { t1 })
+            pollTrue("seed sweep must finish", 15_000L) {
+                !ElevatedCleanupTracker.isSweepInFlight()
+            }
+
+            // 2. Kick at t2 = 12s with start-then-throw starter. The starter spins until the
+            //    inner verify worker observes waitFor(0) on the fresh handle (the on-ramp to
+            //    the claim CAS has necessarily completed by then), then throws OutOfMemoryError.
+            //    NOTE: the spin cannot *assert* — a starter AssertionError is swallowed by the
+            //    kick's catch (_: Throwable) and would surface only as a confusing false kick;
+            //    record the observation and assert it after the call instead.
+            val t2 = TimeUnit.SECONDS.toNanos(12L)
+            val fresh = CountingAliveProcess()
+            ElevatedCleanupTracker.quarantineUnverified(fresh)
+            val callsBefore = fresh.waitCalls.get()
+            val claimObserved = java.util.concurrent.atomic.AtomicBoolean(false)
+            val kicked = ElevatedCleanupTracker.kickSweepAsyncWithThreadStarter(
+                nowNanos = { t2 },
+                startThread = { t ->
+                    t.start()
+                    val spinDeadline = System.currentTimeMillis() + 10_000L
+                    while (fresh.waitCalls.get() == callsBefore && System.currentTimeMillis() < spinDeadline) {
+                        Thread.sleep(20L)
+                    }
+                    if (fresh.waitCalls.get() != callsBefore) claimObserved.set(true)
+                    throw OutOfMemoryError("simulated OOM after starting sweep thread")
+                },
+            )
+            assertTrue(
+                "fresh handle must have been observed by the inner verify worker before the OOM (claim evidence)",
+                claimObserved.get(),
+            )
+            assertFalse("start-then-throw must fail the kick via the catch arm", kicked)
+            // Worker claimed ⇒ catch arm must NOT clear sweepLease; the worker's finally
+            // releases it exactly once — lease must eventually read free.
+            pollTrue("worker finally must release the sweep lease", 15_000L) {
+                !ElevatedCleanupTracker.isSweepInFlight()
+            }
+            // 3. lastSweepStartNanos must NOT be rolled back to t1: a retry within the
+            //    SWEEP_COOLDOWN_MS window of t2 is still throttled (returns false). Had the
+            //    catch arm restored prevStart=t1, 12.5s-10s ≥ 1s cooldown ⇒ kick would start.
+            //    (SWEEP_COOLDOWN_MS == 1000L; tProbe is inside t2's window by 500ms — stable.)
+            val tProbe = t2 + TimeUnit.MILLISECONDS.toNanos(500L)
+            assertFalse(
+                "start-then-throw must not roll back lastSweepStartNanos while the worker claimed",
+                ElevatedCleanupTracker.kickSweepAsync { tProbe },
+            )
+            // 4. Sanity: after the cooldown window of t2 elapses, kicks start again.
+            val tAfter = t2 + TimeUnit.SECONDS.toNanos(2L)
+            assertTrue(
+                "sweep must work once the t2 cooldown elapses",
+                ElevatedCleanupTracker.kickSweepAsync { tAfter },
+            )
+            pollTrue("post-OOM sweep must finish", 15_000L) {
                 !ElevatedCleanupTracker.isSweepInFlight()
             }
         } finally {

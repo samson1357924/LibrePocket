@@ -758,6 +758,70 @@ class PrivilegeBridgeStateTest {
         assertFalse(state.bridgeGranted)
     }
 
+    @Test(timeout = 30_000L) fun revokeMutexTimeout_bestEffortClearVirtualMachineError_propagatesFatal() = runBlocking {
+        // 鎖外 best-effort clear 腿（第二腿）拋 VirtualMachineError：
+        // fatal 不得淪為 suppressed（uniform fatal precedence；Stage 7B 第四站點收齊）——
+        // grant 落庫以 latch 持 opMutex（lockHoldRelease，grant 卡在 updateData 至 revoke 逾時），
+        // revokeOpTimeoutMs=100 → opMutex 等待逾時 → 主失敗為 PRIVILEGE_REVOKE_TIMEOUT ISE；
+        // 鎖外 best-effort clear 的第二次起 updateData 直接拋 OutOfMemoryError（不 hang）→
+        // 補償腿 fatal 成為終端外傳例外，原 ISE 反向附加為其 suppressed。
+        val backing = PreferenceDataStoreFactory.create(scope = scope) {
+            File(dir, "stuck_mutex_best_effort_clear_oom.preferences_pb")
+        }
+        val lockHoldStarted = java.util.concurrent.CountDownLatch(1)
+        val lockHoldRelease = java.util.concurrent.CountDownLatch(1)
+        val saveCalls = java.util.concurrent.atomic.AtomicInteger(0)
+        val fatal = OutOfMemoryError("simulated best-effort clear OOM")
+        val oomDs = object : DataStore<Preferences> by backing {
+            override suspend fun updateData(transform: suspend (t: Preferences) -> Preferences): Preferences {
+                // 第一次 updateData 為 grant 落庫：countDown 後掛住（latch-gated，
+                // 帶 10s 上限，絕不裸 await）直到測試於 revoke 逾時後放行；
+                // clear 路徑的 edit 直接拋 OutOfMemoryError（不 hang）。
+                if (saveCalls.getAndIncrement() == 0) {
+                    lockHoldStarted.countDown()
+                    lockHoldRelease.await(10, TimeUnit.SECONDS)
+                    return backing.updateData(transform)
+                }
+                throw fatal
+            }
+        }
+        val store = PrivilegeBridgeStore(oomDs)
+        val state = PrivilegeBridgeState(
+            bridgeSwitchOn = true,
+            bridgeGranted = true,
+            revokeOpTimeoutMs = 100L,
+        )
+        val grantJob = launch(Dispatchers.IO) {
+            try {
+                state.grant(store, "preset:openai", 1L)
+            } catch (_: Throwable) {
+                // 預期：revoke 搶先推進 epoch → grant 拋 PRIVILEGE_GRANT_REVOKED_CONCURRENTLY
+            }
+        }
+        assertTrue("grant 落庫必已進入臨界區", lockHoldStarted.await(10, java.util.concurrent.TimeUnit.SECONDS))
+
+        val error = try {
+            assertThrows(OutOfMemoryError::class.java) {
+                runBlocking { state.revoke(store) }
+            }
+        } finally {
+            // assertThrows 返回（revoke 於 revokeOpTimeoutMs=100 逾時後拋出）即放行 grant 落庫，
+            // 讓 grantJob 得以完成；finally 保證放行。
+            lockHoldRelease.countDown()
+        }
+        grantJob.join()
+
+        // 註（邊界複製 caveat，實測）：本 runtime 跨 withContext(NonCancellable) 時異常被複製，
+        // 交付的複製體 suppressed=[]，鏈上僅見 [OOM, OOM] 兩件、suppressed 皆空——
+        // 反向附加的 ISE(PRIVILEGE_REVOKE_TIMEOUT) 在呼叫端不可觀測（同
+        // revokeStoreClearIoExceptionThenWithdrawScopeOutOfMemory_propagatesFatal 的紀錄）。
+        // 不 fake 該斷言；此處 pin：type=OOM（不是包裝後的 ISE——未修復時此處必紅）
+        // ＋message 原樣＋旗標 false。
+        assertEquals("simulated best-effort clear OOM", error.message)
+        assertFalse(state.bridgeSwitchOn)
+        assertFalse(state.bridgeGranted)
+    }
+
     @Test fun revokeMutexTimeout_bestEffortClearTimesOut_suppressedClearTimeout() = runBlocking {
         // 同上，但 clear() 路徑的 updateData 為無限 delay（可取消 hang）：
         // best-effort clear 有界（revokeOpTimeoutMs=100）→ 逾時 → suppressed
@@ -1158,6 +1222,104 @@ class PrivilegeBridgeStateTest {
         assertFalse(state.bridgeSwitchOn)
         assertFalse(state.bridgeGranted)
         assertNull("store.clear 已落地，持久授權必已撤銷", store.load())
+    }
+
+    @Test(timeout = 30_000L)
+    fun revokeStoreClearIoExceptionThenWithdrawScopeOutOfMemory_propagatesFatal() = runBlocking {
+        // store.clear() 拋 IOException("simulated clear")＋withdrawScope 拋 OutOfMemoryError：
+        // 第二腿 fatal 不得淪為 suppressed——
+        // 拋出的例外必為 OutOfMemoryError，message 未被包裝/替換。
+        val backing = PreferenceDataStoreFactory.create(scope = scope) {
+            File(dir, "clear_ioe_scope_oom.preferences_pb")
+        }
+        val clearIoFailure = java.io.IOException("simulated clear")
+        val failingStore = PrivilegeBridgeStore(object : DataStore<Preferences> by backing {
+            override suspend fun updateData(transform: suspend (t: Preferences) -> Preferences): Preferences {
+                throw clearIoFailure
+            }
+        })
+        val state = PrivilegeBridgeState(
+            bridgeSwitchOn = true,
+            bridgeGranted = true,
+        )
+        state.audit.record(listOf("id"), "B1-clear-ioe-scope-oom", "DENY")
+
+        val scopeFatal = OutOfMemoryError("simulated withdraw boom")
+        val error = assertThrows(OutOfMemoryError::class.java) {
+            runBlocking { state.revoke(failingStore) { throw scopeFatal } }
+        }
+        assertEquals("fatal 的 message 必與 scope 拋出者一致（未被包裝/替換）", "simulated withdraw boom", error.message)
+        // 註：fatal 的反向附加（store 的 IOException 附於 scope 的 OutOfMemoryError）在本 runtime
+        // 無法於呼叫端觀測——scope 拋出的例外於 withTimeoutOrNull 子協程邊界即被複製，addSuppressed
+        // 落在該副本上，再跨 withContext(NonCancellable) 邊界時複製體再次丟棄 suppressed 並把 cause
+        // 重指向原例外的 cause（實測鏈=[OOM, OOM]，IOException 整串不可達）。此處只釘 type＋message
+        // ＋旗標/審計（fatal 未被合併壓回 IOException——未修復時此處必紅）；scope 例外可觀測併入的
+        // suppressed 釘 pin 見 revokeStoreTimeout_withWithdrawScopeIllegalState_scopeExceptionAsSuppressed
+        //（合併目標為 revoke 內部建立的 ISE，可定位）。
+        assertFalse(state.bridgeSwitchOn)
+        assertFalse(state.bridgeGranted)
+        assertEquals("撤權後審計表必已清空", 0, state.auditCount())
+    }
+
+    @Test(timeout = 30_000L)
+    fun revokeBothLegsVirtualMachineError_firstFatalWins_clearLegPrimary() = runBlocking {
+        // 兩腿皆拋 VirtualMachineError（store.clear 腿先遇、withdrawScope 腿後遇）：
+        // uniform fatal precedence——首個 fatal（執行序在前的 clear 腿）為終端外傳例外；
+        // scope 腿的 OOM 反向附加為其 suppressed（first-fatal-wins，後遇者不得取代先遇者）。
+        val backing = PreferenceDataStoreFactory.create(scope = scope) {
+            File(dir, "both_legs_vmerror.preferences_pb")
+        }
+        val failingStore = PrivilegeBridgeStore(object : DataStore<Preferences> by backing {
+            override suspend fun updateData(transform: suspend (t: Preferences) -> Preferences): Preferences {
+                throw OutOfMemoryError("clear leg OOM")
+            }
+        })
+        val state = PrivilegeBridgeState(
+            bridgeSwitchOn = true,
+            bridgeGranted = true,
+        )
+        state.audit.record(listOf("id"), "B1-both-legs-vmerror", "DENY")
+
+        val error = assertThrows(OutOfMemoryError::class.java) {
+            runBlocking { state.revoke(failingStore) { throw OutOfMemoryError("scope leg OOM") } }
+        }
+        assertEquals("clear leg OOM", error.message)
+        // 註（邊界複製 caveat，實測）：本 runtime 跨 withContext(NonCancellable) 時異常被複製——
+        // 實測鏈=[clear leg OOM, clear leg OOM]，suppressed 皆空（scope leg OOM 反向附加不可觀測）。
+        // 不 fake 該斷言；此處 pin：首個 fatal（clear 腿）為主失敗——message 未被替換為
+        // scope leg OOM（即若第二腿 fatal 取代先遇者，本斷言必紅）。
+        assertFalse(state.bridgeSwitchOn)
+        assertFalse(state.bridgeGranted)
+        assertEquals("撤權後審計表必已清空", 0, state.auditCount())
+    }
+
+    @Test(timeout = 30_000L)
+    fun revokeCePrimaryWithScopeVirtualMachineError_fatalPromotes_ceSuppressed() = runBlocking {
+        // clear 腿拋 CancellationException（primaryFailure=CE）＋withdrawScope 腿拋 VMError：
+        // uniform fatal precedence——第二腿 fatal 不得淪為 suppressed：
+        // scope 腿的 OOM 升格為終端外傳例外，既有 CE 主失敗反向附加為其 suppressed。
+        val backing = PreferenceDataStoreFactory.create(scope = scope) {
+            File(dir, "ce_primary_scope_vmerror.preferences_pb")
+        }
+        val failingStore = PrivilegeBridgeStore(object : DataStore<Preferences> by backing {
+            override suspend fun updateData(transform: suspend (t: Preferences) -> Preferences): Preferences {
+                throw CancellationException("simulated clear CE")
+            }
+        })
+        val state = PrivilegeBridgeState(
+            bridgeSwitchOn = true,
+            bridgeGranted = true,
+        )
+        val error = assertThrows(OutOfMemoryError::class.java) {
+            runBlocking { state.revoke(failingStore) { throw OutOfMemoryError("simulated withdraw boom") } }
+        }
+        assertEquals("simulated withdraw boom", error.message)
+        // 註（邊界複製 caveat，實測）：本 runtime 跨 withContext(NonCancellable) 時異常被複製——
+        // 實測鏈=[withdraw boom, withdraw boom]，suppressed 皆空（反向附加的 CE 在呼叫端不可觀測）。
+        // 不 fake 該斷言；此處 pin：type=OOM（若 fatal 淪為 suppressed、CE 成為主失敗，
+        // 本斷言必紅）＋message 原樣＋flags false。
+        assertFalse(state.bridgeSwitchOn)
+        assertFalse(state.bridgeGranted)
     }
 
     @Test fun revokeStoreAndWithdrawTimeout_mergedFailure_suppressedScopeTimeout() = runBlocking {
@@ -1838,6 +2000,121 @@ class PrivilegeBridgeStateTest {
         } finally {
             state.grantCommitHookForTest = null
             hangLatch.countDown()
+        }
+    }
+
+    @Test(timeout = 30_000L)
+    fun failGrantRevokedConcurrently_compensationClearOutOfMemory_propagatesFatal() = runBlocking {
+        // 補償清庫（epilogue best-effort clear）於第二次起 updateData 拋 OutOfMemoryError：
+        // 補償腿 fatal 不得淪為 logcat-only 吞掉——
+        // grant() 必以 OutOfMemoryError 上拋（不合成 PRIVILEGE_GRANT_REVOKED_CONCURRENTLY ISE 覆蓋 fatal），
+        // 併發撤銷 claim 的 ISE 以 suppressed 保留；旗標 false、審計清空。
+        // harness 同 grantEpilogueCompensationClearHangs_grantDoesNotHang：
+        // 第一次 updateData 為 grant 落庫（成功）；其後（補償清庫）拋 OOM。
+        val backing = PreferenceDataStoreFactory.create(scope = scope) {
+            File(dir, "grant_epilogue_clear_oom.preferences_pb")
+        }
+        val saveCalls = java.util.concurrent.atomic.AtomicInteger(0)
+        val fatal = OutOfMemoryError("simulated compensation clear OOM")
+        val flakyDs = object : DataStore<Preferences> by backing {
+            override suspend fun updateData(transform: suspend (t: Preferences) -> Preferences): Preferences {
+                if (saveCalls.getAndIncrement() == 0) {
+                    return backing.updateData(transform)
+                }
+                throw fatal
+            }
+        }
+        val store = PrivilegeBridgeStore(flakyDs)
+        val state = PrivilegeBridgeState(
+            bridgeSwitchOn = true,
+            bridgeGranted = true,
+        )
+        state.audit.record(listOf("id"), "B1-comp-clear-oom", "DENY")
+        state.grantCommitHookForTest = { state.revokeInMemoryForTest() }
+        try {
+            val error = assertThrows(OutOfMemoryError::class.java) {
+                runBlocking { state.grant(store, "preset:openai", 1L) }
+            }
+            assertEquals("simulated compensation clear OOM", error.message)
+            assertTrue(
+                "例外鏈上必含 IllegalStateException(PRIVILEGE_GRANT_REVOKED_CONCURRENTLY)（claim 碼保留），實際=${throwableChain(error)}",
+                throwableChain(error).any { it is IllegalStateException && it.message == "PRIVILEGE_GRANT_REVOKED_CONCURRENTLY" },
+            )
+            assertFalse("commit 窗口並發撤銷 ⇒ 旗標必 false", state.bridgeGranted)
+            assertEquals("撤權（hook）後審計表必已清空", 0, state.auditCount())
+        } finally {
+            state.grantCommitHookForTest = null
+        }
+    }
+
+    @Test(timeout = 30_000L)
+    fun failGrantRevokedConcurrently_compensationClearIllegalState_keepsRevokedConcurrentlyIse() = runBlocking {
+        // 補償清庫拋非 VMError／非 CE 的 IllegalStateException（既有行為 pin）：
+        // 仍合成 PRIVILEGE_GRANT_REVOKED_CONCURRENTLY（原例外不上拋、不以 suppressed 併入）。
+        val backing = PreferenceDataStoreFactory.create(scope = scope) {
+            File(dir, "grant_epilogue_clear_ise.preferences_pb")
+        }
+        val saveCalls = java.util.concurrent.atomic.AtomicInteger(0)
+        val ioFailure = IllegalStateException("simulated compensation clear failure")
+        val flakyDs = object : DataStore<Preferences> by backing {
+            override suspend fun updateData(transform: suspend (t: Preferences) -> Preferences): Preferences {
+                if (saveCalls.getAndIncrement() == 0) {
+                    return backing.updateData(transform)
+                }
+                throw ioFailure
+            }
+        }
+        val store = PrivilegeBridgeStore(flakyDs)
+        val state = PrivilegeBridgeState(
+            bridgeSwitchOn = true,
+            bridgeGranted = true,
+        )
+        state.grantCommitHookForTest = { state.revokeInMemoryForTest() }
+        try {
+            val error = assertThrows(IllegalStateException::class.java) {
+                runBlocking { state.grant(store, "preset:openai", 1L) }
+            }
+            assertEquals("PRIVILEGE_GRANT_REVOKED_CONCURRENTLY", error.message)
+            assertFalse("commit 窗口並發撤銷 ⇒ 旗標必 false", state.bridgeGranted)
+        } finally {
+            state.grantCommitHookForTest = null
+        }
+    }
+
+    @Test(timeout = 30_000L)
+    fun failGrantRevokedConcurrently_compensationClearCancellation_ceRethrownRaw() = runBlocking {
+        // 補償清庫於第二次起 updateData 拋 CancellationException：
+        // CE 不得被包成 ISE／不得以 logcat-only 吞掉——
+        // failGrantRevokedConcurrently 的 catch 原樣上拋 CE（raw：不經
+        // PRIVILEGE_GRANT_REVOKED_CONCURRENTLY ISE 包裝、不吞）。
+        // harness 同 grantEpilogueCompensationClearHangs_grantDoesNotHang：
+        // 第一次 updateData 為 grant 落庫（成功）；其後（補償清庫）拋 CE。
+        val backing = PreferenceDataStoreFactory.create(scope = scope) {
+            File(dir, "grant_epilogue_clear_ce.preferences_pb")
+        }
+        val saveCalls = java.util.concurrent.atomic.AtomicInteger(0)
+        val flakyDs = object : DataStore<Preferences> by backing {
+            override suspend fun updateData(transform: suspend (t: Preferences) -> Preferences): Preferences {
+                if (saveCalls.getAndIncrement() == 0) {
+                    return backing.updateData(transform)
+                }
+                throw CancellationException("simulated compensation CE")
+            }
+        }
+        val store = PrivilegeBridgeStore(flakyDs)
+        val state = PrivilegeBridgeState(
+            bridgeSwitchOn = true,
+            bridgeGranted = true,
+        )
+        state.grantCommitHookForTest = { state.revokeInMemoryForTest() }
+        try {
+            val error = assertThrows(CancellationException::class.java) {
+                runBlocking { state.grant(store, "preset:openai", 1L) }
+            }
+            assertEquals("simulated compensation CE", error.message)
+            assertFalse("補償清庫 CE 原樣上拋 ⇒ 旗標必 false", state.bridgeGranted)
+        } finally {
+            state.grantCommitHookForTest = null
         }
     }
 

@@ -130,6 +130,106 @@ class FlavorPrivilegeScopeTest {
     }
 
     @Test
+    fun withdrawDetachFailure_clearVirtualMachineError_clearFatalPropagates_detachFailureSuppressed() = runBlocking {
+        // detach 腿失敗（非 fatal）＋ clear 腿拋 VirtualMachineError：
+        // fatal 不得淪為 suppressed——withdraw 拋 clear 腿的 OutOfMemoryError（同一實例），
+        // detach 腿的失敗反向附加為其 suppressed。
+        // 註：detach() 會吞 Exception 與 LinkageError（僅記錄 logcat），IOException 永遠逃不出
+        // detach()，故非 fatal 的 detach 失敗假件以 AssertionError 觸發（同 withdrawDetachFailure_*
+        // 諸測試的既有 idiom）；本測試釘的是「第二腿 fatal 不被既有非 fatal 主失敗掩蓋」。
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val boom = AssertionError("simulated detach boom")
+        val clearFatal = OutOfMemoryError("simulated clear boom")
+        var removeCalls = 0
+        val fake = ShizukuPermissionRequests(
+            addListener = { },
+            removeListener = { removeCalls++; throw boom },
+        )
+        ShizukuPermissionRequests.setProcessForTest(fake)
+        fake.attach()
+        assertTrue("fake attach must succeed or this test is vacuous", fake.isAttached())
+        FlavorPrivilegeScope.grantStoreClearForTest = { throw clearFatal }
+        try {
+            val error = assertThrows(OutOfMemoryError::class.java) {
+                runBlocking { FlavorPrivilegeScope.withdraw(context) }
+            }
+            assertSame("clear 腿的 fatal 必為主失敗（同一實例）", clearFatal, error)
+            assertTrue(
+                "suppressed 必含 detach 腿的 AssertionError（同一實例），實際 suppressed=${error.suppressed.toList()}",
+                error.suppressed.any { it === boom },
+            )
+            assertEquals("detach 恰反註冊一次橋接 listener", 1, removeCalls)
+        } finally {
+            FlavorPrivilegeScope.grantStoreClearForTest = null
+        }
+    }
+
+    @Test
+    fun withdrawDetachVirtualMachineError_clearIoException_firstFatalPropagates_clearErrorSuppressed() = runBlocking {
+        // detach 腿 fatal（OOM）＋ clear 腿 IOException：
+        // first-fatal-wins——withdraw 拋 detach 腿的 OutOfMemoryError（同一實例），
+        // clear 腿的 IOException 以 suppressed 附加。
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val boom = OutOfMemoryError("simulated detach boom")
+        val clearBoom = IOException("simulated clear boom")
+        var removeCalls = 0
+        val fake = ShizukuPermissionRequests(
+            addListener = { },
+            removeListener = { removeCalls++; throw boom },
+        )
+        ShizukuPermissionRequests.setProcessForTest(fake)
+        fake.attach()
+        assertTrue("fake attach must succeed or this test is vacuous", fake.isAttached())
+        FlavorPrivilegeScope.grantStoreClearForTest = { throw clearBoom }
+        try {
+            val error = assertThrows(OutOfMemoryError::class.java) {
+                runBlocking { FlavorPrivilegeScope.withdraw(context) }
+            }
+            assertSame("首個 fatal（detach 腿）必為主失敗（同一實例）", boom, error)
+            assertTrue(
+                "suppressed 必含 clear 腿的 IOException（同一實例），實際 suppressed=${error.suppressed.toList()}",
+                error.suppressed.any { it === clearBoom },
+            )
+            assertFalse(fake.isAttached())
+            assertEquals("detach 恰反註冊一次橋接 listener", 1, removeCalls)
+        } finally {
+            FlavorPrivilegeScope.grantStoreClearForTest = null
+        }
+    }
+
+    @Test
+    fun withdrawDetachAndClearVirtualMachineError_firstFatalWins_detachOomSuppressesClearOom() = runBlocking {
+        // detach 腿 fatal ＋ clear 腿亦 fatal：first-fatal-wins——
+        // withdraw 拋 detach 腿的 OutOfMemoryError（同一實例），clear 腿的 OOM 以 suppressed 附加。
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val boom = OutOfMemoryError("simulated detach boom")
+        val clearFatal = OutOfMemoryError("simulated clear boom")
+        var removeCalls = 0
+        val fake = ShizukuPermissionRequests(
+            addListener = { },
+            removeListener = { removeCalls++; throw boom },
+        )
+        ShizukuPermissionRequests.setProcessForTest(fake)
+        fake.attach()
+        assertTrue("fake attach must succeed or this test is vacuous", fake.isAttached())
+        FlavorPrivilegeScope.grantStoreClearForTest = { throw clearFatal }
+        try {
+            val error = assertThrows(OutOfMemoryError::class.java) {
+                runBlocking { FlavorPrivilegeScope.withdraw(context) }
+            }
+            assertSame("首個 fatal（detach 腿）必為主失敗（同一實例）", boom, error)
+            assertTrue(
+                "suppressed 必含 clear 腿的 OutOfMemoryError（同一實例），實際 suppressed=${error.suppressed.toList()}",
+                error.suppressed.any { it === clearFatal },
+            )
+            assertFalse(fake.isAttached())
+            assertEquals("remove calls must equal 1", 1, removeCalls)
+        } finally {
+            FlavorPrivilegeScope.grantStoreClearForTest = null
+        }
+    }
+
+    @Test
     fun withdrawDetachFailure_throwsDetachError_andStoreIsCleared() = runBlocking {
         // detach 失敗＋clear 成功 → withdraw 抛 detach 的 AssertionError（同一實例）；
         // 持久 Store 仍被 clear（load()==null）——detach 失敗不得阻止跨域清庫。

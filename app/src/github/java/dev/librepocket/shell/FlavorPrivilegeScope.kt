@@ -20,8 +20,8 @@ import dev.librepocket.privilege.github.ShizukuPermissionRequests
  * 舊實例的 pending 狀態不透過任何 production API 外露（測試環境專屬情境）。
  *
  * 失敗合成（fail-closed）：detach 與 clear 各自隔離 try/catch；clear 無論
- * detach 是否失敗皆執行；兩者皆失敗時 detach 的失敗為主失敗、clear 的失敗
- * 以 suppressed 附加（見 withdraw()）。
+ * detach 是否失敗皆執行；否則（皆非 fatal）：detach 的失敗為主失敗、clear 的失敗
+ * 以 suppressed 附加；detach／clear 任一遇 VirtualMachineError 時 fatal 為終端外傳例外，其餘反附 suppressed，兩者皆 VMError 取先遇者（uniform fatal precedence）。
  */
 object FlavorPrivilegeScope {
     @Volatile
@@ -73,10 +73,18 @@ object FlavorPrivilegeScope {
                 grantStore(context).clear()
             }
         } catch (t: Throwable) {
-            if (failure != null) {
-                failure.addSuppressed(t)
-            } else {
+            val existing = failure
+            if (existing == null) {
                 failure = t
+            } else if (t is VirtualMachineError && existing !is VirtualMachineError) {
+                // clear 腿的 fatal 勝出（執行序中僅此一個 VMError）：成為主失敗，
+                // detach 腿的失敗反向附加為其 suppressed。
+                t.addSuppressed(existing)
+                failure = t
+            } else {
+                // 其餘：existing 維持主失敗——含 detach 已是 VMError 的
+                // first-fatal-wins（clear 的失敗附加於其上）與皆非 fatal 的合併。
+                existing.addSuppressed(t)
             }
         }
         if (failure != null) throw failure

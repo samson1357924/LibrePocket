@@ -4,6 +4,7 @@ import androidx.datastore.core.DataStore
 import androidx.datastore.preferences.core.PreferenceDataStoreFactory
 import androidx.datastore.preferences.core.Preferences
 import java.io.File
+import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -12,6 +13,7 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
@@ -251,7 +253,7 @@ class PrivilegeBridgeStateTest {
 
     @Test
     fun grantWhenRevokeLandsBetweenWriteAndSecondRead_forcesFalse() = runBlocking {
-        // second-read 單層防線的確定性 pin：賦值後、回讀前單獨推進 revokeEpoch
+        // second-read 單層防線的確定性 pin：賦值後、回讀前單獨推進 revoke epoch（grantFence 內）
         // （不寫旗標）。若 second-read 被移除，本測試必紅
         // （旗標會停留在賦值寫下的 true，授權復活）。
         val store = store()
@@ -279,7 +281,7 @@ class PrivilegeBridgeStateTest {
         val blockerStore = PrivilegeBridgeStore(object : DataStore<Preferences> by slowStore {
             override val data: Flow<Preferences> = flow {
                 lockHoldStarted.countDown()
-                lockHoldRelease.await()
+                lockHoldRelease.await(10, TimeUnit.SECONDS)
                 emit(androidx.datastore.preferences.core.emptyPreferences())
             }
         })
@@ -288,7 +290,7 @@ class PrivilegeBridgeStateTest {
         val job1 = launch(Dispatchers.IO) {
             state.refresh(blockerStore, "preset:openai", 1L)
         }
-        lockHoldStarted.await(10, java.util.concurrent.TimeUnit.SECONDS)
+        assertTrue(lockHoldStarted.await(10, TimeUnit.SECONDS))
 
         // 以 Unconfined 明確驅動：launch 返回時 job2 已執行到 opMutex.lock() 的掛起點
         //（epochBefore 已捕捉且排隊等鎖）——不再靠 Thread.sleep 猜測排程。
@@ -507,7 +509,7 @@ class PrivilegeBridgeStateTest {
                 // 預期：revoke 搶先 → epoch 變更 → grant 拋 PRIVILEGE_GRANT_REVOKED_CONCURRENTLY
             }
         }
-        lockHoldStarted.await(10, java.util.concurrent.TimeUnit.SECONDS)
+        assertTrue(lockHoldStarted.await(10, TimeUnit.SECONDS))
 
         val t0 = System.currentTimeMillis()
         val error = assertThrows(IllegalStateException::class.java) {
@@ -1085,5 +1087,613 @@ class PrivilegeBridgeStateTest {
         val seqIds = audit.snapshot().map { it.seqId }
         assertTrue(seqIds.none { it == "priv-1" })
         assertTrue(seqIds.last() == "priv-${PrivilegeAuditLog.MAX_RECORDS + 10}")
+    }
+
+    @Test fun refreshAfterFailedRevoke_withStaleValidGrantOnDisk_staysFailClosed() = runBlocking {
+        // stuck grant 持 opMutex → revoke 有界等待 opMutex 逾時 → REVOKE_TIMEOUT；
+        // 鎖外 best-effort clear 因 IOException 快速失敗（suppressed）；
+        // 落盤 fresh grant saved by the grant that then threw 保留在 backing → seal 封存壓住，refresh 一律 Invalid。
+        val backing = PreferenceDataStoreFactory.create(scope = scope) {
+            File(dir, "refresh_after_failed_revoke.preferences_pb")
+        }
+        val lockHoldStarted = java.util.concurrent.CountDownLatch(1)
+        val saveCalls = java.util.concurrent.atomic.AtomicInteger(0)
+        val ioFailure = java.io.IOException("simulated clear IO failure")
+        val failingDs = object : DataStore<Preferences> by backing {
+            override suspend fun updateData(transform: suspend (t: Preferences) -> Preferences): Preferences {
+                // 第一次 updateData 為 grant 落庫：countDown 後延遲約 300ms（可取消）；
+                // 之後 clear 路徑的 edit 直接拋 IOException（不 hang）。
+                if (saveCalls.getAndIncrement() == 0) {
+                    lockHoldStarted.countDown()
+                    kotlinx.coroutines.delay(300)
+                    return backing.updateData(transform)
+                }
+                throw ioFailure
+            }
+        }
+        val store = PrivilegeBridgeStore(failingDs)
+        val state = PrivilegeBridgeState(
+            bridgeSwitchOn = true,
+            bridgeGranted = true,
+            revokeOpTimeoutMs = 100L,
+        )
+        val grantJob = launch(Dispatchers.IO) {
+            try {
+                state.grant(store, "provider-a", 1L)
+            } catch (_: Throwable) {
+                // 預期：revoke 搶先推進 epoch → grant 拋 PRIVILEGE_GRANT_REVOKED_CONCURRENTLY
+            }
+        }
+        assertTrue(lockHoldStarted.await(10, java.util.concurrent.TimeUnit.SECONDS))
+
+        val error = assertThrows(IllegalStateException::class.java) {
+            runBlocking { state.revoke(store) }
+        }
+        grantJob.join()
+
+        assertEquals("PRIVILEGE_REVOKE_TIMEOUT", error.message)
+        // 沿用現有斷言慣例：走訪 cause／suppressed 鏈定位 best-effort clear 失敗
+        val chain = throwableChain(error)
+        assertTrue(
+            "例外鏈上必含 IllegalStateException(PRIVILEGE_REVOKE_BEST_EFFORT_CLEAR_FAILED)，實際=$chain",
+            chain.any {
+                it is IllegalStateException && it.message == "PRIVILEGE_REVOKE_BEST_EFFORT_CLEAR_FAILED"
+            },
+        )
+        // fresh grant saved by the grant that then threw 仍在磁碟（marker/journal 為復活防護，非磁碟已清）：
+        // load() 會被 in-memory marker 擋下回 null，故直接讀 backing 驗證 grant 鍵未擦除。
+        val prefs = backing.data.first()
+        assertEquals(
+            "落盤 fresh grant 必仍在（撤權未完成）",
+            "provider-a",
+            prefs[PRIVILEGE_GRANT_PROVIDER_ID],
+        )
+        // 同一實例 refresh：seal 封存 → Invalid(NEVER_GRANTED)，旗標不復活
+        val check = state.refresh(store, "provider-a", 1L)
+        assertTrue(check is PrivilegeGrantCheck.Invalid)
+        assertEquals(
+            PrivilegeGrantPolicy.REASON_NEVER_GRANTED,
+            (check as PrivilegeGrantCheck.Invalid).reason,
+        )
+        assertFalse(state.bridgeGranted)
+        assertFalse(state.bridgeEffective)
+        // 以「全新 store 實例＋全新 marker」重讀同一 backing：盤面持久授權仍
+        // 視同有效（marker 未落盤／無 journal，load() → Valid）；唯有 seal 能壓住。
+        // 此為 marker-free seal 判別：seal 若失效，此 refresh 必回 Valid。
+        val freshStore = PrivilegeBridgeStore(backing)
+        val freshCheck = state.refresh(freshStore, "provider-a", 1L)
+        assertTrue(freshCheck is PrivilegeGrantCheck.Invalid)
+        assertEquals(
+            PrivilegeGrantPolicy.REASON_NEVER_GRANTED,
+            (freshCheck as PrivilegeGrantCheck.Invalid).reason,
+        )
+        assertFalse(state.bridgeGranted)
+        assertEquals(0, state.auditCount())
+    }
+
+    @Test fun refreshAfterSuccessfulRevoke_storeCleared_staysInvalid() = runBlocking {
+        // 完整成功的 revoke 後 refresh 仍 Invalid；且 revoke 後重開開關，
+        // bridgeEffective 仍 false（seal 封存壓住旗標，開關本身不構成授權）。
+        // 注意：本測試釘住的是「store 已被擦除的 happy path」＋開關的 cosmetic 性質，
+        // 不釘 seal——store 為空 ⇒ refresh 無論 seal 與否皆 Invalid。
+        // （seal 的判別測試見 refreshAfterFailedRevoke_withStaleValidGrantOnDisk_staysFailClosed 與
+        // grantAfterSettledFailedRevoke_* 等 seal 測試。）
+        val store = store()
+        val state = PrivilegeBridgeState(bridgeSwitchOn = true)
+
+        state.grant(store, "preset:openai", 1L)
+        assertTrue("前置：首次成功 grant 後旗標必為 true", state.bridgeGranted)
+
+        state.revoke(store)
+        assertNull("revoke 完整成功後持久授權必已清除", store.load())
+
+        val check = state.refresh(store, "preset:openai", 1L)
+        assertTrue(check is PrivilegeGrantCheck.Invalid)
+        assertEquals(
+            PrivilegeGrantPolicy.REASON_NEVER_GRANTED,
+            (check as PrivilegeGrantCheck.Invalid).reason,
+        )
+        assertFalse(state.bridgeGranted)
+        // 重開開關亦不得復活
+        state.setBridgeSwitch(true)
+        assertFalse("seal 封存期間 bridgeEffective 恆 false", state.bridgeEffective)
+        assertEquals(0, state.auditCount())
+    }
+
+    @Test fun refreshRevokedWhileQueuedOnMutexFailsClosed() = runBlocking {
+        // 鏡像 grantRevokedWhileQueuedOnMutexFailsClosed 的 idiom：
+        // blocker 持有 opMutex（DataStore stuck），refresh 以 Unconfined 排隊，
+        // 佇列中插入 revokeInMemoryForTest() → 排隊中的 refresh 必 fail-closed。
+        // 註：本測試釘住的是 epoch fence（排隊中的 refresh 於醒後見 epoch 不符 ⇒
+        // Invalid(NEVER_GRANTED)），不釘 seal——seal 於入口即封存、refresh 直接回
+        // Invalid 的路徑見 refreshAfterFailedRevoke_*／grantAfterSettledFailedRevoke_* 等 seal 測試。
+        val store = store()
+        val state = PrivilegeBridgeState(bridgeSwitchOn = true)
+        val slowStore = PreferenceDataStoreFactory.create(scope = scope) { File(dir, "rev_queue_refresh.preferences_pb") }
+
+        val lockHoldStarted = java.util.concurrent.CountDownLatch(1)
+        val lockHoldRelease = java.util.concurrent.CountDownLatch(1)
+
+        val blockerStore = PrivilegeBridgeStore(object : DataStore<Preferences> by slowStore {
+            override val data: Flow<Preferences> = flow {
+                lockHoldStarted.countDown()
+                lockHoldRelease.await(10, TimeUnit.SECONDS)
+                emit(androidx.datastore.preferences.core.emptyPreferences())
+            }
+        })
+
+        // Launch job holding opMutex via refresh
+        val job1 = launch(Dispatchers.IO) {
+            state.refresh(blockerStore, "preset:openai", 1L)
+        }
+        assertTrue(lockHoldStarted.await(10, TimeUnit.SECONDS))
+
+        // 以 Unconfined 明確驅動：launch 返回時 job2 已執行到 opMutex.lock() 的掛起點
+        //（epochBefore 已捕捉且排隊等鎖）——不再靠 Thread.sleep 猜測排程。
+        val refreshResult = java.util.concurrent.atomic.AtomicReference<PrivilegeGrantCheck?>()
+        val job2 = launch(kotlinx.coroutines.Dispatchers.Unconfined) {
+            refreshResult.set(state.refresh(store, "preset:openai", 1L))
+        }
+        // launch 返回即代表 job2 已排隊於 opMutex（Mutex 由 job1 持有）。
+
+        // User revokes while job2 is queued
+        state.revokeInMemoryForTest()
+
+        // Release job1
+        lockHoldRelease.countDown()
+        job1.join()
+        job2.join()
+
+        val check = refreshResult.get()
+        assertTrue("排隊中的 refresh 必回 Invalid，實際=$check", check is PrivilegeGrantCheck.Invalid)
+        assertEquals(
+            PrivilegeGrantPolicy.REASON_NEVER_GRANTED,
+            (check as PrivilegeGrantCheck.Invalid).reason,
+        )
+        assertFalse(state.bridgeGranted)
+    }
+
+    @Test fun grantDuringRevokeInFlight_failsFast() = runBlocking {
+        // revoke 卡在 store.clear() 的 hang 假件上（inFlight 於入口設置；opMutex 已取得、
+        // clear 掛起等待測試放開）：期間 grant() 必 fail-fast 拋 REVOKE_IN_PROGRESS，
+        // seal 維持封存（refresh 一律 Invalid）、旗標 false。
+        val backing = PreferenceDataStoreFactory.create(scope = scope) {
+            File(dir, "grant_during_in_flight.preferences_pb")
+        }
+        val clearStarted = java.util.concurrent.CountDownLatch(1)
+        val hangClear = java.util.concurrent.CountDownLatch(1)
+        // 先落盤一份有效授權（plain store，直接走 backing.updateData 不經 hang 假件）：
+        // 供下方 seal 判別——seal 若失效，marker-free 全新 store 的 refresh 必回 Valid。
+        PrivilegeBridgeStore(backing).save(PrivilegeGrantPolicy.grant("preset:openai", 1L))
+        val hangingDs = object : DataStore<Preferences> by backing {
+            override suspend fun updateData(transform: suspend (t: Preferences) -> Preferences): Preferences {
+                clearStarted.countDown()
+                hangClear.await(10, java.util.concurrent.TimeUnit.SECONDS)
+                return backing.updateData(transform)
+            }
+        }
+        val store = PrivilegeBridgeStore(hangingDs)
+        val state = PrivilegeBridgeState(bridgeSwitchOn = true, bridgeGranted = true)
+
+        val revokeJob = launch(Dispatchers.IO) {
+            try {
+                state.revoke(store)
+            } catch (_: Throwable) {
+                // 允許成功或失敗——本測試只關心 inFlight 窗口內的行為
+            }
+        }
+        // revoke 進入 clear()：opMutex 自由取得 → 臨界區內 store.clear() 掛起（inFlight == true）
+        assertTrue(clearStarted.await(10, java.util.concurrent.TimeUnit.SECONDS))
+
+        val error = assertThrows(IllegalStateException::class.java) {
+            runBlocking { state.grant(store, "preset:openai", 1L) }
+        }
+        assertEquals("PRIVILEGE_REVOKE_IN_PROGRESS", error.message)
+        assertFalse(state.bridgeGranted)
+        // seal 仍封存的可觀測後果：refresh 一律 Invalid（不依賴私有欄位）。
+        // 以「全新 healthy store 實例（marker-free）」重讀同一 backing：盤面有持久
+        // 授權，唯有 seal 能壓住（seal 若失效，此 refresh 必回 Valid）。
+        // 不用會 hang 的 hanging store——seal 若回歸，heal 路徑會吊進 hangClear 假件。
+        val freshStore = PrivilegeBridgeStore(backing)
+        val sealedCheck = state.refresh(freshStore, "preset:openai", 1L)
+        assertTrue(sealedCheck is PrivilegeGrantCheck.Invalid)
+        assertEquals(
+            PrivilegeGrantPolicy.REASON_NEVER_GRANTED,
+            (sealedCheck as PrivilegeGrantCheck.Invalid).reason,
+        )
+
+        hangClear.countDown()
+        revokeJob.join()
+    }
+
+    @Test fun grantAfterSettledFailedRevoke_explicitReGrant_liftsSeal() = runBlocking {
+        // 撤權落敗（clear 全失敗：journal／best-effort wipe 皆拋 IOException）→
+        // seal 維持；隨後明確新授權（grant 成功落庫）解除 seal：
+        // 旗標 true，refresh 回 Valid。
+        val backing = PreferenceDataStoreFactory.create(scope = scope) {
+            File(dir, "regrant_lifts_seal.preferences_pb")
+        }
+        val clearFails = java.util.concurrent.atomic.AtomicBoolean(false)
+        val ioFailure = java.io.IOException("simulated clear IO failure")
+        val flakyDs = object : DataStore<Preferences> by backing {
+            override suspend fun updateData(transform: suspend (t: Preferences) -> Preferences): Preferences {
+                if (clearFails.get()) throw ioFailure
+                return backing.updateData(transform)
+            }
+        }
+        val store = PrivilegeBridgeStore(flakyDs)
+        val state = PrivilegeBridgeState(bridgeSwitchOn = true)
+
+        // 前置：一次成功 grant（盤面有真實授權）
+        state.grant(store, "preset:openai", 1L)
+        assertTrue("前置：首次成功 grant 後旗標必為 true", state.bridgeGranted)
+
+        // 撤權落敗：clear 全失敗 → 例外上拋 → seal 維持封存
+        clearFails.set(true)
+        assertThrows(java.io.IOException::class.java) {
+            runBlocking { state.revoke(store) }
+        }
+        assertFalse(state.bridgeGranted)
+        val sealedCheck = state.refresh(store, "preset:openai", 1L)
+        assertTrue("seal 封存期間 refresh 必 Invalid", sealedCheck is PrivilegeGrantCheck.Invalid)
+        assertEquals(
+            PrivilegeGrantPolicy.REASON_NEVER_GRANTED,
+            (sealedCheck as PrivilegeGrantCheck.Invalid).reason,
+        )
+
+        // 明確新授權：grant 成功落庫 → seal 解除 → 旗標 true → refresh 回 Valid
+        clearFails.set(false)
+        val regranted = state.grant(store, "preset:openai", 1L)
+        assertTrue("explicit grant commit 必解除 seal 並置旗標", state.bridgeGranted)
+        // 新授權必落盤（內容比對，鏡像既有 pin 的斷言風格）
+        assertEquals("明確新授權必落盤", regranted, store.load())
+        val check = state.refresh(store, "preset:openai", 1L)
+        assertTrue("seal 解除後 refresh 必 Valid，實際=$check", check is PrivilegeGrantCheck.Valid)
+    }
+
+    @Test fun grantAfterSettledFailedRevoke_saveThrows_keepsSeal() = runBlocking {
+        // 復現落敗撤權前置（同 refreshAfterFailedRevoke_withStaleValidGrantOnDisk_staysFailClosed）：
+        // clear 全失敗（IOException）→ revoke 例外上拋 → seal 維持封存；
+        // 盤上 fresh grant 未被擦除。隨後 re-grant 的 save 亦拋 IOException →
+        // grant 拋錯 → seal 仍封存 → refresh 一律 Invalid
+        // （判別性：以 marker-free 全新 store 重讀同一 backing，seal 若失效，load() → Valid）。
+        val backing = PreferenceDataStoreFactory.create(scope = scope) {
+            File(dir, "save_throws_keeps_seal.preferences_pb")
+        }
+        val clearFails = java.util.concurrent.atomic.AtomicBoolean(false)
+        val saveFails = java.util.concurrent.atomic.AtomicBoolean(false)
+        val clearFailure = java.io.IOException("simulated clear IO failure")
+        val saveFailure = java.io.IOException("simulated save IO failure")
+        val flakyDs = object : DataStore<Preferences> by backing {
+            override suspend fun updateData(transform: suspend (t: Preferences) -> Preferences): Preferences {
+                if (saveFails.get()) throw saveFailure
+                if (clearFails.get()) throw clearFailure
+                return backing.updateData(transform)
+            }
+        }
+        val store = PrivilegeBridgeStore(flakyDs)
+        val state = PrivilegeBridgeState(bridgeSwitchOn = true)
+
+        // 前置：一次成功 grant（盤面有真實授權；隨後撤權落敗無法擦除）
+        state.grant(store, "provider-a", 1L)
+        assertTrue(state.bridgeGranted)
+
+        // 落敗撤權：clear 全失敗 → 例外上拋 → seal 維持封存
+        clearFails.set(true)
+        assertThrows(java.io.IOException::class.java) {
+            runBlocking { state.revoke(store) }
+        }
+        assertFalse(state.bridgeGranted)
+        // 落敗撤權後盤面 grant 鍵未擦除（journal 未寫成、wipe 亦敗）
+        val prefs = backing.data.first()
+        assertEquals(
+            "落敗撤權後 fresh grant 必仍在盤上（撤權未完成）",
+            "provider-a",
+            prefs[PRIVILEGE_GRANT_PROVIDER_ID],
+        )
+
+        // re-grant 的 save 拋 IOException → grant 拋錯 → seal 必維持
+        clearFails.set(false)
+        saveFails.set(true)
+        assertThrows(java.io.IOException::class.java) {
+            runBlocking { state.grant(store, "provider-a", 1L) }
+        }
+        assertFalse(state.bridgeGranted)
+        val sealedCheck = state.refresh(store, "provider-a", 1L)
+        assertTrue("save 落敗後 seal 必維持封存：refresh 一律 Invalid", sealedCheck is PrivilegeGrantCheck.Invalid)
+        assertEquals(
+            PrivilegeGrantPolicy.REASON_NEVER_GRANTED,
+            (sealedCheck as PrivilegeGrantCheck.Invalid).reason,
+        )
+        // marker-free seal 判別：fresh store 讀同一 backing，無 seal 時 load() → Valid
+        val freshStore = PrivilegeBridgeStore(backing)
+        val freshCheck = state.refresh(freshStore, "provider-a", 1L)
+        assertTrue("fresh store 亦必 Invalid（seal 判別：無 seal 時 refresh 必回 Valid）", freshCheck is PrivilegeGrantCheck.Invalid)
+        assertEquals(
+            PrivilegeGrantPolicy.REASON_NEVER_GRANTED,
+            (freshCheck as PrivilegeGrantCheck.Invalid).reason,
+        )
+    }
+
+    @Test fun grantAfterSettledFailedRevoke_expiredGrantDoesNotLiftSeal() = runBlocking {
+        // 復現落敗撤權前置（同 grantAfterSettledFailedRevoke_explicitReGrant_liftsSeal／
+        // grantAfterSettledFailedRevoke_saveThrows_keepsSeal）：
+        // clear 全失敗（IOException）→ revoke 例外上拋 → seal 維持封存；
+        // 盤上 stale grant 未被擦除。隨後以 ttlMs = 0L 明確 re-grant：
+        // 落庫成功但 postCheck Invalid（即刻過期）⇒ seal 不得解除。
+        val backing = PreferenceDataStoreFactory.create(scope = scope) {
+            File(dir, "regrant_expired_keeps_seal.preferences_pb")
+        }
+        val clearFails = java.util.concurrent.atomic.AtomicBoolean(false)
+        val ioFailure = java.io.IOException("simulated clear IO failure")
+        val flakyDs = object : DataStore<Preferences> by backing {
+            override suspend fun updateData(transform: suspend (t: Preferences) -> Preferences): Preferences {
+                if (clearFails.get()) throw ioFailure
+                return backing.updateData(transform)
+            }
+        }
+        val store = PrivilegeBridgeStore(flakyDs)
+        val state = PrivilegeBridgeState(bridgeSwitchOn = true)
+
+        // 前置：一次成功 grant（盤面有真實授權）
+        state.grant(store, "provider-a", 1L)
+        assertTrue(state.bridgeGranted)
+
+        // 落敗撤權：clear 全失敗 → 例外上拋 → seal 維持封存
+        clearFails.set(true)
+        assertThrows(java.io.IOException::class.java) {
+            runBlocking { state.revoke(store) }
+        }
+        assertFalse(state.bridgeGranted)
+        // 落敗撤權後盤面 grant 鍵未擦除（journal 未寫成、wipe 亦敗）
+        val prefs = backing.data.first()
+        assertEquals(
+            "落敗撤權後 stale grant 必仍在盤上（撤權未完成）",
+            "provider-a",
+            prefs[PRIVILEGE_GRANT_PROVIDER_ID],
+        )
+
+        // 明確 re-grant 但即刻過期：ttlMs = 0L → postCheck Invalid ⇒ seal 不得解除
+        clearFails.set(false)
+        state.grant(store, "provider-a", 1L, ttlMs = 0L)
+        assertTrue("postCheck Invalid ⇒ seal 不得解除", state.isRevocationSealedForTest())
+        assertFalse(state.bridgeGranted)
+        // 同實例 refresh 回 Invalid
+        val sealedCheck = state.refresh(store, "provider-a", 1L)
+        assertTrue(
+            "seal 封存期間 refresh 必 Invalid，實際=$sealedCheck",
+            sealedCheck is PrivilegeGrantCheck.Invalid,
+        )
+        // marker-free 新 store refresh 亦回 Invalid（EXPIRED 或 NEVER_GRANTED 皆可，
+        // 不判別理由碼，只斷言 is Invalid）
+        val freshStore = PrivilegeBridgeStore(backing)
+        val freshCheck = state.refresh(freshStore, "provider-a", 1L)
+        assertTrue(
+            "marker-free 新 store refresh 亦必 Invalid，實際=$freshCheck",
+            freshCheck is PrivilegeGrantCheck.Invalid,
+        )
+        assertFalse(state.bridgeGranted)
+        assertFalse(state.bridgeSwitchOn)
+    }
+
+    @Test fun revokeTimeoutPath_reassertsSwitchAndFlag() = runBlocking {
+        // grant 卡住 opMutex（lockHold latch，不再靠 delay 猜排程）→ revoke 開始
+        //（入口關旗、封存 seal）→ revoke 等待 opMutex 逾時後進入鎖外 best-effort clear
+        //（掛起於 hangClear）→ 假件「於 clear 路徑、revoke inFlight 窗口內、revoke 尚未
+        // 回到呼叫端」確定性重新打開開關 → revoke 走完 → 最外層 finally 必重新斷言 switch=false、flag=false。
+        val backing = PreferenceDataStoreFactory.create(scope = scope) {
+            File(dir, "revoke_timeout_reassert.preferences_pb")
+        }
+        val lockHoldStarted = java.util.concurrent.CountDownLatch(1)
+        val lockHold = java.util.concurrent.CountDownLatch(1)
+        val clearStarted = java.util.concurrent.CountDownLatch(1)
+        val hangClear = java.util.concurrent.CountDownLatch(1)
+        val reopenedOnce = java.util.concurrent.atomic.AtomicBoolean(false)
+        val saveCalls = java.util.concurrent.atomic.AtomicInteger(0)
+        // state 先建立：clear 路徑的假件需於 revoke 的 inFlight 窗口內直接操作 state。
+        val state = PrivilegeBridgeState(
+            bridgeSwitchOn = true,
+            bridgeGranted = true,
+            revokeOpTimeoutMs = 100L,
+        )
+        val slowDs = object : DataStore<Preferences> by backing {
+            override suspend fun updateData(transform: suspend (t: Preferences) -> Preferences): Preferences {
+                // 第一次 updateData 為 grant 落庫：countDown 後掛起於 lockHold（由測試於
+                // revoke 結束後放開）；後續 clear 路徑的 edit：宣告 clearStarted 後於窗口內
+                // 重新打開開關，再掛起於 hangClear（由測試放開），確定性建立
+                // 「revoke 已進入 best-effort clear、尚未回到呼叫端」的窗口。
+                if (saveCalls.getAndIncrement() == 0) {
+                    lockHoldStarted.countDown()
+                    lockHold.await(10, java.util.concurrent.TimeUnit.SECONDS)
+                    return backing.updateData(transform)
+                }
+                clearStarted.countDown()
+                if (reopenedOnce.compareAndSet(false, true)) {
+                    // revoke inFlight 窗口內、revoke 尚未返回呼叫端：模擬 UI 重新打開開關
+                    state.setBridgeSwitch(true)
+                }
+                hangClear.await(10, java.util.concurrent.TimeUnit.SECONDS)
+                return backing.updateData(transform)
+            }
+        }
+        val store = PrivilegeBridgeStore(slowDs)
+        val grantJob = launch(Dispatchers.IO) {
+            try {
+                state.grant(store, "preset:openai", 1L)
+            } catch (_: Throwable) {
+                // 預期：revoke 搶先推進 epoch → grant 拋 PRIVILEGE_GRANT_REVOKED_CONCURRENTLY
+            }
+        }
+        assertTrue(lockHoldStarted.await(10, java.util.concurrent.TimeUnit.SECONDS))
+
+        val revokeError = java.util.concurrent.atomic.AtomicReference<Throwable?>()
+        val revokeJob = launch(Dispatchers.IO) {
+            try {
+                state.revoke(store)
+            } catch (t: Throwable) {
+                revokeError.set(t)
+            }
+        }
+        // 等 revoke 進入鎖外 best-effort clear（opMutex 等待已逾時 PRIVILEGE_REVOKE_TIMEOUT）；
+        // 假件已於該窗口內重新打開開關（reopenedOnce 已被消耗）：
+        assertTrue(clearStarted.await(10, java.util.concurrent.TimeUnit.SECONDS))
+        // 放開 clear → revoke 走完 → 最外層 finally 重新斷言 switch+flag：
+        hangClear.countDown()
+        revokeJob.join()
+
+        val error = revokeError.get()
+        assertTrue(
+            "revoke 必 fail-closed 拋 IllegalStateException(PRIVILEGE_REVOKE_TIMEOUT)，實際=$error",
+            error is IllegalStateException && error.message == "PRIVILEGE_REVOKE_TIMEOUT",
+        )
+        assertFalse("revoke 最外層 finally 必重新斷言 switch=false", state.bridgeSwitchOn)
+        assertFalse(state.bridgeGranted)
+
+        // 放開 grant 的 lockHold → grant 醒後見 epoch 不符 → 收場（best-effort clear 已 counted-down，立即放行）
+        lockHold.countDown()
+        grantJob.join()
+    }
+
+    @Test fun grantAfterSettledFailedRevoke_saveCancellation_keepsSeal() = runBlocking {
+        // 落敗撤權（clear 全失敗：IOException）settle 後 seal 維持封存；
+        // 隨後明確新授權的 save 拋 CancellationException（假件直接拋，非父協程預取消）：
+        // CE 原樣傳播（CE-first，不得包裝/折 ISE），seal 維持封存 →
+        // refresh 一律 Invalid（reason == REASON_NEVER_GRANTED）。
+        // 判別性：以 marker-free 全新 store 重讀同一 backing，seal 若失效，load() → Valid。
+        val backing = PreferenceDataStoreFactory.create(scope = scope) {
+            File(dir, "save_cancellation_keeps_seal.preferences_pb")
+        }
+        val clearFails = java.util.concurrent.atomic.AtomicBoolean(false)
+        val saveFailsWithCe = java.util.concurrent.atomic.AtomicBoolean(false)
+        val clearFailure = java.io.IOException("simulated clear IO failure")
+        val flakyDs = object : DataStore<Preferences> by backing {
+            override suspend fun updateData(transform: suspend (t: Preferences) -> Preferences): Preferences {
+                if (saveFailsWithCe.get()) throw CancellationException("simulated save cancellation")
+                if (clearFails.get()) throw clearFailure
+                return backing.updateData(transform)
+            }
+        }
+        val store = PrivilegeBridgeStore(flakyDs)
+        val state = PrivilegeBridgeState(bridgeSwitchOn = true)
+
+        // 前置：一次成功 grant（盤面有真實授權）
+        state.grant(store, "provider-a", 1L)
+        assertTrue(state.bridgeGranted)
+
+        // 落敗撤權並 settle：clear 全失敗 → 例外上拋 → seal 維持
+        clearFails.set(true)
+        assertThrows(java.io.IOException::class.java) {
+            runBlocking { state.revoke(store) }
+        }
+        assertFalse(state.bridgeGranted)
+
+        // re-grant 的 save 拋 CancellationException → CE 原樣傳播 → seal 必維持
+        clearFails.set(false)
+        saveFailsWithCe.set(true)
+        val error = assertThrows(CancellationException::class.java) {
+            runBlocking { state.grant(store, "provider-a", 1L) }
+        }
+        assertEquals("simulated save cancellation", error.message)
+        // 註：JVM CancellationException 本身是 IllegalStateException 的子類；
+        // "不折 ISE" 已由 assertThrows(CancellationException::class.java) 釘住（型別不可為純 ISE）。
+        assertFalse(state.bridgeGranted)
+        val sealedCheck = state.refresh(store, "provider-a", 1L)
+        assertTrue(sealedCheck is PrivilegeGrantCheck.Invalid)
+        assertEquals(
+            PrivilegeGrantPolicy.REASON_NEVER_GRANTED,
+            (sealedCheck as PrivilegeGrantCheck.Invalid).reason,
+        )
+        // marker-free seal 判別：fresh store 讀同一 backing，無 seal 時 load() → Valid
+        val freshStore = PrivilegeBridgeStore(backing)
+        val freshCheck = state.refresh(freshStore, "provider-a", 1L)
+        assertTrue(freshCheck is PrivilegeGrantCheck.Invalid)
+        assertEquals(
+            PrivilegeGrantPolicy.REASON_NEVER_GRANTED,
+            (freshCheck as PrivilegeGrantCheck.Invalid).reason,
+        )
+    }
+
+    @Test fun publishBridgeGranted_sealSetBeforeWrite_doesNotEndTrue() = runBlocking {
+        // seal 置位下旗標絕不能落 true；write conjunct 與 second-read 兩臂共同擋下。
+        // write conjunct 不可單獨判別（見產品 KDoc precision note），此測試固定
+        // 「sealed ⇒ 旗標不可為 true」的整體不變式，不判別兩臂各自。
+        val store = store()
+        store.save(PrivilegeGrantPolicy.grant("preset:openai", 1L))
+        val state = PrivilegeBridgeState(bridgeSwitchOn = true)
+        state.bridgeGrantedPublishHookForTest = { state.setRevocationSealOnlyForTest() }
+        try {
+            state.refresh(store, "preset:openai", 1L)
+        } finally {
+            state.bridgeGrantedPublishHookForTest = null
+        }
+        assertFalse("seal 置位後 write 必不得落 true", state.bridgeGranted)
+    }
+
+    @Test fun publishBridgeGranted_sealSetBetweenWriteAndSecondRead_secondReadForcesFalse() = runBlocking {
+        // second-read 單層 seal 防線 pin：賦值後（旗標可能已寫 true）、second-read 前
+        // 插入 seal；second-read 必把旗標壓回 false。
+        // second-read 若移除 seal 臂，本測試必紅（epoch 未變，epoch 臂不會觸發）。
+        val store = store()
+        store.save(PrivilegeGrantPolicy.grant("preset:openai", 1L))
+        val state = PrivilegeBridgeState(bridgeSwitchOn = true)
+        state.bridgeGrantedEpochBumpHookForTest = { state.setRevocationSealOnlyForTest() }
+        try {
+            state.refresh(store, "preset:openai", 1L)
+        } finally {
+            state.bridgeGrantedEpochBumpHookForTest = null
+        }
+        assertFalse("賦值→回讀間 seal 置位 ⇒ second-read 必壓回 false", state.bridgeGranted)
+    }
+
+    @Test fun grantCommit_revokeEntryDuringCommit_sealSticks() = runBlocking {
+        // 回歸 pin（本次 BLOCK 根因）：grant commit 點緊前模擬「撤銷入口落於 commit 窗口」——
+        // hook 僅推進 epoch＋置 seal（不寫旗標、不重入 revoke）。
+        // commit RMW 必見 epoch 不符 → 不解封 → failGrantRevokedConcurrently（best-effort
+        // clear 失敗亦不覆蓋 seal）→ 拋 PRIVILEGE_GRANT_REVOKED_CONCURRENTLY；
+        // 旗標 false；此後 marker-free 全新 store 的 refresh 亦 Invalid（seal sticks）——
+        // seal 若被無條件 set(false) 解除，盤上殘留的新授權必使 refresh 回 Valid，本測試必紅。
+        val backing = PreferenceDataStoreFactory.create(scope = scope) {
+            File(dir, "grant_commit_revoke_window.preferences_pb")
+        }
+        val saveCalls = java.util.concurrent.atomic.AtomicInteger(0)
+        val ioFailure = java.io.IOException("simulated clear IO failure")
+        // 第一次 updateData 為 grant 落庫（成功）；之後 clear 路徑的 edit 皆拋 IOException
+        // （best-effort 清庫失敗 → 新授權鍵留盤，供 seal 判別）。
+        val flakyDs = object : DataStore<Preferences> by backing {
+            override suspend fun updateData(transform: suspend (t: Preferences) -> Preferences): Preferences {
+                if (saveCalls.getAndIncrement() == 0) {
+                    return backing.updateData(transform)
+                }
+                throw ioFailure
+            }
+        }
+        val store = PrivilegeBridgeStore(flakyDs)
+        val state = PrivilegeBridgeState(bridgeSwitchOn = true)
+        state.grantCommitHookForTest = {
+            state.incrementRevokeEpochOnlyForTest()
+            state.setRevocationSealOnlyForTest()
+        }
+        try {
+            val error = assertThrows(IllegalStateException::class.java) {
+                runBlocking { state.grant(store, "preset:openai", 1L) }
+            }
+            assertEquals("PRIVILEGE_GRANT_REVOKED_CONCURRENTLY", error.message)
+        } finally {
+            state.grantCommitHookForTest = null
+        }
+        assertFalse("commit 窗口並發撤銷 ⇒ 不解封、旗標必 false", state.bridgeGranted)
+        // 新授權落盤但 seal 維持：marker-free 全新 store 重讀必 Invalid（seal 判別）
+        val freshStore = PrivilegeBridgeStore(backing)
+        assertEquals(
+            "re-grant 落盤的授權必仍在（clear 失敗）",
+            "preset:openai",
+            freshStore.load()?.providerId,
+        )
+        val check = state.refresh(freshStore, "preset:openai", 1L)
+        assertTrue(check is PrivilegeGrantCheck.Invalid)
+        assertEquals(
+            PrivilegeGrantPolicy.REASON_NEVER_GRANTED,
+            (check as PrivilegeGrantCheck.Invalid).reason,
+        )
     }
 }

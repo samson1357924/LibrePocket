@@ -13,6 +13,9 @@ internal object PrivilegeBridgeErrors {
     /** opMutex 等待逾時（[PrivilegeBridgeState.revoke]）。 */
     const val REVOKE_TIMEOUT = "PRIVILEGE_REVOKE_TIMEOUT"
 
+    /** revoke 執行中（入口已封存 seal）時呼叫 grant()：fail-fast。 */
+    const val REVOKE_IN_PROGRESS = "PRIVILEGE_REVOKE_IN_PROGRESS"
+
     /** 臨界區內 store.clear() 逾時。 */
     const val REVOKE_STORE_TIMEOUT = "PRIVILEGE_REVOKE_STORE_TIMEOUT"
 

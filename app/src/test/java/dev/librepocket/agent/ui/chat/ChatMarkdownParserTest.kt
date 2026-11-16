@@ -1792,15 +1792,25 @@ class ChatMarkdownParserTest {
         // F2: per-call O(N*depth) with small practical depth; doubling N at fixed depth
         // must scale ~linearly (well under the quadratic 4x plus noise headroom).
         val unit = "**bold** and *italic* with `code` "
-        fun timed(repeat: Int): Long {
-            val input = unit.repeat(repeat)
+        // Hardening (PR #170 CI): single-shot flaked on loaded foss runner (ratio 3.845, t1=5.3 ms); interleaved median-of-7 + doubled base; bound unchanged.
+        fun timedOnce(input: String): Long {
             repeat(3) { ChatMarkdownParser.parseInlineMarkdown(input) }
             val start = System.nanoTime()
             repeat(5) { ChatMarkdownParser.parseInlineMarkdown(input) }
             return System.nanoTime() - start
         }
-        val t1 = timed(400)
-        val t2 = timed(800)
+        val input1 = unit.repeat(800)
+        val input2 = unit.repeat(1600)
+        // Interleaved rounds: each round measures both back to back so machine
+        // drift hits both sides equally; ratio uses per-side medians.
+        val samples1 = LongArray(7)
+        val samples2 = LongArray(7)
+        repeat(7) { i ->
+            samples1[i] = timedOnce(input1)
+            samples2[i] = timedOnce(input2)
+        }
+        val t1 = samples1.sorted()[3]
+        val t2 = samples2.sorted()[3]
         val ratio = t2.toDouble() / maxOf(1L, t1).toDouble()
         assertTrue("parseInline 2x-input ratio $ratio exceeds linear bound (t1=${t1}ns t2=${t2}ns)", ratio < 3.5)
     }

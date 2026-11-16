@@ -35,10 +35,16 @@ import java.time.ZoneId
  * DOCUMENTED, DELIBERATE ASYMMETRIES (the only ones the comparison tolerates):
  * 1. the slice Ok receipt carries `clockMillis`; the fast-lane receipt does
  *    NOT (the fast lane has no clock). The slice receipt is compared with
- *    `clockMillis` PARSED OUT and ignored — never byte-compared raw. The
- *    slice's `clockMillis` field (~28 bytes) also consumes the shrink-loop
- *    budget (FD omits it); the guard will FAIL LOUDLY (not mask) if that
- *    ever diverges.
+ *    `clockMillis` PARSED OUT and ignored — never byte-compared raw; that
+ *    post-hoc strip is cosmetic for the comparison only. Both shrink loops
+ *    ([boundaryShrinkLoopCutPointParity] pins it at the boundary) shrink
+ *    against `MAX_RESULT_CHARS - RESULT_METADATA_RESERVE`: the slice's
+ *    shrink candidate omits `clockMillis`, which the envelope appends only
+ *    after the loop (paid for by the reservation), so both pipelines decide
+ *    on the same effective budget and select identical symbol sets by
+ *    construction regardless of clock value; the comparison's field strip
+ *    stays cosmetic, and the FINAL backstop that rejects an over-
+ *    MAX_RESULT_CHARS JSON stays unchanged on both paths.
  * 2. the slice's `tool` echoes `cappedTake(Redactor.redact(call.name))`; the
  *    fast-lane's `tool` is the constant [LspTools.SYMBOLS_NAME]. The corpus
  *    always calls with `name == "lsp.symbols"` (which both sides render as
@@ -56,7 +62,8 @@ import java.time.ZoneId
  * Everything else — top-level key set (modulo the exclusions above),
  * `returnedCount`/`omittedCount`/`truncated`, `fromStub`, `callId` bounded
  * form, per-symbol name/kind/path redaction+caps, shrink-loop cut points
- * under [SafeToolSlice.MAX_RESULT_CHARS] — must be identical, and the corpus
+ * under [SafeToolSlice.MAX_RESULT_CHARS] minus the shared metadata reserve
+ * ([SafeToolSlice.RESULT_METADATA_RESERVE]) — must be identical, and the corpus
  * below covers: 0/1/N symbols, redaction-triggering names, fields at the
  * [SafeToolSlice.RAW_BACKEND_FIELD_MAX_CHARS] (2000) raw bound and the
  * [SafeToolSlice.MAX_STRING_CHARS] (500) echo cap (both the raw-omission
@@ -66,9 +73,14 @@ import java.time.ZoneId
  * extreme, and oversized call ids (bounded `#`-SHA-256 form).
  *
  * Budget-consumption parity: the fast-lane and slice both shrink the chosen
- * symbols item-wise until the serialized receipt fits [SafeToolSlice.MAX_RESULT_CHARS];
- * the shrink case asserts identical `returnedCount`/`omittedCount` on both
- * sides. The single-symbol-over-budget EXEC_ERROR backstop is unreachable
+ * symbols item-wise until the serialized receipt fits
+ * `MAX_RESULT_CHARS - RESULT_METADATA_RESERVE` (the shared envelope budget
+ * both shrink loops decide on; the emitted slice receipt then carries
+ * `clockMillis` appended after the loop); the shrink case asserts identical
+ * `returnedCount`/`omittedCount` on both sides, and [boundaryShrinkLoopCutPointParity]
+ * pins the identical cut points at the boundary where the raw cap alone
+ * would have let the fast lane keep one more symbol than the slice.
+ * The single-symbol-over-budget EXEC_ERROR backstop is unreachable
  * with today's constants (one max-size symbol serializes far below
  * MAX_RESULT_CHARS — pinned below by [singleSymbolCeilingPin]); the backstop
  * is covered at its projection-boundary EXEC_ERROR arms
@@ -320,6 +332,57 @@ class SymbolReceiptParityTest {
         assertTrue(sliceJson["truncated"]!!.jsonPrimitive.boolean)
         assertTrue(fastJson["truncated"]!!.jsonPrimitive.boolean)
         assertEquals("symbols array must agree byte-wise", fastJson["symbols"].toString(), sliceJson["symbols"].toString())
+    }
+
+    @Test fun boundaryShrinkLoopCutPointParity() {
+        // Boundary corpus pinning the shrink cut points AT the edge where the
+        // two mirrored paths used to diverge. Deterministic and ASCII-only
+        // (fixed clock ⇒ fixed 13-digit clockMillis, fixed field lengths;
+        // no machine/JDK-dependent serialization variance).
+        //
+        // Calibration (measured, see stage-6.4 review notes): 60 symbols ×
+        // name="N".repeat(388). The receipt grows ≈460 bytes per symbol:
+        //   base(42) = 19_521  ≤ reserve-adjusted budget (20_000 − 64 = 19_936)
+        //   base(43) = 19_982  > reserve-adjusted budget, and
+        //               base(43) + 28 (,"clockMillis": + 13-digit millis) = 20_010
+        //             > raw MAX_RESULT_CHARS — the old fast lane kept 43 while
+        //               the old slice dropped to 42.
+        // Both paths must now select EXACTLY 42 symbols and agree
+        // item-wise on the retained tail.
+        val symbols = (1..60).map { benign("N".repeat(388), "function", "app/src/main/Boundary.kt", 7) }
+        val args = """{"query":"Foo","limit":60}"""
+        val sliceResult = sliceReceipt(args, "call-boundary", FixedBackend(symbols))
+        val fastResult = fastReceipt(args, "call-boundary", FixedBackend(symbols))
+        val sliceJson = normalizeSliceOk(sliceResult.resultJson)
+        val fastJson = parse(fastResult.resultJson)
+        assertFalse("boundary corpus must not trip the backstop (slice)", sliceResult.denied)
+        assertFalse("boundary corpus must not trip the backstop (fast lane)", fastResult.denied)
+        assertTrue(
+            "shrunk slice receipt must fit the absolute cap",
+            sliceResult.resultJson.length <= SafeToolSlice.MAX_RESULT_CHARS,
+        )
+        assertTrue(
+            "shrunk fast-lane receipt must fit the absolute cap",
+            fastResult.resultJson.length <= SafeToolSlice.MAX_RESULT_CHARS,
+        )
+        assertEquals("boundary cut point must agree (slice)", 42, sliceJson["returnedCount"]!!.jsonPrimitive.intOrNull)
+        assertEquals("boundary cut point must agree (fast lane)", 42, fastJson["returnedCount"]!!.jsonPrimitive.intOrNull)
+        assertEquals("boundary cut points must select identically", fastJson["returnedCount"], sliceJson["returnedCount"])
+        assertEquals("boundary omittedCount must agree", fastJson["omittedCount"], sliceJson["omittedCount"])
+        assertEquals(60 - 42, sliceJson["omittedCount"]!!.jsonPrimitive.intOrNull)
+        assertEquals("symbols array must agree byte-wise at the boundary", fastJson["symbols"].toString(), sliceJson["symbols"].toString())
+        assertTrue(sliceJson["truncated"]!!.jsonPrimitive.boolean)
+        assertTrue(fastJson["truncated"]!!.jsonPrimitive.boolean)
+    }
+
+    @Test fun resultMetadataReserveExceedsClockMillisOverhead() {
+        // Shared envelope budget only works if the reserve strictly covers the
+        // field the envelope appends after the shrink decision:
+        // `,"clockMillis":` (15 units) + a 13-digit epoch-millis value (13) = 28.
+        assertTrue(
+            "RESULT_METADATA_RESERVE must exceed the clockMillis wrapper + 13 digits",
+            SafeToolSlice.RESULT_METADATA_RESERVE > ",\"clockMillis\":".length + 13,
+        )
     }
 
     @Test fun singleSymbolCeilingPin() {

@@ -174,6 +174,25 @@ class SafeToolSlice(
         const val MAX_RESULT_CHARS = 20_000
 
         /**
+         * Envelope metadata reserve subtracted from the shrink-loop budget in
+         * BOTH Ok pipelines (this class's `ok()` and the fast lane's
+         * `projectOkResult`): the shared effective budget both shrink loops
+         * decide on is `MAX_RESULT_CHARS - RESULT_METADATA_RESERVE`. The
+         * slice appends `,"clockMillis":<13-digit>` only AFTER the shrink
+         * decision, so the loop measures a candidate WITHOUT it — same shape
+         * the fast lane measures — and the two pipelines select identical
+         * symbol sets by construction, regardless of clock value. The
+         * reservation is what pays for the appended field (~28 bytes:
+         * 15-byte `,"clockMillis":` wrapper + 13-digit epoch millis).
+         * 64 keeps a >2× margin; 13-digit millis hold until epoch 10^13 ms
+         * (late 2286), after which millis render wider — the FINAL
+         * `MAX_RESULT_CHARS` backstop after emission (unchanged, in both
+         * places) still fails closed, so the reserve need not track the
+         * widest possible Long. internal: pinned by SymbolReceiptParityTest.
+         */
+        internal const val RESULT_METADATA_RESERVE: Int = 64
+
+        /**
          * Length of the deterministic pairing suffix appended to an
          * over-cap redacted id: the `#` separator plus a 32-hex (128-bit)
          * SHA-256 digest prefix — `1 + 16 * 2` UTF-16 units. Exposed so the
@@ -1131,6 +1150,13 @@ class SafeToolSlice(
      * asymmetries (this receipt's `clockMillis`, the tool echo rule, key
      * order). Shared helpers live in this companion (single source, #19 B3
      * stage-4); never re-copy them into [FastDispatch].
+     *
+     * Budget accounting is shared with the fast lane: both shrink loops
+     * decide against `MAX_RESULT_CHARS - RESULT_METADATA_RESERVE`, and this
+     * receipt's `clockMillis` is appended by the envelope AFTER the shrink
+     * loop (paid for by that reservation, not measured by it), so both
+     * pipelines cut identically regardless of clock value; the FINAL
+     * backstop that rejects an over-[MAX_RESULT_CHARS] JSON stays unchanged.
      */
     private fun ok(
         call: ToolCall,
@@ -1187,7 +1213,10 @@ class SafeToolSlice(
                 put("line", s.line)
             }
         }
-        fun build(chosen: List<kotlinx.serialization.json.JsonObject>, omittedCount: Int, truncated: Boolean): kotlinx.serialization.json.JsonObject =
+        // `includeClockMillis=false` is used ONLY by the shrink loop below: it
+        // measures the shared-envelope-budget candidate (no clockMillis); the
+        // FINAL receipt is emitted with clockMillis (the envelope's field).
+        fun build(chosen: List<kotlinx.serialization.json.JsonObject>, omittedCount: Int, truncated: Boolean, includeClockMillis: Boolean = true): kotlinx.serialization.json.JsonObject =
             buildJsonObject {
                 put("denied", false)
                 put("tool", cappedTake(dev.librepocket.redact.Redactor.redact(call.name).text, MAX_STRING_CHARS))
@@ -1198,7 +1227,7 @@ class SafeToolSlice(
                 put("omittedCount", omittedCount)
                 put("truncated", truncated)
                 put("fromStub", outcome.fromStub)
-                put("clockMillis", clock.millis())
+                if (includeClockMillis) put("clockMillis", clock.millis())
             }
         val chosen = ArrayList(symbolJsons)
         // Worst case accepted deliberately: the scan-down shrink re-serializes
@@ -1209,8 +1238,12 @@ class SafeToolSlice(
         while (chosen.size > 1) {
             val omittedCount = limitOmitted + (symbolJsons.size - chosen.size)
             val truncated = anyFieldTruncated || omittedCount > 0
-            val candidate = build(chosen, omittedCount, truncated).toString()
-            if (candidate.length <= MAX_RESULT_CHARS) break
+            // Shrink against the SHARED envelope budget: the candidate carries
+            // no clockMillis (the envelope appends it after the loop, paid for
+            // by RESULT_METADATA_RESERVE) — same measured shape as the fast
+            // lane, so cut points cannot diverge between the two pipelines.
+            val candidate = build(chosen, omittedCount, truncated, includeClockMillis = false).toString()
+            if (candidate.length <= MAX_RESULT_CHARS - RESULT_METADATA_RESERVE) break
             chosen.removeAt(chosen.lastIndex)
         }
         // A backend returning more than the effective item cap (min of the

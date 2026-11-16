@@ -475,9 +475,14 @@ interface FastToolExecutor {
  * → surrogate-safe cap + `#` + 32-hex SHA-256 of the full redacted string);
  * raw ids never ride the receipt. The
  * serialized result JSON is shrunk item-wise
- * to [SafeToolSlice.MAX_RESULT_CHARS] (dropping the tail, bumping
- * `omittedCount`); a single-symbol remainder still over budget is a typed
- * `EXEC_ERROR` denial — never over-budget output. `omittedCount` counts both
+ * to [SafeToolSlice.MAX_RESULT_CHARS] minus the shared metadata reserve
+ * ([SafeToolSlice.RESULT_METADATA_RESERVE]) — the same effective budget the
+ * slice shrinks against, so both pipelines cut identically regardless of
+ * clock value (the slice's `clockMillis` is decided by the envelope after
+ * the loop and absorbed by the reservation, not measured here) — dropping
+ * the tail and bumping `omittedCount`; a single-symbol remainder still over
+ * budget is a typed `EXEC_ERROR` denial — never over-budget output.
+ * `omittedCount` counts both
  * the item-cap drop and shrink-loop drops; `truncated` is true when any
  * field was truncated/raw-omitted/over-cap or `omittedCount > 0`.
  *
@@ -660,8 +665,11 @@ class LspSymbolsExecutor(
         while (chosen.size > 1) {
             val omittedCount = limitOmitted + (symbolJsons.size - chosen.size)
             val truncated = anyFieldTruncated || omittedCount > 0
+            // 與切片相同的共用 envelope 預算判定：候選本就不含 clockMillis
+            // （fast lane 無時鐘；切片亦改為 envelope 事後附加），
+            // 兩邊皆以 MAX_RESULT_CHARS - RESULT_METADATA_RESERVE 判定切點。
             val candidate = build(chosen, omittedCount, truncated).toString()
-            if (candidate.length <= SafeToolSlice.MAX_RESULT_CHARS) break
+            if (candidate.length <= SafeToolSlice.MAX_RESULT_CHARS - SafeToolSlice.RESULT_METADATA_RESERVE) break
             chosen.removeAt(chosen.lastIndex)
         }
         val omittedCount = limitOmitted + (symbolJsons.size - chosen.size)

@@ -6,6 +6,7 @@ import java.io.InputStream
 import java.io.OutputStream
 import java.util.concurrent.TimeUnit
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -19,7 +20,7 @@ import org.junit.Test
  * `entryClockFailed` ⇒ preflightExpired kill 臂（有界返回 Drained(timedOut=true)）。
  *
  * 注意：`isExpired` 本身不吞拋——fail-closed 收斂（拋⇒視為逾期）由所有 call site
- * 的 `try/catch` 落實；本檔如實釘住該分工（見 [isExpiredClockThrowFailsClosedTrue]）。
+ * 的 `try/catch` 落實；本檔如實釘住該分工（見 [isExpiredClockThrowPropagatesRaw]）。
  */
 class ElevatedClockFallbackTest {
     @Test fun computeDeadlineNanosNegativeTimeoutReturnsNow() {
@@ -46,16 +47,14 @@ class ElevatedClockFallbackTest {
         )
     }
 
-    @Test fun isExpiredClockThrowFailsClosedTrue() {
+    @Test fun isExpiredClockThrowPropagatesRaw() {
         // isExpired 本身對拋鐘不吞——fail-closed 收斂由 call site 的 try/catch 落實
         // （awaitInternal 入口 preflight／cancelNow／legacyCancel 皆拋⇒true，見 def）。
-        // 本測試釘住該分工：裸 isExpired 會透傳拋出，call site 契約收斂為 true。
-        val failClosed = try {
+        // 本測試釘住該分工：caller 負責收斂拋出（見 awaitInternal／awaitSpawn），裸 isExpired
+        // 透傳拋出。處理至 'fail-closed at call sites' 的邏輯屬 call-site，不在本測試重複。
+        assertThrows(RuntimeException::class.java) {
             ElevatedCallSupervisor.isExpired(0L) { throw RuntimeException("clock boom") }
-        } catch (_: Throwable) {
-            true
         }
-        assertTrue("throwing clock must converge to fail-closed (expired) at call sites", failClosed)
     }
 
     @Test fun awaitPreSpawnClockThrowYieldsExpiredNoSpawn() {

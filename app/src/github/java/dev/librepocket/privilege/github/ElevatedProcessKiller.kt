@@ -104,8 +104,9 @@ import java.util.concurrent.atomic.AtomicInteger
  *   Method 在、且本次 `startInstant` 探測可讀）時，兩個信號（destroy 先、
  *   destroyForcibly 後）各自獨立重驗（與子孫逐信號重驗一致），信號經 **handle**
  *   的 `destroy/destroyForcibly` Method 發出（handle 即 attested 身份；
- *   `ProcessHandle.destroy()` 回 Boolean，false 即 EPERM——handle 信號失敗無聲，
- *   與 JDK `process.destroy()` 同，不計入任何計數）；本體信號前僅「proven recycled
+ *   `ProcessHandle.destroy()` 回 Boolean，false 即 EPERM——handle 信號 `invoke`
+ *   返回 false 時計入 [handleSignalRefusedCount]（telemetry-only，不接
+ *   admission/verdict）；Android 實機全數走 unattested 臂）；本體信號前僅「proven recycled
  *   mismatch」（兩讀皆成功＋startInstant 不符）才跳過（見上 R1(a)）；其餘不可驗
  *   一律保守退化為無條件 destroy（fail toward destruction，per-signal）。
  * - 平台**完全無 attestation toolkit**（`toHandle` 缺席／`ProcessHandle` 類缺席／
@@ -337,8 +338,8 @@ object ElevatedProcessKiller {
      *   每次信號前 `isAlive()`＋`startInstant()` 重讀，與子孫逐信號重驗一致）；
      *   attested ⇒ 信號經 **handle** 的 `destroy/destroyForcibly` Method 發出
      *   （handle 即 attested 身份；`ProcessHandle.destroy()` 回 Boolean，false 即
-     *   EPERM——handle 信號失敗無聲，與 JDK `process.destroy()` 同，不計入任何
-     *   計數），不經 `process.destroy()`。**R1(a)：本體不再使用
+     *   EPERM——handle 信號 `invoke` 返回 false 時計入 [handleSignalRefusedCount]（telemetry-only，
+     *   不接 admission/verdict）；Android 實機全數走 unattested 臂），不經 `process.destroy()`。**R1(a)：本體不再使用
      *   「unverifiable ⇒ skip」——僅「proven recycled ⇒ skip」**：僅當兩讀皆成功
      *   且 `startInstant` 不符（可證回收）⇒ 跳過該信號＋[pidReuseSkipped]＋
      *   [bodyPidReuseSkipped]，並以 one-shot latch 抑制本 killTree 剩餘本體信號

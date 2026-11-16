@@ -1306,6 +1306,187 @@ class ElevatedRunnerP1B2Test {
         }
     }
 
+    // ---- Round-9 P2：cleanup worker Thread「建構」拋（constructor-OOME）— never-started 收斂 pin（test seam：cleanupThreadFactory） ----
+
+    /**
+     * [ElevatedProcessIo.cleanupThreadFactory] 注入 `throw OutOfMemoryError` 模擬 Thread(...)
+     * constructor 拋——worker 從未存在、入口 CAS 不可能已被搶 ⇒ 與 startThread 拋同一
+     * never-started 收斂（claim-CAS never-started 臂同臂）：quarantine 先行登記／已佔槽釋放／
+     * debt 收斂／killNeverAttempted 恰好一次。飽和態（beginLingerDebt 已記）斷言 debt 回基線。
+     * finally 還原注入的預設 factory。
+     */
+    @Test fun saturatedCleanupThreadConstructorFailureConvergesLingerDebt() {
+        ElevatedCleanupTracker.clearUnverified()
+        ElevatedCleanupTracker.noteClean()
+        pollOutstandingTo(0)
+        val debtBefore = ElevatedCleanupTracker.lingerDebtCount()
+        val lingerFloorBefore = ElevatedCleanupTracker.lingerDebtFloorHits()
+        val untrackedBefore = ElevatedCleanupTracker.untrackedResidualCount()
+        val killNeverBefore = ElevatedCleanupTracker.killNeverAttemptedCount()
+        val failuresBefore = ElevatedCleanupTracker.quarantineRegistrationFailedCount()
+        val factoryBefore = ElevatedProcessIo.cleanupThreadFactory
+        var prefilled = 0
+        try {
+            repeat(ElevatedCleanupTracker.MAX_OUTSTANDING_CLEANUPS) {
+                assertTrue(ElevatedCleanupTracker.acquireSlot())
+                prefilled++
+            }
+            val quarantineBefore = ElevatedCleanupTracker.quarantinedCount()
+            val victim = KillableImmediateProcess()
+            ElevatedProcessIo.cleanupThreadFactory = { _, _, _ -> throw OutOfMemoryError("ctor OOM (test seam)") }
+            val d = ElevatedProcessIo.drainWithThreadStarter(
+                process = victim,
+                timeoutMs = 300L,
+                killer = { /* never runs: constructor fails before any thread exists */ it.destroy() },
+                isCancelled = { false },
+                startThread = { it.start() },
+            )
+            // constructor-throw 臂恰好 endLingerDebt 一次：debt 必須回到基線（與 worker 退出無關——worker 從未存在）。
+            assertEquals(debtBefore, ElevatedCleanupTracker.lingerDebtCount())
+            assertEquals(0, ElevatedCleanupTracker.lingerDebtCount())
+            assertEquals(lingerFloorBefore, ElevatedCleanupTracker.lingerDebtFloorHits())
+            assertEquals(
+                "kill-never-attempted counter must increment exactly once",
+                killNeverBefore + 1,
+                ElevatedCleanupTracker.killNeverAttemptedCount(),
+            )
+            // 無 worker 即無殘留 ⇒ untracked residual 計數不動（與 start-throw 臂互斥語義不變）。
+            assertEquals(untrackedBefore, ElevatedCleanupTracker.untrackedResidualCount())
+            // 預設 registrar 成功 ⇒ 失敗計數不動（epilogue 與 drain-end helper 皆 dedup 冪等、皆不計）。
+            assertEquals(
+                failuresBefore,
+                ElevatedCleanupTracker.quarantineRegistrationFailedCount(),
+            )
+            assertFalse(
+                "registered arm must not brick admission",
+                ElevatedCleanupTracker.isRegistrationFailedSticky(),
+            )
+            assertTrue("cleanupIncomplete must stay true", d.cleanupIncomplete)
+            assertTrue("untrackedResidual must surface", d.untrackedResidual)
+            assertTrue("timedOut must stay true (kill path)", d.timedOut)
+            assertEquals(-1, d.exitCode)
+            // 飽和態 fixture handle 已於 acquisition-time 同鎖登記（gate 7）。
+            assertEquals(
+                1,
+                ElevatedCleanupTracker.quarantinedCount() - quarantineBefore,
+            )
+            assertTrue(
+                "quarantine must contain the fixture",
+                ElevatedCleanupTracker.quarantineContains(victim),
+            )
+            assertEquals(
+                ElevatedCleanupTracker.MAX_OUTSTANDING_CLEANUPS,
+                ElevatedCleanupTracker.outstanding(),
+            )
+            // 先釋預填槽——outstanding 歸零後 gate 1 通過；debt 已於 ctor 臂同步收斂（== debtBefore），
+            // gate 6 亦通過；gate 7（quarantine acquisition-time 登記）於 debt==0 時獨力封死。
+            repeat(prefilled) { ElevatedCleanupTracker.releaseSlot() }
+            prefilled = 0
+            pollOutstandingTo(0)
+            assertEquals(
+                ElevatedCleanupTracker.Admission.QUARANTINE,
+                ElevatedCleanupTracker.tryEnterReserved(),
+            )
+            assertEquals(0, ElevatedCleanupTracker.activeCalls())
+            // 清除 quarantine 後 admission 必須恢復 OK（debt 0、quarantine 空、outstanding 歸零、
+            // breaker 經 noteClean 歸零）。
+            ElevatedCleanupTracker.clearUnverified()
+            ElevatedCleanupTracker.noteClean()
+            val admission = ElevatedCleanupTracker.tryEnterReserved()
+            if (admission == ElevatedCleanupTracker.Admission.OK) {
+                ElevatedCleanupTracker.leaveCall()
+            }
+            assertEquals(ElevatedCleanupTracker.Admission.OK, admission)
+        } finally {
+            ElevatedProcessIo.cleanupThreadFactory = factoryBefore
+            repeat(prefilled) { ElevatedCleanupTracker.releaseSlot() }
+            ElevatedCleanupTracker.clearUnverified()
+            ElevatedCleanupTracker.noteClean()
+            pollOutstandingTo(0)
+            awaitNoElevatedThreads()
+        }
+    }
+
+    /** 非飽和變體：constructor 拋時 acquire 已成功佔槽——epilogue 登記成功 ⇒ 釋槽恰好一次⇒
+     *  outstanding 歸零；無 debt 可言（`!acquired` 才記）；其餘 accounting 對齊 start-throw 臂。 */
+    @Test fun unsaturatedCleanupThreadConstructorFailureConvergesSlotAndQuarantine() {
+        ElevatedCleanupTracker.clearUnverified()
+        ElevatedCleanupTracker.noteClean()
+        ElevatedCleanupTracker.resetPeak()
+        pollOutstandingTo(0)
+        val debtBefore = ElevatedCleanupTracker.lingerDebtCount()
+        val lingerFloorBefore = ElevatedCleanupTracker.lingerDebtFloorHits()
+        val untrackedBefore = ElevatedCleanupTracker.untrackedResidualCount()
+        val killNeverBefore = ElevatedCleanupTracker.killNeverAttemptedCount()
+        val failuresBefore = ElevatedCleanupTracker.quarantineRegistrationFailedCount()
+        val outstandingBefore = ElevatedCleanupTracker.outstanding()
+        val factoryBefore = ElevatedProcessIo.cleanupThreadFactory
+        try {
+            val quarantineBefore = ElevatedCleanupTracker.quarantinedCount()
+            val victim = KillableImmediateProcess()
+            ElevatedProcessIo.cleanupThreadFactory = { _, _, _ -> throw OutOfMemoryError("ctor OOM (test seam)") }
+            val d = ElevatedProcessIo.drainWithThreadStarter(
+                process = victim,
+                timeoutMs = 300L,
+                killer = { /* never runs: constructor fails before any thread exists */ it.destroy() },
+                isCancelled = { false },
+                startThread = { it.start() },
+            )
+            // acquire 成功而登記成功 ⇒ epilogue 已釋槽——outstanding 回基線。
+            assertEquals(outstandingBefore, ElevatedCleanupTracker.outstanding())
+            assertEquals(0, ElevatedCleanupTracker.outstanding())
+            // 恰一次 acquire（constructor 拋前）⇒ peak==1（release 後不清零）。
+            assertEquals(1, ElevatedCleanupTracker.peakOutstanding())
+            // 無 debt 可言（`!acquired` 才記）：debt 與 floor 皆不動。
+            assertEquals(debtBefore, ElevatedCleanupTracker.lingerDebtCount())
+            assertEquals(0, ElevatedCleanupTracker.lingerDebtCount())
+            assertEquals(lingerFloorBefore, ElevatedCleanupTracker.lingerDebtFloorHits())
+            assertEquals(
+                "kill-never-attempted counter must increment exactly once",
+                killNeverBefore + 1,
+                ElevatedCleanupTracker.killNeverAttemptedCount(),
+            )
+            assertEquals(untrackedBefore, ElevatedCleanupTracker.untrackedResidualCount())
+            assertEquals(
+                failuresBefore,
+                ElevatedCleanupTracker.quarantineRegistrationFailedCount(),
+            )
+            assertFalse(
+                "registered arm must not brick admission",
+                ElevatedCleanupTracker.isRegistrationFailedSticky(),
+            )
+            assertTrue("cleanupIncomplete must stay true", d.cleanupIncomplete)
+            assertTrue("untrackedResidual must surface", d.untrackedResidual)
+            assertTrue("timedOut must stay true (kill path)", d.timedOut)
+            assertEquals(-1, d.exitCode)
+            // 非飽和 acquired==true：registrar 於 epilogue 首次登記（acquisition-time 不登記）＋
+            // drain-end helper dedup 再嘗（冪等）⇒ quarantine 恰好 +1 且含 fixture。
+            assertEquals(
+                1,
+                ElevatedCleanupTracker.quarantinedCount() - quarantineBefore,
+            )
+            assertTrue(
+                "quarantine must contain the fixture",
+                ElevatedCleanupTracker.quarantineContains(victim),
+            )
+            // 清除 quarantine 後 admission 必須恢復 OK（debt 0、quarantine 空、outstanding 歸零、
+            // breaker 經 noteClean 歸零）。
+            ElevatedCleanupTracker.clearUnverified()
+            ElevatedCleanupTracker.noteClean()
+            val admission = ElevatedCleanupTracker.tryEnterReserved()
+            if (admission == ElevatedCleanupTracker.Admission.OK) {
+                ElevatedCleanupTracker.leaveCall()
+            }
+            assertEquals(ElevatedCleanupTracker.Admission.OK, admission)
+        } finally {
+            ElevatedProcessIo.cleanupThreadFactory = factoryBefore
+            ElevatedCleanupTracker.clearUnverified()
+            ElevatedCleanupTracker.noteClean()
+            pollOutstandingTo(0)
+            awaitNoElevatedThreads()
+        }
+    }
+
     // ---- Round-6 P2（D-A5）＋Round-7 P2（claim-CAS）：cleanup worker 起線程「已起 OS 線程後再拋」——claimed worker 殘留之 P2 pin ----
 
     /**
@@ -1488,7 +1669,7 @@ class ElevatedRunnerP1B2Test {
                 d.untrackedResidual,
             )
             // while blocked：custody 已轉移 worker（槽保留）；admission 續拒（gate 5 預留）；floor 不動。
-            assertEquals(1, ElevatedCleanupTracker.outstanding())
+            pollOutstandingTo(1)
             assertEquals(quarantineBefore, ElevatedCleanupTracker.quarantinedCount())
             assertEquals(
                 ElevatedCleanupTracker.Admission.BACKLOG_FULL,

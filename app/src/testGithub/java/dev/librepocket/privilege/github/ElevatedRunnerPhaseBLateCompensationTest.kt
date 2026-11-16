@@ -71,11 +71,17 @@ class ElevatedRunnerPhaseBLateCompensationTest {
         pollActiveTo(0)
         ElevatedCleanupTracker.clearUnverified()
         ElevatedCleanupTracker.noteClean()
+        // 還原預設 registrar（各測試經 [ElevatedProcessIo.quarantineRegistrar] 注入拋出臂後不殘留）。
+        ElevatedProcessIo.quarantineRegistrar = { ElevatedCleanupTracker.quarantineUnverified(it) }
         awaitNoElevatedThreads()
         assertEquals("test leaked outstanding slots", 0, leakedOutstanding)
         assertEquals("test leaked active calls", 0, leakedActive)
         assertEquals("test leaked quarantined processes", 0, leakedQuarantine)
         assertEquals("release floor must not be hit during this test", floorBefore, ElevatedCleanupTracker.releaseFloorHits())
+        // P1B2 tearDown 對齊：debt 歸零需有界輪詢（worker finally 非同步收尾），10 s 上界。
+        pollTrue("linger debt must unwind to zero", 10_000L) {
+            ElevatedCleanupTracker.lingerDebtCount() == 0
+        }
     }
 
     private fun pollOutstandingTo(expected: Int, boundMs: Long = 15_000L) {
@@ -867,6 +873,152 @@ class ElevatedRunnerPhaseBLateCompensationTest {
     }
 
     /**
+     * (b3.6) `elevated-late-spawn` daemon「Thread 建構」拋（Round-9 P2 pin；harness 同 (b)；
+     * test seam：[ElevatedProcessIo.lateSpawnThreadFactory] 注入 constructor 拋）：
+     * caller CAS 認領成功後 `startLateDaemon` 佔槽→`lateSpawnThreadFactory` 拋
+     * OutOfMemoryError／RuntimeException（daemon 從未存在、入口 CAS 不可能被搶）→
+     * 既有 start-throw catch 臂（daemonClaimed CAS-won never-started 分支，建構已併入同一
+     * try）收斂：`releaseCleanupSlotAfterVerify(v, verified=false, slotHeld=true)`→登記先行
+     * →釋槽＋quarantine（預設 registrar 成功）＋lateIncomplete 置位＋countUncleanOnce 恰好
+     * 一次；零 kill 嘗試；不重試起線程。
+     * 與 (b) 起線程失敗臂逐一對齊——constructor-throw 與 start-throw 同臂；
+     * admission 以 QUARANTINE 拒（gate 7）→`clearUnverified()` 後恢復 OK。
+     * finally 還原注入的預設 factory。
+     */
+    @Test fun lateSpawnDaemonThreadConstructorFailureConvergesExactlyOnce() {
+        val ctorFailures: List<() -> Throwable> = listOf(
+            { OutOfMemoryError("simulated OOM in elevated-late-spawn ctor (test seam)") },
+            { RuntimeException("simulated ctor failure on elevated-late-spawn (test seam)") },
+        )
+        for (boom in ctorFailures) {
+            ElevatedCleanupTracker.clearUnverified()
+            ElevatedCleanupTracker.noteClean()
+            pollOutstandingTo(0)
+            pollActiveTo(0)
+            ElevatedCleanupTracker.resetPeak()
+            // PG-8：每次迭代一個全新 baseline——登記數須恰為 before＋1（additive-only）。
+            val quarantineBefore = ElevatedCleanupTracker.quarantinedCount()
+            val spawnEntered = CountDownLatch(1)
+            val spawnRelease = CountDownLatch(1)
+            val cancelGate = CountDownLatch(1)
+            val cancelBlockEntered = CountDownLatch(1)
+            // armed killer 阻塞門：teardown（所有斷言之後）才放；期間任何 kill
+            // 嘗試皆被 kills 計數且卡死於 latch，必然被零 kill 斷言抓住。
+            val killerLatch = CountDownLatch(1)
+            val lateRef = AtomicReference<LatchBlockedDestroyProcess?>()
+            val resultRef = AtomicReference<ElevatedCallSupervisor.Res<Process>?>()
+            val kills = AtomicInteger(0)
+            val isCancelled: () -> Boolean = {
+                if (spawnEntered.count > 0) {
+                    false
+                } else if (resultRef.get() != null) {
+                    false
+                } else {
+                    cancelBlockEntered.countDown()
+                    stuckAwait(cancelGate)
+                    true
+                }
+            }
+            val factoryBefore = ElevatedProcessIo.lateSpawnThreadFactory
+            ElevatedProcessIo.lateSpawnThreadFactory = { _, _, _ -> throw boom() }
+            val bg = Thread {
+                resultRef.set(
+                    ElevatedCallSupervisor.awaitSpawnWithThreadStarter(
+                        deadlineNanos = System.nanoTime() + TimeUnit.SECONDS.toNanos(60),
+                        isCancelled = isCancelled,
+                        killer = {
+                            kills.incrementAndGet()
+                            stuckAwait(killerLatch)
+                        },
+                        startThread = { it.start() },
+                    ) {
+                        spawnEntered.countDown()
+                        stuckAwait(spawnRelease)
+                        LatchBlockedDestroyProcess(killerLatch).also { lateRef.set(it) }
+                    },
+                )
+            }.also { it.isDaemon = true; it.start() }
+            try {
+                assertTrue("spawn must enter", spawnEntered.await(10_000L, TimeUnit.MILLISECONDS))
+                assertTrue(
+                    "caller watcher must block in cancel gate",
+                    cancelBlockEntered.await(10_000L, TimeUnit.MILLISECONDS),
+                )
+                // 放行 spawn→worker 發佈（expired 仍 false，留 Val 給 caller）。
+                spawnRelease.countDown()
+                pollRefNonNull(lateRef, "late spawn")
+                pollTrue("spawn worker must exit before cancel gate opens") {
+                    countLive("elevated-supervisor") == 1
+                }
+                cancelGate.countDown()
+                val res = pollRefNonNull(resultRef, "caller result")
+                assertTrue("expected Res.Expired, got $res", res is ElevatedCallSupervisor.Res.Expired)
+                res as ElevatedCallSupervisor.Res.Expired
+                assertTrue(
+                    "daemon constructor failure must flag cleanupIncomplete, got $res",
+                    res.hasLinger,
+                )
+                val late = pollRefNonNull(lateRef, "late spawn")!!
+                assertEquals("killer must never run on the constructor-failure path", 0, kills.get())
+                assertEquals(
+                    "destroy() must never run on the constructor-failure path",
+                    0,
+                    late.destroyCalls.get(),
+                )
+                assertEquals(
+                    "destroyForcibly() must never run on the constructor-failure path",
+                    0,
+                    late.destroyForciblyCalls.get(),
+                )
+                // 預設 registrar 成功 ⇒ 登記恰好 +1 且含 fixture（additive-only baseline）。
+                assertEquals(
+                    1,
+                    ElevatedCleanupTracker.quarantinedCount() - quarantineBefore,
+                )
+                assertTrue(
+                    "quarantine must contain the late victim",
+                    ElevatedCleanupTracker.quarantineContains(late),
+                )
+                pollOutstandingTo(0)
+                assertEquals("floor must not be hit (exactly once)", floorBefore, ElevatedCleanupTracker.releaseFloorHits())
+                assertEquals(
+                    "breaker must count exactly one incomplete cleanup",
+                    1,
+                    ElevatedCleanupTracker.consecutiveCount(),
+                )
+                assertEquals(0, countLive("elevated-late-spawn"))
+                assertEquals(1, ElevatedCleanupTracker.peakOutstanding())
+                val admission = ElevatedCleanupTracker.tryEnterReserved()
+                if (admission == ElevatedCleanupTracker.Admission.OK) {
+                    ElevatedCleanupTracker.leaveCall()
+                }
+                assertEquals(ElevatedCleanupTracker.Admission.QUARANTINE, admission)
+                // 清除 quarantine 後 admission 必須恢復 OK（outstanding 歸零、breaker 經
+                // noteClean 歸零、`!acquired` 無 debt 可言）——與 (b) 同一恢復契約。
+                ElevatedCleanupTracker.clearUnverified()
+                ElevatedCleanupTracker.noteClean()
+                val admissionAfter = ElevatedCleanupTracker.tryEnterReserved()
+                if (admissionAfter == ElevatedCleanupTracker.Admission.OK) {
+                    ElevatedCleanupTracker.leaveCall()
+                }
+                assertEquals(ElevatedCleanupTracker.Admission.OK, admissionAfter)
+            } finally {
+                ElevatedProcessIo.lateSpawnThreadFactory = factoryBefore
+                // 所有斷言完成後才放 armed killer latch（teardown 放行）；countDown 只此一次。
+                killerLatch.countDown()
+                cancelGate.countDown()
+                spawnRelease.countDown()
+                bg.join(10_000L)
+                pollOutstandingTo(0)
+                pollActiveTo(0)
+                ElevatedCleanupTracker.clearUnverified()
+                ElevatedCleanupTracker.noteClean()
+                awaitNoElevatedThreads()
+            }
+        }
+    }
+
+    /**
      * (b3.5) `elevated-late-spawn` 起線程「已起 OS 線程後再拋」極角（Round-6 D-A5 pin）：
      * startThread ＝`{ t -> t.start(); throw OutOfMemoryError(...) }`——OS 線程已起、daemon
      * 體與 catch 臂之間以 boundary ownership CAS（startLateDaemon 之 `daemonClaimed`）恰好
@@ -1060,7 +1212,7 @@ class ElevatedRunnerPhaseBLateCompensationTest {
                 res is ElevatedCallSupervisor.Res.Expired && res.hasLinger,
             )
             // seal 在位：markLingering 持槽（state 0→1）⇒ outstanding==1 ⇒ admission 拒。
-            assertEquals(1, ElevatedCleanupTracker.outstanding())
+            pollOutstandingTo(1)
             val admission = ElevatedCleanupTracker.tryEnterReserved()
             if (admission == ElevatedCleanupTracker.Admission.OK) {
                 ElevatedCleanupTracker.leaveCall()
@@ -1111,6 +1263,97 @@ class ElevatedRunnerPhaseBLateCompensationTest {
             ElevatedCleanupTracker.clearUnverified()
             ElevatedCleanupTracker.noteClean()
             awaitNoElevatedThreads()
+        }
+    }
+
+    /**
+     * (spawn-ctor) Round-9 P2 pin：`elevated-supervisor` worker「Thread 建構」拋
+     * （test seam：[ElevatedProcessIo.spawnThreadFactory] 注入 constructor 拋；
+     * harness 決定性：無任何 latch 閘——建構失敗為同步路徑，caller 立即返回）：
+     * worker 從未存在、block() 不執行、holder 不寫 ⇒ spawnClaimed CAS-won（本臂唯一
+     * 可達分支）⇒ `Res.Expired(hasLinger = false)`；零 kill 嘗試；零 quarantine 登記；
+     * outstanding 不動（從未佔槽）；breaker 不計（spawn 從未取得 slot／Debt）；
+     * debt／floor 不動；admission 維持 OK。語義即「spawn 從未發生」。
+     * finally 還原注入的預設 factory。
+     */
+    @Test fun spawnThreadConstructorFailureConvergesWithoutChild() {
+        val ctorFailures: List<() -> Throwable> = listOf(
+            { OutOfMemoryError("simulated OOM in elevated-supervisor ctor (test seam)") },
+            { RuntimeException("simulated ctor failure on elevated-supervisor (test seam)") },
+        )
+        for (boom in ctorFailures) {
+            ElevatedCleanupTracker.clearUnverified()
+            ElevatedCleanupTracker.noteClean()
+            pollOutstandingTo(0)
+            pollActiveTo(0)
+            ElevatedCleanupTracker.resetPeak()
+            val breakerBefore = ElevatedCleanupTracker.consecutiveCount()
+            val debtBefore = ElevatedCleanupTracker.lingerDebtCount()
+            val quarantineBefore = ElevatedCleanupTracker.quarantinedCount()
+            val killNeverBefore = ElevatedCleanupTracker.killNeverAttemptedCount()
+            val untrackedBefore = ElevatedCleanupTracker.untrackedResidualCount()
+            val spawnEntered = CountDownLatch(1)
+            val kills = AtomicInteger(0)
+            val resultRef = AtomicReference<ElevatedCallSupervisor.Res<Process>?>()
+            val factoryBefore = ElevatedProcessIo.spawnThreadFactory
+            ElevatedProcessIo.spawnThreadFactory = { _, _, _ -> throw boom() }
+            val bg = Thread {
+                resultRef.set(
+                    ElevatedCallSupervisor.awaitSpawnWithThreadStarter(
+                        deadlineNanos = System.nanoTime() + TimeUnit.SECONDS.toNanos(60),
+                        // isCancelled 恆 false：caller 於建構拋後同步返回，不入輪詢迴圈。
+                        isCancelled = { false },
+                        killer = { kills.incrementAndGet() },
+                        startThread = { it.start() },
+                    ) {
+                        // block 絕不可執行（worker 不存在）。
+                        spawnEntered.countDown()
+                        NoOpHangProcess()
+                    },
+                )
+            }.also { it.isDaemon = true; it.start() }
+            try {
+                val res = pollRefNonNull(resultRef, "caller result")
+                assertTrue("expected Res.Expired, got $res", res is ElevatedCallSupervisor.Res.Expired)
+                assertFalse(
+                    "constructor-throw arm must return hasLinger=false (zero live child), got $res",
+                    (res as ElevatedCallSupervisor.Res.Expired).hasLinger,
+                )
+                assertEquals(
+                    "spawn block must never run (constructor threw before any thread existed)",
+                    1,
+                    spawnEntered.count,
+                )
+                assertEquals("killer must never be signalled", 0, kills.get())
+                assertEquals(0, countLive("elevated-supervisor"))
+                pollOutstandingTo(0)
+                assertEquals(0, ElevatedCleanupTracker.outstanding())
+                assertEquals(0, ElevatedCleanupTracker.activeCalls())
+                assertEquals(
+                    "breaker must not count (spawn never acquired a slot / Debt)",
+                    breakerBefore,
+                    ElevatedCleanupTracker.consecutiveCount(),
+                )
+                assertEquals(quarantineBefore, ElevatedCleanupTracker.quarantinedCount())
+                assertEquals(debtBefore, ElevatedCleanupTracker.lingerDebtCount())
+                assertEquals(floorBefore, ElevatedCleanupTracker.releaseFloorHits())
+                assertEquals(killNeverBefore, ElevatedCleanupTracker.killNeverAttemptedCount())
+                assertEquals(untrackedBefore, ElevatedCleanupTracker.untrackedResidualCount())
+                assertEquals(0, ElevatedCleanupTracker.peakOutstanding())
+                val admission = ElevatedCleanupTracker.tryEnterReserved()
+                if (admission == ElevatedCleanupTracker.Admission.OK) {
+                    ElevatedCleanupTracker.leaveCall()
+                }
+                assertEquals(ElevatedCleanupTracker.Admission.OK, admission)
+            } finally {
+                ElevatedProcessIo.spawnThreadFactory = factoryBefore
+                bg.join(10_000L)
+                pollOutstandingTo(0)
+                pollActiveTo(0)
+                ElevatedCleanupTracker.clearUnverified()
+                ElevatedCleanupTracker.noteClean()
+                awaitNoElevatedThreads()
+            }
         }
     }
 

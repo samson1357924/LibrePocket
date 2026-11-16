@@ -404,9 +404,12 @@ class FastDispatchTest {
             )
         }
         // 單複數 `find symbols` 剝空 ⇒ 澄清（且不會 Fast）。
+        // #19 B3 stage-8.3（Re-review #8 A2）：`查 find 符號` 的 EN-delimited 殘餘
+        // `符號` 原樣保留 ⇒ FAST `符號`（原 NEED_CLARIFICATION pin 翻轉——
+        // Step A SYMBOL_OPENER_EN 消費即設 enDelimited；見 enCommandDelimitedIdentifiersAreVerbatim）。
         val bareSymbol = decide("查 find 符號")
-        assertEquals(RouteKind.DENIED, bareSymbol.route)
-        assertEquals(DenyReason.NEED_CLARIFICATION, bareSymbol.reasonCode)
+        assertEquals(RouteKind.FAST, bareSymbol.route)
+        assertEquals("符號", Json.parseToJsonElement(bareSymbol.toolCall!!.argumentsJson).jsonObject["query"]!!.jsonPrimitive.content)
         val bare = decide("find symbols")
         assertEquals(RouteKind.DENIED, bare.route)
         assertEquals(DenyReason.NEED_CLARIFICATION, bare.reasonCode)
@@ -1519,9 +1522,10 @@ class FastDispatchTest {
             // 殘餘 `是` 為合法單一 L* token ⇒ FAST query=`是`（不是澄清）；
             // 見 positionalCueGrammarPins。「查 要 用 符號」殘餘 `要 用` 含空白 ⇒ 澄清。
             "查 要 用 符號",
-            // `Symbol`/`symbols` 是 cue 詞，剝空後無有意義殘餘 ⇒ 澄清。
-            "查 Symbol 符號",
-            "查 symbols 符號",
+            // #19 B3 stage-8.3（Re-review #8 A2）：`查 Symbol 符號`／`查 symbols 符號`
+            // 的 EN command-form 消費（SYMBOL_OPENER_CMD）即設 enDelimited ⇒ Step C 不剝離，
+            // EN-delimited 殘餘 `符號` 原樣保留 ⇒ FAST `符號`（原 NEED_CLARIFICATION pin 翻轉）；
+            // 不再在此釘為澄清——見 enCommandDelimitedIdentifiersAreVerbatim 的翻轉 pin。
             // astral-only remainder：hasSymbolQuery 以 BMP char 錨定，𠮷 的兩個
             // surrogate units 皆非 letter/digit ⇒ 澄清（fail-safe，已記錄；
             // hasSymbolQuery 保持 BMP-based，不改動該 predicate）。
@@ -3125,5 +3129,89 @@ class FastDispatchTest {
             assertEquals(text, before, backend.invocations.get())
         }
         assertEquals(0, backend.invocations.get())
+    }
+
+    @Test fun enCommandDelimitedIdentifiersAreVerbatim() = runBlocking {
+        // #19 B3 stage-8.3（Re-review #8 A2, P2 BLOCKER）：EN 命令形劃定的殘餘為
+        // verbatim identifier——Step C 尾綴剝離與 pre-Step-B′／post-Step-D 兩道歧義守衛
+        // 一律不適用（enDelimited 旗標：SYMBOL_OPENER_EN／SYMBOL_OPENER_CMD／
+        // SYMBOL_LEADING_SYMBOLS 任一消費即設；CJK opener 消費不設）。
+        // 每對（text → expectedQuery）：decide() FAST + toolName lsp.symbols + query 精確等值
+        // （argumentsJson parseToJsonElement 風格，與 affirmativeSymbolCommandsStayFast 一致）＋
+        // decideAndDispatch（同一 fresh CountingBackend）執行且 invocations +1、
+        // receipt body 原樣回顯識別字（"name":"$expectedQuery:example"）。
+        // 多 token 殘餘（空白）⇒ Step E 拒絕 ⇒ NEED_CLARIFICATION（絕不執行）——
+        // EN-delimited 分支僅限單一 token；CJK 分支行為逐位元不變
+        // （`查 Foo 符號` → FAST `Foo` 等既有 pin 維持綠燈）。
+        val backend = CountingBackend()
+        val dispatcher = lspDispatcher(backend)
+        for ((text, expectedQuery) in listOf(
+            "symbols Foo符號" to "Foo符號",
+            "find symbol Foo符號" to "Foo符號",
+            "find symbols Foo符號" to "Foo符號",
+            "search symbol Foo符號" to "Foo符號",
+            "search symbols Foo符號" to "Foo符號",
+            "symbols 符號" to "符號",
+            // 混合 CJK opener + EN cue：CJK opener 不設 enDelimited，但 EN 命令形消費即設
+            // ⇒ 同一 EN-delimited 規則適用。
+            "查 symbols Foo符號" to "Foo符號",
+            // 混合 opener＋黏 cue 殘餘（stage-8.3；記錄已接受 verbatim 殘餘：
+            // EN grammar 劃定 ⇒ 歧義守衛不適用、不剝離）：
+            "symbols 符號符號" to "符號符號",
+            "查 symbols 符號符號" to "符號符號",
+            "symbols Foo符號xyz" to "Foo符號xyz",
+            // Step D（CJK/EN 共用之邊緣類）剝離尾端 `。`；en-delimited 分支同樣適用。
+            "symbols Foo符號。" to "Foo符號",
+            // #19 B3 stage-8.3 翻轉 pins（原 NEED_CLARIFICATION——EN 劃定語意校正）：
+            // EN-delimited 殘餘 `符號` 原樣保留 ⇒ FAST `符號`。
+            "查 find 符號" to "符號",
+            "查 Symbol 符號" to "符號",
+            "查 symbols 符號" to "符號",
+            // 對稱翻轉 pins（與 find/Symbol 同族）：
+            "查 lookup 符號" to "符號",
+            "查 locate 符號" to "符號",
+            // 前緣剝離殘餘（記錄已接受殘餘：Step D 去全形 `？` ⇒ verbatim `符號`）：
+            "symbols ？符號" to "符號",
+        )) {
+            val d = decide(text)
+            assertEquals(text, RouteKind.FAST, d.route)
+            assertEquals(text, "lsp.symbols", d.toolCall?.toolName)
+            assertNotNull(text, d.toolCall)
+            assertEquals(
+                text,
+                expectedQuery,
+                Json.parseToJsonElement(d.toolCall!!.argumentsJson).jsonObject["query"]!!.jsonPrimitive.content,
+            )
+            val before = backend.invocations.get()
+            val result = dispatcher.decideAndDispatch(text, lspOn, sessionId = "s1", turnIndex = 1)
+            assertEquals(text, RouteKind.FAST, result.decision.route)
+            val executed = result.outcome as? FastDispatchOutcome.Executed
+            assertNotNull("$text must execute against the fake backend (got ${result.outcome})", executed)
+            assertEquals(text, before + 1, backend.invocations.get())
+            assertTrue(
+                "executed body must echo the identifier verbatim: ${executed!!.result.resultJson}",
+                executed.result.resultJson.contains("\"name\":\"$expectedQuery:example\""),
+            )
+        }
+        // 澄清 pins：多 token 殘餘（空白）⇒ Step E 拒絕；EN-delimited 分支亦然（絕不執行）。
+        for (text in listOf(
+            // 尾綴 cue 後夾額外 token——空白 ⇒ Step E 澄清。
+            "symbols Foo符號 extra",
+            // 雙 cue 空白分隔——Step E 空白拒絕。
+            "symbols 符號 符號",
+            "symbols Foo 符號",
+        )) {
+            val d = decide(text)
+            assertEquals(text, RouteKind.DENIED, d.route)
+            assertEquals(text, DenyReason.NEED_CLARIFICATION, d.reasonCode)
+            assertNull(text, d.toolCall)
+            // decideAndDispatch：decision DENIED、outcome 非 Executed、backend.invocations 不增。
+            val before = backend.invocations.get()
+            val result = dispatcher.decideAndDispatch(text, lspOn, sessionId = "s1", turnIndex = 1)
+            assertEquals(text, RouteKind.DENIED, result.decision.route)
+            assertNull(text, result.decision.toolCall)
+            assertFalse(text, result.outcome is FastDispatchOutcome.Executed)
+            assertEquals(text, before, backend.invocations.get())
+        }
     }
 }

@@ -809,8 +809,9 @@ class FastRouter(
          *   `符號有哪些種類`、bare `symbols`、`What is a symbol?`、`Explain symbols`
          *   （無命令式准入 ⇒ 不進 symbol 模板；否定閘不介入）。
          * - `查 find 符號`/`查 search 符號` 等：EN lookup 動詞在 cue 位置
-         *   （Step A，句首錨定）為剝離詞，符號名恰為 find/search/lookup/locate
-         *   者剝空 → clarify（pinned by `englishLookupMarkerStripped`）；
+         *   （Step A，句首錨定）為剝離詞；Stage-8.3 起殘餘 `符號` 為 EN-delimited
+         *   verbatim identifier（Step C carve-out）⇒ FAST `符號`，不再 clarify
+         *   （原 clarify pin 翻轉，見 extraction KDoc Step C carve-out）；
          *   非 cue 位置的動詞不再剝離（見 extraction KDoc）。
          */
         private val NEGATION_HINTS = listOf(
@@ -1100,8 +1101,9 @@ class FastRouter(
          *       （如 `詢問Foo符號` ⇒ FAST query=`問Foo`；記錄殘餘；字典無窮不可封閉枚舉）
          *       + optional 一下;
          *   command form A: `^symbols?\b[\s]*` — `symbols Foo` → `Foo`.
-         *   Applied sequentially (CJK → EN → command), so `查 find 符號` still
-         *   reduces to empty and clarifies.
+         *   Applied sequentially (CJK → EN → command), so `查 find 符號`
+         *   reduces to `符號` (EN-delimited — executes verbatim, stage-8.3;
+         *   see the Step C carve-out below).
          * Step B — ONE leading EN `symbol(s)` cue (`^symbols?\b[\s,]*`,
          *   IGNORE_CASE, word-anchored), stripped at most once:
          *   `symbols Foo` → `Foo`, `Symbol Foo.` → `Foo.`,
@@ -1110,7 +1112,26 @@ class FastRouter(
          *   is touched (never a global `\bsymbols?\b` delete —
          *   `查 Foo.symbols 符號` keeps `Foo.symbols` verbatim).
          * Step C — peel at most ONE trailing CJK keyword-SUFFIX cue,
-         *   END-anchored, then apply the ambiguity guard (stage-7.3, A3):
+         *   END-anchored, then apply the ambiguity guard (stage-7.3, A3;
+         *   EN-delimited 殘餘不進本步驟——見下方 carve-out):
+         *   EN-delimited carve-out (stage-8.3, #19 Re-review #8 A2): 若殘餘由
+         *   EN opener／EN `symbol(s)` command form 劃定（SYMBOL_OPENER_EN／
+         *   SYMBOL_OPENER_CMD／SYMBOL_LEADING_SYMBOLS 任一消費——各以 replaceFirst
+         *   前後字串比對判定實際改動；CJK opener 消費不設旗標），查 token 為
+         *   EN grammar 劃定之 verbatim identifier——Step C 不剝離、兩道歧義
+         *   守衛（pre-Step-B′／post-Step-D）不適用；僅限單一 token
+         *   （空白 ⇒ Step E 澄清）。CJK 純分支（enDelimited=false，無任何 EN
+         *   消費——`查 Foo符號 符號` 等）逐位元不變（維持雙 cue 澄清）；
+         *   混合 opener（CJK 消費後 EN 消費，如 `查 symbols 符號符號`）援用
+         *   本 verbatim 規則 ⇒ FAST `符號符號`。CJK「有尾綴 cue 明確資料」敘述
+         *   僅適用於未經 EN 消費之 CJK 殘餘。
+         *   例：`symbols Foo符號`／`find symbol Foo符號`／`search symbols Foo符號`
+         *   → FAST `Foo符號`；`symbols 符號`（目標名「符號」）→ FAST `符號`；
+         *   `查 symbols Foo符號`（混合 opener）→ FAST `Foo符號`；
+         *   `symbols Foo符號。` → Step D 剝 `。` → FAST `Foo符號`；
+         *   `symbols Foo符號 extra`／`symbols Foo 符號`／`symbols 符號 符號`
+         *   → 空白 ⇒ Step E 澄清。CJK 分支逐位元不變（`查 Foo符號 符號`
+         *   澄清、`查 符號` 澄清、`查 Foo 符號` → FAST `Foo`）。
          *   a single match of
          *   `(?>[\s，,]*)(?:這個|这个|一下)?(?>[\s，,]*)(?:符號|符号)(?>[\s，,]*)$` is
          *   removed (stage-8.2: the flat separator slots are atomic groups — a pure
@@ -1132,14 +1153,15 @@ class FastRouter(
          *   `查 符號 符號` → NEED_CLARIFICATION.
          *   CJK identifiers ending in `符號` queried as a bare glued
          *   `查 X符號` DO execute with X — the single trailing cue is
-         *   consumed: `查 使用者符號` → FAST `使用者`. Identifiers that
-         *   END in `符號` are NOT queryable in any form (the glued cue is
-         *   consumed from every input shape, including the EN
-         *   `symbols X符號` command form) — record this as an accepted
-         *   product limitation; only use an identifier not ending in the cue.
-         *   `函式|函数` are NO LONGER strip words (neither globally nor as
-         *   suffix cues): `查 函式 符號` → `函式` (intended FAST),
-         *   `查 Foo 函式 符號` → multi-token ⇒ NEED_CLARIFICATION.
+         *   consumed: `查 使用者符號` → FAST `使用者`（CJK 分支不變）。
+         *   EN-delimited 分支則相反（stage-8.3 carve-out）：EN 命令形後的
+         *   identifier 原樣保留——`symbols Foo符號` → FAST `Foo符號`
+         *   （cue 為 identifier 的一部分、不被剝離）；CJK-opened 形態仍剝
+         *   尾綴 cue（`查 Foo符號` → FAST `Foo`）。「識別字以 `符號` 結尾」的
+         *   limitation 因此僅餘 CJK 分支。
+          *   `函式|函数` are NO LONGER strip words (neither globally nor as
+          *   suffix cues): `查 函式 符號` → `函式` (intended FAST),
+          *   `查 Foo 函式 符號` → multi-token ⇒ NEED_CLARIFICATION.
          *   Do NOT strip anything intra-remainder.
          * Step B′ — leading EN connectives stripped, REPEATEDLY, but only when
          *   another token remains after the connective
@@ -1262,11 +1284,26 @@ class FastRouter(
          *   CJK identifiers ending in `符號` queried as a bare glued
          *   `查 X符號` DO execute with X (the single trailing cue is
          *   consumed): `查 使用者符號` → FAST `使用者` — a single glued cue is
-         *   unambiguous. Identifiers that END in `符號` are NOT queryable in
-         *   ANY form （the glued cue is consumed from every input shape,
-         *   including the EN `symbols X符號` command form — the cue is
-         *   CJK, not opener-bound); record as accepted product limitation.
-         *   Only DOUBLE-cue-glued shapes (`X符號符號` / `X符號 符號`) clarify.
+         *   unambiguous. Identifiers that END in `符號` are queryable ONLY via
+         *   the EN-delimited command forms (stage-8.3 carve-out): `symbols
+         *   Foo符號` / `find symbol Foo符號` / `search symbols Foo符號` /
+         *   `查 symbols Foo符號` (mixed opener) → FAST `Foo符號` — the cue is
+         *   part of the EN-delimited verbatim identifier; the delimiter-side
+         *   peel is skipped entirely (Step C 不剝離、歧義守衛不適用). CJK-opened
+         *   shapes still peel (`查 Foo符號` → FAST `Foo`) — 「識別字以 `符號`
+         *   結尾」的 limitation 僅餘 CJK 分支。
+         * - EN-delimited glued-cue residual (stage-8.3, accepted verbatim-
+         *   preservation rule): `symbols 符號符號` → FAST `符號符號`（EN grammar
+         *   劃定之 identifier——glued cue 原樣保留為查詢字串 `符號符號`；
+         *   歧義守衛不適用、不剝離）。Accepted verbatim-preservation rule,
+         *   READ-only、有界單 token LSP query。「verbatim」適用於所有 enDelimited=true 形態
+         *   （含 CJK opener 後接 EN 消費之混合 opener——`查 symbols 符號符號`
+         *   ⇒ FAST `符號符號`）；enDelimited=false 之 CJK 分支不援用本規則。
+         *   前緣剝離殘餘：`symbols ？符號` → Step D 剝 `？` → FAST `符號`
+         *   （en-delimited，歧義守衛不適用；L/N 錨點仍由 Step E 把關）。
+         *   Only DOUBLE-cue-glued shapes (`X符號符號` / `X符號 符號`) clarify —
+         *   CJK-delimited branch only; the EN-delimited branch never reaches the
+         *   double-cue guard.
          *   (A chimera `这個符號` — simplified 这 U+8FD9 + traditional
          *   個 U+500B — matches NEITHER `這個` nor `这个` suffix alternative,
          *   so the remainder stays multi-token and clarifies:
@@ -1309,6 +1346,9 @@ class FastRouter(
         // suffix cue (or is exactly that cue), the double-cue shape is structurally
         // ambiguous (`Foo符號 符號`、`Foo符号 符號`、`符號`) and extraction FAILS ⇒
         // NEED_CLARIFICATION. `這個符號`、`这个符號`、`一下符號`、`符號` suffixes.
+        // #19 B3 stage-8.3 — EN-delimited 殘餘（SYMBOL_OPENER_EN／SYMBOL_OPENER_CMD／
+        // SYMBOL_LEADING_SYMBOLS 任一消費）不進本步驟與兩道歧義守衛（見 extractSymbolQuery
+        // 的 enDelimited 旗標）；本 pattern 本身不動——僅調用時機改變。
         // `函式|函数` are deliberately NOT suffix cues here: they are identifier
         // content, never strip words —
         // `查 函式 符號` routes FAST with query `函式`, and
@@ -1367,26 +1407,43 @@ class FastRouter(
 
         private fun extractSymbolQuery(text: String): String {
             var s = text.trim()
+            // #19 B3 stage-8.3 — EN-delimited 殘餘旗標：EN opener（SYMBOL_OPENER_EN）、
+            // command-form EN opener（SYMBOL_OPENER_CMD）或前導 EN `symbol(s)` cue
+            // （SYMBOL_LEADING_SYMBOLS）任一**實際改動字串** ⇒ enDelimited = true。
+            // CJK opener（SYMBOL_CJK_COMMAND_TOKEN）消費本身不設旗標。旗標為 true 時，
+            // Step C 尾綴剝離與 pre-Step-B′／post-Step-D 兩道歧義守衛一律不適用——殘餘
+            // 為 EN grammar 劃定之 verbatim identifier（僅單一 token；空白 ⇒ Step E 澄清）。
+            var enDelimited = false
             // Step A — anchored openers (each applied at most once a position;
-            // sequential so `查 find 符號` reduces to empty and clarifies).
+            // sequential so `查 find 符號` reduces to `符號`).
             s = SYMBOL_OPENER_CJK.replaceFirst(s, "").trim()
-            s = SYMBOL_OPENER_EN.replaceFirst(s, "").trim()
-            s = SYMBOL_OPENER_CMD.replaceFirst(s, "").trim()
+            var afterEn = SYMBOL_OPENER_EN.replaceFirst(s, "")
+            if (afterEn != s) enDelimited = true
+            s = afterEn.trim()
+            var afterCmd = SYMBOL_OPENER_CMD.replaceFirst(s, "")
+            if (afterCmd != s) enDelimited = true
+            s = afterCmd.trim()
             // Step B — ONE leading EN `symbol(s)` cue (word-anchored, at most
             // once). No other part of the remainder is touched here.
-            s = SYMBOL_LEADING_SYMBOLS.replaceFirst(s, "").trim()
+            var afterLead = SYMBOL_LEADING_SYMBOLS.replaceFirst(s, "")
+            if (afterLead != s) enDelimited = true
+            s = afterLead.trim()
             // Step C — peel at most ONE trailing CJK keyword suffix (end-anchored).
-            s = SYMBOL_CJK_KEYWORD_SUFFIX.replaceFirst(s, "").trim()
-            // Ambiguity guard (stage-7.3, A3): after the ONE peel, if the remainder
-            // STILL matches the suffix cue at its end — or is exactly that cue — the
-            // double-cue shape is structurally ambiguous (`Foo符號 符號`,
-            // `Foo符号 符號`, `符號`) ⇒ extraction FAILS ⇒ NEED_CLARIFICATION.
-            // Identifier content is never rewritten — a verbatim remainder may only be
-            // admitted when it parses unambiguously.
-            if (s.isNotEmpty() &&
-                (SYMBOL_CJK_KEYWORD_SUFFIX.containsMatchIn(s) || BARE_SYMBOL_CUE_WRAP.containsMatchIn(s))
-            ) {
-                return ""
+            // EN-delimited 殘餘（enDelimited == true）一律跳過：EN grammar 劃定之
+            // identifier 原樣保留——不剝離、不守衛（stage-8.3 carve-out）。
+            if (!enDelimited) {
+                s = SYMBOL_CJK_KEYWORD_SUFFIX.replaceFirst(s, "").trim()
+                // Ambiguity guard (stage-7.3, A3): after the ONE peel, if the remainder
+                // STILL matches the suffix cue at its end — or is exactly that cue — the
+                // double-cue shape is structurally ambiguous (`Foo符號 符號`,
+                // `Foo符号 符號`, `符號`) ⇒ extraction FAILS ⇒ NEED_CLARIFICATION.
+                // Identifier content is never rewritten — a verbatim remainder may only be
+                // admitted when it parses unambiguously. (EN-delimited 殘餘不適用——見上。)
+                if (s.isNotEmpty() &&
+                    (SYMBOL_CJK_KEYWORD_SUFFIX.containsMatchIn(s) || BARE_SYMBOL_CUE_WRAP.containsMatchIn(s))
+                ) {
+                    return ""
+                }
             }
             // Step B′ — leading EN connectives, repeatedly, only when another
             // token remains after the connective. Applied AFTER the trailing
@@ -1420,7 +1477,9 @@ class FastRouter(
             // — symmetric with the fullwidth `（符號）` case; verbatim Fast
             // admission only for識別字 with real content on both sides of the
             // cue (e.g. `get(符號)` / `使用者(符號)`).
-            if (s.isNotEmpty() &&
+            // EN-delimited 殘餘不適用（stage-8.3）——EN grammar 劃定之 verbatim
+            // identifier 原樣保留（零 cue 處理）。
+            if (!enDelimited && s.isNotEmpty() &&
                 (SYMBOL_CJK_KEYWORD_SUFFIX.containsMatchIn(s) || BARE_SYMBOL_CUE_WRAP.containsMatchIn(s))
             ) {
                 return ""

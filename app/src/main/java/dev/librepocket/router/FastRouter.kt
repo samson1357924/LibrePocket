@@ -115,45 +115,78 @@ import java.util.concurrent.atomic.AtomicLong
  *   on Foo approve）亦不收——anchor-or-nothing。
  * - 已知殘餘（accepted, anchor-or-nothing 一致性）：`with readiness`／`readiness\b`
  *   與 bare `pending`／`review` 之類 identifier 形態一致性接受。
- * - 殘餘：CJK 結構性條件句僅覆蓋所列框架（`等` ＋ 可選 possessor 槽 [\p{L}\p{N}]{0,64}
- *   （空白/半全形逗號可夾其前後；未列 possessor 皆收——`等主管批准`／`等老闆同意`／
- *   `等經理核准`／`等董事會點頭`／`等董老闆批准`／長組織名如 `等安全審核委員會主席批准`／
- *   `等國家安全委員會批准`／9/12 位數字 `等123456789批准`／`等123456789012批准` 皆否決）＋ consent 動詞集
- *   同意|核准|核準|批准|確認|确认|許可|许可|點頭|点头、
- *   consent 動詞（同集）＋ 可選分隔符 [\s，,.;；:：。、！？!?．‥…了過_]*（半/全形空白、`,` `，` `.` `。` `;` `；` `:` `：` `、` `！` `？` `!` `?`、`．` U+FF0E `‥` U+2025 `…` U+2026、下劃線 `_`，以及助詞 `了` `過`）
+ * - 殘餘：CJK 結構性條件句僅覆蓋所列框架（`等` ＋ 可選 possessor 槽——平坦 {0,64} 類（non-atomic；
+ *   其兩個 delimiter 槽為原子群組 `(?>…)`，possessor 槽本身不原子，須回退出動詞左端字元），
+ *   涵蓋 \p{L}/\p{N} ＋ ASCII 識別字標點（`._-$#@/():,;+=~`）＋ \s（及 NFKC 探針摺疊之半全形空白）＋ 半/全形逗號（`,` `，`）＋
+ *   常見 CJK 句讀（`。、！？!?；;：:．‥…`）＋ 全形斜線 `／`（U+FF0F）／全形底線 `＿`（U+FF3F），
+ *   空白/半全形逗號仍可夾 possessor 前後；possessor 內部可夾斜線/識別字標點/空白/CJK 句讀——
+ *   `查Foo符號等資安/法務批准`（半形斜線）／`查Foo符號等資安／法務批准`（U+FF0F 全形斜線）／
+ *   `查Foo符號等CISO/CEO同意`／`查Foo符號等資安_法務批准`／`查Foo符號等主管-法務批准`／
+ *   `查Foo符號等資安 / 法務批准`（斜線兩側夾空白）／`查Foo符號等我回覆再做`／`查Foo符號等你回复`／
+ *   `查Foo符號等經理答覆後再做`／`查Foo符號等經理答复再做`／`查Foo符號等董事會回覆` 此類
+ *   「尚待批准／回覆」形態——所列形態與已知變體（含斜線 possessor、回覆族動詞、動詞內 ≤16 插入
+ *   （CONSENT_VERBS_CJK_FLEX）、Cf 拆分）皆否決；未列示 consent 動詞（執行，fail-OPEN）及
+ *   動詞內 >16 插入仍為已知殘餘（見下節「未列示 consent 動詞」與「動詞內 >16 插入」，
+ *   皆 READ-only／未接線）；未列 possessor 亦皆收（`等主管批准`／`等老闆同意`／`等經理核准`／
+ *   `等董事會點頭`／`等董老闆批准`／長組織名如 `等安全審核委員會主席批准`／`等國家安全委員會批准`／
+ *   9/12 位數字 `等123456789批准`／`等123456789012批准` 皆否決；`等我們同意`／`等你點頭` 仍匹配））＋ consent 動詞集
+ *   同意|核准|核準|批准|確認|确认|許可|许可|點頭|点头|回覆|回复|答覆|答复（繁簡對稱；單一事實來源
+ *   CONSENT_VERBS_CJK_TOKENS，由 tokens 推導 CONSENT_VERBS_CJK_FLEX）、
+ *   consent 動詞（CONSENT_VERBS_CJK_FLEX：動詞內 ≤16 個 INS 插入 INS＝`[\p{L}\p{N}._-$#@/():,;+=~]`；
+ *   INS 排除 \s 與 U+FF0C（全形逗號）；刻意包含 U+002C（半形逗號）——平坦、有界 {0,16} 缺口，
+ *   與 possessor 由動詞首字元錨隔開（無 delimiter 原子性互動；平坦已驗證）；Lo filler 含
+ *   U+115F/1160/3164/FFA0 ⊆ \p{L}；插入上限與 arm D′ 一致，security-audit M2）＋ 可選分隔符 [\s，,.;；:：。、！？!?．‥…了過_]*（半/全形空白、`,` `，` `.` `。` `;` `；` `:` `：` `、` `！` `？` `!` `?`、`．` U+FF0E `‥` U+2025 `…` U+2026、下劃線 `_`，以及助詞 `了` `過`）
  *   ＋ 必填 後-family 後綴（之後|之后|以后|以後|後|后）＋ 可選分隔符 [\s，,.;；:：。、！？!?]*（同上，不含 `了` `過`）＋ 可選 再|才 尾標（arm A），
  *   或 consent 動詞 ＋ 可選分隔符 [\s，,.;；:：。、！？!?．‥…了過_]*（同上）＋ 必填 再|才 尾標（arm B），
  *   只有/只許/只许/只允…才之有界缺口）；EN 開放詞彙不宣稱完備；`\bban\w*\b` 之類（如 `symbols Foo banana` → NEED_CLARIFICATION）、`特別找`
- *   之類普通詞仍收為否定系副作用（recorded, fail-safe）；裸名詞絕不單獨收錄（anchor-or-nothing）；EN 連接詞詞幹槽已納 CJK 許可詞幹
- *   （許可|许可|同意|核准|核準|批准|確認|确认|點頭|点头）——錨定於 EN 連接詞之後者否決；EN/CJK 交集其餘仍 open-world recorded。
+ *   之類普通詞仍收為否定系副作用（recorded, fail-safe）；裸名詞絕不單獨收錄（anchor-or-nothing）；EN 連接詞詞幹槽已納 CJK 許可詞幹槽
+ *   CONSENT_VERBS_CJK_FLEX——錨定於 EN 連接詞之後者否決；EN/CJK 交集其餘仍 open-world recorded。
  * - arm D′（動詞＋ CJK/ASCII 字母數字＋助詞 `了過`＋識別字標點/空白插入 ≤16 個字元＋ 再|才）：`批准Ｄ再做`（全形 D NFKC 折回）／`批准五再說`／
  *   `同意白拿了再做`／`批准主張再做`／`批准主張同意再做`／`批准Ｄ_Ｄ再做`／`批准a-b再做`／`批准Ｄ/Ｄ再做`／`批准Ｄ;Ｄ再做`／`批准Ｄ#Ｄ再做` 皆否決——
- *   L/N/了過/識別字標點/半全形空白插入語全封；不取 ≥17 字（過長歧義為
+ *   L/N/了過/識別字標點/半全形空白插入語全封（stage-8.1 O1：含 `／` U+FF0F／`＿` U+FF3F）；不取 ≥17 字（過長歧義為
  *   識別字可能性上升、過度否決成本逆轉，{0,16} 為審裁下限）；帶空白 ⇒ whitespace 閘；全形英文撇號等
  *   fullwidth 字母（NFKC 折回 ASCII）亦收，所字形不再被識別字規避。`批准然後再做`（然後＝2×\p{L}）已由本臂
  *   否決（`然`/`後` 皆為 Lo）——舊「然後未列 linker」殘餘記錄自 D′ 起作廢。
  *   （可接受的過度否決記錄：黏合 CJK 識別字 vs 同意子句無法僅憑語法分離——例如 `查批准的再生符號`
  *   被 arm D′ 否決（span 到達 再）；fail-safe 方向，記錄）
- * - 已知殘餘（accepted, frame-local）：possessor 槽為 {0,64} 平坦 [\p{L}\p{N}] 類（不巢狀量化，線性時間），
- *   涵蓋現實組織名（含數字與中文）；possessor 超過 64 個 \p{L}/\p{N} 字元時框架不匹配 → fail-open
+ * - 已知殘餘（accepted, frame-local；Re-review #8 A1 修訂）：possessor 槽為 {0,64} 平坦類（non-atomic；
+ *   其兩個 delimiter 槽為原子群組 `(?>…)`，possessor 槽本身不原子——須回退出動詞左端字元），
+ *   （\p{L}/\p{N} ＋ ASCII 識別字標點 `._-$#@/():,;+=~` ＋ \s（及 NFKC 探針摺疊之半全形空白）＋ 半/全形逗號 ＋ CJK 句讀 `。、！？!?；;：:．‥…`
+ *   ＋ `／` U+FF0F ／ `＿` U+FF3F；有界、無巢狀量化、無災難性回溯（possessor 槽不回溯出動詞左端字元之外；delimiter 為原子群組）（最壞多項式有界）），
+ *   涵蓋現實組織名（含數字、中文、識別字標點與 CJK 句讀）；possessor 超過 64 個單位時框架不匹配 → fail-open
  *   （單 token 命令形 end-to-end；帶空白則不執行）；consent 動詞與 再|才 之間僅許分隔符/了過（arm A/B）
- *   或 ≤16 個 CJK/ASCII 字母數字＋助詞 `了過`（arm D′）才否決——`批准Ｄ再做`（全形 D NFKC 折回）／`批准五再說`／
+ *   或 ≤16 個 CJK/ASCII 字母數字＋助詞 `了過`（arm D′ 自身插入槽；動詞內插入 ≤16 見 FLEX）才否決——`批准Ｄ再做`（全形 D NFKC 折回）／`批准五再說`／
  *   `同意白拿了再做`／`批准主張再做`／`批准然後再做`（然後＝2×\p{L}，已為 arm D′ 所收）皆否決；
- *   仍殘餘者：possessor >64 之 `等…同意`（無再|才）——見下節，open-world 殘餘。
- *   {0,64} 槽與 consent 動詞集不巢狀量化，無災難性回溯。
+ *   仍殘餘者：possessor >64 之 `等…同意`（無再|才）——見下節，open-world 殘餘；
+ *   動詞內 >16 插入（如 `批`+17 個插入字元+`准`）亦否決不了——見下節「未列示 consent 動詞」（FLEX 上限 16），fail-OPEN。
+ *   {0,64} 槽與 consent 動詞集（含 FLEX）不巢狀量化。
+ *   過度否決記錄（accepted fail-safe, do not "fix"）：possessor 內部斜線/識別字標點/空白/CJK 句讀
+ *   （如 `等資安/法務批准`／`等CISO/CEO同意`／`等資安 / 法務批准`／`等主管-法務批准`／`等資安_法務批准`）
+ *   新帶來的否決即為 A1 修正目標形態本身；任何超出該形態的黏合識別字過度否決一律接受——
+ *   方向固定為 fail-safe（從不執行），不得以「收回」此類輸入為名放寬 possessor 槽。
+ * - 已知殘餘（accepted, open-world fail-OPEN；Re-review #8 安全審計 M3）：未列示 consent 動詞
+ *   （`審批`／`應允`／`承諾`／`認可`／`允許`／`授權`／`首肯`／`放行` 等近義詞族——列舉不盡，封閉清單不可能完備）
+ *   一律不匹配條件句框架 ⇒ 不成立 clause-gate 否決 ⇒ 落其餘閘；是 FAST 即執行（fail-OPEN——與
+ *   前閘「過度否決 fail-safe」前提相反，如實記錄之方向）。目前唯一 executionReady 工具為 lsp.symbols，
+ *   READ-only、未接線——以本 lane 現況（唯一 executionReady 為 READ-only、未接線）之實害為零；含 consent 動詞內 >16 插入者亦同（FLEX 上限 16，對稱 arm D′）。
+ *   若本 lane 未來接線非 READ 工具，封閉 consent 動詞清單必須先重新審視——已規劃的補救方向為
+ *   對 `等…` 框架加超集 deny-guard（open-world deny-by-default 之一致化），非逐一枚舉動詞。
  * - 已知殘餘（accepted, not fixed；separator hardening 現況）：consent 動詞與 後-family/再|才 之間夾
  *   半/全形分隔符（`\s` `,` `，` `.` `。` `;` `；` `:` `：` `、` `！` `？` `!` `?`、`．` U+FF0E `‥` U+2025 `…` U+2026、下劃線 `_`）與助詞 `了` `過`
  *   一律視為連接符——`批准,再做`／`批准，再做`／`批准;再做`／`批准:再做`／`批准了再做`／
  *   `批准。再做`／`同意後，再查`／`批准，才做` 皆否決；possessor 兩端單空白落在框架兩個分隔槽內，
  *   arm D 仍然匹配（如 `等 安全審核委員會主席 批准` → clause gate 否決）；possessor 內部夾空白
- *   （如 `等安全 審核主席 批准`）clause 框架不匹配，帶空白殘餘落 whitespace 澄清／no-match——
- *   never FAST、never executes。殘餘：possessor 超過 64 個 \p{L}/\p{N} 字元 → fail-open；
+ *   （如 `等安全 審核主席 批准`／`等資安 / 法務批准`，stage-8.1 起斜線兩側夾空白亦同）由
+ *   possessor 平坦類收（\s 含空白與半全形空白）——框架匹配 ⇒ clause gate 否決（fail-safe；
+ *   否決方向從不執行）；帶空白不再落 whitespace 澄清／no-match 路徑，直接 clause gate 否決；
+ *   殘餘：possessor 超過 64 個單位 → fail-open；
  *   `只有.{0,8}才` 之有界 {0,8} 不變；EN 開放詞彙 open-world 不變。
  *   （`批准然後再做` 自 arm D′ 起 ¬ 殘餘——然後 2×\p{L}，必否決。）
  * - 已知殘餘（accepted, frame-local, not fixed；audit F7）：CJK 框架分隔符現涵蓋 \s，
  *   故 `同意 後再查`（consent 動詞與後-family 間僅一空白）已由 arm A 於 clause gate 否決（原
  *   「clause gate 放行、extraction whitespace 閘把關」之描述自分隔符類納入後不再成立）；
- *   框架內更廣義的空白相鄰（如 possessor 內部夾空白）仍不匹配 → 落 whitespace 澄清／no-match，永不執行；僅記錄。
+ *   框架內更廣義的空白相鄰（如 possessor 內部夾空白）—— stage-8.1 起 possessor 平坦類含 \s，
+ *   possessor 內部夾空白已由 等-arm 框架匹配 ⇒ clause gate 否決（fail-safe，永不執行）；僅記錄。
  * - 已知過度否決（accepted fail-safe, do not "fix"）：`查 Main 方法 符號` 因 CJK
  *   方法 教學標記事否決落 DENIED——保留，僅記錄；`查 Foo 符號 pending review`
  *   亦因結構性詞幹 `review` 否決——為預期結果。
@@ -427,27 +460,41 @@ class FastRouter(
         //        a|an|some|any|prior|is|are|was|were|has|have|had|been，最多 3 個）
         //       ＋ 動詞/詞幹槽（approv\w*|agree\w*|consent\w*|confirm\w*|say\w*/said|
         //       allow\w*|release\w*|permit\w*|ok\w*|okay\w*|go[- ]?ahead\w*|ready|
-        //       permission|review|（許可|许可|同意|核准|核準|批准|確認|确认|點頭|点头），皆 \w* 或 \b 詞幹錨定）——gerund/過去式/第三人稱
+        //       permission|review|CONSENT_VERBS_CJK_FLEX（consent 動詞槽單一事實來源，插入 ≤16），EN 詞幹皆 \b/\w* 錨定；CJK FLEX 無詞邊界概念（依連接詞左錨））——gerund/過去式/第三人稱
         //       一併涵蓋（`after approving`、`once approved`、`after I had approved`、
         //       `once it is approved`、`since I approved`、`after my approval`）；
         //       裸 `\b(?:approval|approved|consent|pending)\b` 絕不單獨收錄；
         //    C. `\bwait\s+(?:for|until|till)\b`、`\bhold\s+(?:on|off)\b`、`\bnot\s+yet\b`；
-        //    D. CJK 結構性條件句僅覆蓋所列框架：`等[\s，,]*(?:[\p{L}\p{N}]{0,64}[\s，,]*)?(?:同意|核准|核準|批准|確認|确认|許可|许可|點頭|点头)`
-        //       （possessor 槽：0–64 個 \p{L}/\p{N} 字母/數字，其前後可夾空白與半/全形逗號；
+        //    D. CJK 結構性條件句僅覆蓋所列框架：`等(?>[\s，,]*)(?:FLAT{0,64}(?>[\s，,]*))?CONSENT_VERBS_CJK_FLEX`
+        //       （stage-8.1 A1 ＋ security-audit M1/M2：possessor 槽放寬為平坦類——\p{L}/\p{N} ＋ ASCII 識別字標點
+        //        `._-$#@/():,;+=~` ＋ \s（及 NFKC 探針摺疊之半全形空白）＋ 半/全形逗號 `,` `，`
+        //        ＋ CJK 句讀 `。、！？!?；;：:．‥…` ＋ `／` U+FF0F ／ `＿` U+FF3F；無巢狀量化、無類內交替、
+        //        同一 {0,64} 上界；其兩個 delimiter 槽為原子群組 `(?>…)`——possessor 槽本身 non-atomic，
+        //        須回退出動詞左端字元（M1：possessor/delimiter 重疊 ⇒ 4090 個逗號級輸入否決失敗曾 O(N²·64)）；
+        //        possessor 內部可夾斜線/識別字標點/空白/CJK 句讀；
+        //        ——`等資安/法務批准`／`等CISO/CEO同意`／`等資安 / 法務批准` 皆否決）；
+        //        consent 動詞槽＝CONSENT_VERBS_CJK_FLEX（由 CONSENT_VERBS_CJK_TOKENS 推導；
+        //        M2：動詞內 ≤16 個 INS 插入，INS＝`[\p{L}\p{N}._-$#@/():,;+=~]`，Lo filler ⊆ \p{L}；
+        //        INS 排除 \s 與 U+FF0C（全形逗號），刻意包含 U+002C（半形逗號）——平坦、有界 {0,16} 缺口，
+        //        與 possessor 由動詞首字元錨隔開（無 delimiter 原子性互動；平坦已驗證）；
+        //        插入上限與 arm D′ 一致；FLEX 僅於五處列舉點使用）；
         //        不再限封閉代名詞表——未列 possessor 皆收（`等主管批准`／`等老闆同意`／`等經理核准`／
         //        `等董事會點頭`／`等董老闆批准`／長組織名 `等安全審核委員會主席批准`／
         //        `等國家安全委員會批准`／9/12 位數字 `等123456789批准`／`等123456789012批准` 皆否決；`等我們同意`／`等你點頭` 仍匹配）；
-        //        槽為平坦 {0,64} 與 consent 動詞集不巢狀量化，無災難性回溯、線性時間）、
-        //       `(?:同意|核准|核準|批准|確認|确认|許可|许可|點頭|点头)[\s，,.;；:：。、！？!?．‥…了過_]*(?:之後|之后|以後|以后|後|后)(?:[\s，,.;；:：。、！？!?．‥…_]*(?:再|才))?`／
-        //       `(?:同意|核准|核準|批准|確認|确认|許可|许可|點頭|点头)[\s，,.;；:：。、！？!?．‥…了過_]*(?:再|才)`
+        //        有界、無巢狀量化、無災難性回溯（possessor 槽不回溯出動詞左端字元之外；delimiter 為原子群組）（最壞多項式有界））、
+        //       `CONSENT_VERBS_CJK_FLEX[\s，,.;；:：。、！？!?．‥…了過_]*(?:之後|之后|以後|以后|後|后)(?:[\s，,.;；:：。、！？!?．‥…_]*(?:再|才))?`／
+        //       `CONSENT_VERBS_CJK_FLEX[\s，,.;；:：。、！？!?．‥…了過_]*(?:再|才)`
         //       （兩臂：A＝動詞＋可選分隔符 [\s，,.;；:：。、！？!?．‥…了過_]*（半/全形空白、`,` `，` `.` `。` `;` `；` `:` `：` `、` `！` `？` `!` `?`、`．` `‥` `…` `_`、助詞 `了` `過`）
         //        ＋必填後-family＋可選分隔符 [\s，,.;；:：。、！？!?]*（同上，不含 `了` `過`）＋可選 再|才，
         //       `同意後`／`批准後`／`批准後再做`／`同意後，再查`／`批准。再做` 皆否決；
         //       B＝動詞＋可選分隔符（同上）＋必填再|才（無後-family），`批准再做`／`批准才做`／`批准,再做`／`批准，才做`／`批准了再做` 皆否決；
         //        無 `再|才` 亦不匹配——`查 批准 符號` 保持 FAST；
-        //       D′＝動詞＋插入 arm（L/N/了過 ≤16 個字元）必填再|才：`批准Ｄ再做`／`同意白拿了再做` 皆否決；
+        //       D′＝FLEX 動詞＋插入 arm（L/N/了過＋識別字標點/空白 ≤16 個字元）必填再|才：`批准Ｄ再做`／`同意白拿了再做` 皆否決；
+        //       FLEX 動詞槽（security-audit M2）：動詞內各字元之間允許 ≤16 個 INS 插入
+        //       （INS＝`[\p{L}\p{N}._-$#@/():,;+=~]`）——`批A准再做`／`批_准`／`核1準` 等
+        //       動詞內 1 插入字元亦否決（fail-safe）；插入 >16 字仍為殘餘（fail-OPEN，見 M3 節）；
         //       以及有界缺口 `只有.{0,8}才`／`只許.{0,8}才|只许.{0,8}才`／`只允.{0,8}才`（無裸名詞 CJK 匹配）；
-        //       已知殘餘（accepted, frame-local）：`等` 與 consent 動詞之間的 possessor 超過 64 個 L/N 字元
+        //       已知殘餘（accepted, frame-local）：`等` 與 consent 動詞之間的 possessor 超過 64 個單位
         //       不匹配 → fail-open（單 token 命令形 end-to-end FAST；帶空白則不執行）；
         //       插入 ≤16 字 L/N/了過＋必填再|才（arm D′）——`批准Ｄ再做` 等亦否決；
         //       Cf-split 拆分（如 `等\u200B主管批准`）由 spaced/joined 探針還原覆蓋（兩探針與 raw 取聯集）。
@@ -485,20 +532,54 @@ class FastRouter(
         // （`詢問Foo符號` ⇒ FAST query=`問Foo` 等無窮類）視為剩餘 verbatim 識別字
         // 原樣執行（READ-only；記錄殘餘；`質詢` 因首字 ∉ opener → no-match）。
         private const val SYMBOL_CJK_COMMAND_TOKEN = "(?:查詢|查询|搜尋|搜寻|搜索|查找|尋找|寻找|找尋|找寻|查|找|尋|搜|詢|寻|询)"
+        // #19 B3 stage-8.1（A1 修正＋security-audit M2 修正）：CJK consent 動詞集——
+        // PERMISSION_CONDITIONAL_CLAUSE 五處列舉點的單一事實來源（single source；比照
+        // SYMBOL_CJK_COMMAND_TOKEN 之於 opener，兩正則不可能再各自漂移）。繁簡對稱；
+        // 回覆|回复|答覆|答复 自 stage-8.1 起納入。
+        // TOKENS＝字面動詞清單；CONSENT_VERBS_CJK_FLEX 由 tokens 推導（tokens 單一來源）。
+        // FLEX＝動詞內允許 ≤16 個 INS 插入（INS＝extraction allow-list 字母/數字/識別字標點的
+        // Lo filler 含 U+115F/1160/3164/FFA0 皆 ⊆ \p{L}；INS 排除 \s 與 U+FF0C（全形逗號），
+        // 刻意包含 U+002C（半形逗號）——平坦、有界 {0,16} 缺口，與 possessor 由動詞首字元錨隔開
+        // （無 delimiter 原子性互動；平坦已驗證）；插入上限與 arm D′ 一致；verb 內夾空白會撞
+        // whitespace 閘 ⇒ 澄清 ⇒ 永不執行）。
+        // {0,16} 插入上限與 arm D′ 一致。INS 內 `-` 逸出為 `\\-`、`$` 以 `${'$'}` 表示；類內無 `]` 未逸出字元。
+        // 任一列舉點再手寫同意|核准… 即視為漂移，須改回引用 FLEX（tokens 推導）。
+        private val CONSENT_VERBS_CJK_TOKENS = listOf(
+            "同意", "核准", "核準", "批准", "確認", "确认", "許可", "许可", "點頭", "点头", "回覆", "回复", "答覆", "答复",
+        )
+        // 動詞內插入：tokens 內各字元之間放一個有界 [INS]{0,16}（FLEX 僅於五處列舉點使用）；
+        // 平坦交替、無巢狀量化、無類別量化（INS 排除 \s 與 U+FF0C；`,` 仍含於 INS（有界 {0,16}、與 possessor 由動詞首字元隔開）），nesting depth ≤2。
+        private val CONSENT_VERBS_CJK_FLEX = "(?:" +
+            CONSENT_VERBS_CJK_TOKENS.joinToString("|") { v ->
+                v.map { it }.joinToString("[\\p{L}\\p{N}._\\-${'$'}#@/():,;+=~]{0,16}")
+            } + ")"
         private val AFFIRMATIVE_OPENER_CJK =
             Regex("^(?:(?:請|麻煩|帮我|幫我|给我|給我|请)[\\s，,]*)?" + SYMBOL_CJK_COMMAND_TOKEN)
         private val PERMISSION_CONDITIONAL_CLAUSE = Regex(
             "\\bonly\\s+(?:after|when|if|until|once|before|with|upon)\\s+[a-z\\s]*?(?:approval|consent|permission)\\b" +
                 "|\\b(?:after|until|unless|once|when|while|if|before|since|whenever|as|because|provided|upon|following|pending|with|subject\\s+to|prior\\s+to|given|on)[\\s,]+" +
                 "(?:(?:i|we|you|they|anyone|he|she|it|my|our|your|their|his|her|the|this|that|a|an|some|any|prior|is|are|was|were|has|have|had|been)[\\s,]+){0,3}?" +
-                "(?:approv\\w*|agree\\w*|consent\\w*|confirm\\w*|say\\w*|said\\b|allow\\w*|release\\w*|permit\\w*|ok\\w*|okay\\w*|go[- ]?ahead\\w*|ready\\b|permission\\b|review\\b|(?:許可|许可|同意|核准|核準|批准|確認|确认|點頭|点头))" +
+                "(?:approv\\w*|agree\\w*|consent\\w*|confirm\\w*|say\\w*|said\\b|allow\\w*|release\\w*|permit\\w*|ok\\w*|okay\\w*|go[- ]?ahead\\w*|ready\\b|permission\\b|review\\b|" + CONSENT_VERBS_CJK_FLEX + ")" +
                 "|\\bwait\\s+(?:for|until|till)\\b" +
                 "|\\bhold\\s+(?:on|off)\\b" +
                 "|\\bnot\\s+yet\\b" +
-                "|等[\\s，,]*(?:[\\p{L}\\p{N}]{0,64}[\\s，,]*)?(?:同意|核准|核準|批准|確認|确认|許可|许可|點頭|点头)" +
-                "|(?:同意|核准|核準|批准|確認|确认|許可|许可|點頭|点头)[\\s，,.;；:：。、！？!?．‥…了過_]*(?:之後|之后|以後|以后|後|后)(?:[\\s，,.;；:：。、！？!?．‥…_]*(?:再|才))?" +
-                "|(?:同意|核准|核準|批准|確認|确认|許可|许可|點頭|点头)[\\s，,.;；:：。、！？!?．‥…了過_]*(?:再|才)" +
-                "|(?:同意|核准|核準|批准|確認|确认|許可|许可|點頭|点头)[\\p{L}\\p{N}了過\\s，,.;；:：。、！？!?．‥…_$#@/():,;+=~-]{0,16}(?:再|才)" + // arm D′：CJK/ASCII/全形字母（NFKC 折）＋助詞＋識別字標點/空白插入於動詞與再|才之間（如 `批准Ｄ再做`/`同意白拿了再做`/`批准Ｄ_Ｄ再做`/`批准a-b再做`/`批准Ｄ/Ｄ再做`）——L/N/了過/標點/空白插入 ≤16 字、fail-safe 否決
+                // #19 B3 stage-8.1（A1）＋security-audit M1/M2：possessor 槽放寬為平坦 {0,64} 類（non-atomic）——
+                // \p{L}/\p{N} ＋
+                // ASCII 識別字標點 `._-$#@/():,;+=~` ＋ \s ＋ 半/全形逗號 `,` `，` ＋
+                // 常見 CJK 句讀 `。、！？!?；;：:．‥…` ＋ 全形斜線／ U+FF0F／全形底線＿ U+FF3F。
+                // 無巢狀量化、無類內交替、同一 {0,64} 上界；其兩個 delimiter 槽為原子群組 `(?>…)`
+                // （M1：`\s`/`,`/`，` 與 delimiter 重疊，4090 個逗號級輸入曾造成 possessor/delimiter
+                // 反覆回溯 ⇒ O(N²·64)；atomic delimiter 封死回溯，possessor 本身保持 non-atomic
+                // 以便回退出動詞左端字元）；
+                // possessor 內部可夾斜線/識別字標點/空白/CJK 句讀（`等資安/法務批准`／
+                // `等CISO/CEO同意`／`等資安 / 法務批准`）⇒ clause gate 否決。
+                // `-` 逸出為 `\\-`；`$` 以 `${'$'}` 表示；類內無 `]` 未逸出字元。
+                // （`.`（U+002E）已含於 ASCII 識別字標點；`．` U+FF0E 已含於 CJK 句讀；
+                //  具體形狀：`等(?>[\\s，,]*)(?:POSS{0,64}(?>[\\s，,]*))?FLEX動詞`。）
+                "|等(?>[\\s，,]*)(?:[\\p{L}\\p{N}._\\-${'$'}#@/():,;+=~\\s，,。、！？!?；;：:．‥…／＿]{0,64}(?>[\\s，,]*))?" + CONSENT_VERBS_CJK_FLEX +
+                "|" + CONSENT_VERBS_CJK_FLEX + "[\\s，,.;；:：。、！？!?．‥…了過_]*(?:之後|之后|以後|以后|後|后)(?:[\\s，,.;；:：。、！？!?．‥…_]*(?:再|才))?" +
+                "|" + CONSENT_VERBS_CJK_FLEX + "[\\s，,.;；:：。、！？!?．‥…了過_]*(?:再|才)" +
+                "|" + CONSENT_VERBS_CJK_FLEX + "[\\p{L}\\p{N}了過\\s，,.;；:：。、！？!?．‥…_$#@/():,;+=~／＿-]{0,16}(?:再|才)" + // arm D′：FLEX 動詞＋CJK/ASCII/全形字母（NFKC 折）＋助詞＋識別字標點/空白（含 `／` U+FF0F／`＿` U+FF3F）插入於動詞與再|才之間（如 `批准Ｄ再做`/`同意白拿了再做`/`批准Ｄ_Ｄ再做`/`批准a-b再做`/`批准Ｄ/Ｄ再做`/`批准Ｄ／Ｄ再做`）——L/N/了過/標點/空白插入 ≤16 字、fail-safe 否決
                 "|只有.{0,8}才" +
                 "|只許.{0,8}才|只许.{0,8}才" +
                 "|只允.{0,8}才",

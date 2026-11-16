@@ -2830,8 +2830,10 @@ class FastDispatchTest {
             "只有我核准才查",
             "只許我確認才查",
             "只允他確認才查",
-            // #19 B3 stage-6.2（F1 修正後語意）：CJK possessor 槽（[\p{L}\p{N}]{0,64}，不限封閉代名詞表——
-            // 主管/老闆/經理/董事會/工廠 等未列 possessor、長組織名與數字 possessor 皆收）＋雙臂 consent 框架：
+            // #19 B3 stage-6.2（F1 修正後語意）：CJK possessor 槽（stage-8.1 起放寬為平坦 {0,64} 類：
+            // \p{L}/\p{N} ＋ ASCII 識別字標點 `._-$#@/():,;+=~` ＋ \s ＋ 半/全形逗號 ＋ CJK 句讀
+            // （`。、！？!?；;：:．‥…`）＋ `／` U+FF0F／`＿` U+FF3F；不限封閉代名詞表——
+            // 主管/老闆/經理/董事會/工廠 等未列 possessor、長組織名與數字 possessor 皆收；possessor 內部斜線/標點/空白亦收）＋雙臂 consent 框架：
             // A＝動詞＋可選分隔符（半/全形空白、`,` `，` `.` `。` `;` `；` `:` `：` `、` `！` `？` `!` `?`、助詞 `了` `過`）
             //   ＋必填後-family（再|才 可選、其前亦可夾分隔符，`同意後`／`批准後`／`同意後，再查` 皆否決）；
             // B＝動詞＋可選分隔符（同上）＋必填再|才（`批准再做`／`批准才做`／`批准,再做`／`批准了再做` 皆否決）；
@@ -2853,7 +2855,7 @@ class FastDispatchTest {
             "查 Foo 符號等主管\u200B同意",
             // 精確 report 字串（無空白形式）：
             "查Foo符號等主管批准再做",
-            // #19 B3 stage-7.1（A1）：CJK possessor 槽放寬至 [\p{L}\p{N}]{0,64}（平坦、線性），
+            // #19 B3 stage-7.1（A1）：CJK possessor 槽放寬至 [\p{L}\p{N}]{0,64}（平坦、線性；stage-8.1 再放寬為上述平坦類），
             // consent 動詞與 後-family/再|才 之間夾半/全形分隔符與助詞 `了` 亦否決。
             // 原 `positionalCueGrammarPins` 之 FAST pins 翻轉為 DENIED：
             "查Foo符號等123456789批准",
@@ -2904,6 +2906,48 @@ class FastDispatchTest {
             // arm D 仍匹配 ⇒ decide() DENIED、reasonCode=null（no-match fallback，verified；
             // 絕不以 NEED_CLARIFICATION 過度斷言）——絕不執行（never FAST）。
             "查Foo符號等 安全審核委員會主席 批准",
+            // #19 B3 stage-8.1（A1 修正）：「尚待批准／回覆」條件句形態——等-arm possessor
+            // 槽放寬為平坦 {0,64} 類（\p{L}/\p{N} ＋ ASCII 識別字標點 ＋ \s ＋ 半/全形逗號
+            // ＋ CJK 句讀 ＋ `／` U+FF0F／`＿` U+FF3F），consent 動詞集新增 回覆|回复|答覆|答复（繁簡對稱）：
+            "查Foo符號等資安/法務批准",
+            "查Foo符號等CISO/CEO同意",
+            "查Foo符號等資安／法務批准", // U+FF0F fullwidth solidus
+            "查Foo符號等資安_法務批准",
+            "查Foo符號等主管-法務批准",
+            "查Foo符號等資安 / 法務批准", // 斜線兩側夾空白
+            "查Foo符號等我回覆再做",
+            "查Foo符號等你回复",
+            "查Foo符號等經理答覆後再做",
+            "查Foo符號等經理答复再做",
+            "查Foo符號等董事會回覆",
+            // #19 B3 stage-8.1（security-audit O2/O3；M1/M2 修正之回歸釘）：
+            // arm A 回覆/答覆族（bare 後-family 亦否決）／arm B 簡體答复：
+            "查Foo符號回覆後再做",
+            "查Foo符號答覆後", // arm A bare 後-family，無再|才
+            "查Foo符號答复再做", // arm B（簡體答复）
+            // Cf-split possessor-with-slash（unicode escape 寫法）：
+            "查Foo符號等\u200B資安/法務批准",
+            // U+3000 全形空白——NFKC 探針摺疊為 ASCII 空白 ⇒ spaced/joined 探針否決：
+            "查Foo符號等資安\u3000/\u3000法務批准",
+            // 動詞內 ≤16 插入（CONSENT_VERBS_CJK_FLEX）仍否決：
+            "查Foo符號等主管批A准",
+            "查Foo符號等主管批_准",
+            "查Foo符號等主管批ㅤ准", // U+3164 Hangul filler（Lo ⊆ \p{L} ⊆ INS）
+            "查Foo符號等主管同A意",
+            "查Foo符號批A准再做", // arm B（相容 D′）+ FLEX：FLEX 動詞 `批A准` 後空插入 + 再
+            "查Foo符號等主管回A覆",
+            "查Foo符號等主管答A复",
+            // M1 回歸釘：等-arm delimiter 為原子群組 ⇒ 大量連續 `，` 不得造成
+            // possessor/delimiter 反覆回溯（原 O(N²·64) 否決失敗）；assert DENIED + toolCall==null。
+            // 長度恰為 MAX_INTENT_CHARS＝4096（再多字元會撞輸入長度閘——該閘先於任何 regex，
+            // 否決毫無回歸意義）。
+            // 結尾 `呢` 使 admission 於疑問尾標探針否決 ⇒ decide() 落 RULES 無命中 ⇒ no-match DENIED，
+            // 不進 extraction 路徑——stage-7.3 既有模式（`SYMBOL_CJK_KEYWORD_SUFFIX`／`BARE_SYMBOL_CUE_WRAP`
+            // 兩相鄰貪婪 `[\s，,]*` 類，其等長交疊之分割枚舉於長逗號串為超線性多項式（O(n²)，實務長逗號串可致掛起/超時））經 decide() 觸發會掛起；
+            // 該路徑不在本 stage 範圍（extraction 不動）。本釘仍強迫 PERMISSION_CONDITIONAL_CLAUSE
+            // 對完整原始文本跑 raw 探針（M1 於此釘被實際演練）；若有人把 atomic delimiter 退回非原子，
+            // 本測試會永久掛住（＝回歸被抓到）。
+            "查Foo符號等" + "，".repeat(4087) + "X呢",
         )) {
             // decide()：decision is DENIED, toolCall == null。
             val d = decide(text)
@@ -2928,6 +2972,10 @@ class FastDispatchTest {
             "search symbol Foo" to "Foo",
             "find symbol Foo" to "Foo",
             "查 Foo 符號" to "Foo",
+            // #19 B3 stage-8.1（A1）：無 possessor／無 consent 動詞形態之精確 query 釘住——
+            //  possessor 槽放寬／consent 動詞集擴充後，`查Foo符號` 仍須 FAST 且 query 恰為 `Foo`
+            //  （extraction Step C 剝一個尾綴 `符號`——`Foo符號` 非本輸入之殘餘，見 extractSymbolQuery）。
+            "查Foo符號" to "Foo",
             "查 SymbolTable 符號" to "SymbolTable",
             "find symbols Foo" to "Foo",
             // #5（B3 re-review）EN connective strip 仍生效（legacy compatibility）。

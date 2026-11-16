@@ -354,17 +354,24 @@ class PrivilegeBridgeState @VisibleForTesting internal constructor(
 
     /**
      * 並發撤銷於 post-save 各重查或 commit RMW 前落地的共同收場：
-     * 旗標落 false，best-effort 清庫（失敗可接受——revoke 側具備
-     * marker/journal 復活防護——但不得吞 CancellationException：CE 原樣上拋；
-     * 其餘失敗必留一行 logcat，不靜默）後拋
+     * 旗標落 false，best-effort 清庫（有界：revokeOpTimeoutMs；逾時與失敗同級——
+     * 失敗可接受——revoke 側具備 marker/journal 復活防護——但不得吞
+     * CancellationException：CE 原樣上拋；其餘失敗必留一行 logcat，不靜默）後拋
      * `PRIVILEGE_GRANT_REVOKED_CONCURRENTLY`。
+     * 有界保證僅對服從協作式取消的 I/O 成立（與 revoke() 相同前提）。
      */
     private suspend fun failGrantRevokedConcurrently(store: PrivilegeBridgeStore): Nothing {
         bridgeGranted = false
         // best-effort 清庫：失敗可接受（revoke 側具備 marker/journal 復活防護），
         // 但不得吞 CancellationException（會掩蓋取消語義）；
         // 失敗必留一行 logcat（不靜默）。
-        try { store.clear() } catch (t: Throwable) {
+        try {
+            val cleared = withTimeoutOrNull(revokeOpTimeoutMs) { store.clear() }
+            if (cleared == null) {
+                // 與失敗同級：補償清庫逾時，記一行 logcat（不靜默、無例外參數），續拋 ISE。
+                safeLogW(TAG, "revoke-compensation clear timed out")
+            }
+        } catch (t: Throwable) {
             if (t is CancellationException) throw t
             safeLogW(TAG, "revoke-compensation clear failed", t)
         }
@@ -436,6 +443,7 @@ class PrivilegeBridgeState @VisibleForTesting internal constructor(
      * false，fail-closed）→ 有界清持久授權 → 鎖外有界執行可選跨域
      * `withdrawScope`（如 github 側 Shizuku 授權 Store 的 `clear()`，
      * 由 #136-B3 產品接線傳入，本檔不跨源集引用）。
+     * 審計表於持久耐久性結果未知前先行清除（既有行為，明文登錄：失敗撤權亦清審計，與『盡量撤銷』政策一致；見 THREAT_MODEL item 1）。
      *
      * seal 語義：入口即以單一 atomic RMW 推進 epoch 並封存（sticky）seal
      * （epoch++ 與 seal 置位同一 packed word，見 [grantFence]）；
@@ -593,6 +601,7 @@ class PrivilegeBridgeState @VisibleForTesting internal constructor(
             }
 
         /** 僅單測隔離用：丟棄行程實例（產品不得調用）。 */
+        @VisibleForTesting
         internal fun resetProcessForTest() {
             synchronized(this) {
                 processInstance = null

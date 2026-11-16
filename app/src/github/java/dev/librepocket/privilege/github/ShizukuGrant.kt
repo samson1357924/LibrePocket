@@ -182,10 +182,10 @@ object ShizukuGrantPolicy {
  * (vii) 本檔測試以單執行緒注入 seam 釘住順序語義；未證明真並行 interleaving 的行為；
  *     並行 save() vs load()-heal 的完整化併 #136-B3 generation fence。
  */
-class ShizukuGrantStore(
+class ShizukuGrantStore internal constructor(
     private val dataStore: DataStore<Preferences>,
     private val ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
-    val revokeMarker: PendingRevokeMarker = PendingRevokeMarker(null),
+    internal val revokeMarker: PendingRevokeMarker = PendingRevokeMarker(null),
 ) {
     /**
      * Context 便利構造子。

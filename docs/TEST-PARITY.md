@@ -17,27 +17,28 @@
 
 | # | bridge 側（file:line） | Shizuku 側（file:line） | 意圖 |
 |---|------------------------|------------------------|------|
-| 1 | `PrivilegeBridgeGrantTest.kt:64` neverGrantedIsInvalid | `ShizukuGrantTest.kt:55` neverGrantedIsInvalid | 從未授權 → Invalid(NEVER_GRANTED) |
-| 2 | `:70` malformedGrantIsInvalid | `:61` malformedGrantIsInvalid | 格式損毀 → Invalid |
-| 3 | `:137` unreadableConfigFailsClosed | `:136` unreadableConfigFailsClosed | 讀不到當前 endpoint/revision → Invalid（fail-closed） |
-| 4 | `:146` endpointSwitchInvalidatesGrant | `:143` endpointSwitchInvalidatesGrant | endpoint 變更即失效 |
-| 5 | `:153` revisionBumpInvalidatesGrant | `:150` revisionBumpInvalidatesGrant | revision 推進即失效 |
-| 6 | `:160` matchingEndpointAndRevisionIsValid | `:157` matchingEndpointAndRevisionIsValid | 相同 endpoint＋revision → Valid |
-| 7 | `:212` grantValidationRejectsInvalidInputs | `:103` grantValidationRejectsInvalidInputs | 簽發參數校驗 |
-| 8 | `:251` saveBlankProviderThrows | `:199` saveBlankProviderThrows | 空白 providerId 簽發／落庫即拋 |
-| 9 | `:321` revokeClearsPersistence | `:174` revokeClearsPersistence | clear 後 load()==null |
-| 10 | `:331` loadMissingKeysYieldsNull | `:571` loadMissingKeysYieldsNull | 缺鍵 → null |
-| 11 | `:358` cancellationExceptionPropagatesWithoutBeingSwallowed | `:634` cancellationExceptionPropagatesWithoutBeingSwallowed | CE 不得被吞 |
-| 12 | `:563` journalBlocksResurrection_whenClearFails_afterJournalWritten | `:296` journalBlocksResurrection_whenClearFails_afterJournalWritten | journal 落盤後 clear 失敗：journal 擋復活 |
-| 13 | `:598` journalWritten_clearThrows_restartLoadDenied | `:364` journalWritten_clearThrows_restartLoadDenied | journal 已寫＋clear 拋：重啟後 load()==null |
-| 14 | `:627` pendingMarker_parentIsRegularFile_clearFails_restartGrantMustNotResurrect | `:329` pendingMarker_parentIsRegularFile_clearFails_restartGrantMustNotResurrect | marker 父為普通檔案 → clear 失敗 → 重啟後授權不復活 |
-| 15 | `:663` saveClearsJournal | `:478` saveClearsJournal | 新授權取代撤權日誌 |
-| 16 | `:689` journalWriteFailure_bestEffortWipesKeys_sameProcessAndRestartDeny | `:393` journalWriteFailure_bestEffortWipesKeys_sameProcessAndRestartDeny | journal 寫失敗＋best-effort wipe：同進程／重啟皆拒 |
-| 17 | `:726` saveAfterCrashedClear_survivesStaleJournalHeal | `:430` saveAfterCrashedClear_survivesStaleJournalHeal | crash 後 save：新授權不被 stale journal heal 誤擦 |
-| 18 | `:773` check_withUnhealedJournalPending_returnInvalid | `:504` check_withUnhealedJournalPending_returnInvalid | journal 未癒合時 check → Invalid |
-| 19 | `:824` pendingRevokeMarkerPreventsResurrectionAndSelfHeals | `:532` pendingRevokeMarkerPreventsResurrectionAndSelfHeals | marker 擋復活＋self-heal |
-| 20 | `:885` saveLandsBetweenJournalAndErase_clearKeepsFreshGrant | `:593` saveLandsBetweenJournalAndErase_clearKeepsFreshGrant | journal 與擦除之間落 grant：clear 保留新授權 |
-| 21 | `:293` storeRoundTripBindsRevisionAndExpiry（同意圖、不同名；bridge 側含 `expiresAtMs` round-trip 斷言） | `:162` storeRoundTripBindsRevision | grant 落庫 round-trip（綁定 revision；bridge 另綁 expiry） |
+| 1 | `PrivilegeBridgeGrantTest.kt:80` neverGrantedIsInvalid | `ShizukuGrantTest.kt:71` neverGrantedIsInvalid | 從未授權 → Invalid(NEVER_GRANTED) |
+| 2 | `:86` malformedGrantIsInvalid | `:77` malformedGrantIsInvalid | 格式損毀 → Invalid |
+| 3 | `:153` unreadableConfigFailsClosed | `:152` unreadableConfigFailsClosed | 讀不到當前 endpoint/revision → Invalid（fail-closed） |
+| 4 | `:162` endpointSwitchInvalidatesGrant | `:159` endpointSwitchInvalidatesGrant | endpoint 變更即失效 |
+| 5 | `:169` revisionBumpInvalidatesGrant | `:166` revisionBumpInvalidatesGrant | revision 推進即失效 |
+| 6 | `:176` matchingEndpointAndRevisionIsValid | `:173` matchingEndpointAndRevisionIsValid | 相同 endpoint＋revision → Valid |
+| 7 | `:228` grantValidationRejectsInvalidInputs | `:119` grantValidationRejectsInvalidInputs | 簽發參數校驗 |
+| 8 | `:267` saveBlankProviderThrows | `:215` saveBlankProviderThrows | 空白 providerId 簽發／落庫即拋 |
+| 9 | `:337` revokeClearsPersistence | `:190` revokeClearsPersistence | clear 後 load()==null |
+| 10 | `:347` loadMissingKeysYieldsNull | `:638` loadMissingKeysYieldsNull | 缺鍵 → null |
+| 11 | `:374` cancellationExceptionPropagatesWithoutBeingSwallowed | `:701` cancellationExceptionPropagatesWithoutBeingSwallowed | CE 不得被吞 |
+| 12 | `:588` journalBlocksResurrection_whenClearFails_afterJournalWritten | `:321` journalBlocksResurrection_whenClearFails_afterJournalWritten | journal 落盤後 clear 失敗：journal 擋復活 |
+| 13 | `:623` journalWritten_clearThrows_restartLoadDenied | `:389` journalWritten_clearThrows_restartLoadDenied | journal 已寫＋clear 拋：重啟後 load()==null |
+| 14 | `:652` pendingMarker_parentIsRegularFile_clearFails_restartGrantMustNotResurrect | `:354` pendingMarker_parentIsRegularFile_clearFails_restartGrantMustNotResurrect | marker 父為普通檔案 → clear 失敗 → 重啟後授權不復活 |
+| 15 | `:688` saveClearsJournal | `:545` saveClearsJournal | 新授權取代撤權日誌 |
+| 16 | `:714` journalWriteFailure_bestEffortWipesKeys_sameProcessAndRestartDeny | `:418` journalWriteFailure_bestEffortWipesKeys_sameProcessAndRestartDeny | journal 寫失敗＋best-effort wipe：同進程／重啟皆拒 |
+| 17 | `:793` saveAfterCrashedClear_survivesStaleJournalHeal | `:497` saveAfterCrashedClear_survivesStaleJournalHeal | crash 後 save：新授權不被 stale journal heal 誤擦 |
+| 18 | `:840` check_withUnhealedJournalPending_returnInvalid | `:571` check_withUnhealedJournalPending_returnInvalid | journal 未癒合時 check → Invalid |
+| 19 | `:891` pendingRevokeMarkerPreventsResurrectionAndSelfHeals | `:599` pendingRevokeMarkerPreventsResurrectionAndSelfHeals | marker 擋復活＋self-heal |
+| 20 | `:952` saveLandsBetweenJournalAndErase_clearKeepsFreshGrant | `:660` saveLandsBetweenJournalAndErase_clearKeepsFreshGrant | journal 與擦除之間落 grant：clear 保留新授權 |
+| 21 | `:309` storeRoundTripBindsRevisionAndExpiry（同意圖、不同名；bridge 側含 `expiresAtMs` round-trip 斷言） | `:178` storeRoundTripBindsRevision | grant 落庫 round-trip（綁定 revision；bridge 另綁 expiry） |
+| 22 | `:751` journalAndWipeBothFail_clearRethrowsJournalWriteError | `:455` journalAndWipeBothFail_clearRethrowsJournalWriteError | journal 寫入＋best-effort wipe 雙失敗 ⇒ clear() rethrow journal 例外；marker 落盤；grant 鍵留存 |
 
 （bridge 檔案行號：`app/src/test/java/dev/librepocket/shell/PrivilegeBridgeGrantTest.kt`；
 Shizuku 檔案行號：`app/src/testGithub/java/dev/librepocket/privilege/github/ShizukuGrantTest.kt`。）
@@ -72,10 +73,10 @@ Shizuku 檔案：`app/src/testGithub/java/dev/librepocket/privilege/github/Shizu
 
 ## 未鏡像／缺口（誠實列缺）
 
-- **`loadFailureFoldsToNull`（bridge:381）在 Shizuku 側無對應測試**：Shizuku `load()`
+- **`loadFailureFoldsToNull`（bridge:397）在 Shizuku 側無對應測試**：Shizuku `load()`
   同為 fail-closed folding（見 `ShizukuGrantStore.load()` 的 catch→null），但**未釘住**——
   建議回填（同一 fail-closed 實作，補釘即關閉此缺口）。
-- **`refreshAndCheck_withPendingMarker_returnInvalid`（bridge:800）**：pending-marker × refresh()
+- **`refreshAndCheck_withPendingMarker_returnInvalid`（bridge:867）**：pending-marker × refresh()
   路徑的橋側專屬釘；Shizuku 側無 refresh()，僅有 `check_withUnhealedJournalPending_returnInvalid`
   （journal 分支，表 1 第 18 項）。
 - Shizuku 側 **`SaveAfterCrashedClear`／`saveLandsBetweenJournalAndErase`** 與 bridge 側

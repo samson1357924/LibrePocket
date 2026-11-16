@@ -60,7 +60,7 @@ private fun safeLogW(tag: String, msg: String, e: Throwable? = null) {
  *   `exists()==true` 會造成永久 pending 且永不好——反向失效，故用 `isFile`）；
  *   `file == null` 時只看記憶體。檔案系統/安全例外一律 fail-closed 回 true。
  */
-class PendingRevokeMarker(val file: File? = null) {
+internal class PendingRevokeMarker(val file: File? = null) {
     private val inMemoryPending = java.util.concurrent.atomic.AtomicBoolean(false)
 
     fun isPending(): Boolean = try {
@@ -274,10 +274,10 @@ object PrivilegeGrantPolicy {
  * (vii) 本檔測試以單執行緒注入 seam 釘住順序語義；未證明真並行 interleaving 的行為；
  *     並行 save() vs load()-heal 的完整化併 #136-B3 generation fence。
  */
-class PrivilegeBridgeStore(
+class PrivilegeBridgeStore internal constructor(
     private val dataStore: DataStore<Preferences>,
     private val ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
-    val revokeMarker: PendingRevokeMarker = PendingRevokeMarker(null),
+    internal val revokeMarker: PendingRevokeMarker = PendingRevokeMarker(null),
     private val clock: () -> Long = { System.currentTimeMillis() },
 ) {
     /**

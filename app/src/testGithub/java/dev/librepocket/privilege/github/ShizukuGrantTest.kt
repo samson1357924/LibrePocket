@@ -47,6 +47,22 @@ class ShizukuGrantTest {
         dir.deleteRecursively()
     }
 
+    /** 走訪 [t] 的 cause／suppressed 鏈（含自身），回傳不重複的例外清單。 */
+    private fun throwableChain(t: Throwable): List<Throwable> {
+        val out = mutableListOf<Throwable>()
+        val seen = java.util.Collections.newSetFromMap(java.util.IdentityHashMap<Throwable, Boolean>())
+        val queue: ArrayDeque<Throwable> = ArrayDeque()
+        queue.add(t)
+        while (queue.isNotEmpty()) {
+            val cur = queue.removeFirst()
+            if (!seen.add(cur)) continue
+            out.add(cur)
+            cur.cause?.let(queue::add)
+            cur.suppressed.forEach(queue::add)
+        }
+        return out
+    }
+
     private fun store(name: String = "grant_${System.nanoTime()}.preferences_pb"): ShizukuGrantStore {
         val dataStore = PreferenceDataStoreFactory.create(scope = scope) { File(dir, name) }
         return ShizukuGrantStore(dataStore)
@@ -277,18 +293,27 @@ class ShizukuGrantTest {
      * save() 消耗 call #1，clear() 的 journal 寫入為 call #2、擦除 edit 為 call #3。
      * failOnCall=2 亦有測試使用（journal 寫入失敗 → best-effort wipe →
      * rethrow 原始例外，見 journalWriteFailure_bestEffortWipesKeys_sameProcessAndRestartDeny）。
+     * failOnCalls（選填）：以 call 序號對應各自 IOException，可同時失敗多次
+     * （雙重失敗 pin，見 journalAndWipeBothFail_clearRethrowsJournalWriteError）；
+     * failOnCall 路徑不受影響。
      */
     private class FailOnUpdateCallDataStore(
         private val delegate: DataStore<Preferences>,
     ) : DataStore<Preferences> by delegate {
         var failOnCall: Int? = null
+        var failOnCalls: Map<Int, IOException>? = null
+        val callCount = java.util.concurrent.atomic.AtomicInteger(0)
         private var call = 0
+
+        fun updateDataCallCount(): Int = callCount.get()
 
         override suspend fun updateData(transform: suspend (t: Preferences) -> Preferences): Preferences {
             call += 1
+            callCount.incrementAndGet()
             if (failOnCall == call) {
                 throw IOException("simulated update failure at call #$call")
             }
+            failOnCalls?.get(call)?.let { throw it }
             return delegate.updateData(transform)
         }
     }
@@ -425,6 +450,48 @@ class ShizukuGrantTest {
         val restarted = ShizukuGrantStore(backing, revokeMarker = PendingRevokeMarker(markerFile))
         assertNull(restarted.load())
         assertFalse("marker must be gone after marker-branch self-heal", markerFile.exists())
+    }
+
+    @Test fun journalAndWipeBothFail_clearRethrowsJournalWriteError() = runBlocking {
+        // journal 寫入（call #2）與 best-effort wipe（call #3）雙重失敗：
+        // clear() 必 rethrow journal 例外本身（primary identity——wipe 例外不得遮蔽）；
+        // marker 先於 journal edit 已置 pending（markPending 於 call #2 前執行）；
+        // journal 未落盤（journal 寫入本身失敗）；授權鍵仍在 backing（雙重失敗殘留——
+        // 呼叫端必須視 clear() 例外為「撤權未完成」並重試）。
+        val backing = PreferenceDataStoreFactory.create(scope = scope) {
+            File(dir, "shizuku_journal_and_wipe_both_fail.preferences_pb")
+        }
+        val journalBoom = IOException("journal boom")
+        val wipeBoom = IOException("wipe boom")
+        val failingDs = FailOnUpdateCallDataStore(backing)
+        failingDs.failOnCalls = mapOf(2 to journalBoom, 3 to wipeBoom)
+        val markerFile = File(dir, "shizuku_journal_and_wipe_both_fail.pending")
+        val store = ShizukuGrantStore(failingDs, revokeMarker = PendingRevokeMarker(markerFile))
+
+        store.save(ShizukuGrantPolicy.grant("preset:openai", 5L, 15)) // call #1
+        val thrown = assertThrows(IOException::class.java) {
+            runBlocking { store.clear() }
+        }
+        assertTrue(
+            "save + journal + wipe 至少三次 updateData 嘗試，實際=${failingDs.updateDataCallCount()}",
+            failingDs.updateDataCallCount() >= 3,
+        )
+        // primary identity：clear() 必 rethrow journal 例外本身（非 wipe 例外）。
+        // kotlinx 除錯模式會於 coroutine 邊界複製例外（原例外落於複製體的 cause 鏈上）；
+        // 兩種模式統一斷言：走訪 cause／suppressed 鏈必遇 journalBoom 本身，且不得遇 wipeBoom。
+        val chain = throwableChain(thrown)
+        assertTrue(
+            "例外鏈上必遇 journalBoom 本身，實際=${chain.map { "${it.javaClass.name}: ${it.message}" }}",
+            chain.any { it === journalBoom },
+        )
+        assertFalse(
+            "例外鏈上不得遇 wipeBoom（primary 不得被 wipe 例外遮蔽），實際=${chain.map { "${it.javaClass.name}: ${it.message}" }}",
+            chain.any { it === wipeBoom },
+        )
+        val prefs = backing.data.first()
+        assertEquals("preset:openai", prefs[SHIZUKU_GRANT_PROVIDER_ID])
+        assertTrue("雙重失敗：marker 旗標必仍 pending", store.revokeMarker.isPending())
+        assertFalse("journal 寫入本身失敗 ⇒ journal 不得存在", prefs.contains(SHIZUKU_REVOKE_JOURNAL))
     }
 
     @Test fun saveAfterCrashedClear_survivesStaleJournalHeal() = runBlocking {

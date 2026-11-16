@@ -6,6 +6,8 @@ import androidx.datastore.preferences.core.Preferences
 import java.io.File
 import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -18,6 +20,7 @@ import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -527,21 +530,27 @@ class PrivilegeBridgeStateTest {
     }
 
     @Test fun revokeWithStuckMutex_bestEffortClearPersists() = runBlocking {
-        // grant 落庫以 delay 持 opMutex 慢放（約 300ms、可取消）；revokeOpTimeoutMs=100
-        // → opMutex 等待逾時 → PRIVILEGE_REVOKE_TIMEOUT；鎖外 best-effort clear
-        //（不延遲）必落地 → store.load() == null；旗標全 false。
+        // grant 落庫以 latch 持 opMutex（lockHoldRelease，grant 卡在 updateData 至 revoke 逾時）；revokeOpTimeoutMs=100
+        // → opMutex 等待逾時 → PRIVILEGE_REVOKE_TIMEOUT；revoke 的鎖外 best-effort clear
+        // 因 DataStore actor 被 grant 佔用以 critical section 被佔 >100ms，故逾時
+        //（suppressed `PRIVILEGE_REVOKE_BEST_EFFORT_CLEAR_TIMEOUT`）；持久擦除由
+        // grant 落庫後的有界 epilogue compensation clear（Item A）完成，故 store.load() == null；
+        // 旗標全 false。
         val backing = PreferenceDataStoreFactory.create(scope = scope) {
             File(dir, "stuck_mutex_best_effort.preferences_pb")
         }
         val lockHoldStarted = java.util.concurrent.CountDownLatch(1)
+        val lockHoldRelease = java.util.concurrent.CountDownLatch(1)
         val saveCalls = java.util.concurrent.atomic.AtomicInteger(0)
         val slowDs = object : DataStore<Preferences> by backing {
             override suspend fun updateData(transform: suspend (t: Preferences) -> Preferences): Preferences {
-                // 第一次 updateData 為 grant 落庫：countDown 後延遲約 300ms（可取消）；
-                // 後續 clear 路徑的 edit 不延遲，確保鎖外 best-effort clear 可在時限內落地。
+                // 第一次 updateData 為 grant 落庫：countDown 後掛住（latch-gated，
+                // 帶 10s 上限，絕不裸 await）直到測試於 revoke 逾時後放行；
+                // 後續 clear 路徑的 edit 不延遲，讓 grant 落庫後的有界 epilogue compensation
+                // clear 可在時限內落地（鎖外 best-effort clear 因 DataStore actor 被佔而逾時）。
                 if (saveCalls.getAndIncrement() == 0) {
                     lockHoldStarted.countDown()
-                    kotlinx.coroutines.delay(300)
+                    lockHoldRelease.await(10, TimeUnit.SECONDS)
                 }
                 return backing.updateData(transform)
             }
@@ -559,21 +568,27 @@ class PrivilegeBridgeStateTest {
                 // 預期：revoke 搶先推進 epoch → grant 拋 PRIVILEGE_GRANT_REVOKED_CONCURRENTLY
             }
         }
-        lockHoldStarted.await(10, java.util.concurrent.TimeUnit.SECONDS)
+        assertTrue("grant 落庫必已進入臨界區", lockHoldStarted.await(10, java.util.concurrent.TimeUnit.SECONDS))
 
-        val error = assertThrows(IllegalStateException::class.java) {
-            runBlocking { state.revoke(store) }
+        val error = try {
+            assertThrows(IllegalStateException::class.java) {
+                runBlocking { state.revoke(store) }
+            }
+        } finally {
+            // assertThrows 返回（revoke 於 revokeOpTimeoutMs=100 逾時後拋出）即放行 grant 落庫，
+            // 讓 grantJob 得以完成；finally 保證放行。
+            lockHoldRelease.countDown()
         }
         grantJob.join()
 
         assertEquals("PRIVILEGE_REVOKE_TIMEOUT", error.message)
         assertFalse(state.bridgeSwitchOn)
         assertFalse(state.bridgeGranted)
-        assertNull("鎖外 best-effort clear 已落地，持久授權必已撤銷", store.load())
+        assertNull("持久擦除由 grant epilogue compensation 有界完成（鎖外 best-effort clear 逾時），持久授權必已撤銷", store.load())
     }
 
     @Test fun revokeMutexTimeout_bestEffortClearFailsFast_suppressedClearFailed() = runBlocking {
-        // grant 落庫以 delay 持 opMutex（> revokeOpTimeoutMs=100）；clear()（含臨界區內
+        // grant 落庫以 latch 持 opMutex（lockHoldRelease，grant 卡在 updateData 至 revoke 逾時）；clear()（含臨界區內
         // 與 best-effort）路徑的 updateData 直接拋 IOException（不 hang）。
         // → opMutex 等待逾時 → PRIVILEGE_REVOKE_TIMEOUT；鎖外 best-effort clear 因
         // IOException 快速失敗 → suppressed ISE(PRIVILEGE_REVOKE_BEST_EFFORT_CLEAR_FAILED)，
@@ -582,15 +597,17 @@ class PrivilegeBridgeStateTest {
             File(dir, "stuck_mutex_best_effort_clear_fails.preferences_pb")
         }
         val lockHoldStarted = java.util.concurrent.CountDownLatch(1)
+        val lockHoldRelease = java.util.concurrent.CountDownLatch(1)
         val saveCalls = java.util.concurrent.atomic.AtomicInteger(0)
         val ioFailure = java.io.IOException("simulated clear IO failure")
         val failingDs = object : DataStore<Preferences> by backing {
             override suspend fun updateData(transform: suspend (t: Preferences) -> Preferences): Preferences {
-                // 第一次 updateData 為 grant 落庫：countDown 後延遲約 300ms（可取消）；
+                // 第一次 updateData 為 grant 落庫：countDown 後掛住（latch-gated，
+                // 帶 10s 上限，絕不裸 await）直到測試於 revoke 逾時後放行；
                 // clear 路徑的 edit 直接拋 IOException（不 hang）。
                 if (saveCalls.getAndIncrement() == 0) {
                     lockHoldStarted.countDown()
-                    kotlinx.coroutines.delay(300)
+                    lockHoldRelease.await(10, TimeUnit.SECONDS)
                     return backing.updateData(transform)
                 }
                 throw ioFailure
@@ -609,10 +626,16 @@ class PrivilegeBridgeStateTest {
                 // 預期：revoke 搶先推進 epoch → grant 拋 PRIVILEGE_GRANT_REVOKED_CONCURRENTLY
             }
         }
-        lockHoldStarted.await(10, java.util.concurrent.TimeUnit.SECONDS)
+        assertTrue("grant 落庫必已進入臨界區", lockHoldStarted.await(10, java.util.concurrent.TimeUnit.SECONDS))
 
-        val error = assertThrows(IllegalStateException::class.java) {
-            runBlocking { state.revoke(store) }
+        val error = try {
+            assertThrows(IllegalStateException::class.java) {
+                runBlocking { state.revoke(store) }
+            }
+        } finally {
+            // assertThrows 返回（revoke 於 revokeOpTimeoutMs=100 逾時後拋出）即放行 grant 落庫，
+            // 讓 grantJob 得以完成；finally 保證放行。
+            lockHoldRelease.countDown()
         }
         grantJob.join()
 
@@ -652,14 +675,16 @@ class PrivilegeBridgeStateTest {
             File(dir, "stuck_mutex_best_effort_clear_timeout.preferences_pb")
         }
         val lockHoldStarted = java.util.concurrent.CountDownLatch(1)
+        val lockHoldRelease = java.util.concurrent.CountDownLatch(1)
         val saveCalls = java.util.concurrent.atomic.AtomicInteger(0)
         val hangingDs = object : DataStore<Preferences> by backing {
             override suspend fun updateData(transform: suspend (t: Preferences) -> Preferences): Preferences {
-                // 第一次 updateData 為 grant 落庫：countDown 後延遲約 300ms（可取消）；
+                // 第一次 updateData 為 grant 落庫：countDown 後掛住（latch-gated，
+                // 帶 10s 上限，絕不裸 await）直到測試於 revoke 逾時後放行；
                 // clear 路徑的 edit 掛起（while delay，可取消），由 best-effort 逾時取消。
                 if (saveCalls.getAndIncrement() == 0) {
                     lockHoldStarted.countDown()
-                    kotlinx.coroutines.delay(300)
+                    lockHoldRelease.await(10, TimeUnit.SECONDS)
                     return backing.updateData(transform)
                 }
                 while (true) kotlinx.coroutines.delay(1_000)
@@ -678,15 +703,22 @@ class PrivilegeBridgeStateTest {
                 // 預期：revoke 搶先推進 epoch → grant 拋 PRIVILEGE_GRANT_REVOKED_CONCURRENTLY
             }
         }
-        lockHoldStarted.await(10, java.util.concurrent.TimeUnit.SECONDS)
+        assertTrue("grant 落庫必已進入臨界區", lockHoldStarted.await(10, java.util.concurrent.TimeUnit.SECONDS))
 
         val t0 = System.currentTimeMillis()
-        val error = assertThrows(IllegalStateException::class.java) {
-            runBlocking { state.revoke(store) }
+        val error = try {
+            assertThrows(IllegalStateException::class.java) {
+                runBlocking { state.revoke(store) }
+            }
+        } finally {
+            // assertThrows 返回（revoke 於 revokeOpTimeoutMs=100 逾時後拋出）即放行 grant 落庫；
+            // finally 保證放行。
+            lockHoldRelease.countDown()
         }
         val elapsed = System.currentTimeMillis() - t0
         // grant 落庫後的 epilogue 會 best-effort 再 clear() 一次（同一個無限 hang 假件），
-        // 該路徑無界；以取消代 join，避免 grantJob 永久掛起。
+        // 該路徑現由 revokeOpTimeoutMs 有界（含補償清庫有界化）；
+        // 以取消代 join 仍安全且對取消語義無影響。
         grantJob.cancelAndJoin()
 
         assertEquals("PRIVILEGE_REVOKE_TIMEOUT", error.message)
@@ -1097,15 +1129,17 @@ class PrivilegeBridgeStateTest {
             File(dir, "refresh_after_failed_revoke.preferences_pb")
         }
         val lockHoldStarted = java.util.concurrent.CountDownLatch(1)
+        val lockHoldRelease = java.util.concurrent.CountDownLatch(1)
         val saveCalls = java.util.concurrent.atomic.AtomicInteger(0)
         val ioFailure = java.io.IOException("simulated clear IO failure")
         val failingDs = object : DataStore<Preferences> by backing {
             override suspend fun updateData(transform: suspend (t: Preferences) -> Preferences): Preferences {
-                // 第一次 updateData 為 grant 落庫：countDown 後延遲約 300ms（可取消）；
+                // 第一次 updateData 為 grant 落庫：countDown 後掛住（latch-gated，
+                // 帶 10s 上限，絕不裸 await）直到測試於 revoke 逾時後放行；
                 // 之後 clear 路徑的 edit 直接拋 IOException（不 hang）。
                 if (saveCalls.getAndIncrement() == 0) {
                     lockHoldStarted.countDown()
-                    kotlinx.coroutines.delay(300)
+                    lockHoldRelease.await(10, TimeUnit.SECONDS)
                     return backing.updateData(transform)
                 }
                 throw ioFailure
@@ -1126,8 +1160,14 @@ class PrivilegeBridgeStateTest {
         }
         assertTrue(lockHoldStarted.await(10, java.util.concurrent.TimeUnit.SECONDS))
 
-        val error = assertThrows(IllegalStateException::class.java) {
-            runBlocking { state.revoke(store) }
+        val error = try {
+            assertThrows(IllegalStateException::class.java) {
+                runBlocking { state.revoke(store) }
+            }
+        } finally {
+            // assertThrows 返回（revoke 於 revokeOpTimeoutMs=100 逾時後拋出）即放行 grant 落庫；
+            // finally 保證放行。
+            lockHoldRelease.countDown()
         }
         grantJob.join()
 
@@ -1643,6 +1683,71 @@ class PrivilegeBridgeStateTest {
             state.bridgeGrantedEpochBumpHookForTest = null
         }
         assertFalse("賦值→回讀間 seal 置位 ⇒ second-read 必壓回 false", state.bridgeGranted)
+    }
+
+    @Test fun grantEpilogueCompensationClearHangs_grantDoesNotHang() = runBlocking {
+        // 補償清庫有界 pin（revokeOpTimeoutMs）：grant commit 窗口插入並發撤銷
+        //（grantCommitHookForTest 內 revokeInMemoryForTest() 推進 epoch＋置 seal；
+        // 不寫 Store、不重入 revoke）。commit RMW 見 epoch 不符 ⇒
+        // failGrantRevokedConcurrently ⇒ best-effort 補償清庫。
+        // fake 的第二次起 updateData（補償清庫路徑）以 CountDownLatch 掛住、
+        // 僅測試 finally 放開；hang 迴圈內以 ensureActive() 響應協作式取消——
+        // withTimeoutOrNull(revokeOpTimeoutMs=100) 必於上限內取消該假件並返回 null
+        //（latch 放開前絕不返回的無界路徑不存在）。
+        // 斷言：grant 以 ISE(PRIVILEGE_GRANT_REVOKED_CONCURRENTLY) 結束且 <5s；
+        // 掛住的補償清庫已在 latch 放開前被取消。
+        val backing = PreferenceDataStoreFactory.create(scope = scope) {
+            File(dir, "grant_epilogue_hang.preferences_pb")
+        }
+        val hangLatch = java.util.concurrent.CountDownLatch(1)
+        val compensationClearEntered = java.util.concurrent.atomic.AtomicBoolean(false)
+        val compensationClearCancelled = java.util.concurrent.atomic.AtomicBoolean(false)
+        val saveCalls = java.util.concurrent.atomic.AtomicInteger(0)
+        // 第一次 updateData 為 grant 落庫（成功）；其後每次（補償清庫）掛住直到 finally 放開，
+        // 但於 5ms 切片輪詢中以 ensureActive() 響應取消（絕不裸 await、絕不靠時序猜測）。
+        val hangingDs = object : DataStore<Preferences> by backing {
+            override suspend fun updateData(transform: suspend (t: Preferences) -> Preferences): Preferences {
+                if (saveCalls.getAndIncrement() == 0) {
+                    return backing.updateData(transform)
+                }
+                compensationClearEntered.set(true)
+                try {
+                    while (!hangLatch.await(5, TimeUnit.MILLISECONDS)) {
+                        currentCoroutineContext().ensureActive()
+                    }
+                    return backing.updateData(transform)
+                } catch (t: Throwable) {
+                    if (t is CancellationException) {
+                        compensationClearCancelled.set(true)
+                    }
+                    throw t
+                }
+            }
+        }
+        val store = PrivilegeBridgeStore(hangingDs)
+        val state = PrivilegeBridgeState(
+            bridgeSwitchOn = true,
+            revokeOpTimeoutMs = 100L,
+        )
+        state.grantCommitHookForTest = { state.revokeInMemoryForTest() }
+        try {
+            val t0 = System.currentTimeMillis()
+            val error = assertThrows(IllegalStateException::class.java) {
+                runBlocking { withTimeout(5_000L) { state.grant(store, "preset:openai", 1L) } }
+            }
+            val elapsed = System.currentTimeMillis() - t0
+            assertEquals("PRIVILEGE_GRANT_REVOKED_CONCURRENTLY", error.message)
+            assertTrue("epilogue 補償清庫必有界返回，took ${elapsed}ms", elapsed < 5_000L)
+            assertTrue("補償清庫路徑必已進入", compensationClearEntered.get())
+            assertTrue(
+                "掛住的補償清庫必已被 withTimeoutOrNull 取消（latch 放開前即離開）",
+                compensationClearCancelled.get(),
+            )
+            assertFalse("commit 窗口並發撤銷 ⇒ 旗標必 false", state.bridgeGranted)
+        } finally {
+            state.grantCommitHookForTest = null
+            hangLatch.countDown()
+        }
     }
 
     @Test fun grantCommit_revokeEntryDuringCommit_sealSticks() = runBlocking {

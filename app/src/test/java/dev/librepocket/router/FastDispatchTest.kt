@@ -3214,4 +3214,64 @@ class FastDispatchTest {
             assertEquals(text, before, backend.invocations.get())
         }
     }
+
+    // #19 B3 stage-8.4（Re-review #8 A3）：C++ global-namespace 前綴 `::Foo` 是
+    // 不同 scope——SYMBOL_EDGE 前導分支不再剝 `:`（U+003A）／`：`（U+FF1A），
+    // leading colon 原樣保留 verbatim（leading colons 一律不剝/不改寫）；
+    // 尾端分支（stage-8.2 possessive `++$`）不動。`:Foo`（單冒號）為記錄之 verbatim
+    // 殘餘（READ-only）；全形 `：`（U+FF1A）Step E 是 ASCII-punct-only ⇒
+    // NEED_CLARIFICATION（fail-closed，絕不 rewrite 成 `Foo`）；`查 Foo: 符號`
+    // 尾端 `:` 仍剝（前後不對稱，記錄）；`查 ::符號 符號` 歧義守衛照舊澄清。
+    // （argumentsJson parseToJsonElement 風格，與 enCommandDelimitedIdentifiersAreVerbatim 一致）
+    @Test fun leadingColonPrefixesPreserved() = runBlocking {
+        val backend = CountingBackend()
+        val dispatcher = lspDispatcher(backend)
+        for ((text, expectedQuery) in listOf(
+            "查 ::Foo 符號" to "::Foo",
+            "查 ::std::vector 符號" to "::std::vector",
+            "查 :Foo 符號" to ":Foo",
+            "查 Foo: 符號" to "Foo",
+            // Leading-colon token-body residual（記錄已接受殘餘：冒號開頭入 Step E）：
+            "查 ::,Foo 符號" to "::,Foo",
+            "查 :;Foo 符號" to ":;Foo",
+        )) {
+            val d = decide(text)
+            assertEquals(text, RouteKind.FAST, d.route)
+            assertEquals(text, "lsp.symbols", d.toolCall?.toolName)
+            assertNotNull(text, d.toolCall)
+            assertEquals(
+                text,
+                expectedQuery,
+                Json.parseToJsonElement(d.toolCall!!.argumentsJson).jsonObject["query"]!!.jsonPrimitive.content,
+            )
+            val before = backend.invocations.get()
+            val result = dispatcher.decideAndDispatch(text, lspOn, sessionId = "s1", turnIndex = 1)
+            assertEquals(text, RouteKind.FAST, result.decision.route)
+            val executed = result.outcome as? FastDispatchOutcome.Executed
+            assertNotNull("$text must execute against the fake backend (got ${result.outcome})", executed)
+            assertEquals(text, before + 1, backend.invocations.get())
+            assertTrue(
+                "executed body must echo the identifier verbatim: ${executed!!.result.resultJson}",
+                executed.result.resultJson.contains("\"name\":\"$expectedQuery:example\""),
+            )
+        }
+        // 澄清 pins：全形 `：`（U+FF1A）Step E 拒絕（fail-closed）；
+        // `::符號 符號` 歧義守衛照舊澄清（pre-Step-B′ 守衛先行；post-Step-D 守衛為後備）。
+        for (text in listOf(
+            "查 ：Foo 符號",
+            "查 ::符號 符號",
+        )) {
+            val d = decide(text)
+            assertEquals(text, RouteKind.DENIED, d.route)
+            assertEquals(text, DenyReason.NEED_CLARIFICATION, d.reasonCode)
+            assertNull(text, d.toolCall)
+            // decideAndDispatch：decision DENIED、outcome 非 Executed、backend.invocations 不增。
+            val before = backend.invocations.get()
+            val result = dispatcher.decideAndDispatch(text, lspOn, sessionId = "s1", turnIndex = 1)
+            assertEquals(text, RouteKind.DENIED, result.decision.route)
+            assertNull(text, result.decision.toolCall)
+            assertFalse(text, result.outcome is FastDispatchOutcome.Executed)
+            assertEquals(text, before, backend.invocations.get())
+        }
+    }
 }

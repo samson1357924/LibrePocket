@@ -1174,9 +1174,22 @@ class FastRouter(
          *   runs first, THEN this loop — prose order matches application
          *   order) so the suffix cue cannot mask the "another token remains"
          *   guard.
-         * Step D — edge trim ONLY: leading/trailing runs of
-         *   `[\s，。、？?：:「」『』“”"'（）]` stripped repeatedly. Nothing
-         *   intra-token is ever removed by this step. NOTE: halfwidth `!` and
+         * Step D — edge trim ONLY: runs of
+         *   LEADING `[\s，。、？?「」『』“”"'（）]`（stage-8.4：前導類不再含
+         *   `:`（U+003A）／`：`（U+FF1A））and TRAILING
+         *   `[\s，。、？?：:「」『』“”"'（）]`（stage-8.2 possessive `++$`，不動）
+         *   stripped repeatedly. Nothing
+         *   intra-token is ever removed by this step.
+         *   Stage-8.4（Re-review #8 A3）：前導 colon 不再剝離——C++
+         *   global-namespace 前綴 `::Foo` 與 `Foo` 為不同 scope，一律原樣保留
+         *   verbatim（leading colons 一律不剝/不改寫（trailing edge class 維持不變））；單冒號 `:Foo`
+         *   （U+003A）亦原樣保留（`查 :Foo 符號` → FAST `:Foo`，記錄，READ-only）；
+         *   全形 `：`（U+FF1A）同樣不被前導類剝除，但 Step E 是 ASCII-punct-only
+         *   ⇒ `查 ：Foo 符號` 拒絕 ⇒ NEED_CLARIFICATION（fail-closed，絕不
+         *   rewrite 成 `Foo`）；尾端 colon 類不變（`查 Foo: 符號` → FAST `Foo`，
+         *   前後不對稱為記錄行為）；`查 ::符號 符號` 之歧義守衛照舊澄清
+         *   （belt-and-suspenders，pinned）。
+         *   NOTE: halfwidth `!` and
          *   the halfwidth parens are deliberately NOT in the edge class —
          *   `查 ! Foo`-class inputs must clarify, and `get(id)` must survive
          *   verbatim (intra parens are allow-listed, never edge-stripped);
@@ -1214,6 +1227,8 @@ class FastRouter(
          * `查 Foo.bar 符號` → `Foo.bar`, `查 Foo.symbol.bar 符號` →
          * `Foo.symbol.bar`, `查 foo/symbol.kt 符號` → `foo/symbol.kt`,
          * `查 Foo::symbol 符號` / `查 std::vector 符號` → `::` preserved,
+         * `查 ::Foo 符號` / `查 ::std::vector 符號` → `::Foo` / `::std::vector`
+         * （stage-8.4：前導 `::` 原樣保留 verbatim；前導冒號非剝離類）,
          * `查 Foo.symbols 符號` → `Foo.symbols` (intra-`symbols` survives),
          * `查 get(id) 符號` → `get(id)`, `查 3.14 符號` → `3.14`,
          * `查 3,14 符號` → `3,14`, `查 中文變數 符號` → `中文變數`.
@@ -1260,8 +1275,14 @@ class FastRouter(
          *   the old strip-to-empty → clarify behavior is retired, pinned).
          * - `查 符號表 符號` → FAST `符號表`; `查 使用者 符號` → FAST `使用者`
          *   (stage-6.3; filler-substrings no longer deleted, pinned).
-         * - Halfwidth `:` IS in the edge class (step D): `查 Foo: 符號` edge-
-         *   trims to FAST `Foo` (unchanged stage-2 semantics); `.` `;` are
+         * - Halfwidth `:` IS in the edge class's TRAILING branch only (step D,
+         *   stage-8.4: the LEADING branch dropped `:`／`：`): `查 Foo: 符號` edge-
+         *   trims to FAST `Foo` (unchanged stage-2 semantics); the leading
+         *   `::Foo` shape is preserved verbatim (stage-8.4, Re-review #8 A3 —
+         *   C++ global-namespace prefix, never rewritten to `Foo`); `查 :Foo
+         *   符號` → FAST `:Foo`（記錄，READ-only）；`查 ：Foo 符號`（全形
+         *   U+FF1A）Step E 拒絕 ⇒ NEED_CLARIFICATION（fail-closed）。
+         *   `.` `;` are
          *   NOT in the edge class (`查 Foo. 符號` / `查 Foo; 符號` fail
          *   step E). A halfwidth comma glued to an identifier at cue
          *   position is absorbed by the step-C suffix cue (`查 Foo, 符號` →
@@ -1292,6 +1313,12 @@ class FastRouter(
          *   peel is skipped entirely (Step C 不剝離、歧義守衛不適用). CJK-opened
          *   shapes still peel (`查 Foo符號` → FAST `Foo`) — 「識別字以 `符號`
          *   結尾」的 limitation 僅餘 CJK 分支。
+         * - Leading-colon token-body residual (stage-8.4, accepted verbatim-preservation):
+         *   leading `:`/`::` 一律不剝後，Step E 的 ASCII allow-list（含 `, ; + = ~` 等）內
+         *   緊鄰冒號的 token body 亦原樣入查詢——`查 ::,Foo 符號` ⇒ FAST `::,Foo`／
+         *   `查 :;Foo 符號` ⇒ FAST `:;Foo`（單 token、無空白、字母/數字字符類＋allow-list 標點、
+         *   JSON-escaped、READ-only、LSP opaque match、executor 端 parseArgs 二次把關）。
+         *   與 `.bar`／`-main` 同一已接受殘餘類；絕不因此放寬 Step E。
          * - EN-delimited glued-cue residual (stage-8.3, accepted verbatim-
          *   preservation rule): `symbols 符號符號` → FAST `符號符號`（EN grammar
          *   劃定之 identifier——glued cue 原樣保留為查詢字串 `符號符號`；
@@ -1301,6 +1328,11 @@ class FastRouter(
          *   ⇒ FAST `符號符號`）；enDelimited=false 之 CJK 分支不援用本規則。
          *   前緣剝離殘餘：`symbols ？符號` → Step D 剝 `？` → FAST `符號`
          *   （en-delimited，歧義守衛不適用；L/N 錨點仍由 Step E 把關）。
+         *   前導 colon 之互動（stage-8.4）：leading `::` 一律原樣保留 verbatim，
+         *   兩分支皆然——enDelimited=true（`symbols ::Foo`／`find symbol
+         *   ::Foo`／混合 opener `查 symbols ::Foo`）與 enDelimited=false
+         *   （`查 ::Foo 符號`）皆適用（Step D 前導類不再含 `:`／`：`）；
+         *   全形 `：`（U+FF1A）不論分支皆由 Step E 拒絕 ⇒ 澄清（fail-closed）。
          *   Only DOUBLE-cue-glued shapes (`X符號符號` / `X符號 符號`) clarify —
          *   CJK-delimited branch only; the EN-delimited branch never reaches the
          *   double-cue guard.
@@ -1384,11 +1416,17 @@ class FastRouter(
         // 對每個 start position 重新貪婪掃掠全尾 run 並逐格回溯重檢 `$`，呈超線性
         // （4096 字元輸入實測「修前」~246 ms/次，單次提取即含一輪）。possessive 消費不退讓：
         // 純尾標點 run 在 `$` 錨之外無消費者，故不能剪掉任何成功匹配（成功路徑匹配
-        // 逐字相同）；失敗路徑一次掃掠定局。前導分支不動；`:`／`：` 兩個類內皆原樣保留
-        // ——移動/移除 colon 類屬 stage-8.4 範圍，stage-8.4 語意互動不受本檔影響。
+        // 逐字相同）；失敗路徑一次掃掠定局。
+        // #19 B3 stage-8.4 — 前導分支移除 `:`（U+003A）／`：`（U+FF1A）：C++
+        // global-namespace 前綴 `::Foo` 為不同 scope，原樣保留 verbatim——前導 colon
+        // 一律不剝（leading colons 一律不剝/不改寫（trailing edge class 不變）；Re-review #8 A3）。全形 `：`
+        // 亦不再被前導類剝除，但 Step E 是 ASCII-punct-only ⇒ `查 ：Foo 符號`
+        // 拒絕 ⇒ NEED_CLARIFICATION（fail-closed，絕不 rewrite 成 `Foo`）。
+        // 尾端分支（含 possessive `++$` 與 `：:` 兩字元）不動；`查 Foo: 符號`
+        // 尾端 `:` 仍剝 ⇒ FAST `Foo`（前後不對稱為記錄行為）。
         // possessive 變更實測無效能收益（no-op；start-position × trailing-run 掃描仍為超線性——僅消除單次 attempt 內的 give-back 回溯，已量測 ~246/275 ms 修前後不變）；保留為安全/正典形態。
         private val SYMBOL_EDGE = Regex(
-            "^[\\s，。、？?：:「」『』“”\"'（）]+|[\\s，。、？?：:「」『』“”\"'（）]++$",
+            "^[\\s，。、？?「」『』“”\"'（）]+|[\\s，。、？?：:「」『』“”\"'（）]++$",
         )
         private const val SYMBOL_ALLOWED_PUNCT = "._-${'$'}#@/():,;+=~"
 

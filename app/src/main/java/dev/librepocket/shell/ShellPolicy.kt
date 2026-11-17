@@ -25,6 +25,9 @@ import java.nio.file.attribute.BasicFileAttributes
  */
 object ShellPolicy {
 
+    /** 致命集合（與 PrivilegeRevoke／executePrivilegeRevoke 致命集合同集合）：[VirtualMachineError] ∪ [ThreadDeath]。 */
+    private fun isFatal(t: Throwable?): Boolean = t is VirtualMachineError || t is ThreadDeath
+
     /** 允許執行的二進位（basename 比對，均為無副作用的查詢/列目類）。 */
     val ALLOWED_BINARIES: Set<String> = setOf(
         "ls",
@@ -143,6 +146,9 @@ object ShellPolicy {
     /** 預設單次執行超時。 */
     const val DEFAULT_TIMEOUT_MS: Long = 10_000L
 
+    /** 提權通道單次執行超時上限（fail-safe clamp；超限即夾至此值，見 [dev.librepocket.router.ElevatedWiring]）。 */
+    const val MAX_ELEVATED_TIMEOUT_MS: Long = 60_000L
+
     /** 預設配額：每分鐘最多執行次數。 */
     const val DEFAULT_MAX_CALLS: Int = 30
     const val DEFAULT_WINDOW_MS: Long = 60_000L
@@ -190,6 +196,9 @@ object ShellPolicy {
      *   [PrivilegeAuditLog.encodeArgv] 誠實注記；雜湊單射只對良構字串成立，
      *   入站即拒故產品路徑不可達替換分支）；
      * - 含 null 元素（`List<String>` 契約破壞，原始型別擦除混入 null）。
+     * - 致命例外（VirtualMachineError／ThreadDeath）一律原樣重拋（不映 null／DENY）；
+     *   作用於本函式所有 catch（size／iterator()／hasNext()／next()／toByteArray 配置點），
+     *   不論是否含 untrusted 代碼（VM-fatal 可於任意點投遞）。
      *
      * 記憶體上界：單項先驗字元數（≤4K 才物化位元組，≤12K），總量累積超 64K 即停，
      * 故峰值暫存 ≤64K＋12K，有界。
@@ -197,14 +206,16 @@ object ShellPolicy {
     fun copyArgvBounded(src: List<String>): List<String>? {
         val n: Int = try {
             src.size
-        } catch (_: Throwable) {
+        } catch (t: Throwable) {
+            if (isFatal(t)) throw t
             return null
         }
         if (n < 0 || n > MAX_ELEVATED_ARGC) return null
         val out = ArrayList<String>(n)
         val it: Iterator<String> = try {
             src.iterator()
-        } catch (_: Throwable) {
+        } catch (t: Throwable) {
+            if (isFatal(t)) throw t
             return null
         }
         var totalBytes = 0
@@ -215,7 +226,8 @@ object ShellPolicy {
                 if (count >= MAX_ELEVATED_ARGC) return null
                 val s: String = try {
                     it.next()
-                } catch (_: Throwable) {
+                } catch (t: Throwable) {
+                    if (isFatal(t)) throw t
                     return null
                 } ?: return null
                 if (s.length > MAX_ELEVATED_ARG_CHARS) return null
@@ -223,7 +235,8 @@ object ShellPolicy {
                 if (hasLoneSurrogate(s)) return null
                 val bytes: ByteArray = try {
                     s.toByteArray(Charsets.UTF_8)
-                } catch (_: Throwable) {
+                } catch (t: Throwable) {
+                    if (isFatal(t)) throw t
                     return null
                 }
                 totalBytes += bytes.size
@@ -231,7 +244,8 @@ object ShellPolicy {
                 out.add(s)
                 count++
             }
-        } catch (_: Throwable) {
+        } catch (t: Throwable) {
+            if (isFatal(t)) throw t
             return null
         }
         // size 謊報偏大或併發縮減（產出與 size 不一致）即拒。

@@ -15,7 +15,7 @@ import org.junit.Test
 /**
  * S3 提權執行分派測試（BACKLOG D09，矩陣 §3/§4）：
  * 先四參門禁（含 reasonCode），Allowed 才執行審計版；
- * 門禁未過不建子進程且同樣寫 DENY 審計（全路徑留痕）。
+ * 門禁未過不建子進程且同樣寫 DENY 審計（CE／Error 除外）。
  */
 class ElevatedDispatchTest {
 

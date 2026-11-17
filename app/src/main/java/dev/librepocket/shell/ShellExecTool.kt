@@ -16,7 +16,7 @@ import dev.librepocket.redact.Redactor
  *   直接 exec 遇跨域一律 [ShellResult.Denied]（[RestrictedShell] 經
  *   `FileScope.decide` 拒絕，foss/github 即使橋接已授權亦然，需改走 D09 橋）；
  *   提權執行一律經 [executeElevated]（審計版，必須傳 [PrivilegeAuditLog]）
- *   留痕，無審計直行路徑不存在。
+ *   留痕（除 CancellationException／Error 外恰一筆；CE 重拋零審計、require 誤用 fail-fast）。
  *
  * 本檔案零 Android 依賴，JVM 單測可直接斷言。
  */
@@ -58,9 +58,9 @@ object ShellExecTool {
      * 提權執行（S3 D09，唯一產品路徑）：執行後把「種類名 + 雜湊」寫入 [audit]，
      * 輸出明文不進表。真實現（Shizuku/Root）由風味源集注入 [runner]。
      *
-     * 注意：無 audit 的過載已刪除 —— 任何提權執行都必須留痕，
+     * 注意：無 audit 的過載已刪除 —— 任何提權執行（除 CancellationException／Error 外恰一筆）都必須留痕，
      * 呼叫方一律傳 [PrivilegeAuditLog]（見 [dev.librepocket.router.ElevatedDispatch]，
-     * 先四參門禁再執行，全路徑審計）。
+     * 先四參門禁再執行，審計必行（除 CE／Error 外恰一筆）。
      *
      * Phase 4（P2-1，PR #140）：入口先 [frozenOrNull] 凍結 argv＋reason，
      * 同一凍結物件用於 gate（上游 [dev.librepocket.router.ElevatedDispatch]
@@ -69,7 +69,7 @@ object ShellExecTool {
      * 見 F9）即 `Denied(BLACKLISTED)` 且零 spawn，審計以空 argv＋原始
      * reasonCode 記一筆 DENY（argv 讀取本身不可信，故不雜湊原文）。
      *
-     * Round-3 Phase H（P2-5）：審計契約升級為「所有執行必有一筆審計」——
+     * Round-3 Phase H（P2-5）：審計契約升級為「所有執行（除 CE／Error 外恰一筆）必有一筆審計」——
      * [runner.run][ElevatedShellRunner.run] 非致命 throw（注入 fake 抛
      * `IllegalStateException`、真 runner 在 thread 建立／IO 邊界抛未預期例外）
      * 不再外抛：映 `Failed`（訊息經 [Redactor.redactError] 收斂，攜例外類名，
@@ -96,8 +96,18 @@ object ShellExecTool {
      * 產品調用方（傳 gate 後同一 frozen 經 [executeElevatedFrozen]；本函數僅供
      * Dispatch 外的防線縱深與單測直調，產品代碼禁止直調本函數繞過
      * [dev.librepocket.router.PrivilegeGate] 確認／投影／reason 門。誤調即編譯期
-     * 攔截（internal 可見性），見 `ShellGateSoleEntryTest`）。
+     * 攔截（internal 可見性）＋ 產品源集（全 flavor、java＋kotlin、含 debug）token
+     * 掃描雙重防線；提權鏈 sole-entry 為 `ElevatedWiring.execute`（唯一合法呼叫方），
+     * 三 pin 見 `ElevatedSoleEntryTest.soleEntryForExecuteWithFrozen`
+     * （僅 Wiring 得呼叫）、`ElevatedSoleEntryTest.executeElevatedZeroAllowance`
+     * （zero tolerance，本函數零直調亦涵蓋）、
+     * `ElevatedSoleEntryTest.executeElevatedFrozenSoleEntry`（僅 ElevatedDispatch）；
+     * 殘餘同-package 裸呼叫需 code review 把關。本函數零直調同見
+     * `ShellStage5Test.soleEntryNoDirectToolCallsInMain`）。
+     *
+     * @JvmSynthetic（封死 Java 經 JVM mangled 名稱直呼內部成員；對 Kotlin 呼叫者無影響）
      */
+    @JvmSynthetic
     internal fun executeElevated(
         request: ElevatedRequest,
         runner: ElevatedShellRunner,
@@ -138,10 +148,15 @@ object ShellExecTool {
      * （尤其 `MutableList` 背板：runner／審計讀到活引用即舊 snapshot TOCTOU
      * 重現）。公開入口一律走 [executeElevated]（入口凍結＋單次凍結 SLA）；
      * 同模組唯一產品調用為 [dev.librepocket.router.ElevatedDispatch]
-     * （傳 gate 後同一 frozen），跨模組產品調用不存在。
+     * （傳 gate 後同一 frozen），跨模組產品調用不存在（由
+     * `ElevatedSoleEntryTest.executeElevatedFrozenSoleEntry` pin 攔截；
+     * 僅 ElevatedDispatch.kt 允許命中）。
      * 本函數刻意不做二次凍結：傳未凍結物件的行為未定義（TOCTOU），由可見性
      * （internal）＋本契約防範，不另加執行期重驗。
+     *
+     * @JvmSynthetic（封死 Java 經 JVM mangled 名稱直呼內部成員；對 Kotlin 呼叫者無影響）
      */
+    @JvmSynthetic
     internal fun executeElevatedFrozen(
         frozen: ElevatedRequest,
         runner: ElevatedShellRunner,

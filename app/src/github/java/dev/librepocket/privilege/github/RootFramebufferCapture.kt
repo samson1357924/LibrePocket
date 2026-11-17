@@ -32,8 +32,8 @@ enum class FrameSource {
  * D09 門禁（合規要求）：本類不再內建任何 `ProcessBuilder`/`su` 直行路徑。
  * 兩個讀取函數均為必填注入 —— 產品接線必須使用 [screencapViaElevated] /
  * [fb0ViaElevated]（先 [dev.librepocket.shell.ShellPolicy.validateElevated]
- * + 配額 + reasonCode 非空 + bridgeGranted，後 [PrivilegeAuditLog.recordResult]，
- * 全路徑留痕），禁止傳入繞過提權通道的裸子進程 lambda。
+ * + 配額 + reasonCode 非空 + bridgeGranted，後 [PrivilegeAuditLog.recordResult]），
+ * 禁止傳入繞過提權通道的裸子進程 lambda。
  *
  * B2 二進位修正（Issue #136 B2）：舊 `screencapViaElevated` 經
  * `ShellResult.Ok.stdout.toByteArray(UTF_8)` 往返，非 UTF-8 位元組（PNG）

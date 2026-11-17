@@ -175,8 +175,8 @@ jobs:
       fail-fast: false
       matrix:
         flavor: [play, foss, github]
-    # 單風味實測約 7m（編譯 3.5m + 測試）；三 job 並跑，wall 取決於最慢分片。
-    timeout-minutes: 20
+    # 單風味實測約 13-20m，其中 github 最慢（約 20m）；本 PR 再增加約 100 個測試；三 job 並跑，wall 取決於最慢分片。
+    timeout-minutes: 30
     # Python-only: keeps __pycache__ off runners for the bare python3 gate
     # steps (write-budget + duration gates); Gradle steps are unaffected.
     env:

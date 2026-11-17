@@ -10,6 +10,7 @@ import dev.librepocket.shell.frozenOrNull
 import dev.librepocket.shell.ShellResult
 import dev.librepocket.tool.Projection
 import dev.librepocket.tool.ToolDef
+import kotlinx.coroutines.CancellationException
 
 /**
  * S3 提權執行分派（BACKLOG D09，矩陣 §3/§4）：產品路徑調用 [PrivilegeGate]
@@ -18,12 +19,18 @@ import dev.librepocket.tool.ToolDef
  * 順序：四參 args-aware [PrivilegeGate.check]（攜 reasonCode）
  * → 僅 [GateResult.Allowed] 才走審計版
  * [ShellExecTool.executeElevated]；門禁未過一律不建子進程，且同樣寫一筆
- * DENY 審計（全路徑留痕，無審計直行路徑不存在）。
+ * DENY 審計（除 CancellationException／Error 外恰一筆；CE 重拋零審計、
+ * require 誤用 fail-fast）。
+ *
+ * [execute]（legacy 直通閘）為 `internal`——與 [executeWithFrozen] 同級，
+ * 產品源集零調用（pin 見 `ElevatedSoleEntryTest.legacyElevatedDispatchExecuteZeroAllowance`）；
+ * 門禁僅驗 tool／projection／confirmed／reason，不重驗 policy／bridge／grant，
+ * 產品路徑一律改走 [dev.librepocket.router.ElevatedWiring].execute。
  */
 object ElevatedDispatch {
 
     /**
-     * 門禁先行、審計必行的提權執行。
+     * 門禁先行、審計必行（除 CancellationException／Error 外恰一筆）的提權執行。
      *
      * Phase 4（P2-1，PR #140）：入口先凍結 [request]（見
      * [dev.librepocket.shell.frozenOrNull]），同一凍結物件用於門禁
@@ -34,14 +41,14 @@ object ElevatedDispatch {
      * [ShellExecTool.executeElevated] 保證（非致命 throw 映 `Failed`＋一筆
      * FAILED 審計，致命重抛前亦已盡力審計），本函數不再另包 try/catch——
      * 重複捕捉即重複審計（`audit.size()==2` 違反單筆契約），故此處刻意只做
-     * 單一委派；「所有執行必有一筆審計」由工具層單點保證（直調工具層與經
+     * 單一委派；「所有執行（除 CE／Error 外恰一筆）必有一筆審計」由工具層單點保證（直調工具層與經
      * dispatch 同契約，見工具層 KDoc）。
      *
      * Round-4 Phase N（P2-1 gate-first＋SLA 統一＋P2-2 reason 上限）：
      * - gate-first：cheap 門（tool 名／projection／confirmed／reasonCode 空與
      *   長度——皆只讀不可變 `String`／對象引用，不碰不可信 `argv`）一律在快照
      *   之前。`confirmed=false`／projection blocked／reason 缺失或超限即零
-     *   snapshot worker（不解析 argv）；門禁未過仍寫一筆 DENY 審計（全路徑留痕），
+     *   snapshot worker（不解析 argv）；門禁未過仍寫一筆 DENY 審計（CE 重拋路徑除外），
      *   但以空 argv＋有界 reason 記（超限 reason 不哈希，記空串標記；其餘記
      *   原 reason——已验长度，有界）。
      * - reasonCode 超限（[PrivilegeAuditLog.MAX_REASON_CODE_BYTES] UTF-8 位元組）
@@ -59,8 +66,11 @@ object ElevatedDispatch {
      * @param confirmed 當輪二次確認。
      * @param projection 投影（`privilege_bridge` 未開即 UNAVAILABLE，先擋）。
      * @param request 提權請求（含 reasonCode，門禁與審計共用同一份凍結）。
+     *
+     * @JvmSynthetic（封死 Java 經 JVM mangled 名稱直呼內部成員；對 Kotlin 呼叫者無影響）
      */
-    fun execute(
+    @JvmSynthetic
+    internal fun execute(
         tool: ToolDef,
         confirmed: Boolean,
         projection: Projection,
@@ -73,7 +83,7 @@ object ElevatedDispatch {
             "ElevatedDispatch only serves ${PrivilegeGate.ELEVATED_TOOL}, not ${tool.name}"
         }
         // P2-2 先行：reason 只读（String 不可变，零 worker），超限即拒，
-        // 不碰 argv、不哈希无界输入。
+        // 不碰 argv、不哈希無界输入。
         if (PrivilegeAuditLog.isReasonCodeTooLong(request.reasonCode)) {
             val tooLong = ShellResult.Denied(
                 ShellDeny.BLACKLISTED,
@@ -84,12 +94,30 @@ object ElevatedDispatch {
         }
         // P2-1 gate-first：cheap 门先行（只读 reason，不碰 argv）。
         // 未过即 DENY＋一笔审计（空 argv＋有界 reason），零 snapshot worker。
-        val gate = PrivilegeGate.check(
-            tool,
-            confirmed,
-            projection,
-            mapOf("reasonCode" to request.reasonCode),
-        )
+        // check 本身不得令致命例外逃逸式吞掉：CE 重拋；VirtualMachineError／ThreadDeath
+        // 亦重拋（SafeToolSlice 同集合同語義；不轉 Denied、不寫 DENY 審計）；其餘
+        // Throwable（含 require(toolName) IAE）fail-closed → Denied＋一筆 DENY。
+        val gate = try {
+            PrivilegeGate.check(
+                tool,
+                confirmed,
+                projection,
+                mapOf("reasonCode" to request.reasonCode),
+            )
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: VirtualMachineError) {
+            throw e
+        } catch (e: ThreadDeath) {
+            throw e
+        } catch (_: Throwable) {
+            val gateDenied = ShellResult.Denied(
+                ShellDeny.NOT_WHITELISTED,
+                "privilege gate evaluation failed (fail-closed, no spawn)",
+            )
+            audit.record(emptyList(), request.reasonCode, PrivilegeAuditLog.verdictName(gateDenied))
+            return gateDenied
+        }
         if (gate !is GateResult.Allowed) {
             val denied = ShellResult.Denied(
                 ShellDeny.NOT_WHITELISTED,
@@ -106,6 +134,45 @@ object ElevatedDispatch {
             )
             audit.record(emptyList(), request.reasonCode, PrivilegeAuditLog.verdictName(snapshotDenied))
             return snapshotDenied
+        }
+        return ShellExecTool.executeElevatedFrozen(frozen, runner, audit, timeoutMs)
+    }
+
+    /**
+     * Single-freeze fast path for callers that have already performed required gates/reverify
+     * and hold a valid frozen [ElevatedRequest] snapshot (F7). Performs cheap final invariants
+     * and delegates to [ShellExecTool.executeElevatedFrozen] so runner execution/result auditing
+     * happens exactly once without re-freezing.
+     *
+     * 唯一合法呼叫方：[ElevatedWiring].execute（重驗通過後委派；本 PR 新 pin 見
+     * `ElevatedSoleEntryTest.soleEntryForExecuteWithFrozen`）。
+     *
+     * PRECONDITION (defense-in-depth): caller MUST have completed tool/confirmation/projection/
+     * policy/bridge/grant checks and post-confirm reverify on the same immutable snapshot.
+     * Do not call with unverified or stale requests; misuse inside module can bypass gates.
+     * sole-entry 由 `ElevatedSoleEntryTest`（產品源集 main＋foss＋play＋github＋debug，java＋kotlin 雙目錄 token 掃描，best-effort tripwire）攔截，除 `ElevatedDispatch.kt`（宣明檔）外，產品源集出現 `executeWithFrozen(` 呼叫即 fail。
+     *
+     * @JvmSynthetic（封死 Java 經 JVM mangled 名稱直呼內部成員；對 Kotlin 呼叫者無影響）
+     */
+    @JvmSynthetic
+    internal fun executeWithFrozen(
+        tool: ToolDef,
+        frozen: ElevatedRequest,
+        runner: ElevatedShellRunner,
+        audit: PrivilegeAuditLog,
+        timeoutMs: Long = ShellPolicy.DEFAULT_TIMEOUT_MS,
+    ): ShellResult {
+        require(tool.name == PrivilegeGate.ELEVATED_TOOL) {
+            "ElevatedDispatch only serves ${PrivilegeGate.ELEVATED_TOOL}, not ${tool.name}"
+        }
+        // Cheap invariant: reason bound (String-only). Frozen request is from bounded snapshot path.
+        if (PrivilegeAuditLog.isReasonCodeTooLong(frozen.reasonCode)) {
+            val tooLong = ShellResult.Denied(
+                ShellDeny.BLACKLISTED,
+                "reasonCode too long (fail-closed, no spawn)",
+            )
+            audit.record(emptyList(), "", PrivilegeAuditLog.verdictName(tooLong))
+            return tooLong
         }
         return ShellExecTool.executeElevatedFrozen(frozen, runner, audit, timeoutMs)
     }

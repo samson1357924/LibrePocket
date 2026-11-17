@@ -96,7 +96,8 @@ import kotlin.coroutines.coroutineContext
  * unique) `call`/`tool` pair. Two DISTINCT raw ids that redact to the SAME
  * bounded id are disambiguated the same way on the normalized (wire) ids.
  *
- * Denials are TYPED RESULTS (not throws, except [CancellationException]):
+ * Denials are TYPED RESULTS (not throws, except [CancellationException],
+ * [VirtualMachineError], and [ThreadDeath], which propagate unwrapped):
  * every model call gets a paired `tool` message (call-id pairing preserved
  * per the T1 provider contracts), so DENY/cancel/schema-error paths are
  * observable with backend invocation count zero (pinned by tests).
@@ -559,7 +560,9 @@ class SafeToolSlice(
     /**
      * Execute one attempt's model tool calls in order. Never throws except
      * [CancellationException] (cancel aborts remaining calls; partial
-     * results are discarded by the throw — zero further backend effects).
+     * results are discarded by the throw — zero further backend effects),
+     * [VirtualMachineError], and [ThreadDeath], which propagate unwrapped
+     * (fail-loud for fatal VM state; ordinary failures are typed denies).
      * Backend exceptions (non-cancel) are mapped to typed `EXEC_ERROR`
      * denials to preserve call-id pairing; a backend call exceeding the
      * registry `ToolAnnotations.timeoutMs` is a typed `EXEC_DENIED`.
@@ -797,14 +800,21 @@ class SafeToolSlice(
         if (tool.sideEffect != SideEffect.READ) {
             return deny(call, DenyCodes.SCOPE_DENIED, "sideEffect=${tool.sideEffect} not allowed in slice")
         }
-        // A throwing ctxSupplier (or projection predicate) is a scope failure,
-        // not a turn crash: deny typed with a fixed detail so no exception
-        // message rides the wire, and never touch policy/backend.
+        // A throwing ctxSupplier (or projection predicate) is a scope failure for
+        // ordinary failures: deny typed with a fixed detail so no exception
+        // message rides the wire, and never touch policy/backend. CancellationException
+        // and VirtualMachineError/ThreadDeath propagate unwrapped (the former by
+        // structured-concurrency contract; the latter as fatal VM state — see
+        // ShellExecTool and SafeToolSlice KDoc).
         val projection = try {
             tool.project(ctxSupplier())
         } catch (e: CancellationException) {
             throw e
-        } catch (_: Exception) {
+        } catch (e: VirtualMachineError) {
+            throw e
+        } catch (e: ThreadDeath) {
+            throw e
+        } catch (_: Throwable) {
             return deny(call, DenyCodes.SCOPE_DENIED, "projection unavailable")
         }
         if (projection.level != CapabilityLevel.NATIVE) {
@@ -817,13 +827,31 @@ class SafeToolSlice(
             policy.evaluateFresh(POLICY_ACTION, tool.name).verdict
         } catch (e: CancellationException) {
             throw e
-        } catch (_: Exception) {
+        } catch (e: VirtualMachineError) {
+            throw e
+        } catch (e: ThreadDeath) {
+            throw e
+        } catch (_: Throwable) {
             null
         }
         if (verdict != Verdict.ALLOW) {
             return deny(call, DenyCodes.POLICY_DENIED, verdict?.name ?: "ERROR")
         }
-        when (val gate = PrivilegeGate.check(tool, confirmed = false, projection)) {
+        // check 本身不得讓 CE／VirtualMachineError／ThreadDeath 逃逸進 typed deny：三者一律重拋；
+        // 其餘 Throwable（含 require(toolName) IAE）fail-closed → typed deny（不落後端、不洩漏例外細節）。
+        // （gate 的 VM/ThreadDeath 無法故障注入——PrivilegeGate.check 為 object 函式——故無對應注入測試。）
+        val gate = try {
+            PrivilegeGate.check(tool, confirmed = false, projection)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: VirtualMachineError) {
+            throw e
+        } catch (e: ThreadDeath) {
+            throw e
+        } catch (_: Throwable) {
+            return deny(call, DenyCodes.SCOPE_DENIED, "privilege gate evaluation failed")
+        }
+        when (gate) {
             is GateResult.Allowed -> Unit
             is GateResult.NeedConfirm ->
                 return deny(call, DenyCodes.NEED_CONFIRM, gate.toolName)

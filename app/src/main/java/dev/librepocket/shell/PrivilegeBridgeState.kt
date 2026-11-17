@@ -292,7 +292,7 @@ class PrivilegeBridgeState @VisibleForTesting internal constructor(
      * 落庫後並發撤銷的 best-effort 清庫（revoke-in-flight 補償）失敗時必留一行
      * logcat（不靜默）；此路徑為 revoke-in-flight 補償，fail-closed 語義不變
      * （記憶體旗標已先落 false、`IllegalStateException` 照拋，`CancellationException`
-     * 原樣上拋）。補償清庫的 VMError 原樣上拋（見 failGrantRevokedConcurrently）。
+     * 原樣上拋）。補償清庫的 VMError／ThreadDeath 原樣上拋（見 failGrantRevokedConcurrently）。
      *
      * 呼叫端不得傳入未來時間戳（否則授權可能在簽發前即「有效」）；
      * `atMs` 逾現在時刻即 fail-fast 抛 [IllegalArgumentException]（`AT_MS_IN_FUTURE`）。
@@ -357,7 +357,7 @@ class PrivilegeBridgeState @VisibleForTesting internal constructor(
      * 並發撤銷於 post-save 各重查或 commit RMW 前落地的共同收場：
      * 旗標落 false，best-effort 清庫（有界：revokeOpTimeoutMs；逾時與失敗同級——
      * 失敗可接受——revoke 側具備 marker/journal 復活防護——但不得吞
-     * CancellationException：CE 原樣上拋；其餘失敗必留一行 logcat，不靜默；例外：`t is VirtualMachineError` 時原樣上拋、附 `PRIVILEGE_GRANT_REVOKED_CONCURRENTLY` suppressed（不 logcat，fatal 不靜默化））後拋
+     * CancellationException：CE 原樣上拋；其餘失敗必留一行 logcat，不靜默；例外：`t is VirtualMachineError`／`ThreadDeath` 時原樣上拋、附 `PRIVILEGE_GRANT_REVOKED_CONCURRENTLY` suppressed（不 logcat，fatal 不靜默化））後拋
      * `PRIVILEGE_GRANT_REVOKED_CONCURRENTLY`。
      * 有界保證僅對服從協作式取消的 I/O 成立（與 revoke() 相同前提）。
      */
@@ -374,7 +374,7 @@ class PrivilegeBridgeState @VisibleForTesting internal constructor(
             }
         } catch (t: Throwable) {
             if (t is CancellationException) throw t
-            if (t is VirtualMachineError) {
+            if (t is VirtualMachineError || t is ThreadDeath) {
                 // 補償清庫腿 fatal：不得淪為 logcat-only 吞掉——
                 // 併發撤銷 claim 的 ISE 以 suppressed 附加（claim 碼保留），fatal 原樣上拋。
                 t.addSuppressed(IllegalStateException(PrivilegeBridgeErrors.GRANT_REVOKED_CONCURRENTLY))
@@ -483,7 +483,7 @@ class PrivilegeBridgeState @VisibleForTesting internal constructor(
      * 附加（非 [CancellationException]）。
      *
      * 持久層／跨域 scope 抛錯時仍先落記憶體收回再重抛（fail-closed：
-     * 收回永不因持久失敗而殘留可用旗標）；（無 VirtualMachineError 協存時）[CancellationException] 原樣傳播；withdrawScope 協存 VMError 時 VMError 終端外傳、其餘例外（含 CE）反附 suppressed（uniform fatal precedence，見 #136-B1 Stage 7B）。
+     * 收回永不因持久失敗而殘留可用旗標）；（無 VirtualMachineError／ThreadDeath 協存時）[CancellationException] 原樣傳播；withdrawScope 協存 fatal（VirtualMachineError／ThreadDeath）時 fatal 終端外傳、其餘例外（含 CE）反附 suppressed（uniform fatal precedence，見 #136-B1 Stage 7B）。
      * [withdrawScope] 在 [opMutex] 鎖外執行（不再持有鎖），但仍僅應執行外部
      * Store 清除（例如 ShizukuGrantStore.clear()），嚴禁回調本物件的
      * [grant]、[refresh] 或 [revoke]（語義錯亂，且 [revoke] 重入將重複清表）。
@@ -527,13 +527,13 @@ class PrivilegeBridgeState @VisibleForTesting internal constructor(
                         )
                     }
                 } catch (t: Throwable) {
-                    // 補償清庫的 VirtualMachineError 為終端外傳例外（uniform fatal precedence；此前被 ISE 包裝降級，Stage 7B 一併收齊）。
-                    if (t is VirtualMachineError) {
+                    // 補償清庫的 VirtualMachineError／ThreadDeath 為終端外傳例外（uniform fatal precedence；此前被 ISE 包裝降級，Stage 7B 一併收齊）。
+                    if (t is VirtualMachineError || t is ThreadDeath) {
                         t.addSuppressed(primaryFailure)
                         primaryFailure = t
                     } else {
                         // 不得以 CancellationException 作 suppressed（不與 CE-first 契約同形）：
-                        // 非 VMError 失敗一律包 IllegalStateException。
+                        // 非 fatal（非 VirtualMachineError／ThreadDeath）失敗一律包 IllegalStateException。
                         primaryFailure.addSuppressed(
                             IllegalStateException(PrivilegeBridgeErrors.REVOKE_BEST_EFFORT_CLEAR_FAILED, t),
                         )
@@ -581,10 +581,10 @@ class PrivilegeBridgeState @VisibleForTesting internal constructor(
                     // 「CE 一律包 ISE」的約束——primary 已存在時，CE-first 已無判別空間，
                     // 合併方向以既有 primary 為主；#136-B3 以測試釘此語義（見 TESTING/B3 前置）。
                     val existingScope = primaryFailure
-                    if (t is VirtualMachineError && existingScope !is VirtualMachineError) {
+                    if ((t is VirtualMachineError || t is ThreadDeath) && existingScope !is VirtualMachineError && existingScope !is ThreadDeath) {
                         // 第二腿 fatal（既有主失敗非 fatal）：fatal 不得淪為 suppressed——
                         // 既有主失敗反向附加到 fatal 上，fatal 成為唯一主失敗；
-                        // 既有主失敗已是 VMError 時維持 first-fatal-wins（t 附加於其上）。
+                        // 既有主失敗已是 fatal 時維持 first-fatal-wins（t 附加於其上）。
                         existingScope?.let(t::addSuppressed)
                         primaryFailure = t
                     } else if (existingScope != null) {

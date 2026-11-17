@@ -485,7 +485,7 @@ silently downgrade redaction or writes):
   true shaping) is exempt from the PR gate by construction (skips without
   `NIGHTLY_STRESS=1`) and has its own 35-minute nightly timeout.
 - Per-class Gradle sharding with independent per-class timeouts is Proposed
-  (not wired): today the per-flavor job timeout (`timeout-minutes: 20`) plus
+  (not wired): today the per-flavor job timeout (`timeout-minutes: 30`) plus
   the two gates above are the enforcement. Do not claim sharded execution until
   it is wired and run.
 

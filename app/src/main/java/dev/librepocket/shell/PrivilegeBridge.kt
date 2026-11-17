@@ -1,6 +1,7 @@
 package dev.librepocket.shell
 
 import java.io.File
+import java.util.concurrent.ExecutionException
 import java.util.concurrent.Future
 import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.SynchronousQueue
@@ -9,6 +10,9 @@ import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.TimeoutException
 import java.util.concurrent.atomic.AtomicInteger
+
+/** 致命集合（與 PrivilegeRevoke／executePrivilegeRevoke 致命集合同集合）：[VirtualMachineError] ∪ [ThreadDeath]。 */
+private fun isFatal(t: Throwable?): Boolean = t is VirtualMachineError || t is ThreadDeath
 
 /**
  * 提權子進程預留介面（BACKLOG D05/D09，矩陣 §3）。
@@ -48,7 +52,7 @@ data class ElevatedRequest(
  * daemon，不擋 JVM 退出）。阻塞於不可中斷操作（吞中斷的自訂 iterator）即永久
  * 持一份 argv 引用，但全域至多 [ElevatedSnapshotPool.POOL_SIZE] 份（池满后新
  * caller 即时 fail-closed，不再起 worker）；供给阻塞 list 的本来就是呼叫方
- * 自身，属自限 DoS，不放大为跨呼叫无界（旧“每冻结恰一 worker”已消除）。
+ * 自身，属自限 DoS，不放大为跨呼叫無界（旧“每冻结恰一 worker”已消除）。
  * github 侧 runner 内快照另经 `awaitPreSpawn` 同 deadline 监督
  * （残留进 slot／breaker 终审，见 runner KDoc），本门只覆 main 侧入口。
  */
@@ -95,18 +99,116 @@ internal object ElevatedSnapshotPool {
         },
     )
 
-    /** 忙即 null（fail-closed，不抛，零新 thread）。 */
+    /** 忙即 null（fail-closed，零新 thread；致命 VMError/ThreadDeath 重拋）。 */
     fun <T> trySubmit(block: () -> T): Future<T>? = try {
         pool.submit(block)
     } catch (_: RejectedExecutionException) {
         null
-    } catch (_: Throwable) {
-        // 起线程失败（资源枯竭）同样 fail-closed。
+    } catch (t: Throwable) {
+        // 起线程失败（资源枯竭）同样 fail-closed；致命（VMError/ThreadDeath）重拋。
+        if (isFatal(t)) throw t
         null
     }
 
     /** 執行中 worker 數（僅單測斷言有界用；近似值）。 */
     internal fun activeCount(): Int = pool.activeCount
+}
+
+/**
+ * 有界專用 supplier 池（Round-5 Phase 1，P2#3＝安全 M1）：
+ *
+ * [ElevatedSnapshotPool] 的同型小池（容量 [POOL_SIZE]＝2、零佇列、daemon，
+ * thread 名 `elevated-supplier-N`），專供不具取消協作的同步 supplier
+ * （`ctxSupplier`／`bridgeGranted`／`grantCheck` 與 `freezeCtx` 的拷貝體）
+ * 在有界線程上執行。
+ *
+ * 為什麼不重用 [ElevatedSnapshotPool]：快照池的槽位是為 argv 凍結保留的
+ * 共用門（入口／重驗各消費一次）；supplier 阻塞（如 Shizuku binder 無回應）
+ * 佔住兩槽即讓入口凍結全數 fail-closed，跨子系統互相放大故障。容量一樣
+ * 保守（2）、語義同型（池滿即拒、不排隊）。
+ *
+ * 飽和語義 fail-closed：池忙（2 槽皆卡於忽略 interrupt 的 supplier）時新
+ * caller 即時回 null（[trySubmit] 回 null → [boundedSupplierCall] 回 null →
+ * 呼叫方按既有 fail-closed 路徑拒絕，零等待）；全域殘留 worker 恆 ≤2。
+ */
+internal object ElevatedSupplierPool {
+    /** 池容量（殘留引用全域上界同值）。 */
+    const val POOL_SIZE: Int = 2
+
+    private val threadSeq = AtomicInteger(0)
+    private val pool = ThreadPoolExecutor(
+        POOL_SIZE,
+        POOL_SIZE,
+        0L,
+        TimeUnit.MILLISECONDS,
+        SynchronousQueue(),
+        ThreadFactory { r ->
+            Thread(r, "elevated-supplier-${threadSeq.incrementAndGet()}").apply {
+                isDaemon = true
+            }
+        },
+    )
+
+    /** 忙即 null（fail-closed，零新 thread；致命 VMError/ThreadDeath 重拋）。 */
+    fun <T> trySubmit(block: () -> T): Future<T>? = try {
+        pool.submit(block)
+    } catch (_: RejectedExecutionException) {
+        null
+    } catch (t: Throwable) {
+        // 起线程失败（资源枯竭）同样 fail-closed；致命（VMError/ThreadDeath）重拋。
+        if (isFatal(t)) throw t
+        null
+    }
+}
+
+/**
+ * 有界 supplier 呼叫（F4）：caller 恆有界（`get ≤ timeoutMs`；逾時路徑含
+ * `cancel(true)`＋grace[SNAPSHOT_GRACE_MS]，最壞 ≈ timeoutMs＋200ms；
+ * 預設 1s → ≤ ~1.2s），不隨忽略 interrupt 的 supplier 無限等待。
+ *
+ * - 池滿（[ElevatedSupplierPool] 兩槽皆佔用）→ 即時回 null（fail-closed）；
+ * - 正常 → 回傳 supplier 結果（含 null 結果，呼叫方自行 fail-closed 解讀）；
+ * - 逾時 → `cancel(true)`＋grace（[SNAPSHOT_GRACE_MS]）輪詢 `isDone` 後回 null
+ *   （worker 仍未退出即池內殘留，全域上界 [ElevatedSupplierPool.POOL_SIZE]）；
+ * - caller 被中斷 → 復位 interrupt flag、`cancel(true)`、回 null；
+ * - supplier 抛 [kotlinx.coroutines.CancellationException] → 重拋（取消語義
+ *   不得被吞）；supplier 抛 VirtualMachineError / ThreadDeath → 重拋（致命不得偽裝成授權拒絕；CE 同樣重拋）；其餘 Exception / AssertionError → null（fail-closed）。
+ */
+internal fun <T> boundedSupplierCall(
+    block: () -> T,
+    timeoutMs: Long = SNAPSHOT_MAX_WAIT_MS,
+): T? {
+    val future = ElevatedSupplierPool.trySubmit(block) ?: return null
+    return try {
+        future.get(timeoutMs, TimeUnit.MILLISECONDS)
+    } catch (_: TimeoutException) {
+        future.cancel(true)
+        // grace：给可中断 worker 退出机会；仍未 done 即池内残留（有界，见上）。
+        val graceEnd = System.nanoTime() + SNAPSHOT_GRACE_MS * 1_000_000L
+        while (!future.isDone && System.nanoTime() < graceEnd) {
+            try {
+                Thread.sleep(10L)
+            } catch (_: InterruptedException) {
+                Thread.currentThread().interrupt()
+                break
+            }
+        }
+        null
+    } catch (_: InterruptedException) {
+        Thread.currentThread().interrupt()
+        future.cancel(true)
+        null
+    } catch (e: ExecutionException) {
+        // supplier 致命失敗：ExecutionException 解包，VMError/ThreadDeath/CE 原樣重拋。
+        val cause = e.cause
+        if (cause is kotlinx.coroutines.CancellationException) throw cause
+        if (cause != null && isFatal(cause)) throw cause
+        null
+    } catch (t: Throwable) {
+        // CE 於此不可達（CE 為 ExecutionException 包裝後於上臂解包）；致命一律重拋（防禦縱深）。
+        if (t is kotlinx.coroutines.CancellationException || isFatal(t)) throw t
+        null
+    }
 }
 
 /**
@@ -129,6 +231,8 @@ internal object ElevatedSnapshotPool {
  * （零 spawn；池忙即时回 null，零新 thread；中斷後仍存活即池內殘留，全域上界
  * [ElevatedSnapshotPool.POOL_SIZE]，見上殘餘聲明）。提交失敗（池滿／起線程失敗）
  * 同樣回 null（資源枯竭／飽和 fail-closed）。
+ *
+ * 拷貝 worker 以 VirtualMachineError / ThreadDeath 拋出即原樣重拋（不做 DENY 映射）。
  */
 internal fun ElevatedRequest.frozenOrNull(): ElevatedRequest? {
     val future = ElevatedSnapshotPool.trySubmit { ShellPolicy.copyArgvBounded(argv) }
@@ -152,8 +256,15 @@ internal fun ElevatedRequest.frozenOrNull(): ElevatedRequest? {
         Thread.currentThread().interrupt()
         future.cancel(true)
         return null
-    } catch (_: Throwable) {
-        // 拷貝抛（理论不可达，copyArgvBounded 内已全收敛）即 fail-closed。
+    } catch (e: ExecutionException) {
+        // 拷貝 worker 致命失敗：ExecutionException 解包，VMError/ThreadDeath 原樣重拋（不做 DENY 映射）。
+        val cause = e.cause
+        if (cause != null && isFatal(cause)) throw cause
+        // 拷貝致命失敗（VMError/ThreadDeath）已於上臂重拋；其餘普通失敗即 fail-closed。
+        return null
+    } catch (t: Throwable) {
+        if (isFatal(t)) throw t
+        // 拷貝普通失敗（CME／自訂 List 抛 Exception）即 fail-closed；致命已由上臂先攔。
         return null
     }
     if (copy == null) return null

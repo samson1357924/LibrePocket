@@ -2064,4 +2064,81 @@ class SafeToolSliceTest {
         )
         assertEquals(0, backend.invocations.get())
     }
+
+    @Test fun projectionVirtualMachineErrorPropagatesUnwrapped() = runBlocking {
+        // VirtualMachineError (here OutOfMemoryError) is fatal to the VM:
+        // it must propagate to the caller UNWRAPPED, never collapse into a
+        // typed deny (mirrors ShellExecTool's contract).
+        val backend = CountingBackend()
+        val s = SafeToolSlice(
+            ctxSupplier = { throw OutOfMemoryError("projection-oom") },
+            policy = allowPolicy(),
+            backend = backend,
+            clock = fixedClock,
+        )
+        try {
+            s.execute(listOf(call(id = "oom-1")))
+            throw AssertionError("expected OutOfMemoryError to propagate")
+        } catch (e: OutOfMemoryError) {
+            assertEquals("projection-oom", e.message)
+        }
+        assertEquals(0, backend.invocations.get())
+    }
+
+    @Test fun policyEvaluateFreshVirtualMachineErrorPropagatesUnwrapped() = runBlocking {
+        // A PolicyStore whose evaluateFresh throws ThreadDeath: fatal to
+        // the thread — must propagate unwrapped, never a POLICY_DENIED
+        // typed deny.
+        val backend = CountingBackend()
+        val throwing = object : PolicyStore {
+            override fun evaluate(action: String, resource: String): PolicyDecision =
+                PolicyDecision(Verdict.ALLOW, null, 0L)
+            override suspend fun setRule(rule: PolicyRule) = Unit
+            override suspend fun removeRule(pattern: String) = Unit
+            override suspend fun listRules(): List<PolicyRule> = emptyList()
+            override suspend fun evaluateFresh(action: String, resource: String): PolicyDecision =
+                throw ThreadDeath()
+        }
+        val s = SafeToolSlice(
+            ctxSupplier = { ProjectionContext(userSwitches = mapOf("lsp" to true)) },
+            policy = throwing,
+            backend = backend,
+            clock = fixedClock,
+        )
+        try {
+            s.execute(listOf(call(id = "td-1")))
+            throw AssertionError("expected ThreadDeath to propagate")
+        } catch (e: ThreadDeath) {
+            // propagated unwrapped — good
+        }
+        assertEquals(0, backend.invocations.get())
+    }
+
+    @Test fun policyEvaluateFreshOutOfMemoryErrorPropagatesUnwrapped() = runBlocking {
+        // Same shape with OutOfMemoryError (fatal VM error), pinned
+        // separately from the ThreadDeath variant.
+        val backend = CountingBackend()
+        val throwing = object : PolicyStore {
+            override fun evaluate(action: String, resource: String): PolicyDecision =
+                PolicyDecision(Verdict.ALLOW, null, 0L)
+            override suspend fun setRule(rule: PolicyRule) = Unit
+            override suspend fun removeRule(pattern: String) = Unit
+            override suspend fun listRules(): List<PolicyRule> = emptyList()
+            override suspend fun evaluateFresh(action: String, resource: String): PolicyDecision =
+                throw OutOfMemoryError("policy-oom")
+        }
+        val s = SafeToolSlice(
+            ctxSupplier = { ProjectionContext(userSwitches = mapOf("lsp" to true)) },
+            policy = throwing,
+            backend = backend,
+            clock = fixedClock,
+        )
+        try {
+            s.execute(listOf(call(id = "oom-2")))
+            throw AssertionError("expected OutOfMemoryError to propagate")
+        } catch (e: OutOfMemoryError) {
+            assertEquals("policy-oom", e.message)
+        }
+        assertEquals(0, backend.invocations.get())
+    }
 }

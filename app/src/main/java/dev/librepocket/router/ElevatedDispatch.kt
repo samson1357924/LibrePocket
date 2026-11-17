@@ -94,8 +94,9 @@ object ElevatedDispatch {
         }
         // P2-1 gate-first：cheap 门先行（只读 reason，不碰 argv）。
         // 未过即 DENY＋一笔审计（空 argv＋有界 reason），零 snapshot worker。
-        // check 本身不得令 Throwable 逃逸：CE 重拋；其餘 Throwable（含 require(toolName) IAE）
-        // fail-closed → Denied＋一笔 DENY。
+        // check 本身不得令致命例外逃逸式吞掉：CE 重拋；VirtualMachineError／ThreadDeath
+        // 亦重拋（SafeToolSlice 同集合同語義；不轉 Denied、不寫 DENY 審計）；其餘
+        // Throwable（含 require(toolName) IAE）fail-closed → Denied＋一筆 DENY。
         val gate = try {
             PrivilegeGate.check(
                 tool,
@@ -104,6 +105,10 @@ object ElevatedDispatch {
                 mapOf("reasonCode" to request.reasonCode),
             )
         } catch (e: CancellationException) {
+            throw e
+        } catch (e: VirtualMachineError) {
+            throw e
+        } catch (e: ThreadDeath) {
             throw e
         } catch (_: Throwable) {
             val gateDenied = ShellResult.Denied(

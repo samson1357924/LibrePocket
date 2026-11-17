@@ -756,9 +756,12 @@ class FastRouter(
                 // stage-12.1 起：cue 之後的尾綴（`三個工作天後啟動` 類）已由 terminal-position rule 嚴格 subsumed——本 arm 保留為防禦縱深；
                 // 對 EN opener 夾帶 CJK cue（如 `symbols …三天後…`）仍為主要否決依據（terminal-position rule 不適用 EN 側）。
                 "|(?:(?:[0-9０-９一二兩两三四五六七八九十廿卅百零幾几千萬万]{1,5}|半)(?:個|多)?(?:天|日|週|周|星期|礼拜|禮拜|個月|个月|月|年|小時|小时|鐘頭|钟头|分鐘|分钟|秒|時|时|點|点|點鐘|点钟)(?:之|以)?(?:後|后))" + // arm M：cardinal-time-expression nucleus（stage-11.1；Re-review #11 A1 [P1]）——任意位置 CJK 基數詞＋時間單位＋後|后 ⇒ clause gate 否決（識別字含核者一律 DENIED，accepted fail-safe）
+                // #19 B3 stage-13.1（Re-review #15 A1 [P1] + P2）：CJK-leading ambiguous parse ⇒ clarification——EN fallback 不再救援；
+                // CJK-leading 且 `符號|符号` 計數 ≥ 2（CJK 相入口，EN-leading 不觸發）⇒ 歧義 ⇒ Rejected ⇒ clarification；
+                // EN 命令形 `symbols …`（leading、delimiter-bounded）不變（EN-leading 話語豁免本規則族；stage-8.3 verbatim 契約維持）。
                 // #19 B3 stage-12.1（Re-review #12 A1，[P1/BLOCKER]）：terminal-position rule（於抽取層 [finishSymbolQueryExtraction] 落地，非本 clause gate 之臂）。
                 // 僅非-EN-delimited（CJK 優先相）適用；EN-delimited 分支豁免（stage-8.3 verbatim 契約：
-                // `查 symbols Foo符號xyz`／`查 symbols Foo符號`／`symbols Foo符號xyz` 皆 FAST verbatim）。
+                // `查 symbols Foo符號`／`symbols Foo符號xyz` 皆 FAST verbatim；`查 symbols Foo符號xyz` 已非 FAST——CJK-leading 先讀 CJK 語法，見下）。
                 // CJK-leading 話語中，最後一個 `符號`|`符号` 之後若含任一 \p{L}|\p{N} 碼點詞碼（additive deny-only）⇒ extraction 硬失敗 ⇒ 否決／澄清。
                 // 此規則對 CJK-leading/non-enDelimited 話語嚴格 subsumes arms H/I/J/K/L/M 之「cue 之後尾綴」殘餘類——
                 // 未列舉 consent 名詞（`等法務簽核`／`等同事核對`）／星期（`週五啟動`）／工作天偏移（`三個工作天後啟動`）／
@@ -875,7 +878,7 @@ class FastRouter(
          * (above on the CJK-preferred/EN two‑phase helper), not inside this affirmative gate: if the
          * last occurrence of either CJK symbol cue (`符號` / `符号`) in the remainder is followed by
          * ANY \p{L}|\p{N} code point (CJK ideographs, Kana, Hangul, Latin letters, fullwidth/halfwidth
-         * digits), extraction RETURNS \"\" (hasSymbolQuery=false ⇒ missingQuestionFor ⇒
+         * digits), extraction Rejected (hasSymbolQuery=false ⇒ missingQuestionFor ⇒
          * [DenyReason.NEED_CLARIFICATION]; never executes, never FAST). Rationale: a CJK
          * `查<identifier>符號` is a complete affirmative command plus a unique identifier — trailing
          * content with any letter/digit is never part of that shape, it is a deferral/consent/condition/
@@ -885,14 +888,17 @@ class FastRouter(
          * weekday names, work-day offsets, 隔天／週末／隨時, and bare `之後|以後` with trailing text —
          * without another closed synonym enumeration of identities/dates. It fires only in the CJK-preferred/
          * non-enDelimited extraction phase (CJK-leading utterances without EN consumption). The EN-delimited
-         * branches are exempt by the stage-8.3 verbatim contract (`查 symbols Foo符號xyz`，`查 symbols Foo符號`，`查 find 符號` 皆 FAST verbatim).
-         * Named residual (EN-delimited verbatim, READ-only): `查 symbols Foo符號等法務簽核` processes as CJK phase
-         * rejects suffix `等法務簽核` (L) ⇒ falls through to EN phase, CMD consumes `symbols `, enDelimited=true
-         * ⇒ rule exempt ⇒ Step E passes ⇒ FAST verbatim query=`Foo符號等法務簽核` — an open-world accepted
-         * EN-delimited residual, READ-only, same class as every `symbols <CJK-token>` verbatim; named explicitly
-         * here (documented, pinned, not closed) so the rule is never overclaimed as closing EN-side. The dual-phase fallthrough on CJK-led
-         * utterances WITHOUT EN consumption (`查Foo符號等法務簽核`) still double-rejects (CJK fails suffix rule,
-         * EN re-runs the same helper with enDelimited=false ⇒ same rule ⇒ `""` ⇒ NEED_CLARIFICATION).
+         * branches are exempt by the stage-8.3 verbatim contract (`symbols Foo符號xyz`（EN-leading），`查 symbols Foo符號`，`查 find 符號` 皆 FAST verbatim).
+         * #19 B3 stage-13.1（Re-review #15 A1 [P1] + P2）—— closure：`查 symbols Foo符號等法務簽核`／`查 symbols Foo符號xyz` 不再 FAST——
+         * stage-12.1 之 named residual 於 stage-13.1 封口：CJK 相 terminal-position rule Rejects（尾綴 `等法務簽核`／`xyz` 含 \p{L}）⇒
+         * 整句 DENY／NEED_CLARIFICATION（hasSymbolQuery=false ⇒ missingQuestionFor）；EN fallback 不再救援（CJK 相 Rejected ⇒ no EN rescue）。
+         * 非「已接受殘餘」——兩個 `查`-led 形態現皆終局澄清。Asymmetry 仍成立：EN-leading twin（`symbols 等法務簽核`、`symbols Foo符號xyz`）
+         * 仍 FAST by stage-8.3（EN-leading 話語不經 CJK 相）。
+         * 同時新增 CJK 相入口多 cue 規則：CJK-leading 且 `符號|符号` 計數 ≥ 2 ⇒ Rejected（ambiguity；P2 結構性封口）——
+         * `查Foo符號等法務簽核符號`／`查Foo符號週五啟動符號`／`查 symbols 符號符號` 皆 DENY（EN-leading `symbols 符號符號` 不受影響）。
+         * EN 命令形 `symbols …`（leading、delimiter-bounded）不變：`symbols Foo符號等法務簽核`／`symbols Foo符號xyz` 仍 FAST verbatim
+         * （EN-leading 話語不經 CJK 相，規則不觸發）。CJK-leading 但 EN-delimited verbatim 形態已無例外：CJK 相或拒（A1）、或多 cue（P2）——
+         * 兩規則均要求 AFFIRMATIVE_OPENER_CJK（CJK 相入口先行），EN-leading 話語維持 stage-8.3 carve-out 不變。
          * It is additive deny-only: it can only flip previously-FAST utterances to DENIED/NEED_CLARIFICATION,
          * never the reverse. Negation/interrogative/extraction existing NEED_CLARIFICATION semantics
          * are preserved (extraction now fails earlier, in the same fail-closed direction as the particles rule).
@@ -1334,15 +1340,19 @@ class FastRouter(
          * NEED_CLARIFICATION) — never silently rewritten into a different
          * query and executed.
          *
-         * Two-phase extraction (stage-9.2, Re-review #9 A2): when a CJK opener
+         * Two-phase extraction (stage-9.2, Re-review #9 A2; stage-13.1, Re-review #15 A1 [P1] + P2 型別化): when a CJK opener
          * （SYMBOL_OPENER_CJK）actually leads the utterance, the post-opener
          * remainder is FIRST parsed by the CJK branch alone (suffix-cue peel +
          * both ambiguity guards + Step-B′ EN connectives + Step D edge trim —
          * NO EN cue machine) via the shared
-         * [finishSymbolQueryExtraction] helper. A non-empty result returns
-         * immediately; an empty CJK pass (or no CJK opener at all) falls through
-         * to the EN pipeline below, whose own identical guards reproduce any
-         * CJK-branch rejection. Both phases share [finishSymbolQueryExtraction],
+         * [finishSymbolQueryExtraction] helper. A [SymbolExtract.Parsed] result returns
+         * immediately; a [SymbolExtract.NoShape] CJK pass (the remainder is NOT CJK
+         * grammar at all — currently the Step-E whitespace gate) falls through
+         * to the EN pipeline below; a [SymbolExtract.Rejected] CJK pass HARD-DENIES
+         * the whole utterance — the EN fallback is NOT run (stage-13.1: a negative
+         * CJK decision is never laundered into a positive EN verdict).
+         * CJK-leading with `符號|符号` count ≥ 2 is Rejected at the CJK-phase entry
+         * (multi-cue ⇒ structurally ambiguous; stage-13.1 P2 結構性封口). Both phases share [finishSymbolQueryExtraction],
          * so the CJK and EN post-opener paths cannot drift on Steps C–E.
          * CJK-opener consumption sets neither enDelimited nor the
          * `symbols?`-cue budget; EN cue/verb/CMD consumption sets both.
@@ -1358,7 +1368,7 @@ class FastRouter(
          * 不改寫；CJK-leading 語句一律先讀 CJK 語法）；`find symbol symbol` ⇒
          * FAST `symbol`、`symbols symbols` ⇒ FAST `symbols`、
          * `find symbol Foo` ⇒ FAST `Foo`、`查 Symbol Foo` ⇒ FAST `Foo`、
-         * `查 Foo符號 符號` 仍澄清（兩分支皆先守衛 fail-closed）。
+         * `查 Foo符號 符號` 仍澄清（CJK 相 ambiguity guard Rejected ⇒ 終局 deny，EN 相不入——stage-13.1 A1）。
          * Steps, in application (code) order:
          *
          * Step A — anchored openers (each at most once, start-anchored):
@@ -1406,12 +1416,18 @@ class FastRouter(
          *   （空白 ⇒ Step E 澄清）。CJK 純分支（enDelimited=false，無任何 EN
          *   消費——`查 Foo符號 符號` 等）逐位元不變（維持雙 cue 澄清）；
          *   #19 B3 stage-9.2 — 兩階段改寫後，「CJK opener 後接 EN 消費」的
-         *   混合形態改走 CJK-preferred 優先：CJK 階段先解析（剝尾綴 cue、雙守衛），
-         *   失敗（空白/守衛拒絕，如 `查 symbols 符號符號` → 守衛拒 ⇒ 空）才落到
+         *   混合形態改走 CJK-preferred 優先：CJK 階段先解析（剝尾綴 cue、雙守衛）；
+         *   #19 B3 stage-13.1（Re-review #15 A1+P2）起：CJK 階段 **Rejected ⇒ 整句 DENY，EN fallback 不再救援**——
+         *   僅 CJK 階段回傳 NoShape（目前僅 Step-E whitespace/empty 閘；如 `查 Symbol Foo`/`查 symbols Foo` 類）才落到
          *   EN pipeline；此時 EN 消費（SYMBOL_OPENER_CMD `symbols `）即設
-         *   enDelimited + cue budget（Step B 跳過），Step C 不剝離 ⇒ FAST `符號符號`。
-         *   CJK「有尾綴 cue 明確資料」敘述僅適用於未經 EN 消費之 CJK 殘餘；
-         *   EN 消費發生於 CJK 階段失敗後的 EN fallback，而非 CJK 階段本身。
+         *   enDelimited + cue budget（Step B 跳過），Step C 不剝離 ⇒ FAST（verbatim 綁定）。
+         *   CJK-leading 且 `符號|符号` 計數 ≥ 2（如 `查 symbols 符號符號`；計數施於 NFKC+Cf 剝離探針
+         *   [clauseProbeJoined]，關閉 Cf 拆分繞過；`符號符號` ⇒ 2，`符號`＋`符号` 合計 ⇒ 2）⇒ CJK 相入口 Rejected ⇒ DENY/澄清
+         *   （stage-13.1 P2；不再經 EN fallback 洗成 `符號符號`；撤回類「識別字夾雙 cue」——含 `查 符號表 符號`／`查 符號Extra 符號`，
+         *   原 FAST 釘已全數撤回 ⇒ DENIED/NEED_CLARIFICATION）；CJK-leading 且尾綴含 L/N（如 `查 symbols Foo符號xyz`、
+         *   `查 symbols Foo符號等法務簽核`）⇒ terminal-position rule Rejected ⇒ DENY（stage-13.1 A1；stage-12.1 named residual 封口，
+         *   皆為 unpinned-或已列舉之翻轉釘）。CJK「有尾綴 cue 明確資料」敘述僅適用於未經 EN 消費之 CJK 殘餘；
+         *   EN 消費發生於 CJK 階段 NoShape 後的 EN fallback，而非 CJK 階段本身。
          *   例：`symbols Foo符號`／`find symbol Foo符號`／`search symbols Foo符號`
          *   → FAST `Foo符號`；`symbols 符號`（目標名「符號」）→ FAST `符號`；
          *   `查 symbols Foo符號`（混合 opener）→ FAST `Foo符號`；
@@ -1430,7 +1446,7 @@ class FastRouter(
          *   `查 AlarmManager這個符號` → `AlarmManager` (glued single cue),
          *   `查 AlarmManager 這個符號` → `AlarmManager`,
          *   `查 AlarmManager 这个符號` → `AlarmManager`,
-         *   `查 使用者 符號` → `使用者`, `查 符號表 符號` → `符號表`.
+         *   `查 使用者 符號` → `使用者`；`查 符號表 符號` ⇒ 澄清（雙 cue ⇒ CJK 相入口 Rejected；撤回類「識別字夾雙 cue」，stage-13.1 P2）。
          *   Ambiguity guard (stage-7.3, A3): after the ONE peel, if the
          *   remainder STILL matches the suffix cue at its end — or is exactly
          *   that cue — the double-cue shape is structurally ambiguous
@@ -1518,7 +1534,8 @@ class FastRouter(
          *   must be Unicode letter (L*) or number (N*), or one of
          *   `. _ - $ # @ / ( ) : , ; + = ~` — else fails (incl. Format/Cf and
          *   control chars); (v) the remainder must carry at least one
-         *   letter-or-number code point. Failing ⇒ extraction returns "" ⇒
+         *   letter-or-number code point. Failing ⇒ the CJK phase returns Rejected; the EN-phase-only/generalist failure returns Rejected at call-site (NoShape emerges only from Step-E whitespace/empty, mapped at call site on EN phase to Rejected)（stage-13.1：
+         *   [SymbolExtract]；CJK 相 ⇒ 整句 DENY，EN fallback 不救援；EN 相 ⇒ deny）⇒
          *   [hasSymbolQuery] false ⇒ [missingQuestionFor] ⇒
          *   NEED_CLARIFICATION (never a rewritten query).
          *   Additional standing rule (stage-6.1, unchanged): a remainder
@@ -1577,8 +1594,9 @@ class FastRouter(
          * - `查 是 符號` → FAST `是` (stage-6.3; CJK filler substrings are no
          *   longer deleted — the single-token remainder stands on its own;
          *   the old strip-to-empty → clarify behavior is retired, pinned).
-         * - `查 符號表 符號` → FAST `符號表`; `查 使用者 符號` → FAST `使用者`
-         *   (stage-6.3; filler-substrings no longer deleted, pinned).
+         * - `查 符號表 符號` ⇒ 澄清/NEED_CLARIFICATION（雙 cue ⇒ CJK 相入口 Rejected；stage-13.1 P2 撤回類「識別字夾雙 cue」——
+         *   原 FAST 釘已撤回，與 stage-6.3「filler-substrings 不再刪除」無關，兩 cues 令本形態歧義）;
+         *   `查 使用者 符號` → FAST `使用者` (stage-6.3; filler-substrings no longer deleted, pinned).
          * - Halfwidth `:` is no longer in the edge class's TRAILING branch either
          *   (stage-9.3, Re-review #9 A3 — the LEADING branch dropped `:`／`：` at
          *   stage-8.4, the TRAILING branch now too): `查 Foo: 符號` → FAST `Foo:`
@@ -1646,9 +1664,11 @@ class FastRouter(
          *   preservation rule): `symbols 符號符號` → FAST `符號符號`（EN grammar
          *   劃定之 identifier——glued cue 原樣保留為查詢字串 `符號符號`；
          *   歧義守衛不適用、不剝離）。Accepted verbatim-preservation rule,
-         *   READ-only、有界單 token LSP query。「verbatim」適用於所有 enDelimited=true 形態
-         *   （stage-9.2 起：含 CJK opener 後 CJK 階段失敗、於 EN fallback 消費 EN
-         *   command form 之混合 opener——`查 symbols 符號符號` ⇒ FAST `符號符號`）；
+         *   READ-only、有界單 token LSP query。本 carve-out 僅 EN-leading twin 適用：
+         *   `symbols 符號符號`（EN-leading、無 CJK opener）⇒ FAST `符號符號`；
+         *   mixed opener `查 symbols 符號符號` 已撤回（撤回類「識別字夾雙 cue」；stage-13.1 P2）：
+         *   CJK-leading 且 `符號|符号` 計數 ≥ 2（NFKC+Cf 剝離探針）⇒ CJK 相入口 Rejected ⇒ DENY/澄清，
+         *   EN fallback 不再救援（`符號符號` 不再原樣綁定）；
          *   enDelimited=false 之 CJK 分支不援用本規則。
          *   前緣剝離殘餘：`symbols ？符號` → Step D 剝 `？` → FAST `符號`
          *   （en-delimited，歧義守衛不適用；L/N 錨點仍由 Step E 把關）。
@@ -1781,26 +1801,74 @@ class FastRouter(
             return cp <= 0x7E && SYMBOL_ALLOWED_PUNCT.indexOf(cp.toChar()) >= 0
         }
 
+        // #19 B3 stage-13.1（Re-review #15 A1 [P1] + P2）：extraction 的型別化結果。
+        // 【稽核可見契約：NoShape ⇒ EN fallback；Rejected ⇒ 終局否決】（兩相共用
+        // [finishSymbolQueryExtraction]；EN 相永不產生 NoShape 語義）：
+        //   Parsed(content) — Steps C–E 全部通過，verbatim 識別字（原樣綁定、READ-only）；
+        //   Rejected        — 終局否決：terminal-position rule／BARE_SYMBOL_CUE_WRAP（包夾守衛）／
+        //                     SYMBOL_CJK_KEYWORD_SUFFIX 後置歧義守衛／particles（嗎|吗|呢）／
+        //                     stage-13.1 多 cue 計數（CJK 相入口，NFKC+Cf 剝離探針）／Step E 之
+        //                     非-whitespace 檢核失敗（含 Cf/控制字元、允許集外碼點、無 L/N 錨點、
+        //                     句首/句尾標點——如 `查 符號！`（Cf/allow-list 失敗，Step E）；
+        //                     （`查 符號+`／`查 符號:` 則早在 BARE_SYMBOL_CUE_WRAP 包夾守衛拒絕）：
+        //                     deny-by-fail-closed——CJK 相：整句 DENY
+        //                     （hasSymbolQuery=false ⇒ missingQuestionFor ⇒ NEED_CLARIFICATION），
+        //                     EN fallback 不入；EN 相：呼叫端映為 deny。絕不執行、絕不改寫；
+        //   NoShape         — 僅代表「此殘餘非 CJK 語法形態」：僅 Step E whitespace／empty 閘
+        //                     回傳（如 `查 Symbol Foo` 之 EN grammar 形態）；CJK 相 NoShape ⇒
+        //                     EN fallback 照常（today's behavior）；EN 相→ deny。
+        private sealed class SymbolExtract {
+            data class Parsed(val content: String) : SymbolExtract()
+            object NoShape : SymbolExtract()
+            object Rejected : SymbolExtract()
+        }
+
+        /** 非重疊計數（`符號符號` ⇒ 2；`符號`/`符号` 無自重疊邊界，非重疊步進即精確）。 */
+        private fun countOccurrences(text: String, needle: String): Int {
+            var count = 0
+            var index = text.indexOf(needle)
+            while (index >= 0) {
+                count++
+                index = text.indexOf(needle, index + needle.length)
+            }
+            return count
+        }
+
         /**
          * #19 B3 stage-9.2 (Re-review #9 A2, [P2]) — two-phase extraction,
-         * CJK-preferred with EN fallback. A CJK opener
+         * CJK-preferred with EN fallback; #19 B3 stage-13.1（Re-review #15 A1 [P1] + P2）型別化。
+         * A CJK opener
          * （SYMBOL_OPENER_CJK）leading the utterance means the utterance is CJK
          * grammar: the post-opener remainder is first parsed by the CJK branch
          * ONLY (suffix-cue peel + both ambiguity guards + Step-B′ EN connectives
-         * + Step D edge trim — NO EN cue machine). If that yields a non-empty
-         * query it is returned; only an empty CJK pass (or no CJK opener at
-         * all) falls through to the EN pipeline below.
+         * + Step D edge trim — NO EN cue machine). If that yields a [SymbolExtract.Parsed]
+         * result it is returned; a [SymbolExtract.NoShape] CJK pass (i.e. the
+         * remainder is NOT CJK grammar at all — currently the Step-E whitespace/empty
+         * gate) falls through to the EN pipeline below; a [SymbolExtract.Rejected]
+         * CJK pass HARD-DENIES the whole utterance — the EN fallback is NOT run.
+         *
+         * stage-13.1 不變式（CJK-leading ambiguous parse ⇒ clarification；EN fallback 不再救援）：
+         *   CJK 相 Parsed ⇒ 直接返回；CJK 相 Rejected ⇒ 整句 DENY／NEED_CLARIFICATION
+         *   （hasSymbolQuery=false ⇒ missingQuestionFor）；絕不執行、絕不改寫、絕不落 EN；
+         *   CJK-leading 且 `符號|符号` 計數 ≥ 2（CJK 相入口，EN-leading 不觸發）⇒ Rejected
+         *   （歧義——兩側皆無法唯一綁定；P2 結構性封口）。計數施於 **NFKC+Cf 剝離探針**
+         *   （[clauseProbeJoined]——與 admission clause gate 同一 Cf-strip 探針；關閉 `符\u200B號`
+         *   拆分繞過；`符號符號` ⇒ 2、`符號`＋`符号` 合計 ⇒ 2；撤回類「識別字夾雙 cue」——
+         *   `查 符號表 符號`／`查 符號Extra 符號`／`查 symbols 符號符號` 原 FAST 釘已全數撤回 ⇒ DENIED）；
+         *   EN 命令形 `symbols …`（leading、delimiter-bounded）不變（EN-leading 話語不經 CJK 相）。
          *
          * CJK-pass examples: `查 Symbol 符號` → peel → FAST `Symbol`；
          * `查 symbols 符號` → peel → FAST `symbols`；`查 find 符號` → peel →
          * FAST `find`；`查 Foo符號` → FAST `Foo`；`查 Symbol Foo` → 無尾綴 cue
-         * ⇒ 不剝（Step E 拒絕空白）⇒ CJK pass 空 ⇒ EN pipeline：
+         * ⇒ 不剝（Step E 拒絕空白）⇒ CJK pass NoShape ⇒ EN pipeline：
          * SYMBOL_OPENER_CMD 消費 `Symbol `（cue 記帳）⇒ Step B 跳過 ⇒ FAST `Foo`。
          * `查 Foo符號 符號` — CJK ambiguity guard（peel 後殘餘仍匹配尾綴 cue）
-         * FAILS ⇒ CJK pass 回傳 "" ⇒ EN pipeline：CJK 消費後 EN 各步無消費、
-         * enDelimited=false ⇒ 同一守衛再度 FAIL ⇒ NEED_CLARIFICATION（絕不執行）。
+         * FAILS ⇒ Rejected ⇒ 整句 DENY（NEED_CLARIFICATION；EN 相不入；絕不執行）。
+         * `查 symbols Foo符號等法務簽核` — CJK terminal-position rule FAILS（L 尾綴）
+         * ⇒ Rejected ⇒ 整句 DENY（stage-13.1：不再經 EN fallback 洗成 FAST
+         * `Foo符號等法務簽核`；stage-12.1 之 named residual 已封口）。
          */
-        private fun extractSymbolQuery(text: String): String {
+        private fun extractSymbolQuery(text: String): SymbolExtract {
             val trimmed = text.trim()
             // #19 B3 stage-9.2 — Phase 1: CJK-preferred pass (only when a CJK
             // opener actually leads). CJK-opener consumption does NOT set
@@ -1808,15 +1876,26 @@ class FastRouter(
             // branch bypasses the whole Step A-EN/CMD/Step-B machine.
             val cjkMatch = SYMBOL_OPENER_CJK.find(trimmed)
             if (cjkMatch != null && cjkMatch.range.first == 0) {
+                // #19 B3 stage-13.1（P2 結構性；Re-review #15 P2；R1/R4 修訂）：CJK-leading 且 `符號|符号` 計數 ≥ 2 ⇒
+                // 歧義（兩側皆無法唯一綁定）⇒ Rejected。計數施於 **NFKC+Cf 剝離探針**
+                // （[clauseProbeJoined]——與 admission clause gate 同一 Cf-strip 探針；關閉 `符\u200B號`
+                // Cf 拆分繞過），非原始字串（原始字串計數會被 Cf 拆分規避：`符\u200B號符號`  raw 計 1）；
+                // CJK cue 同家族、單一預算：`符號符號` ⇒ 2、`符號`＋`符号` 合計 ⇒ 2。
+                // cjkMatch 非 null 且位於 0 ⇒
+                // AFFIRMATIVE_OPENER_CJK 已匹配（與其同前綴形）；僅 CJK 相生效，EN-leading 話語不觸發。
+                val probe = clauseProbeJoined(trimmed)
+                if (countOccurrences(probe, "符號") + countOccurrences(probe, "符号") >= 2) {
+                    return SymbolExtract.Rejected
+                }
                 val cjkRemainder = trimmed.substring(cjkMatch.range.last + 1).trim()
-                val cjkQuery = finishSymbolQueryExtraction(cjkRemainder, enDelimited = false)
-                if (cjkQuery.isNotEmpty()) return cjkQuery
-                // Empty CJK pass (whitespace-bearing remainder, an ambiguity
-                // guard rejection, …) ⇒ fall through to the EN pipeline, which
-                // re-consumes the same CJK opener and runs the full A/B machine.
-                // The EN path's own guards reproduce any CJK-branch rejection —
-                // never silently trading the CJK result for an execution when no EN consumption occurs;
-                // when EN grammar delimits the carve-out, the documented stage-8.3 verbatim binding applies.
+                when (val r = finishSymbolQueryExtraction(cjkRemainder, enDelimited = false)) {
+                    is SymbolExtract.Parsed -> return r
+                    // #19 B3 stage-13.1（Re-review #15 A1 [P1]）：CJK 相 Rejected ⇒ 整句 DENY；
+                    // 一個否決的 CJK 判定不得被 EN fallback 洗成肯定通過（絕不落 EN pipeline）。
+                    SymbolExtract.Rejected -> return SymbolExtract.Rejected
+                    // NoShape（目前僅 Step-E whitespace/empty 閘）⇒ EN fallback 照常。
+                    SymbolExtract.NoShape -> Unit
+                }
             }
             var s = trimmed
             // #19 B3 stage-8.3 — EN-delimited 殘餘旗標：EN opener（SYMBOL_OPENER_EN）、
@@ -1857,7 +1936,11 @@ class FastRouter(
                 lead
             }
             s = afterLead.trim()
-            return finishSymbolQueryExtraction(s, enDelimited)
+            return when (val r = finishSymbolQueryExtraction(s, enDelimited)) {
+                is SymbolExtract.Parsed -> r
+                // EN 相：NoShape（Step-E whitespace/empty）映為 deny（無後續 fallback）；Rejected ⇒ deny（fail-closed）。
+                else -> SymbolExtract.Rejected
+            }
         }
 
         /**
@@ -1868,11 +1951,21 @@ class FastRouter(
          * loosen the guards per branch; the enDelimited flag is the ONLY
          * branch-switch, exactly as in the pre-9.2 single pipeline.
          *
+         * stage-13.1（Re-review #15 A1+P2）：回傳型別改為 [SymbolExtract]——
+         * Parsed 即 verbatim 內容；Rejected 即硬性 DENY（deny-by-fail-closed；
+         * hasSymbolQuery=false ⇒ NEED_CLARIFICATION；絕不執行、絕不改寫；終局否決）；
+         * NoShape 僅於 Step-E whitespace／empty 閘回傳（CJK 相：EN fallback 仍適用；
+         * EN 相：呼叫端映為 deny（[SymbolExtract.Rejected]）；EN 相不產生 NoShape 語義）。
+         * 對應表（NoShape vs Rejected 分流，與 [SymbolExtract] 宣告處註解一致）：
+         * Step E whitespace/empty ⇒ [SymbolExtract.NoShape]；terminal-position rule／
+         * BARE_SYMBOL_CUE_WRAP／SYMBOL_CJK_KEYWORD_SUFFIX 後置歧義守衛／particles（嗎|吗|呢）／
+         * Step E 非-whitespace 檢核失敗 ⇒ [SymbolExtract.Rejected]。
+         *
          * Step C — peel at most ONE trailing CJK keyword suffix (end-anchored).
          * EN-delimited 殘餘（enDelimited == true）一律跳過：EN grammar 劃定之
          * identifier 原樣保留——不剝離、不守衛（stage-8.3 carve-out）。
          */
-        private fun finishSymbolQueryExtraction(s0: String, enDelimited: Boolean): String {
+        private fun finishSymbolQueryExtraction(s0: String, enDelimited: Boolean): SymbolExtract {
             var s = s0
             // #19 B3 stage-12.1（Re-review #12 A1，[P1/BLOCKER]）：terminal-position rule（非-enDelimited 抽取相適用；
             // 位於抽取層、非准入閘及任何 arm；deny-by-fail-closed，永不執行；EN-delimited 相不適用——見下）。
@@ -1885,11 +1978,12 @@ class FastRouter(
             // 只否決、不改寫；admit 方向不變；negation/extraction 之既有 NEED_CLARIFICATION 語義保留不變；
             // EN-delimited 分支豁免（stage-8.3 verbatim 契約——`symbols Foo符號xyz` ⇒ `Foo符號xyz`
             // 原樣綁定；`查 symbols Foo符號` ⇒ `Foo符號` 原樣綁定；兩者 皆釘住（pinned）FAST）。
-            // CJK-leading 純中文殘餘（`查Foo符號等法務簽核` 等；無 EN 消費）在雙相中均被拒（CJK 相與 EN 相 enDelimited=false 重新觸發同一條規則）；admission gate 不動。
+            // CJK-leading 純中文殘餘（`查Foo符號等法務簽核` 等；無 EN 消費）CJK 相即 Rejected ⇒ 整句 DENY（stage-13.1：EN fallback 不再救援；
+            // 未消費 EN 之 EN 相若再入本 helper，enDelimited=false 亦重新觸發同一條規則——fail-closed 不變；admission gate 不動）。
             if (!enDelimited) {
                 val lastCueIdx = maxOf(s.lastIndexOf("符號"), s.lastIndexOf("符号"))
                 if (lastCueIdx >= 0 && LETTER_OR_NUMBER.containsMatchIn(s.substring(lastCueIdx + 2))) {
-                    return ""
+                    return SymbolExtract.Rejected
                 }
             }
             if (!enDelimited) {
@@ -1903,7 +1997,7 @@ class FastRouter(
                 if (s.isNotEmpty() &&
                     (SYMBOL_CJK_KEYWORD_SUFFIX.containsMatchIn(s) || BARE_SYMBOL_CUE_WRAP.containsMatchIn(s))
                 ) {
-                    return ""
+                    return SymbolExtract.Rejected
                 }
             }
             // Step B′ — leading EN connectives, repeatedly, only when another
@@ -1943,13 +2037,13 @@ class FastRouter(
             if (!enDelimited && s.isNotEmpty() &&
                 (SYMBOL_CJK_KEYWORD_SUFFIX.containsMatchIn(s) || BARE_SYMBOL_CUE_WRAP.containsMatchIn(s))
             ) {
-                return ""
+                return SymbolExtract.Rejected
             }
             // Particles rule (stage-6.1, unchanged) — CJK interrogative
             // particles （嗎|吗|呢） anywhere in the remainder ⇒ extraction
             // FAILS (empty) ⇒ NEED_CLARIFICATION (fail-closed; never
             // stripped, never part of a plausible query).
-            if (s.contains('嗎') || s.contains('吗') || s.contains('呢')) return ""
+            if (s.contains('嗎') || s.contains('吗') || s.contains('呢')) return SymbolExtract.Rejected
             // Step E — immutable remainder validation. After steps A–D the
             // remainder is NEVER rewritten; it is only admitted or rejected:
             // empty ⇒ fail; ANY remaining whitespace ⇒ fail; sentence-final
@@ -1959,25 +2053,26 @@ class FastRouter(
             // `:` disjunct is kept, defense-in-depth noted); any code point
             // outside {Unicode L*, N*} ∪ `. _ - $ # @ / ( ) : , ; + = ~` ⇒
             // fail (incl. Format/control); at least one L/N anchor required.
-            if (s.isEmpty()) return ""
-            if (s.startsWith(',') || s.startsWith('；') || s.startsWith('，') || s.startsWith(';')) return ""
-            if (s.endsWith('.') || s.endsWith(',') || s.endsWith(';')) return ""
+            // 空殘餘（如 `查 符號` peel 後為空、或 mid-pipeline 完全剝光）同屬「非 CJK 語法形態」——
+            // stage-13.1 R3：Step E whitespace／empty 皆 NoShape（CJK 相：EN fallback 照常；EN 相：呼叫端映為 deny）。
+            if (s.isEmpty()) return SymbolExtract.NoShape
+            if (s.startsWith(',') || s.startsWith('；') || s.startsWith('，') || s.startsWith(';')) return SymbolExtract.Rejected
+            if (s.endsWith('.') || s.endsWith(',') || s.endsWith(';')) return SymbolExtract.Rejected
             var hasLetterOrDigit = false
             var i = 0
             while (i < s.length) {
                 val cp = s.codePointAt(i)
                 val type = Character.getType(cp)
-                if (Character.isWhitespace(cp) || Character.isSpaceChar(cp) ||
-                    type == Character.FORMAT.toInt() || type == Character.CONTROL.toInt()
-                ) {
-                    return ""
-                }
-                if (!isQueryCodePointAllowed(cp)) return ""
+                // #19 B3 stage-13.1：whitespace／empty 閘僅代表「非 CJK 單 token 語法形態」（如 `查 Symbol Foo` 之 EN grammar）；
+                // CJK 相 ⇒ NoShape（EN fallback 適用）；EN 相由呼叫端映為 deny（EN 相無後續 fallback）。
+                if (Character.isWhitespace(cp) || Character.isSpaceChar(cp)) return SymbolExtract.NoShape
+                if (type == Character.FORMAT.toInt() || type == Character.CONTROL.toInt()) return SymbolExtract.Rejected
+                if (!isQueryCodePointAllowed(cp)) return SymbolExtract.Rejected
                 if (isQueryLetterOrNumberType(type)) hasLetterOrDigit = true
                 i += Character.charCount(cp)
             }
             // …and at least one letter/digit must anchor the query.
-            return if (hasLetterOrDigit) s else ""
+            return if (hasLetterOrDigit) SymbolExtract.Parsed(s) else SymbolExtract.Rejected
         }
 
         /**
@@ -1997,12 +2092,18 @@ class FastRouter(
          * No-category glyphs and astral letters/digits, e.g. ① U+2460, U+1D7D8);
          * the stricter of the two decides — fail-safe direction, pinned by
          * the `查 𠮷 符號` clarification pin.
+         *
+         * 僅 [SymbolExtract.Parsed] 視為有意義殘餘——NoShape／Rejected 皆不綁定
+         * （hasSymbolQuery=false ⇒ [missingQuestionFor] ⇒ NEED_CLARIFICATION；
+         * toolCall 永不綁定）。BMP-Char 錨定語意不變（strictly BMP `isLetterOrDigit()`）。
          */
         private fun hasSymbolQuery(text: String): Boolean =
-            extractSymbolQuery(text).any { it.isLetterOrDigit() }
+            (extractSymbolQuery(text) as? SymbolExtract.Parsed)?.content?.any { it.isLetterOrDigit() } == true
 
         private fun symbolArgs(text: String): String {
-            val q = extractSymbolQuery(text)
+            // 非 Parsed ⇒ query 綁為空字串；toolCall 永不會以此路徑綁定（hasSymbolQuery=false
+            // ⇒ missingQuestionFor 先行 ⇒ NEED_CLARIFICATION；空 query 絕不執行）。
+            val q = (extractSymbolQuery(text) as? SymbolExtract.Parsed)?.content.orEmpty()
             return "{\"query\": \"${esc(q)}\", \"limit\": ${LspTools.DEFAULT_LIMIT}}"
         }
 

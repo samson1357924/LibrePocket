@@ -600,7 +600,7 @@ class FastDispatchTest {
             "查 foo.symbols 符號" to "foo.symbols",
             // CJK filler-substring deletion is gone (identifiers survive):
             "查 使用者 符號" to "使用者",
-            "查 符號表 符號" to "符號表",
+            // （stage-13.1：`查 符號表 符號` 已撤回 ⇒ DENIED——見本函式末尾；撤回類「識別字夾雙 cue」。）
             "查 查理 符號" to "查理",
             "查 用例 符號" to "用例",
             "查 中文變數 符號" to "中文變數",
@@ -662,8 +662,7 @@ class FastDispatchTest {
             "查詢一下Foo符號" to "Foo",
             // 單字＋空白（行為不變，釘住）：
             "找 Foo 符號" to "Foo",
-            // 記錄殘餘（stage-7.3 A3 複核裁決）：前綴為 cue 詞但有內容識別字 → verbatim 承認：
-            "查 符號Extra 符號" to "符號Extra", // 與 `符號表` 同語義——殘餘 verbatim
+            // （stage-13.1：`查 符號Extra 符號` 已撤回 ⇒ DENIED——見本函式末尾；撤回類「識別字夾雙 cue」。）
             // 記錄殘餘（stage-2/F1 邊析裁決）：step D 邊緣類透明度——glued `。`＋cue 可整段剝：
             "查 Foo 。符號" to "Foo",          // U+3002 邊緣類透明度（step D 剝 `。`）→ FAST Foo
             // 記錄殘餘（stage-7.4A4 複核裁決）：suffix cue 分隔類吸收 U+FF0C（AlarmManager 為合法識別字）：
@@ -687,6 +686,17 @@ class FastDispatchTest {
             val obj = Json.parseToJsonElement(d.toolCall!!.argumentsJson).jsonObject
             assertEquals(text, expectedQuery, obj["query"]!!.jsonPrimitive.content)
             assertEquals(text, LspTools.DEFAULT_LIMIT, obj["limit"]!!.jsonPrimitive.content.toInt())
+        }
+        // #19 B3 stage-13.1（Re-review #15 P2；撤回類「識別字夾雙 cue」）：CJK-leading 且 `符號|符号` 計數 ≥ 2
+        // （NFKC+Cf 剝離探針，關閉 Cf 拆分繞過）⇒ CJK 相入口 Rejected ⇒ DENIED/NEED_CLARIFICATION（原 FAST 釘全數撤回）。
+        for (text in listOf(
+            "查 符號表 符號",   // 原 FAST query=`符號表`（stage-6.3 釘）—— stage-13.1 撤回
+            "查 符號Extra 符號", // 原 FAST query=`符號Extra`（stage-7.3 A3 複核裁決）—— stage-13.1 撤回
+        )) {
+            val d = decide(text)
+            assertEquals(text, RouteKind.DENIED, d.route)
+            assertEquals(text, DenyReason.NEED_CLARIFICATION, d.reasonCode)
+            assertNull(text, d.toolCall)
         }
     }
 
@@ -3211,12 +3221,15 @@ class FastDispatchTest {
             "查 symbols Foo符號" to "Foo符號",
             // 混合 opener＋黏 cue 殘餘（stage-8.3；記錄已接受 verbatim 殘餘：
             // EN grammar 劃定 ⇒ 歧義守衛不適用、不剝離）：
+            // EN-leading `symbols 符號符號` 不經 CJK 相，仍 FAST。
             "symbols 符號符號" to "符號符號",
-            "查 symbols 符號符號" to "符號符號",
+            // stage-13.1 釘住（Re-review #15 optional #1）：EN-leading 雙 cue 黏合（`symbols <CJK ident>`）verbatim FAST：
+            "symbols Foo符號等法務簽核" to "Foo符號等法務簽核",
+            // （#19 B3 stage-13.1 翻轉釘（Re-review #15 P2，撤回類「識別字夾雙 cue」）：`查 symbols 符號符號` 自 FAST 移至下方 DENIED pins——
+            // CJK-leading 話語先讀 CJK 語法；CJK 相入口多 cue 計數（NFKC+Cf 剝離探針）≥ 2 ⇒ Rejected ⇒ 整句 DENY；EN fallback 不再救援。）
             "symbols Foo符號xyz" to "Foo符號xyz",
-            "查 symbols Foo符號xyz" to "Foo符號xyz",
-            // stage-12.1 名前置殘餘（EN-delimited 判讀，READ-only）：CJK tail 但被 EN cue 消費 ⇒ verbatim 保留：
-            "查 symbols Foo符號等法務簽核" to "Foo符號等法務簽核",
+            // （#19 B3 stage-13.1 翻轉釘：`查 symbols Foo符號xyz`／`查 symbols Foo符號等法務簽核` 自 FAST 移至下方 DENIED pins——
+            // CJK-leading 話語先讀 CJK 語法；CJK 相 terminal-position rule Rejected（L 尾綴）⇒ 整句 DENY；EN fallback 不再救援。）
             // Step D（CJK/EN 共用之邊緣類）剝離尾端 `。`；en-delimited 分支同樣適用。
             "symbols Foo符號。" to "Foo符號",
             // #19 B3 stage-8.3 翻轉 pins（原 NEED_CLARIFICATION——EN 劃定語意校正）：
@@ -3255,10 +3268,25 @@ class FastDispatchTest {
         // 澄清 pins：多 token 殘餘（空白）⇒ Step E 拒絕；EN-delimited 分支亦然（絕不執行）。
         for (text in listOf(
             // 尾綴 cue 後夾額外 token——空白 ⇒ Step E 澄清。
+            "symbols 符號表 符號",
             "symbols Foo符號 extra",
             // 雙 cue 空白分隔——Step E 空白拒絕。
             "symbols 符號 符號",
             "symbols Foo 符號",
+            // #19 B3 stage-13.1 翻轉釘（Re-review #15 A1 [P1]，deny-by-extraction；由 FAST flip 為 DENIED）：
+            // CJK-leading 話語先讀 CJK 語法；CJK 相 terminal-position rule Rejected（尾綴含 \p{L}）⇒ 整句 DENY（EN fallback 不再救援）：
+            "查 symbols Foo符號xyz",
+            // stage-12.1 名前置殘餘（曾名 verbatim residual、EN-delimited 判讀）——stage-13.1 封口：CJK Rejected ⇒ 不再經 EN fallback 洗成 FAST
+            "查 symbols Foo符號等法務簽核",
+            // #19 B3 stage-13.1 翻轉釘（Re-review #15 P2，撤回類「識別字夾雙 cue」；由 FAST flip 為 DENIED）：
+            // CJK-leading 且 `符號|符号` 計數 ≥ 2（NFKC+Cf 剝離探針）⇒ CJK 相入口 Rejected ⇒ 整句 DENY（EN fallback 不再救援）：
+            "查 symbols 符號符號",
+            // #19 B3 stage-13.1 新增 EN-verb mixed re-pins（Re-review #15 A1；未往 pin，行為同一根機制：CJK 相 terminal-position rule 否決 L 尾綴）：
+            "查 find Foo符號xyz",
+            "查 lookup Foo符號blah",
+            // #19 B3 stage-13.1（R4）pin：CJK 相入口多 cue 計數施於 NFKC+Cf 剝離探針——`符\u200B號…` Cf 拆分 cue 計為 `符號`：
+            // 探針 `查 Foo符號符號` 計 2 ⇒ CJK 相入口 Rejected ⇒ DENIED（Step E 亦會拒 Cf——double fail-closed）：
+            "查 Foo符\u200B號符號",
         )) {
             val d = decide(text)
             assertEquals(text, RouteKind.DENIED, d.route)
@@ -3281,7 +3309,10 @@ class FastDispatchTest {
     // ⇒ Step B 整體跳過；CMD 自身仍只消費一次）；(b) 兩階段 CJK-preferred-fallback——
     // CJK opener 引領的語句先由 CJK 分支解析（尾綴 cue 剝離＋兩道歧義守衛＋Step-B′
     // EN connectives＋Step D 邊緣剝離，無 EN cue machine），非空結果即返回；CJK 階段
-    // 失敗（空白/守衛拒絕）才落入 EN pipeline。CJK opener 消費本身不設 enDelimited、
+    // 失敗（空白/守衛拒絕）才落入 EN pipeline——#19 B3 stage-13.1 起收窄：CJK 階段
+    // Rejected ⇒ 整句 DENY（EN fallback 不再救援）；僅 NoShape（現僅 Step-E whitespace/empty 閘，
+    // 如 `查 Symbol Foo`）才落入 EN pipeline；且 CJK-leading 且 `符號|符号` 計數 ≥ 2 ⇒ CJK 相入口 Rejected。
+    // CJK opener 消費本身不設 enDelimited、
     // 不耗 cue budget；EN cue/verb/CMD 消費才設。CJK 階段與 EN pipeline 共用 Steps C–E
     // （finishSymbolQueryExtraction），兩分支不可能漂移。
     // 驗證期望（decide() 端到端，與 enCommandDelimitedIdentifiersAreVerbatim 同一
@@ -3291,10 +3322,10 @@ class FastDispatchTest {
     //   `symbols symbols`    → FAST `symbols`（同上）；
     //   `find symbol Foo`    → FAST `Foo`；
     //   `查 Foo符號`         → FAST `Foo`（CJK-preferred 尾綴 cue 剝離，不變保證）；
-    //   `查 Symbol Foo`      → FAST `Foo`（CJK 階段 Step E 拒空白 ⇒ EN fallback：
+    //   `查 Symbol Foo`      → FAST `Foo`（CJK 相 Step E whitespace/empty ⇒ NoShape ⇒ EN fallback：
     //                           CMD `Symbol ` 耗 budget ⇒ Step B 跳過 ⇒ `Foo`）。
     // CJK 雙 cue 仍澄清（fail-closed）：`查 Foo符號 符號` — CJK ambiguity guard
-    //   （peel 後殘餘仍匹配尾綴 cue）拒絕 ⇒ CJK 階段空 ⇒ EN pipeline 同守衛再度拒絕
+    //   （peel 後殘餘仍匹配尾綴 cue）拒絕 ⇒ CJK 相 Rejected ⇒ 終局否決，EN pipeline 不入（stage-13.1 A1）
     //   ⇒ NEED_CLARIFICATION（絕不執行）。
     @Test fun enCueBudgetAndCjkPreferredExtractionPinned() = runBlocking {
         val backend = CountingBackend()
@@ -3305,7 +3336,7 @@ class FastDispatchTest {
             "find symbol Foo" to "Foo",
             // stage-9.2 不變保證 pin：CJK-preferred 分支 peel 尾綴 cue ⇒ `Foo`。
             "查 Foo符號" to "Foo",
-            // CJK 階段失敗 ⇒ EN fallback 路徑 ⇒ `Foo`（記錄已接受殘餘：
+            // CJK 相 NoShape（EN grammar 形態）⇒ EN fallback 路徑 ⇒ `Foo`（記錄已接受殘餘：
             // `Symbol` 與 `Foo` 間空白被 EN grammar 劃定）。
             "查 Symbol Foo" to "Foo",
             // stage-9.4（release-gate 鎳）：CJK-leading single-token CJK-preferred-fallback 代表例——
@@ -3453,8 +3484,10 @@ class FastDispatchTest {
         // stage-11.1（Re-review #11 A1 [P1]）：arm L（person-anchored wait nucleus 等|待|直到|直至×人稱字，31 個）／arm M（cardinal-time-expression nucleus 基數詞＋時間單位＋後|后），
         // 皆任意位置、同一 PERMISSION_CONDITIONAL_CLAUSE clause gate；不再依賴 consent 動詞識別、不枚舉端點/延後動詞。arm K over-deny 之 P2 acknowledgment 見 KDoc。
         // stage-12.1（Re-review #12 A1 [P1/BLOCKER]）：terminal-position rule——最後一個 `符號|符号` 之後仍含 \p{L}|\p{N} 碼點 ⇒ extraction 硬失敗
-        // （[finishSymbolQueryExtraction] 非 EN-delimited 相；加性 deny-only；CJK 分支及 EN fallback 之非-enDelimited 相皆生效；
+        // （[finishSymbolQueryExtraction] 非 EN-delimited 相；加性 deny-only；CJK 相 Rejected ⇒ 整句 DENY，EN fallback 不再救援（stage-13.1）；EN 相非-enDelimited 再觸發同一規則；
         // 識別字含 CJK 者必須止於 cue；suffix 僅非 L/N（標點／空白／emoji）仍 FAST by design；suffix 含 L/N（如 `，一下`，`一` `下` 皆 \p{L}）⇒ 澄清）。
+        // stage-13.1（Re-review #15 A1 [P1] + P2）：CJK 相 Rejected ⇒ EN fallback 不再救援（`查 symbols Foo符號xyz`／`查 symbols Foo符號等法務簽核` 自 FAST flip 為 DENIED，見 enCommandDelimitedIdentifiersAreVerbatim）；
+        // CJK-leading 且 `符號|符号` 計數 ≥ 2（CJK 相入口，EN-leading 不觸發）⇒ 歧義 ⇒ Rejected ⇒ clarification（`查Foo符號等法務簽核符號`／`查Foo符號週五啟動符號`）。
         // stage-10.1（Re-review #10 A1 [P1]）：arm J（wait/until＋completion nucleus 等|待|直到|直至×放行|結束|完成|完畢|通過|核准|批准|確認|同意|回覆|通知）／
         // arm K（bare temporal nucleus 明早|明晚|明天|明日|後天|后天|大後天|大后天|下週|下星期|下周|下下週|下下周|下個月|下个月|月底|年底|日後|日后|幾天後|几天后|過幾天|过几天|稍後|稍后|晚點|晚点|等下|待會|待会|待會兒|待会儿|回頭|回头|隔天|隔日|次日|翌日|翌週|翌周|翌年，41 顆粒）／
         // arm H 動詞核擴充至 20 個 Lo 動詞（＋通知|告訴|通報|報告|匯報|彙報|回信|提醒），皆任意位置、同一 PERMISSION_CONDITIONAL_CLAUSE clause gate。
@@ -3588,6 +3621,10 @@ class FastDispatchTest {
             "查Foo符號隨時可以",   // L-suffix；stage-12.1 之前為 FAST 級（隨時 非 arm K 顆粒）
             "查Foo符號以後再做",   // L-suffix；裸 `以後` 尾帶其他文字（arm H `再做` 亦命中，雙臂）
             "查Foo符號，一下",       // `一`/`下` 皆 \p{L}（Lo） ⇒ DENIED（stage-12.1 KDoc 所記 accepted over-deny，固化 pin）
+            // #19 B3 stage-13.1 新增負向釘（Re-review #15 P2 [P2]，multi-cue ambiguity；deny-by-extraction；CJK 相入口 `符號|符号` 計數 ≥ 2）：
+            // 內部（非末位）cue 不再被靜默放行；query 為空（assert toolCall==null + route==DENIED + invocations 不變）：
+            "查Foo符號等法務簽核符號",
+            "查Foo符號週五啟動符號",
         )) {
             val d = decide(text)
             assertEquals(text, RouteKind.DENIED, d.route)

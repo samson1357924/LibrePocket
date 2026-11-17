@@ -19,7 +19,10 @@ import java.io.OutputStream
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeoutOrNull
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -396,6 +399,132 @@ class ElevatedWiringB3Test {
                 // 取消解除 blocking IO：drain 受監督 kill 後回 TimedOut（非 Ok、非 hang）。
                 assertTrue("$result", result is ShellResult.TimedOut)
                 assertTrue("cancel must destroy hanging process", hang.destroyed)
+            } finally {
+                pollOutstandingTo(0)
+                pollActiveTo(0)
+            }
+        }
+    }
+
+    // 與既有 cancelReleasesBlockingIo 同形，但取消來源為實際協程 job.cancel()——覆蓋
+    // runInterruptible 與 withContext(Dispatchers.IO) 經 coroutine 取消投遞
+    // interrupt→waitFor(InterruptedException)→isCancelled→killer 的完整路徑；
+    // assert 兩個合法終態（TimedOut 或 CE 展開）任一皆可——清理語義才是 pin 點。
+    @Test fun coroutineCancellationReleasesBlockingIo() = runBlocking {
+        for (isRoot in listOf(true, false)) {
+            // 本輪隔離（與 setUp/tearDown 同語義）：interrupt-driven unwind 會使 drain 結束時
+            // block worker 的中斷旗標被恢復（join 捕獲分支 re-set），post-kill verify 的
+            // join(VERIFY_JOIN_MS) 即時抛 InterruptedException→verify=false→fake handle 必
+            // 登記入 quarantine（本 fake 永不自行結束，此為中斷投遞的決定性後果，非實作 bug）。
+            // 不清理，下一輪 admission 必見 QUARANTINE（與本測試要釘的取消語義無關的隔離問題）。
+            // 衍生：interrupt-unwind ⇒ cleanup unverifiable ⇒ quarantine（by design）；
+            // production 宜以 { !job.isActive } job-hook 取 isCancelled，使 verify 維持可行（本檔仍保留
+            // AtomicBoolean 變體作對照）。
+            // 註：與 AtomicBoolean 變體不同——後者不中斷 drain worker，verify 走完 5s 正常驗證、
+            // 不登記 quarantine，故其不需要此隔離。
+            ElevatedCleanupTracker.clearUnverified()
+            ElevatedCleanupTracker.noteClean()
+            // hang 直到被 killer 銷毀（fake process 同 cancelReleasesBlockingIo：
+            // waitEntered 供取消前輪詢，destroyed/destroy/destroyForcibly/waitFor 同形）。
+            // 隱含假設 runner drain 的 waitFor 切片（50ms）遠小於 15s join 預算。
+            val waitEntered = CountDownLatch(1)
+            val hang = object : java.lang.Process() {
+                var destroyed = false
+                override fun getOutputStream(): OutputStream = ByteArrayOutputStream()
+                override fun getInputStream(): InputStream = ByteArrayInputStream("ok".toByteArray())
+                override fun getErrorStream(): InputStream = ByteArrayInputStream(ByteArray(0))
+                override fun waitFor(): Int =
+                    if (destroyed) 0 else throw IllegalThreadStateException("process has not exited")
+                override fun waitFor(timeout: Long, unit: TimeUnit): Boolean {
+                    waitEntered.countDown()
+                    try {
+                        Thread.sleep(unit.toMillis(timeout))
+                    } catch (_: InterruptedException) {
+                        Thread.currentThread().interrupt()
+                    }
+                    return destroyed
+                }
+                override fun exitValue(): Int =
+                    if (destroyed) 0 else throw IllegalThreadStateException("process has not exited")
+                override fun destroy() {
+                    destroyed = true
+                }
+                override fun destroyForcibly(): java.lang.Process {
+                    destroyed = true
+                    return this
+                }
+            }
+            val audit = PrivilegeAuditLog()
+            // isCancelled 用 DEFAULT 語義 { Thread.currentThread().isInterrupted }——
+            // runInterruptible 在 job 取消時中斷排程中的 drain 執行緒；
+            // 與 production runners 的 empty-implementer 契約一致。
+            val runner = if (isRoot) {
+                RootSuRunner(
+                    privateRoot = privateRoot,
+                    bridgeGranted = GrantFixtures.bridgeOn,
+                    activationCheck = GrantFixtures.activationOn,
+                    spawn = { hang },
+                    suBinary = "/system/bin/su",
+                    isCancelled = { Thread.currentThread().isInterrupted },
+                    grantCheck = GrantFixtures.allowAlways,
+                    execSearchDirs = hermeticExec!!.searchDirs,
+                    execAllowedRoots = hermeticExec!!.allowedRoots,
+                    execIsWritable = hermeticExec!!.systemOwned,
+                )
+            } else {
+                ShizukuShellRunner(
+                    privateRoot = privateRoot,
+                    bridgeGranted = GrantFixtures.bridgeOn,
+                    activationCheck = GrantFixtures.activationOn,
+                    pingBinder = { true },
+                    spawn = { hang },
+                    status = { ShizukuStatus.Available(15) },
+                    isCancelled = { Thread.currentThread().isInterrupted },
+                    grantCheck = GrantFixtures.allowAlways,
+                    execSearchDirs = hermeticExec!!.searchDirs,
+                    execAllowedRoots = hermeticExec!!.allowedRoots,
+                    execIsWritable = hermeticExec!!.systemOwned,
+                )
+            }
+            try {
+                var result: ShellResult? = null
+                var caughtCe: kotlin.coroutines.cancellation.CancellationException? = null
+                // bg 為 test coroutine 的子 job（Dispatchers.IO）：bg.cancel() 只取消 bg，
+                // 不殺 test —— CE（若展開）在此 lambda 內收斂。
+                val bg = launch(Dispatchers.IO) {
+                    // 消毒：Dispatchers.IO 為跨測試共享池，任一先行的 coroutine 測試（如 cancelReleasesBlockingIo）
+                    // 的 runInterruptible 交付的 interrupt 會殘留於被回收的 worker（join 恢復位元）；
+                    // 預設 isCancelled（Thread.currentThread().isInterrupted）對帶殘旗的 worker
+                    // 會在 checkPreSpawnCancel／cancelledAtEntry 讀到 stale true，於 spawn 前
+                    // 即 bail（fail-closed，never reaches waitFor）——與本測試要驗的
+                    // 「取消投遞到 blocking IO」語義無關。僅清入口殘旗；bg.cancel() 之後
+                    // runInterruptible 交付的 interrupt 仍照常生效。
+                    Thread.interrupted()
+                    try {
+                        // timeoutMs=60s 遠大於 15s join 預算：若取消接線壞掉，deadline 不會拯救（測試會 fail 而非 pass）。
+                        result = wireExecute(argv = listOf("id"), runner = runner, audit = audit, timeoutMs = 60_000L)
+                    } catch (ce: kotlin.coroutines.cancellation.CancellationException) {
+                        caughtCe = ce
+                    }
+                }
+                // 等 drain 進入 waitFor（blocking IO）再取消：5s 上限，逾時 fail（無固定 sleep 時序假設）。
+                if (!waitEntered.await(5_000L, TimeUnit.MILLISECONDS)) {
+                    throw AssertionError("drain never entered waitFor within 5s")
+                }
+                val cancelStart = System.currentTimeMillis()
+                bg.cancel()
+                val completed = withTimeoutOrNull(15_000L) { bg.join(); true } != null
+                val elapsed = System.currentTimeMillis() - cancelStart
+                assertTrue("coroutine must complete within bounded time after cancel", completed)
+                assertFalse("bg must not be active after cancel+join", bg.isActive)
+                // 取消解除 blocking IO：kill 到達 fake process。
+                assertTrue("cancel must destroy hanging process", hang.destroyed)
+                assertTrue("cancel must finish well before deadline, elapsed=${elapsed}ms", elapsed < 10_000L)
+                // 合法終態（任一皆可）：result is TimedOut（drain 受監督 kill 後回）或 CE 展開（caughtCe != null）。
+                // 清理語義才是 pin 點；此處僅作弱斷言（二擇一不空）。
+                assertTrue("cancellation must land as CE-unwind or TimedOut: result=$result", caughtCe != null || result is ShellResult.TimedOut)
+                // Audit：不斷言嚴格 audit 結果——CE 展開路徑可能零一筆（CE 不寫 DENY/TIMEOUT）；
+                // timeout 路徑則寫 TIMEOUT×1。此處只關心取消→kill→有界完成。
             } finally {
                 pollOutstandingTo(0)
                 pollActiveTo(0)

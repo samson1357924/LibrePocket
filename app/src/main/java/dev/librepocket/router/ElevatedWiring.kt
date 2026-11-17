@@ -43,6 +43,13 @@ import kotlin.coroutines.coroutineContext
  *   基線；呼叫方仍持有的 list 事後任何突變（含供應器執行期間）都不可能改變此基線；
  *   呼叫方 list 事後突變造成 `argvMatchesSnapshot` 失敗 → BLACKLISTED Denied、零 spawn；
  *   spawn／audit 只讀凍結拷貝；confirmed=false cheap deny 不碰 argv，語義不變；
+ * - 有意取捨（turn-10 P3）：confirmed=true 路徑在 cheap gate 通過後、
+ *   任何可掛起供應器之前先凍結——含終將被 projection/policy/gate 拒絕的請求
+ *   仍先耗用全域 ElevatedSnapshotPool 槽（≈ ≤1.2s）；換取確認向量不可竄改。
+ *   一般 JSON argv 非 hostile AbstractList，此代價可忽略；hostile 案例有界且
+ *   池槽釋放後續恢復（見 hostileFrozenArgvPoolBudgetDeniedPolicyPin）；若未來在
+ *   UI/confirm coordinator 層建立 immutable pending request＋一次性 confirmation
+ *   token，此排序可改為 gate-first。
  * - 不可變快照 [ElevatedSnapshot]：argv（防禦拷貝＋不可變包裝）／
  *   reasonCode／flavor／投影開關（freeze 後的不可變有界拷貝）／grant 身份
  *   （grantProviderId／grantConfigRevision）；

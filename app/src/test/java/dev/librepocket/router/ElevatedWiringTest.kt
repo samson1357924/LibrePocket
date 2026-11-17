@@ -3293,4 +3293,81 @@ class ElevatedWiringTest {
         assertEquals(0, audit.size())
         assertTrue(audit.countByVerdict().isEmpty())
     }
+
+    @Test fun hostileFrozenArgvPoolBudgetDeniedPolicyPin() = runBlocking {
+        // 不翻旗、不另建 confirmation token；此測試釘策略拒絕路徑上 hostile argv 對快照池的有界佔用與事後恢復（turn-10 P3 記錄）。
+        // hostile argv：size 性質刻意延遲 ~1_200ms 並**忽略（吞）中斷**——模擬不合作之
+        // AbstractList：frozenOrNull 逾時 cancel(true) 對此 worker 無效，池槽佔用全額 ~1.2s
+        // （1s get＋200ms grace 之後 caller 已判定 fail-closed，但 worker 仍睡滿 1_200ms）。
+        class SlowBlockingArgv : AbstractList<String>() {
+            override val size: Int
+                get() {
+                    // 退化為睡滿 1_200ms 的固定延遲，吞中斷。
+                    try {
+                        Thread.sleep(1_200L)
+                    } catch (_: InterruptedException) {
+                        // 刻意吞中斷：不復位旗標、不提前退出（非合作型 hostile AbstractList）。
+                    }
+                    return 1
+                }
+            override fun get(index: Int): String = "id"
+            // iterator／next 行為正常——但拷貝路徑會先卡在 size，iterator 不被觸及。
+            override fun iterator(): MutableIterator<String> = mutableListOf("id").iterator()
+        }
+
+        val audit = PrivilegeAuditLog()
+
+        suspend fun invoke(argv: List<String>): Triple<ShellResult, SpawnCounter, Long> {
+            val runner = SpawnCounter()
+            val start = System.currentTimeMillis()
+            val r = ElevatedWiring.execute(
+                argv = argv,
+                reasonCode = "B3-T",
+                confirmed = true,
+                ctxSupplier = { elevatedCtx() },
+                policyStore = denyPolicy(),
+                runner = runner,
+                audit = audit,
+                grantCheck = { validGrant() },
+                bridgeGranted = { true },
+            )
+            val elapsed = System.currentTimeMillis() - start
+            return Triple(r, runner, elapsed)
+        }
+
+        // Call 1：hostile argv → 入口預綁定凍結 ~1.2s（1s get＋200ms grace）後 fail-closed Denied。
+        // 上界 5_000ms 為寬鬆 backstop（不釘固定時序）；calls 1/2 期間池槽最多殘留，
+        // 池滿→frozenOrNull 即時回 null 仍是 Denied＋零 spawn，不影審計列數。
+        val (r1, runner1, elapsed1) = invoke(SlowBlockingArgv())
+        assertTrue("$r1", r1 is ShellResult.Denied)
+        assertEquals(0, runner1.calls)
+        assertTrue("hostile freeze path must stay bounded, elapsed=${elapsed1}ms", elapsed1 < 5_000L)
+
+        // Call 2：同形。
+        val (r2, runner2, elapsed2) = invoke(SlowBlockingArgv())
+        assertTrue("$r2", r2 is ShellResult.Denied)
+        assertEquals(0, runner2.calls)
+        assertTrue("hostile freeze path must stay bounded, elapsed=${elapsed2}ms", elapsed2 < 5_000L)
+
+        // 確定性等待池槽釋放（非時序運氣）：frozenOrNull 在 caller 端 ~1.2s 已 fail-closed，
+        // 但吞中斷的 worker 會睡滿 1_200ms；以 poll activeCount==0 為準（同 ShellElevatedPhaseNTest 樣式），
+        // 逾時上限 10s——高負載下 worker 亦必在 ~1.2s 後退出，wait 只是輪詢不是睡死。
+        val poolIdleDeadline = System.currentTimeMillis() + 10_000L
+        while (dev.librepocket.shell.ElevatedSnapshotPool.activeCount() != 0 &&
+            System.currentTimeMillis() < poolIdleDeadline) {
+            Thread.sleep(10L)
+        }
+        assertEquals(0, dev.librepocket.shell.ElevatedSnapshotPool.activeCount())
+
+        // Call 3：健康 argv＋同 denyPolicy——須被策略拒絕（"policy denied"），而非池饑餓
+        // （"elevated snapshot failed"）；此斷言區分「健康凍結完成→到達 policy 拒絕」與
+        // 「池槽尚未恢復→frozenOrNull 即時 null」。
+        val (r3, runner3, _) = invoke(listOf("id"))
+        assertTrue("$r3", r3 is ShellResult.Denied)
+        assertTrue("$r3", (r3 as ShellResult.Denied).message.contains("policy denied"))
+        assertEquals(0, runner3.calls)
+
+        assertEquals(mapOf("DENY" to 3), audit.countByVerdict())
+        assertEquals(3, audit.size())
+    }
 }

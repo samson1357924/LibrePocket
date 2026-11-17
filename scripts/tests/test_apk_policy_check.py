@@ -1127,6 +1127,150 @@ class ApkPolicyHarness(unittest.TestCase):
             "            '      A: android:exported(0x01010010)=(type 0x12)0xffffffff' \\\n"
             "            '      A: android:multiprocess(0x01010013)=(type 0x12)0x0' \\\n"
             "            '      A: android:authorities(0x01010018)=\"dev.librepocket.agent.github.shizuku\" (Raw: \"dev.librepocket.agent.github.shizuku\")' ;;\n"
+            "        shizuku-ok-app-enabled-false)\n"
+            "          # Re-review #11 Finding 3: the merged <application> carries its\n"
+            "          # OWN android:enabled=false (4-space attribute level) while the\n"
+            "          # ShizukuProvider block is UNCHANGED compliant - the Android\n"
+            "          # <provider> spec requires BOTH application and provider to be\n"
+            "          # enabled, so no provider can be instantiated and the binder\n"
+            "          # surface is dead on arrival. The binding gate +\n"
+            "          # InitializationProvider rows stay so the fixture is realistic.\n"
+            "          printf '%s\\n' 'E: manifest' \\\n"
+            "            '  A: package=\"dev.librepocket.agent.github\"' \\\n"
+            "            '  A: android:versionCode(0x0101021b)=(type 0x10)0x1' \\\n"
+            "            '  E: application' \\\n"
+            "            '    A: android:fullBackupContent(0x010104eb)=@0x7f010000' \\\n"
+            "            '    A: android:dataExtractionRules(0x0101063e)=@0x7f010001' \\\n"
+            "            '    A: android:networkSecurityConfig(0x01010527)=@0x7f010002' \\\n"
+            "            '    A: android:enabled(0x0101000e)=(type 0x12)0x0' \\\n"
+            "            '    E: meta-data (line=2)' \\\n"
+            "            '      A: android:name(0x01010003)=\"moe.shizuku.client.V3_SUPPORT\" (Raw: \"moe.shizuku.client.V3_SUPPORT\")' \\\n"
+            "            '      A: android:value(0x01010024)=(type 0x12)0xffffffff' \\\n"
+            "            '    E: provider (line=3)' \\\n"
+            "            '      A: android:name(0x01010003)=\"androidx.startup.InitializationProvider\" (Raw: \"androidx.startup.InitializationProvider\")' \\\n"
+            "            '      A: android:exported(0x01010010)=(type 0x12)0x0' \\\n"
+            "            '      A: android:authorities(0x01010018)=\"dev.librepocket.agent.github.androidx-startup\" (Raw: \"dev.librepocket.agent.github.androidx-startup\")' \\\n"
+            "            '      A: android:initOrder(0x010103a7)=(type 0x10)0x64' \\\n"
+            "            '    E: provider (line=4)' \\\n"
+            "            '      A: android:name(0x01010003)=\"rikka.shizuku.ShizukuProvider\" (Raw: \"rikka.shizuku.ShizukuProvider\")' \\\n"
+            "            '      A: android:permission(0x01010006)=\"android.permission.INTERACT_ACROSS_USERS_FULL\" (Raw: \"android.permission.INTERACT_ACROSS_USERS_FULL\")' \\\n"
+            "            '      A: android:enabled(0x0101000e)=(type 0x12)0xffffffff' \\\n"
+            "            '      A: android:exported(0x01010010)=(type 0x12)0xffffffff' \\\n"
+            "            '      A: android:multiprocess(0x01010013)=(type 0x12)0x0' \\\n"
+            "            '      A: android:authorities(0x01010018)=\"dev.librepocket.agent.github.shizuku\" (Raw: \"dev.librepocket.agent.github.shizuku\")' ;;\n"
+            "        shizuku-ok-app-enabled-true)\n"
+            "          # Re-review #11 Finding 3: same application-level own attribute\n"
+            "          # pinned to the exact compiled boolean true - must PASS with the\n"
+            "          # provider block unchanged.\n"
+            "          printf '%s\\n' 'E: manifest' \\\n"
+            "            '  A: package=\"dev.librepocket.agent.github\"' \\\n"
+            "            '  A: android:versionCode(0x0101021b)=(type 0x10)0x1' \\\n"
+            "            '  E: application' \\\n"
+            "            '    A: android:fullBackupContent(0x010104eb)=@0x7f010000' \\\n"
+            "            '    A: android:dataExtractionRules(0x0101063e)=@0x7f010001' \\\n"
+            "            '    A: android:networkSecurityConfig(0x01010527)=@0x7f010002' \\\n"
+            "            '    A: android:enabled(0x0101000e)=(type 0x12)0xffffffff' \\\n"
+            "            '    E: meta-data (line=2)' \\\n"
+            "            '      A: android:name(0x01010003)=\"moe.shizuku.client.V3_SUPPORT\" (Raw: \"moe.shizuku.client.V3_SUPPORT\")' \\\n"
+            "            '      A: android:value(0x01010024)=(type 0x12)0xffffffff' \\\n"
+            "            '    E: provider (line=3)' \\\n"
+            "            '      A: android:name(0x01010003)=\"androidx.startup.InitializationProvider\" (Raw: \"androidx.startup.InitializationProvider\")' \\\n"
+            "            '      A: android:exported(0x01010010)=(type 0x12)0x0' \\\n"
+            "            '      A: android:authorities(0x01010018)=\"dev.librepocket.agent.github.androidx-startup\" (Raw: \"dev.librepocket.agent.github.androidx-startup\")' \\\n"
+            "            '      A: android:initOrder(0x010103a7)=(type 0x10)0x64' \\\n"
+            "            '    E: provider (line=4)' \\\n"
+            "            '      A: android:name(0x01010003)=\"rikka.shizuku.ShizukuProvider\" (Raw: \"rikka.shizuku.ShizukuProvider\")' \\\n"
+            "            '      A: android:permission(0x01010006)=\"android.permission.INTERACT_ACROSS_USERS_FULL\" (Raw: \"android.permission.INTERACT_ACROSS_USERS_FULL\")' \\\n"
+            "            '      A: android:enabled(0x0101000e)=(type 0x12)0xffffffff' \\\n"
+            "            '      A: android:exported(0x01010010)=(type 0x12)0xffffffff' \\\n"
+            "            '      A: android:multiprocess(0x01010013)=(type 0x12)0x0' \\\n"
+            "            '      A: android:authorities(0x01010018)=\"dev.librepocket.agent.github.shizuku\" (Raw: \"dev.librepocket.agent.github.shizuku\")' ;;\n"
+            "        shizuku-ok-app-enabled-ref)\n"
+            "          # Re-review #11 Finding 3: a resource reference for the\n"
+            "          # application-level android:enabled is not provably true at the\n"
+            "          # artifact level - @0x... passes through _xmltree_attr_value\n"
+            "          # verbatim and fails closed against the exact compiled boolean.\n"
+            "          printf '%s\\n' 'E: manifest' \\\n"
+            "            '  A: package=\"dev.librepocket.agent.github\"' \\\n"
+            "            '  A: android:versionCode(0x0101021b)=(type 0x10)0x1' \\\n"
+            "            '  E: application' \\\n"
+            "            '    A: android:fullBackupContent(0x010104eb)=@0x7f010000' \\\n"
+            "            '    A: android:dataExtractionRules(0x0101063e)=@0x7f010001' \\\n"
+            "            '    A: android:networkSecurityConfig(0x01010527)=@0x7f010002' \\\n"
+            "            '    A: android:enabled(0x0101000e)=@0x7f010099' \\\n"
+            "            '    E: meta-data (line=2)' \\\n"
+            "            '      A: android:name(0x01010003)=\"moe.shizuku.client.V3_SUPPORT\" (Raw: \"moe.shizuku.client.V3_SUPPORT\")' \\\n"
+            "            '      A: android:value(0x01010024)=(type 0x12)0xffffffff' \\\n"
+            "            '    E: provider (line=3)' \\\n"
+            "            '      A: android:name(0x01010003)=\"androidx.startup.InitializationProvider\" (Raw: \"androidx.startup.InitializationProvider\")' \\\n"
+            "            '      A: android:exported(0x01010010)=(type 0x12)0x0' \\\n"
+            "            '      A: android:authorities(0x01010018)=\"dev.librepocket.agent.github.androidx-startup\" (Raw: \"dev.librepocket.agent.github.androidx-startup\")' \\\n"
+            "            '      A: android:initOrder(0x010103a7)=(type 0x10)0x64' \\\n"
+            "            '    E: provider (line=4)' \\\n"
+            "            '      A: android:name(0x01010003)=\"rikka.shizuku.ShizukuProvider\" (Raw: \"rikka.shizuku.ShizukuProvider\")' \\\n"
+            "            '      A: android:permission(0x01010006)=\"android.permission.INTERACT_ACROSS_USERS_FULL\" (Raw: \"android.permission.INTERACT_ACROSS_USERS_FULL\")' \\\n"
+            "            '      A: android:enabled(0x0101000e)=(type 0x12)0xffffffff' \\\n"
+            "            '      A: android:exported(0x01010010)=(type 0x12)0xffffffff' \\\n"
+            "            '      A: android:multiprocess(0x01010013)=(type 0x12)0x0' \\\n"
+            "            '      A: android:authorities(0x01010018)=\"dev.librepocket.agent.github.shizuku\" (Raw: \"dev.librepocket.agent.github.shizuku\")' ;;\n"
+            "        shizuku-ok-app-enabled-int-typed)\n"
+            "          # Re-review #11 Finding 3: a non-boolean typed encoding (integer\n"
+            "          # type 0x10) for the application-level android:enabled is not a\n"
+            "          # boolean at all - the decoder fails closed naming android:enabled.\n"
+            "          printf '%s\\n' 'E: manifest' \\\n"
+            "            '  A: package=\"dev.librepocket.agent.github\"' \\\n"
+            "            '  A: android:versionCode(0x0101021b)=(type 0x10)0x1' \\\n"
+            "            '  E: application' \\\n"
+            "            '    A: android:fullBackupContent(0x010104eb)=@0x7f010000' \\\n"
+            "            '    A: android:dataExtractionRules(0x0101063e)=@0x7f010001' \\\n"
+            "            '    A: android:networkSecurityConfig(0x01010527)=@0x7f010002' \\\n"
+            "            '    A: android:enabled(0x0101000e)=(type 0x10)0x1' \\\n"
+            "            '    E: meta-data (line=2)' \\\n"
+            "            '      A: android:name(0x01010003)=\"moe.shizuku.client.V3_SUPPORT\" (Raw: \"moe.shizuku.client.V3_SUPPORT\")' \\\n"
+            "            '      A: android:value(0x01010024)=(type 0x12)0xffffffff' \\\n"
+            "            '    E: provider (line=3)' \\\n"
+            "            '      A: android:name(0x01010003)=\"androidx.startup.InitializationProvider\" (Raw: \"androidx.startup.InitializationProvider\")' \\\n"
+            "            '      A: android:exported(0x01010010)=(type 0x12)0x0' \\\n"
+            "            '      A: android:authorities(0x01010018)=\"dev.librepocket.agent.github.androidx-startup\" (Raw: \"dev.librepocket.agent.github.androidx-startup\")' \\\n"
+            "            '      A: android:initOrder(0x010103a7)=(type 0x10)0x64' \\\n"
+            "            '    E: provider (line=4)' \\\n"
+            "            '      A: android:name(0x01010003)=\"rikka.shizuku.ShizukuProvider\" (Raw: \"rikka.shizuku.ShizukuProvider\")' \\\n"
+            "            '      A: android:permission(0x01010006)=\"android.permission.INTERACT_ACROSS_USERS_FULL\" (Raw: \"android.permission.INTERACT_ACROSS_USERS_FULL\")' \\\n"
+            "            '      A: android:enabled(0x0101000e)=(type 0x12)0xffffffff' \\\n"
+            "            '      A: android:exported(0x01010010)=(type 0x12)0xffffffff' \\\n"
+            "            '      A: android:multiprocess(0x01010013)=(type 0x12)0x0' \\\n"
+            "            '      A: android:authorities(0x01010018)=\"dev.librepocket.agent.github.shizuku\" (Raw: \"dev.librepocket.agent.github.shizuku\")' ;;\n"
+            "        shizuku-ok-app-enabled-decoy)\n"
+            "          # Re-review #11 Finding 3 (child-decoy isolation): the InitializationProvider\n"
+            "          # CHILD carries android:enabled=false at the 6-space child attribute\n"
+            "          # level - a CHILD attribute must never satisfy or trip the\n"
+            "          # application-level gate (exact own-indent isolation). The\n"
+            "          # application itself declares no enabled and stays compliant; the\n"
+            "          # provider-level gate does not require InitializationProvider to be\n"
+            "          # enabled (it is not heuristic-detected and not DEX-evidenced).\n"
+            "          printf '%s\\n' 'E: manifest' \\\n"
+            "            '  A: package=\"dev.librepocket.agent.github\"' \\\n"
+            "            '  A: android:versionCode(0x0101021b)=(type 0x10)0x1' \\\n"
+            "            '  E: application' \\\n"
+            "            '    A: android:fullBackupContent(0x010104eb)=@0x7f010000' \\\n"
+            "            '    A: android:dataExtractionRules(0x0101063e)=@0x7f010001' \\\n"
+            "            '    A: android:networkSecurityConfig(0x01010527)=@0x7f010002' \\\n"
+            "            '    E: meta-data (line=2)' \\\n"
+            "            '      A: android:name(0x01010003)=\"moe.shizuku.client.V3_SUPPORT\" (Raw: \"moe.shizuku.client.V3_SUPPORT\")' \\\n"
+            "            '      A: android:value(0x01010024)=(type 0x12)0xffffffff' \\\n"
+            "            '    E: provider (line=3)' \\\n"
+            "            '      A: android:name(0x01010003)=\"androidx.startup.InitializationProvider\" (Raw: \"androidx.startup.InitializationProvider\")' \\\n"
+            "            '      A: android:enabled(0x0101000e)=(type 0x12)0x0' \\\n"
+            "            '      A: android:exported(0x01010010)=(type 0x12)0x0' \\\n"
+            "            '      A: android:authorities(0x01010018)=\"dev.librepocket.agent.github.androidx-startup\" (Raw: \"dev.librepocket.agent.github.androidx-startup\")' \\\n"
+            "            '      A: android:initOrder(0x010103a7)=(type 0x10)0x64' \\\n"
+            "            '    E: provider (line=4)' \\\n"
+            "            '      A: android:name(0x01010003)=\"rikka.shizuku.ShizukuProvider\" (Raw: \"rikka.shizuku.ShizukuProvider\")' \\\n"
+            "            '      A: android:permission(0x01010006)=\"android.permission.INTERACT_ACROSS_USERS_FULL\" (Raw: \"android.permission.INTERACT_ACROSS_USERS_FULL\")' \\\n"
+            "            '      A: android:enabled(0x0101000e)=(type 0x12)0xffffffff' \\\n"
+            "            '      A: android:exported(0x01010010)=(type 0x12)0xffffffff' \\\n"
+            "            '      A: android:multiprocess(0x01010013)=(type 0x12)0x0' \\\n"
+            "            '      A: android:authorities(0x01010018)=\"dev.librepocket.agent.github.shizuku\" (Raw: \"dev.librepocket.agent.github.shizuku\")' ;;\n"
             "        shizuku-arbitrary-fqn)\n"
             "          # Arbitrary, non-official FQN detected via the name\n"
             "          # heuristic only (ShizukuProvider token in\n"
@@ -3789,6 +3933,162 @@ class ApkPolicyHarness(unittest.TestCase):
                 with self.assertRaisesRegex(policy_inspect.PolicyError, msg):
                     policy_inspect._iter_application_providers(tree)
 
+    def test_github_application_enabled_fail_closed_branches(self) -> None:
+        # Direct pins of the fail-closed branches in
+        # _check_github_application_enabled (own-level scan, namespace
+        # discipline, id<->name agreement, duplicate detection, and the
+        # tab/shallow-indent hardening) fed crafted xmltree STRINGS - no APK
+        # fixture: the gate only locates the <application> span and scans
+        # its OWN attribute level, so the manifest skeleton is all it needs.
+        def _app_tree(attr_lines: list[str]) -> str:
+            # <manifest> > <application> with the given body lines. Bare
+            # lines print at the application's OWN attribute indent (4
+            # spaces, aapt's two-space hierarchy step); lines given with
+            # their own leading whitespace are used verbatim (child lines,
+            # or the tab/shallow-indent lines under test).
+            body = "\n".join(
+                line if line[:1] in (" ", "\t") else "    " + line
+                for line in attr_lines
+            )
+            return f"E: manifest\n  E: application\n{body}\n"
+
+        cases = (
+            (
+                "duplicate-own-level-enabled",
+                _app_tree([
+                    "A: android:enabled(0x0101000e)=(type 0x12)0xffffffff",
+                    "A: android:enabled(0x0101000e)=(type 0x12)0xffffffff",
+                ]),
+                r"declared more than once \(duplicate attribute\)",
+            ),
+            (
+                "aliased-namespace-prefix",
+                _app_tree([
+                    "A: ns1:enabled(0x0101000e)=(type 0x12)0xffffffff",
+                ]),
+                r"unexpected or unbound namespace prefix",
+            ),
+            (
+                "bare-enabled-unbound-namespace",
+                _app_tree([
+                    "A: enabled(0x0101000e)=(type 0x12)0xffffffff",
+                ]),
+                r"unexpected or unbound namespace prefix",
+            ),
+            (
+                "foreign-uri-namespace",
+                _app_tree([
+                    "A: http://evil.example/android:enabled(0x0101000e)=(type 0x12)0xffffffff",
+                ]),
+                r"unexpected or unbound namespace prefix",
+            ),
+            (
+                "caps-namespace-prefix",
+                _app_tree([
+                    "A: Android:enabled(0x0101000e)=(type 0x12)0xffffffff",
+                ]),
+                r"unexpected or unbound namespace prefix",
+            ),
+            (
+                "enabled-local-name-with-exported-id",
+                _app_tree([
+                    "A: android:enabled(0x01010010)=(type 0x12)0xffffffff",
+                ]),
+                r"disagrees with Android attribute ID 0x01010010 \(that ID is 'exported'\)",
+            ),
+            (
+                "exported-local-name-with-enabled-id",
+                _app_tree([
+                    "A: android:exported(0x0101000e)=(type 0x12)0xffffffff",
+                ]),
+                r"disagrees with Android attribute ID 0x0101000e \(that ID is 'enabled'\)",
+            ),
+            (
+                "enabled-with-unexpected-resource-id",
+                _app_tree([
+                    "A: android:enabled(0x7f010099)=(type 0x12)0xffffffff",
+                ]),
+                r"has unexpected resource ID 0x7f010099",
+            ),
+            (
+                "malformed-own-level-line",
+                _app_tree([
+                    "A: enabled",
+                ]),
+                r"malformed attribute line",
+            ),
+            (
+                "no-space-after-colon",
+                _app_tree([
+                    "A:android:enabled(0x0101000e)=(type 0x12)0xffffffff",
+                ]),
+                r"malformed attribute line",
+            ),
+            (
+                "tab-indented-own-level-line",
+                _app_tree([
+                    "\tA: android:enabled(0x0101000e)=(type 0x12)0x0",
+                ]),
+                r"unexpectedly indented or tab-indented",
+            ),
+            (
+                "shallow-indent-own-level-line",
+                _app_tree([
+                    "  A: android:enabled(0x0101000e)=(type 0x12)0x0",
+                ]),
+                r"unexpectedly indented or tab-indented",
+            ),
+            (
+                # Order irrelevance: the single own-level enabled line is
+                # scanned even AFTER a child provider block carrying its own
+                # compliant 6-space attributes; not a duplicate.
+                "own-level-enabled-after-child-block",
+                _app_tree([
+                    "E: provider",
+                    '      A: android:name="rikka.shizuku.ShizukuProvider"',
+                    "      A: android:enabled=(type 0x12)0xffffffff",
+                    "A: android:enabled=(type 0x12)0x0",
+                ]),
+                r"must be the exact boolean true",
+            ),
+            (
+                # N:-declared alias is deliberately NOT resolved by this pin.
+                "n-declared-alias-not-resolved",
+                'N: foo="http://schemas.android.com/apk/res/android"\n'
+                + _app_tree([
+                    "E: provider",
+                    '      A: android:name="rikka.shizuku.ShizukuProvider"',
+                    "A: foo:enabled(0x0101000e)=(type 0x12)0xffffffff",
+                ]),
+                r"unexpected or unbound namespace prefix",
+            ),
+        )
+        for label, tree, msg in cases:
+            with self.subTest(case=label):
+                with self.assertRaisesRegex(policy_inspect.PolicyError, msg):
+                    policy_inspect._check_github_application_enabled(tree)
+
+        # Positive controls: absence (Android default true), the exact
+        # compiled boolean true, and a compliant-absent own level with a
+        # DISABLED child attribute (child lines never shadow or trip the
+        # application's own level) all PASS with no exception.
+        with self.subTest(case="absent-enabled-defaults-true"):
+            policy_inspect._check_github_application_enabled(_app_tree([]))
+        with self.subTest(case="exact-boolean-true-accepted"):
+            policy_inspect._check_github_application_enabled(
+                _app_tree([
+                    "A: android:enabled(0x0101000e)=(type 0x12)0xffffffff",
+                ])
+            )
+        with self.subTest(case="child-enabled-false-ignored-when-own-level-absent"):
+            policy_inspect._check_github_application_enabled(
+                _app_tree([
+                    "E: provider",
+                    '      A: android:name="rikka.shizuku.ShizukuProvider"',
+                    "      A: android:enabled=(type 0x12)0x0",
+                ])
+            )
+
     def test_iter_application_providers_requires_application_element(self) -> None:
         # F4: a merged manifest without <application> has no provider scope;
         # the iterator must fail closed with the named PolicyError, never a
@@ -3890,6 +4190,117 @@ class ApkPolicyHarness(unittest.TestCase):
             apk, "github", xmltree_mode="bindings", expect_provider="optional"
         )
         self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+
+    def test_github_application_enabled_contract(self) -> None:
+        # Re-review #11 Finding 3: the merged <application>'s OWN
+        # android:enabled is pinned (github mode only) - the Android
+        # <provider> spec requires BOTH application and provider to be
+        # enabled; an application-disabled artifact cannot instantiate any
+        # provider, Shizuku binder surface dead on arrival. Expected owner
+        # of every red in this test: _check_github_application_enabled
+        # (wired into the github branch BEFORE the DEX/provider checks);
+        # the provider-side android:enabled pin stays with
+        # _check_provider_attrs. Every required-green APK below ships a
+        # DEX that class_def-defines the official provider class so the
+        # required-provider counting layer (11A) is satisfied.
+        official_dex = minimal_dex(
+            class_definitions=(("Lrikka/shizuku/ShizukuProvider;", None),),
+        )
+
+        # (1) application own android:enabled=false, provider block UNCHANGED
+        #     compliant => red; the provider-side gate is green by design,
+        #     so the owner of this rejection is the application-level pin.
+        with self.subTest(case="application-enabled-false-rejected"):
+            apk = complete_apk(
+                self.tmp / "app-enabled-false.apk",
+                minimal_dex(type_descriptors=("Ljava/lang/Object;",)),
+            )
+            result = self._run_scanner_cli(
+                apk,
+                "github",
+                xmltree_mode="shizuku-ok-app-enabled-false",
+                expect_provider="required",
+            )
+            self.assertNotEqual(result.returncode, 0, result.stderr + result.stdout)
+            self.assertIn("<application>", result.stderr)
+            self.assertIn("android:enabled", result.stderr)
+
+        # (2) application own android:enabled=(type 0x12)0xffffffff => green.
+        #     Owner of the pass: the application-level pin (exact compiled
+        #     boolean true); required-green needs the official class_def.
+        with self.subTest(case="application-enabled-true-allowed"):
+            apk = complete_apk(self.tmp / "app-enabled-true.apk", official_dex)
+            result = self._run_scanner_cli(
+                apk,
+                "github",
+                xmltree_mode="shizuku-ok-app-enabled-true",
+                expect_provider="required",
+            )
+            self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+
+        # (3) application-level enabled ABSENT = Android default true => green.
+        #     Fixture: the existing shizuku-ok (no own-level enabled); the
+        #     owner of the pass is the absence default-true branch.
+        with self.subTest(case="application-enabled-absent-allowed"):
+            apk = complete_apk(self.tmp / "app-enabled-absent.apk", official_dex)
+            result = self._run_scanner_cli(
+                apk,
+                "github",
+                xmltree_mode="shizuku-ok",
+                expect_provider="required",
+            )
+            self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+
+        # (4) application own android:enabled=@0x7f010099 (resource ref) =>
+        #     red; refs pass through _xmltree_attr_value verbatim and fail
+        #     closed against the exact compiled boolean true.
+        with self.subTest(case="application-enabled-reference-rejected"):
+            apk = complete_apk(
+                self.tmp / "app-enabled-ref.apk",
+                minimal_dex(type_descriptors=("Ljava/lang/Object;",)),
+            )
+            result = self._run_scanner_cli(
+                apk,
+                "github",
+                xmltree_mode="shizuku-ok-app-enabled-ref",
+                expect_provider="required",
+            )
+            self.assertNotEqual(result.returncode, 0, result.stderr + result.stdout)
+            self.assertIn("<application>", result.stderr)
+            self.assertIn("android:enabled", result.stderr)
+
+        # (5) application own android:enabled=(type 0x10)0x1 (integer typed)
+        #     => red; typed non-boolean encodings raise inside
+        #     _xmltree_attr_value with the android:enabled-carrying label.
+        with self.subTest(case="application-enabled-int-typed-rejected"):
+            apk = complete_apk(
+                self.tmp / "app-enabled-int-typed.apk",
+                minimal_dex(type_descriptors=("Ljava/lang/Object;",)),
+            )
+            result = self._run_scanner_cli(
+                apk,
+                "github",
+                xmltree_mode="shizuku-ok-app-enabled-int-typed",
+                expect_provider="required",
+            )
+            self.assertNotEqual(result.returncode, 0, result.stderr + result.stdout)
+            self.assertIn("<application>", result.stderr)
+            self.assertIn("android:enabled", result.stderr)
+
+        # (6) InitializationProvider CHILD carries enabled=(type 0x12)0x0 at
+        #     the 6-space child attribute level; application declares NO own
+        #     enabled => green. Owner isolation: exact own-indent scan; the
+        #     provider-level gate does not require InitializationProvider to
+        #     be enabled (not heuristic-detected, not DEX-evidenced).
+        with self.subTest(case="child-decoy-does-not-trip-application-gate"):
+            apk = complete_apk(self.tmp / "app-enabled-decoy.apk", official_dex)
+            result = self._run_scanner_cli(
+                apk,
+                "github",
+                xmltree_mode="shizuku-ok-app-enabled-decoy",
+                expect_provider="required",
+            )
+            self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
 
     def test_github_required_provider_must_have_dex_class_def(self) -> None:
         # Re-review #11 Finding 1: the github required-provider gate must

@@ -87,8 +87,14 @@ ShizukuProvider existence/contract pin: every DEX-evidenced subclass must be
 declared in the merged manifest and carry the full attribute contract
 (``android:enabled=true``; base permission; exported=true; multiprocess
 absent|false), so a renamed ``Bridge extends ShizukuProvider`` with an
-arbitrary authority cannot pass as invisible; heuristic-detected providers
-(name- or authority-suffix ``.shizuku``) must declare ``android:authorities``
+arbitrary authority cannot pass as invisible; the merged ``<application>``'s
+OWN ``android:enabled`` is pinned the same way (exact compiled boolean true
+or absent - Android's documented default) because the Android <provider>
+spec requires BOTH application and provider to be enabled - an
+application-disabled artifact cannot instantiate any provider, Shizuku
+binder surface dead on arrival (``_check_github_application_enabled``).
+Heuristic-detected providers (name- or authority-suffix ``.shizuku``) must
+declare ``android:authorities``
 exactly ``{merged-package}.shizuku`` (the Shizuku binder channel). In github
 mode ``--expect-provider required`` upgrades the ShizukuProvider check to a
 fail-closed existence contract (the merged manifest must declare exactly one
@@ -2701,6 +2707,169 @@ def _provider_name_matches_dex_class(name: str, java_name: str, package: str) ->
     )
 
 
+def _check_github_application_enabled(xmltree: str) -> None:
+    """Pin the merged ``<application>``'s OWN ``android:enabled`` (github mode).
+
+    github-mode scope (deliberate, documented): this pin wires into the
+    ``--mode github`` branch of ``inspect_apk`` ONLY. play/foss artifacts
+    are untouched - the github artifact is the one whose Shizuku binder
+    surface this gate proves, and the foss/play contract split stays as it
+    is. No new CLI flag exists; both ``--expect-provider optional`` and
+    ``--expect-provider required`` runs get the pin.
+
+    Android's <provider> spec requires BOTH the application and the
+    provider to be enabled: a merged ``<application>`` carrying
+    ``android:enabled=false`` cannot instantiate ANY provider - the
+    compliant ShizukuProvider the provider-side gate certifies
+    (``_check_provider_attrs``) is never created, so the Shizuku binder
+    channel that resolves ``<package>.shizuku`` dead-ends on arrival,
+    even though the provider's own ``android:enabled`` is true. This is
+    an AVAILABILITY pin, not a privilege check: a merged artifact that
+    cannot prove application availability fails closed here. The two
+    requirements are independent and both hold.
+
+    Own-attribute isolation is by EXACT indent. aapt prints the
+    ``<application>`` element at ``app_indent`` and its own attributes at
+    ``app_indent + 2`` (two-space hierarchy steps), while every CHILD
+    element's attributes print at ``app_indent + 4`` or deeper. Only
+    ``A:`` lines at exactly ``app_indent + 2`` leading spaces are
+    considered, so a CHILD carrying a decoy
+    ``android:enabled=(type 0x12)0x0`` at child indent can neither trip
+    the gate nor satisfy it - child attributes never shadow the
+    application's own, and the application's own attribute is never
+    satisfied by a child's. Scanning covers EVERY own-level ``A:`` line
+    anywhere inside the application block, so a decoy cannot hide behind
+    child elements either. A tab-indented or shallower-than-own-level
+    ``A:`` line inside the application block fails closed as well: per
+    aapt's two-space hierarchy no such line can ever legitimately print
+    there (own-level is spaces at exactly ``app_indent + 2``; deeper
+    children print spaces-only and longer).
+
+    Absence is Android's documented default (``enabled=true``) and
+    PASSES - an application with no explicit ``android:enabled`` is not
+    treated as disabled. An explicit value must be the exact compiled
+    boolean true. Anything else fails closed: a compiled boolean false,
+    any other typed encoding (untypable values raise inside
+    ``_xmltree_attr_value``), or a resource reference (``@0x…`` /
+    ``?0x…`` passes through verbatim from ``_xmltree_attr_value`` and is
+    never equal to ``"true"`` - an unproven reference fails closed by
+    design; the gate never guesses what an unresolved resource resolves
+    to).
+
+    Namespace discipline is deliberately TIGHTER than the provider-side
+    gate: the compiled attribute print is accepted only under the
+    ``android`` prefix or the fully spelled
+    ``http://schemas.android.com/apk/res/android:`` qname; anything else
+    - including ``N:``-declared alias prefixes, which are NOT resolved
+    here - is rejected outright for the enabled attribute rather than
+    guessed. (Namespace aliases are legal XML but out of scope for this
+    compiled-attribute pin; the limitation is accepted and documented
+    rather than silently mis-resolved.)
+
+    id<->name agreement mirrors the provider-side shape: 0x0101000e is
+    ``android:enabled`` (see ``_PROVIDER_ANDROID_ATTR_IDS``). A different
+    id appearing with the local name ``enabled`` (or 0x0101000e appearing
+    with a different local name) fails closed naming both, and duplicate
+    application-level ``android:enabled`` declarations fail closed as
+    duplicates.
+    """
+    lines, app_index, end, app_indent = _locate_application_manifest_span(xmltree)
+    own_indent = app_indent + 2
+    attr_prefix = " " * own_indent
+    own_a_lines: list[tuple[str, str, str]] = []
+    for line in lines[app_index + 1 : end]:
+        stripped = line.lstrip(" \t")
+        if stripped.startswith("A:"):
+            leading = line[: len(line) - len(stripped)]
+            if "\t" in leading or len(leading) < own_indent:
+                raise PolicyError(
+                    "merged manifest <application> has an unexpectedly "
+                    f"indented or tab-indented attribute line: {line.strip()!r}"
+                )
+        a_match = _PROVIDER_ATTR_LINE_RE.match(line)
+        if a_match is None:
+            if line.startswith(attr_prefix + "A:"):
+                # Own-level attribute the provider line grammar cannot
+                # parse: fail closed rather than skip past an anomaly.
+                raise PolicyError(
+                    f"merged manifest <application> has malformed attribute line: "
+                    f"{line.strip()!r}"
+                )
+            continue  # child element lines / child A: lines (deeper) / chatter
+        if a_match.group(1) != attr_prefix:
+            continue  # a child's attribute prints deeper and is never ours
+        attr_lhs = a_match.group(2).strip()
+        attr_rhs = a_match.group(3).strip()
+        attr_id_match = re.search(r"\(\s*(0x[0-9a-fA-F]+)\s*\)\s*$", attr_lhs)
+        attr_id = attr_id_match.group(1).lower() if attr_id_match else None
+        attr_qname = (
+            attr_lhs[: attr_id_match.start()].strip()
+            if attr_id_match is not None
+            else attr_lhs
+        )
+        if ":" in attr_qname:
+            ns_prefix, attr_local = attr_qname.rsplit(":", 1)
+        else:
+            ns_prefix, attr_local = "", attr_qname
+        if attr_local != "enabled" and attr_id != "0x0101000e":
+            continue  # unrelated application-level attribute
+        # Namespace rule for `enabled` (fail closed on anything unbound):
+        # only the literal `android` prefix or the fully spelled Android
+        # res-android URI qname binds; anything else - including
+        # N:-declared aliases (aliases are out of scope for this pin and
+        # are NOT resolved) - is rejected rather than guessed.
+        if ns_prefix not in ("android", _ANDROID_NS):
+            raise PolicyError(
+                f"merged manifest <application> android:enabled attribute "
+                f"{attr_lhs!r} uses an unexpected or unbound namespace "
+                f"prefix (line: {line.strip()!r})"
+            )
+        # id<->name agreement, mirroring the provider-side shape:
+        # 0x0101000e IS android:enabled - a mismatch fails closed naming both.
+        if attr_id is not None and attr_id in _PROVIDER_ANDROID_ATTR_IDS:
+            expected_local = _PROVIDER_ANDROID_ATTR_IDS[attr_id]
+            if attr_local != expected_local:
+                raise PolicyError(
+                    f"merged manifest <application> android:enabled attribute "
+                    f"{attr_lhs!r} disagrees with Android attribute ID {attr_id} "
+                    f"(that ID is {expected_local!r})"
+                )
+        elif attr_local == "enabled":
+            if attr_id is not None:
+                # An id outside the known Android map is never a proof of
+                # android:enabled - mirror the provider-side refusal.
+                raise PolicyError(
+                    f"merged manifest <application> android:enabled attribute "
+                    f"{attr_lhs!r} has unexpected resource ID {attr_id}"
+                )
+            # Local name without an id is accepted (same tolerance as the
+            # provider-side gate for synthetic dumps); decoded below.
+        own_a_lines.append((attr_lhs, attr_id or "", attr_rhs))
+    if len(own_a_lines) > 1:
+        raise PolicyError(
+            f"merged manifest <application> android:enabled declared more than "
+            f"once (duplicate attribute): {own_a_lines[0][0]!r} / "
+            f"{own_a_lines[1][0]!r}"
+        )
+    if not own_a_lines:
+        # Absent at the application level: Android's documented default is
+        # enabled=true, so this PASSES (no fail-closed default flip here).
+        return
+    _attr_lhs, _attr_id, raw_rhs = own_a_lines[0]
+    # Resource references (@0x…/?0x…) pass through verbatim here (see
+    # _xmltree_attr_value) and therefore never equal "true":
+    # resource-unproven values fail closed, deliberately - the gate never
+    # guesses what an unresolved resource resolves to.
+    decoded = _xmltree_attr_value(
+        raw_rhs, "merged manifest <application> android:enabled"
+    )
+    if decoded != "true":
+        raise PolicyError(
+            f"merged manifest <application> android:enabled must be the "
+            f"exact boolean true (or absent, Android default); got {decoded!r}"
+        )
+
+
 def _check_github_dex_shizuku_providers(
     xmltree: str, parsed_dexes: list[ParsedDex], package: str
 ) -> set[str]:
@@ -2991,6 +3160,11 @@ def inspect_apk(apk: Path, mode: str, aapt: str, dexdump: str, expect_provider: 
         # degrade the mode.
         parsed_dexes = _parse_root_dexes(apk, dex_infos, dexdump)
         merged_package = _merged_manifest_package(xmltree, permissions)
+        # The merged <application>'s OWN android:enabled is pinned BEFORE
+        # any provider check: availability of the whole provider surface
+        # precedes the provider attribute contract. Applies in both
+        # optional and required modes (no extra flag).
+        _check_github_application_enabled(xmltree)
         dex_java_names = _check_github_dex_shizuku_providers(
             xmltree, parsed_dexes, merged_package
         )

@@ -101,7 +101,7 @@ ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
 BLACKLIST_PERMS="SEND_SMS RECEIVE_SMS READ_SMS MANAGE_EXTERNAL_STORAGE BIND_ACCESSIBILITY_SERVICE BIND_VPN_SERVICE"
 # Comma form for the structured validator (same tokens).
 BLACKLIST_PERMS_CSV=$(printf '%s' "$BLACKLIST_PERMS" | tr ' \n' ',,')
-FOSS_BLACKLIST="com.google.mlkit com.google.android.gms com.microsoft.cognitiveservices.speech rikka.shizuku"
+FOSS_BLACKLIST="com.google.mlkit com.google.android.gms com.microsoft.cognitiveservices.speech rikka.shizuku moe.shizuku"
 # P2-1 通行 manifest 政策（locked decision：任何 flavor 皆 NO SMS、NO
 # MANAGE_EXTERNAL_STORAGE、NO VPN）：結構化 permission-removal 掃描在「每一個」
 # 分支都要跑（F6：MAIN manifest 加進 SEND_SMS 必須讓每個 flavor 門都紅）。
@@ -470,10 +470,19 @@ fi
 
 for ART in "$@"; do
     printf '== artifact (%s APK gate): %s ==\n' "$MODE" "$ART"
-    python3 -P "$ROOT/scripts/apk_policy_inspect.py" \
-        --mode "$MODE" \
-        --apk "$ART" \
-        --aapt "$AAPT" \
-        --dexdump "$DEXDUMP"
+    if [ "$MODE" = github ]; then
+        python3 -P "$ROOT/scripts/apk_policy_inspect.py" \
+            --mode "$MODE" \
+            --expect-provider required \
+            --apk "$ART" \
+            --aapt "$AAPT" \
+            --dexdump "$DEXDUMP"
+    else
+        python3 -P "$ROOT/scripts/apk_policy_inspect.py" \
+            --mode "$MODE" \
+            --apk "$ART" \
+            --aapt "$AAPT" \
+            --dexdump "$DEXDUMP"
+    fi
 done
 printf 'play_policy_check (%s APK gate): PASS\n' "$MODE"

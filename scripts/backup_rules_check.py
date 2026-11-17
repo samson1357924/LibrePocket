@@ -109,18 +109,34 @@ REQUIRED_EXCLUDES: tuple[tuple[str, str], ...] = (
     ("file", "librepocket_keysets"),
 )
 
-# Required device-bound excludes (re-review #3 finding #3 [P3]): per-device
-# system state that must not migrate to a restored device, enforced with the
-# same missing-entry severity as REQUIRED_EXCLUDES (see
-# _missing_exclude_errors). Each entry is (domain, path).
+# Required device-bound excludes (re-review #3 finding #3 [P3] + #136-B1
+# grant lifecycle): per-device system/authorization state that must not migrate
+# to a restored device, enforced with the same missing-entry severity as
+# REQUIRED_EXCLUDES (see _missing_exclude_errors). Each entry is (domain, path).
 #   - ("sharedpref", "assistant_role.xml"): `everHeld` for the system
 #     ROLE_ASSISTANT grant (finding D [P3]); restoring it onto an
 #     unauthorized device would misreport REVOKED.
+#   - ("file", "datastore/librepocket_privilege_bridge.preferences_pb"):
+#     device-bound privilege bridge grant DataStore (#136-B1); must not migrate
+#     across backup or device transfer.
+#   - ("file", "datastore/librepocket_shizuku_grant.preferences_pb"):
+#     device-bound Shizuku authorization grant DataStore (#136-B1); must not
+#     migrate across backup or device transfer.
+#   - ("file", "datastore/librepocket_privilege_bridge.preferences_pb.tmp") and
+#     ("file", "datastore/librepocket_shizuku_grant.preferences_pb.tmp"):
+#     the DataStore FileStorageConnection writes <name>.preferences_pb.tmp then
+#     renames; the read path never resolves a leftover .tmp, but a restored .tmp
+#     would migrate stale grant metadata across devices, so exact rules exclude
+#     the siblings too.
 # Deliberately NOT part of BackupPolicy.KEY_FILES_EXCLUDED (key/vault-only);
 # the drift guard in scripts/tests/test_apk_policy_check.py pins that 5-item
 # Kotlin list separately.
 REQUIRED_DEVICE_BOUND_EXCLUDES: tuple[tuple[str, str], ...] = (
     ("sharedpref", "assistant_role.xml"),
+    ("file", "datastore/librepocket_privilege_bridge.preferences_pb"),
+    ("file", "datastore/librepocket_privilege_bridge.preferences_pb.tmp"),
+    ("file", "datastore/librepocket_shizuku_grant.preferences_pb"),
+    ("file", "datastore/librepocket_shizuku_grant.preferences_pb.tmp"),
 )
 
 # Allowlisted device-bound extras (NOT key material, NOT part of
@@ -253,11 +269,13 @@ def _missing_exclude_errors(
     """Report excludes missing from the REQUIRED + DEVICE-BOUND set.
 
     Both ``REQUIRED_EXCLUDES`` (BackupPolicy.KEY_FILES_EXCLUDED, key/vault)
-    and ``REQUIRED_DEVICE_BOUND_EXCLUDES`` (per-device system state, finding
-    #3 [P3]) must be present in every checked scope: a resources-overlay /
-    merger rewrite that drops ``assistant_role.xml`` fails here as a missing
-    entry (fail-closed), even though ``exact_excludes`` would otherwise
-    tolerate it as allowlisted. Missing from EITHER set is a FAIL.
+    and ``REQUIRED_DEVICE_BOUND_EXCLUDES`` (per-device system/authorization
+    state, finding #3 [P3] + #136-B1 grant lifecycle) must be present in every
+    checked scope: a resources-overlay / merger rewrite that drops a required
+    device-bound exclude such as ``assistant_role.xml`` or the privilege grant
+    DataStores fails here as a missing entry (fail-closed), even though
+    ``exact_excludes`` would otherwise tolerate it as allowlisted. Missing from
+    EITHER set is a FAIL.
     """
     return [
         f"{path}: {_where(branch_label)}missing exclude domain={domain} path={rule_path}"
@@ -267,6 +285,49 @@ def _missing_exclude_errors(
         )
         if (domain, rule_path) not in present
     ]
+
+
+def _unexpected_include_errors(
+    path: str,
+    branch_label: str,
+    node: ET.Element,
+    depth: int = 0,
+    skip_tags: frozenset[str] = frozenset(),
+) -> list[str]:
+    """Report any ``<include>`` element at any depth (exact-set mode only).
+
+    The compiled backup rules must be include-free: an ``<include>`` in the
+    compiled artifact re-adds paths the exact-set contract exists to keep
+    out (the compiled bytes must be exactly ``REQUIRED_EXCLUDES`` +
+    ``REQUIRED_DEVICE_BOUND_EXCLUDES`` and nothing else), so any appearance
+    fails as the set violation it is, naming the branch and the offending
+    ``domain``/``path``. The walk recurses into include/exclude sub-trees
+    too, bounded by ``_MAX_RULE_NEST_DEPTH`` (deeper shapes surface as a
+    clean depth FAIL, not a RecursionError).
+    """
+    errors: list[str] = []
+    for child in node:
+        if child.tag in skip_tags:
+            # 該子樹由呼叫端以 per-section 走訪各自回報（避免雙重計數）。
+            continue
+        if child.tag == "include":
+            domain = child.get("domain")
+            rule_path = child.get("path")
+            errors.append(
+                f"{path}: {_where(branch_label)}unexpected <include> "
+                f"domain={domain!r} path={rule_path!r} - the compiled "
+                "backup rules must be include-free (exact-set contract)"
+            )
+        if depth >= _MAX_RULE_NEST_DEPTH:
+            errors.append(
+                f"{path}: {_where(branch_label)}<include>-scan exceeds the "
+                f"maximum rule nesting depth {_MAX_RULE_NEST_DEPTH}"
+            )
+            continue
+        errors.extend(
+            _unexpected_include_errors(path, branch_label, child, depth + 1, skip_tags)
+        )
+    return errors
 
 
 def _unexpected_exclude_errors(
@@ -354,7 +415,12 @@ def validate_tree(
     excludes beyond ``REQUIRED_EXCLUDES`` + ``REQUIRED_DEVICE_BOUND_EXCLUDES``
     (single-sourced as ``ALLOWED_EXTRA_EXCLUDES``)
     - see ``_unexpected_exclude_errors`` - while a missing entry from EITHER
-    set still fails via ``_missing_exclude_errors``.
+    set still fails via ``_missing_exclude_errors``; and additionally refuses
+    ANY ``<include>`` element at any depth - including one sitting directly
+    under the ``<data-extraction-rules>`` root, outside both gated sections;
+    see ``_unexpected_include_errors``: the compiled backup rules must be
+    include-free. Source-level semantics
+    (``exact_excludes=False``) are unchanged.
     """
     if root.tag != expected_root:
         return [f"{path}: expected root <{expected_root}>, found <{root.tag}>"]
@@ -368,6 +434,7 @@ def validate_tree(
         errors.extend(_missing_exclude_errors(path, "", present))
         if exact_excludes:
             errors.extend(_unexpected_exclude_errors(path, "", present))
+            errors.extend(_unexpected_include_errors(path, "", root))
     elif root.tag == "data-extraction-rules":
         # Android's runtime parser visits EVERY matching section occurrence
         # (duplicates included), so the gate validates all of them too;
@@ -380,6 +447,14 @@ def validate_tree(
         # in _UNDECIDED_SECTIONS); hardcoding the walk against
         # supported names keeps a future platform section from sneaking past
         # as a "skip".
+        if exact_excludes:
+            # A root-level <include> sits OUTSIDE both gated sections, so the
+            # per-section walk below would never see it - mirror the
+            # full-backup-content branch and refuse it at the root. Gated
+            # sections are skipped here; the per-section walk reports them.
+            errors.extend(
+                _unexpected_include_errors(path, "", root, skip_tags=_GATE_SECTIONS)
+            )
         seen: set[str] = set()
         for child in root:
             if child.tag in _UNDECIDED_SECTIONS:
@@ -404,6 +479,7 @@ def validate_tree(
                 errors.extend(
                     _unexpected_exclude_errors(path, f"<{child.tag}>", present)
                 )
+                errors.extend(_unexpected_include_errors(path, f"<{child.tag}>", child))
         for branch in _GATE_SECTIONS:
             if branch not in seen:
                 errors.append(f"{path}: missing <{branch}>")

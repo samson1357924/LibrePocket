@@ -547,13 +547,28 @@ handlers' XML while the manifest binding and source files all stay faithful
 `test_compiled_backup_rules_evaluate_via_shared_engine`). Second, the Github
 debug flavor is not a play or foss artifact, so its compiled bytes must not
 escape the gate either: pr-check.yml's github step runs the scanner's
-`--mode github` right after the play/foss policy gate - the scanner mode
-itself executes only the mode-independent artifact authorities (merged
-backup bindings, compiled rules bytes, compiled NSC), and the SAME step
+`--mode github --expect-provider required` right after the play/foss policy gate - the scanner mode
+does execute the mode-independent artifact authorities (merged
+backup bindings, compiled rules bytes, compiled NSC), and under
+`--expect-provider required` additionally enforces the github-only
+ShizukuProvider existence contract (the merged manifest must declare exactly
+one compliant provider; every DEX-evidenced ShizukuProvider subclass must be
+declared and carry the full attribute contract — INTERACT_ACROSS_USERS_FULL
+base permission, exported exactly true, multiprocess absent|false, no
+grantUriPermissions, no path-permission — plus the merged-artifact
+`android:enabled` exactly true (compiled boolean) and, for the official
+heuristic-detected surface, authorities exactly `{applicationId}.shizuku`; DEX-evidenced renamed subclass that matches ≥2 manifest provider blocks fails closed (uniqueness, both expect modes); android:authorities must carry ≥1 non-empty post-trim segment; plus the merged `<application>` `android:enabled` exactly true (compiled boolean; absent → Android default true; ref/typed/false fail closed); plus, for `--expect-provider required`, every declared ShizukuProvider's canonical FQN must be DEFINED among the parsed root DEX class_defs (official RIKKA class included; type_ids alone insufficient) with duplicate identity checked by canonical FQN;
+renamed DEX-evidenced subclasses with arbitrary authorities remain admitted
+under "the contract is the permission" design), and the SAME step
 additionally runs the common five-token source scan (see P2-1 below) -
-with no flavor-DEX class-table policy, matching the scanner's own
-docstring (that flavor ships proprietary components by design)
-(`ApkPolicyHarness.test_github_mode_passes_mode_independent_authorities`;
+with no play/foss flavor DEX class-table policy, matching the scanner's own
+docstring (that flavor ships proprietary components by design; the github
+mode still parses the root DEX shards to evidence ShizukuProvider
+subclasses)
+(`ApkPolicyHarness.test_github_mode_passes_mode_independent_authorities`,
+`ApkPolicyHarness.test_github_expect_provider_required_fail_closed`,
+`ApkPolicyHarness.test_github_enabled_and_authority_contract`,
+`ApkPolicyHarness.test_github_canonical_component_name_resolution`;
 the wiring is pinned by `PolicyCiGateControl`). Third, the Play source
 permission blacklist is enforced by `backup_rules_check.py`'s
 `validate_permission_removals` (CLI: `--check-permission-removals
@@ -632,8 +647,10 @@ variants (`:app:assemblePlayRelease :app:assembleFossRelease
 debug-tier artifact policy to each lane's release APK in the same job:
 the shell gate for Play and Foss (`scripts/play_policy_check.sh` /
 `--foss` over `app/build/outputs/apk/{play,foss}/release/*.apk`) and the
-mode-independent artifact authorities (`apk_policy_inspect.py --mode
-github`) on the github release output. The release APKs are UNSIGNED (the
+github-mode artifact authorities (`apk_policy_inspect.py --mode
+github --expect-provider required`, the same ShizukuProvider existence contract
+as the debug tier — not a mode-independent-only authority set) on the github
+release output. The release APKs are UNSIGNED (the
 job runs without `-PreleaseSigning`, so `app/build.gradle.kts` assigns no
 signing config and AGP emits `app-<flavor>-release-unsigned.apk`); the
 output-dir glob is naming-drift-proof and fails closed when no APK was
@@ -965,8 +982,10 @@ For release artifact policy, run the following from the repository root after
 the successful six-variant assembly above. Use fresh outputs from the tested
 commit (do not rely on old APKs). This mirrors CI's release glob and its
 Play/Foss gates; the GitHub shell gate also performs the common source-manifest
-scan that CI runs in its GitHub debug step. It runs the same mode-independent
-artifact checks for each GitHub release APK. Install Android SDK build-tools
+scan that CI runs in its GitHub debug step. It runs the same github-mode
+artifact checks (`apk_policy_inspect.py --mode github --expect-provider
+required`, not a mode-independent-only authority set) for each GitHub release
+APK. Install Android SDK build-tools
 with `aapt` and `dexdump` available as described by the policy script; missing
 tools or APKs fail rather than skip. The subshell stops on the first failure.
 
@@ -1109,6 +1128,21 @@ report artifact (see the 2026-10-29 run above); a missing lane is missing
 evidence, never a pass.
 
 Instrumented tests are a separate device-dependent tier. The existing [P1 androidTest runbook](specs/P1_ANDROIDTEST_RUNBOOK.md) lists test classes and sample commands, but its device matrix and prior status notes are not current CI evidence. Before treating a device matrix as a merge/release gate, maintainers must name the required API/flavor/device coverage, run it, and retain results tied to the tested SHA. Do not report a device pass when no device was used.
+
+## 本機 host-layout 敏感測試與 privilege 子系（#136-B1）
+
+本機（非標準 coreutils 佈局／非標準 locale）已知環境失敗——均為環境所致，非測試碼缺陷，亦非 PR 引入。locale 對本機結果影響為機器實測：`files.*` 於 `LC_ALL=C.utf8` 重驗 **123/123 綠**、於 `LC_ALL=C` 仍重現 **16 個** locale／CJK 路徑失敗；`ShellPhysicalGateTest.dotdotEncoding_locked` 於 `LC_ALL=C` 紅、`LC_ALL=C.utf8` 綠（locale 相依，非 PR 引入；CI 佈局全綠）。privilege 子系 target 類已於 2026-11-16 本機以 ANDROID_HOME 實跑綠（見該 bullet）：
+
+- `PrivilegeBridgeRevokeRunnerTest`（github）已注入 `HermeticExecFixture`（暫存搜尋目錄＋假 `id` 執行檔＋`execSearchDirs`/`execAllowedRoots`/`execIsWritable` 注入兩 runner），**不再依賴宿主 `/usr/bin/id` 版面**；本機實測 12/12 綠（含 `failedPersistentRevoke_markerPersists_restartRefreshDeniedAndZeroSpawn` 等重啟/自癒案）。
+- `files.*` 本次重驗（2026-11-16 head c14367c8 快照；githubDebug 車道；於 `LC_ALL=C.utf8` 執行；foss/play 以 CI 為準）**123 個（8 suite）全綠**；於 `LC_ALL=C`（ASCII/POSIX）仍重現 **16 個** locale／CJK 路徑失敗（`unsafe path: 中文…`，與此前記錄一致，非 PR 引入；locale 相依）；`ShellPhysicalGateTest.dotdotEncoding_locked` 於 `LC_ALL=C` 紅、`LC_ALL=C.utf8` 綠（locale 相依，非 PR 引入；CI 佈局全綠）；`ChatMarkdown`／`Chat`／`NetworkPolicy` 為 load-sensitive flaky（本次重跑：`NetworkPolicyTest.preflightPropagatesBlockExceptions`、`ChatMarkdownUiTest.thinkingAlign…scalesLinearly`、`ChatSessionFactoryCrossOriginForkTest.openSession_crossOrigin_forksIdNoticesAndKeepsLedgersApart`、`B2Phase1DispatcherGrantTest.unsolicitedToolCallWhenSwitchFlipsOffToOnStaysRecordsOnly`（Room 5s）、`ElevatedRunnerY1Test.rootSuccessBlockedStdoutIsFailedNotOkComplete`（30s）皆綠）；以上均以 CI 實跑為準，本機綠（含 locale 差異）不等於裝置驗證。
+- **privilege 子系 target 類——2026-11-16 本機實跑綠**：`ShizukuPermissionRequestTest` 38/38（含 attachFailureKeepsGuardFalseAndDetachDoesNotThrow 改注入 seam、CE-burn pin、seed 拒絕路徑）、`PrivilegeBridgeStateTest` 56/56（Stage 7A 新增兩案 `revokeMutexTimeout_thenMutexBecomesUsableForNextGrant`／`revokeAcquiresMutexFreely_completesAndNextGrantProceeds`、Stage 7B 七案（FlavorPrivilegeScopeTest 另新增三案）；grantAtExactlyNow_accepted、failedSecondGrant_preservesPreviousBridgeGranted、revokeStoreClearCancellation_withWithdrawScope*／revokeStoreClearRuntimeFailure_withWithdrawScopeCancellation* 複合真值目，＋#136-B1 Re-review#5 封存（sticky revoke-pending seal）釘測 13 案：refreshAfterFailedRevoke_withStaleValidGrantOnDisk_staysFailClosed、refreshAfterSuccessfulRevoke_storeCleared_staysInvalid、refreshRevokedWhileQueuedOnMutexFailsClosed、grantDuringRevokeInFlight_failsFast、grantAfterSettledFailedRevoke_explicitReGrant_liftsSeal／…saveThrows_keepsSeal／…saveCancellation_keepsSeal／…expiredGrantDoesNotLiftSeal、publishBridgeGranted_sealSetBeforeWrite_doesNotEndTrue／…sealSetBetweenWriteAndSecondRead_secondReadForcesFalse、grantCommit_revokeEntryDuringCommit_sealSticks、grantEpilogueCompensationClearHangs_grantDoesNotHang、revokeTimeoutPath_reassertsSwitchAndFlag；github/foss/play 三 flavor）、`PrivilegeBridgeGrantTest` 41/41（新增 journalAndWipeBothFail_clearRethrowsJournalWriteError）、`ShizukuGrantTest` 24/24（同鏡像）、`PrivilegeRevokeTest` 9/9（MainScreen 一鍵收回 helper 級：access-layer CE＋active scope ⇒ banner、inactive scope CE 重拋、VMError 重拋、withdraw 恰一次、flags fail-closed）、`PrivilegeRevokeViewModelTest` 7/7、`PrivilegeRevokeWiringTest` 2/2（Robolectric Compose；activity recreate 時撤權 INFLIGHT 存活且雙擊守門——#136-B1 Stage 7C 釘測）、`PrivilegeRevokeNavPopTest` 2/2（Robolectric Compose；真實 `StartupGateHost`＋真實 `NavHost`＋真實抽屜「新對話」pop SETTINGS → 再進 Settings：INFLIGHT 存活、executor 不重入、失敗釋放後 ERROR 顯示且可重試（成功→IDLE）；`PrivilegeRevokeWiring` 的 `viewModel()` owner 已提升出 NavBackStackEntry（`findComponentActivity()` ContextWrapper walk，無 Activity 環境 fail-loud——#136-B1 Re-review #9 釘測））、`PendingRevokeMarkerTest` 7/7、`PrivilegeBridgeStoreRobolectricTest` 7/7、`ShizukuGrantStoreRobolectricTest` 7/7、`FlavorPrivilegeScopeTest` 9/9（detach/clear VMError 三新案：withdrawDetachFailure_clearVirtualMachineError_clearFatalPropagates_detachFailureSuppressed、withdrawDetachVirtualMachineError_clearIoException_firstFatalPropagates_clearErrorSuppressed、withdrawDetachAndClearVirtualMachineError_firstFatalWins_detachOomSuppressesClearOom；另新增撤權失敗矩陣 3 案（detach 失敗以 AssertionError 假件注入、clear 失敗以 `FlavorPrivilegeScope.grantStoreClearForTest` hook 注入——filesDir 級 sabotage 對 JVM 內共享的 preferencesDataStore delegate 不可靠）＋ cachedStore 換綁身分的反射 pin；橋↔Shizuku 測試鏡射清單見 [TEST-PARITY](TEST-PARITY.md)）、`FlavorPrivilegeScopeCommonTest` 1/1、`ShizukuProviderRobolectricTest`、`ShizukuManifestPinTest`；三 flavor `:app:test*DebugUnitTest --tests 'dev.librepocket.shell.*'` 皆僅剩 `ShellPhysicalGateTest.dotdotEncoding_locked`（本檔列於上方本機 locale 已知環境失敗，非 PR 引入）；Python policy harness `python3 -m pytest scripts/tests/` → **937 passed, 1 skipped**（**1004 subtests**；含 renamed-subclass DEX-evidence fixtures、.tmp sibling 負向釘測、canonical component-name 解析 CLI 釘測、enabled/authorities 契約釘測、required-provider DEX class-def 釘測與 canonical 別名唯一性釘測、application-level enabled 契約與 17 支 fail-closed 分支直釘測、DEX-evidenced renamed subclass 唯一性與 required 出口（同類別重複宣告 fail-closed、optional/required 皆啟用）、authorities 存在性最低有效性釘測（missing／empty／delimiter-only 負向、space-tolerant 正向））。`docs_claim_check.sh` PASSED。**本機綠不覆蓋 CI 佈局與裝置**；合併門檻為 CI（`gh pr checks 166`），發布前仍需按上列重驗指令重跑。重驗指令：`./gradlew :app:testGithubDebugUnitTest --tests 'dev.librepocket.shell.*' --tests 'dev.librepocket.privilege.github.*'`（foss/play 另跑同名 shell 套件）。
+- KDoc 已知限制見 THREAT_MODEL「#136-B1 提權橋」條目與 `PrivilegeBridgeState`／`PrivilegeBridgeStore`／`ShizukuGrantStore` KDoc（grant/refresh opMutex 無界、heal 無 audit 計數、marker OR 語義等）。Store 測試以單執行緒注入 seam 釘住順序語義，未證明真並行 interleaving 行為；並行 save() vs load()-heal 的完整化併 #136-B3 generation fence。
+
+MainScreen wiring 與 Compose 接線（#136-B1 Stage 7C 已補）：helper 級 `PrivilegeRevokeTest` 9/9 綠；content-level 接線已拆出共用 `PrivilegeRevokeWiring` Composable 並以 Robolectric Compose 覆蓋（`PrivilegeRevokeWiringTest` 2/2：suspend 中 Activity recreate→INFLIGHT 存活、Activity 實銷毀釘測（assertNotSame）、釋放後失敗路徑顯示 ERROR＋成功路徑歸 IDLE、重建後雙擊不重入 revoke）；owner 提升至 Activity 之後（#136-B1 Re-review #9 修復：`PrivilegeRevokeWiring` 以 `findComponentActivity()` ContextWrapper walk 將 `viewModel()` 綁定至宿主 ComponentActivity——無 Activity 環境 fail-loud，絕不回落 Settings 的 NavBackStackEntry；config change 與 destination pop 皆存活），destination-pop 覆蓋亦已補齊：`PrivilegeRevokeNavPopTest` 2/2（真實 NavHost＋抽屜「新對話」pop SETTINGS → 再進 Settings：INFLIGHT 存活、executor 不重入、失敗→ERROR 可重試、成功→IDLE）＋ VM 機器測試 `PrivilegeRevokeViewModelTest` 7/7（成功／失敗／雙擊互斥／錯誤黏性／retry 重路由／executor 極性釘測）。**仍缺全端到端**：`MainScreen → SettingsScreen` 在真 Activity 上的 recreate 路徑（真實 MainScreen 掛載）與相機 lane instrumented 驗證，綁定 #136-B3 activation gate；helper VMError 終端分支已由 `PrivilegeRevokeTest` pin，**VM 的 executor-throws fatal arm 暫無釘測**（kotlinx-coroutines-test 全域 ExceptionCollector 會殘留 poison sibling Compose harness——WARN-2 待 B3 或隔離 JVM pin；helper 層已被覆蓋）。**行程死亡（kill）時 revoke VM 狀態重置為 Idle**（viewModelScope／VM 隨行程滅）；跨重啟後續語義由持久 journal／marker 承接（fail-closed），非 UI 狀態。
+
+## Open items（#136-B1）
+
+- **WARN-2（VM executor-throws fatal arm 暫無釘測）**：`PrivilegeRevokeViewModelTest` 未覆蓋 `executor` 拋出（executor-throws 路徑的）fatal arm——kotlinx-coroutines-test 全域 ExceptionCollector 會殘留 poison sibling Compose harness（同 JVM 內 sibling Compose 測試被牽連 fail），故未以現有 harness 釘測；helper 層 VMError 終端分支已由 `PrivilegeRevokeTest` pin。**處置：待 B3 或以隔離 JVM（獨立 test JVM／forkEvery）pin 補上。綁定期限：此 pin 不得晚於 #136-B3 activation gate 翻 `true`（見 CAPABILITY_MATRIX #136-B1 行之 B3 前置清單），亦不得在 B3 的 activation PR 合併後補上。**
 
 ## Security-sensitive test expectations
 

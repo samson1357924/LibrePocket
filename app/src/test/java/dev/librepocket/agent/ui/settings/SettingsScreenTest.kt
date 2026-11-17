@@ -34,6 +34,7 @@ import dev.librepocket.agent.ui.setup.setupErrorText
 import dev.librepocket.automation.AutomationSettingsState
 import dev.librepocket.provider.ProviderProtocol
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Rule
 import org.junit.Test
@@ -700,5 +701,78 @@ class SettingsScreenTest {
         composeRule.onNodeWithTag("webDdgsSwitch").performScrollTo().assertIsNotEnabled()
         composeRule.onNodeWithTag("webSearxngUrl").performScrollTo().assertIsNotEnabled()
         composeRule.onNodeWithTag("webResetButton").performScrollTo().assertIsNotEnabled()
+    }
+
+    @Test
+    fun privilegeRevoke_idleStateRendersAndTriggersRevoke() {
+        var revokeClicked = false
+        composeRule.setContent {
+            SettingsScreen(
+                padding = PaddingValues(0.dp),
+                gate = readyGate(),
+                privilegeAuditCount = 3,
+                privilegeRevokeInFlight = false,
+                privilegeRevokeError = false,
+                onRevokePrivilege = { revokeClicked = true },
+            )
+        }
+        composeRule.onNodeWithText("目前審計筆數：3", substring = true).performScrollTo().assertIsDisplayed()
+        onLogoutArea("一鍵收回提權授權並清空審計").assertIsDisplayed().assertIsEnabled()
+        composeRule.onAllNodesWithText("收回失敗，持久授權可能仍在，請重試").assertCountEquals(0)
+        composeRule.onAllNodesWithText("收回中…").assertCountEquals(0)
+
+        onLogoutArea("一鍵收回提權授權並清空審計").performClick()
+        assertTrue(revokeClicked)
+    }
+
+    @Test
+    fun privilegeRevoke_inFlightStateDisablesButtonAndShowsProgress() {
+        composeRule.setContent {
+            SettingsScreen(
+                padding = PaddingValues(0.dp),
+                gate = readyGate(),
+                privilegeRevokeInFlight = true,
+                privilegeRevokeError = false,
+            )
+        }
+        onLogoutArea("收回中…").assertIsDisplayed().assertIsNotEnabled()
+        composeRule.onAllNodesWithText("一鍵收回提權授權並清空審計").assertCountEquals(0)
+    }
+
+    @Test
+    fun privilegeRevoke_inFlightPerformClickDoesNotTriggerCallback() {
+        var revokeClicked = false
+        composeRule.setContent {
+            SettingsScreen(
+                padding = PaddingValues(0.dp),
+                gate = readyGate(),
+                privilegeRevokeInFlight = true,
+                privilegeRevokeError = false,
+                onRevokePrivilege = { revokeClicked = true },
+            )
+        }
+        val node = onLogoutArea("收回中…")
+        node.assertIsDisplayed().assertIsNotEnabled()
+        // Compose disabled 節點不暴露 OnClick action：依框架版本 performClick 可能直接抛异常，
+        // 也可能静默 no-op；無論哪種語義，回呼皆不得觸發（此處不依賴哪一種，故不斷言异常）。
+        runCatching { node.performClick() }
+        assertFalse("inFlight=true 時按鈕 disabled，performClick 不得觸發回呼", revokeClicked)
+    }
+
+    @Test
+    fun privilegeRevoke_errorStateDisplaysErrorMessageAndAllowsRetry() {
+        var retryClicked = false
+        composeRule.setContent {
+            SettingsScreen(
+                padding = PaddingValues(0.dp),
+                gate = readyGate(),
+                privilegeRevokeInFlight = false,
+                privilegeRevokeError = true,
+                onRevokePrivilege = { retryClicked = true },
+            )
+        }
+        onLogoutArea("收回失敗，持久授權可能仍在，請重試").assertIsDisplayed()
+        onLogoutArea("一鍵收回提權授權並清空審計").assertIsDisplayed().assertIsEnabled().performClick()
+        assertTrue(retryClicked)
     }
 }

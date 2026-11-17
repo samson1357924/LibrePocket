@@ -16,6 +16,13 @@ this helper): about 17-20 root DEX shards, largest shard about 43.8 MB, and
 about 65-80 MB total DEX. Limits below leave headroom for that inventory; they
 are resource limits, not evidence that any real APK passed this scanner.
 
+Provider attribute decoding (blast-radius note): the seven Shizuku security
+attributes are decoded for EVERY provider in EVERY mode; a non-Shizuku
+provider carrying an untypable boolean encoding fails the whole artifact
+gate. This is deliberate and documented - compiled 0x12 is the only legal
+boolean encoding, so real builds cannot hit it; the foss/play lanes inherit
+this for their provider checks as well.
+
 Backup-binding authority: this scanner asserts that the MERGED manifest
 (what the final APK will actually run) still carries
 ``android:fullBackupContent``/``android:dataExtractionRules`` bound to the
@@ -69,13 +76,40 @@ so the canonical path is only the label/fallback, never a hard-coded dump
 operand.
 
 Modes: ``--mode play`` / ``--mode foss`` run every scanner policy.  The
-additional ``--mode github`` runs ONLY the mode-independent artifact
+additional ``--mode github`` runs the mode-independent artifact
 authorities (merged manifest backup bindings, compiled backup-rules bytes,
 merged networkSecurityConfig binding + compiled NSC) plus the COMMON flavor
 permission policy below: the Github debug artifact is neither a Play nor a
 Foss package, so the flavor DEX class-table policies do not apply, while the
 same manifest/resource merger paths this scanner exists to police are shared
-by all three flavors.
+by all three flavors. The github mode additionally enforces the
+ShizukuProvider existence/contract pin: every DEX-evidenced subclass must be
+declared in the merged manifest and carry the full attribute contract
+(``android:enabled=true``; base permission; exported=true; multiprocess
+absent|false), so a renamed ``Bridge extends ShizukuProvider`` with an
+arbitrary authority cannot pass as invisible; the merged ``<application>``'s
+OWN ``android:enabled`` is pinned the same way (exact compiled boolean true
+or absent - Android's documented default) because the Android <provider>
+spec requires BOTH application and provider to be enabled - an
+application-disabled artifact cannot instantiate any provider, Shizuku
+binder surface dead on arrival (``_check_github_application_enabled``).
+Heuristic-detected providers (name- or authority-suffix ``.shizuku``) must
+declare ``android:authorities``
+exactly ``{merged-package}.shizuku`` (the Shizuku binder channel). In github
+mode ``--expect-provider required`` upgrades the ShizukuProvider check to a
+fail-closed existence contract (the merged manifest must declare exactly one
+compliant provider; two detected provider blocks resolving to the same
+canonical component name - any alias spelling - fail closed, and every
+detected provider's canonical class must be DEFINED in a root DEX shard
+(class_defs, not type_ids mentions)); the default ``optional`` only verifies
+provider attributes when a provider is present. That existence contract is
+github-only: the new defined-class backing and canonical duplicate identity
+are enforced inside ``_github_required_provider_total``, which only the
+github ``--expect-provider required`` path calls - no foss/play behavior is
+changed by these additions. When a ShizukuProvider is present, the
+upstream ``attachInfo()`` hard contract is pinned regardless of mode:
+``exported`` must be the exact boolean true and ``multiprocess`` absent or
+the exact boolean false.
 
 Common manifest policy (P2-1): SMS, MANAGE_EXTERNAL_STORAGE, and VPN
 declarations are forbidden in EVERY flavor (``COMMON_FORBIDDEN_PERMISSIONS``
@@ -202,6 +236,7 @@ PLAY_DEFINED_CLASS_PREFIXES = (
     "Ldev/librepocket/agent/foss/",
     "Ldev/librepocket/privilege/github/",
     "Lrikka/shizuku/",
+    "Lmoe/shizuku/",
 )
 PLAY_FORBIDDEN_SUPERCLASSES = frozenset(
     (
@@ -214,12 +249,14 @@ FOSS_MANIFEST_NEEDLES = (
     "com.google.android.gms",
     "com.microsoft.cognitiveservices.speech",
     "rikka.shizuku",
+    "moe.shizuku",
 )
 FOSS_TYPE_PREFIXES = (
     "Lcom/google/mlkit/",
     "Lcom/google/android/gms/",
     "Lcom/microsoft/cognitiveservices/speech/",
     "Lrikka/shizuku/",
+    "Lmoe/shizuku/",
 )
 # Android root multidex names are classes.dex, then classes2.dex through
 # classesN.dex. Accept every canonical decimal N >= 2 (including 10+), while
@@ -247,18 +284,44 @@ class DescriptorBudget:
         self.remaining_bytes -= encoded_bytes
 
 
+# ShizukuProvider DEX detection (github artifact gate): a class DEFINED in a
+# root DEX shard whose superclass descriptor is one of these names - or
+# which descends from one transitively through any number of re-layered
+# superclasses (``Bridge extends Middle extends ShizukuProvider``) - is a
+# ShizukuProvider subclass however it is renamed in the merged manifest.
+# ``Lmoe/shizuku/ShizukuProvider;`` has no official-AAR counterpart and is
+# treated as suspicious like any other renamed subclass.
+_SHIZUKU_PROVIDER_SUPERCLASSES = frozenset(
+    (
+        "Lrikka/shizuku/ShizukuProvider;",
+        "Lmoe/shizuku/ShizukuProvider;",
+    )
+)
+# The single legitimate upstream definition. A DEX-evidenced subclass whose
+# own descriptor is this exact name is not processed (the official class
+# itself; see _check_github_dex_shizuku_providers).
+_OFFICIAL_SHIZUKU_PROVIDER_DESCRIPTOR = "Lrikka/shizuku/ShizukuProvider;"
+
+
 class ParsedDex:
-    __slots__ = ("type_descriptors", "defined_classes", "superclasses")
+    __slots__ = (
+        "type_descriptors",
+        "defined_classes",
+        "superclasses",
+        "class_superclasses",
+    )
 
     def __init__(
         self,
         type_descriptors: tuple[str, ...],
         defined_classes: frozenset[str],
         superclasses: frozenset[str],
+        class_superclasses: frozenset[tuple[str, str]],
     ) -> None:
         self.type_descriptors = type_descriptors
         self.defined_classes = defined_classes
         self.superclasses = superclasses
+        self.class_superclasses = class_superclasses
 
 
 def _u32(data: bytes, offset: int, what: str) -> int:
@@ -551,6 +614,7 @@ def parse_dex_type_tables(data: bytes, *, descriptor_budget: DescriptorBudget | 
 
     defined_classes: set[str] = set()
     superclasses: set[str] = set()
+    class_superclasses: set[tuple[str, str]] = set()
     seen_class_indices: set[int] = set()
     for index in range(class_count):
         cursor = class_offset + 32 * index
@@ -571,8 +635,14 @@ def parse_dex_type_tables(data: bytes, *, descriptor_budget: DescriptorBudget | 
             if not (superclass.startswith("L") and superclass.endswith(";")):
                 raise PolicyError("DEX superclass_idx does not name an object type")
             superclasses.add(superclass)
+            class_superclasses.add((class_descriptor, superclass))
 
-    return ParsedDex(tuple(type_descriptors), frozenset(defined_classes), frozenset(superclasses))
+    return ParsedDex(
+        tuple(type_descriptors),
+        frozenset(defined_classes),
+        frozenset(superclasses),
+        frozenset(class_superclasses),
+    )
 
 
 def _canonical_member_name(name: str) -> str:
@@ -1058,9 +1128,53 @@ def _validate_aapt_output(aapt: str, apk: Path) -> tuple[str, str]:
         [aapt, "dump", "xmltree", str(apk), "AndroidManifest.xml"],
         "aapt dump xmltree",
     )
-    if not re.search(r"(?im)^\s*E:\s*manifest\b", xmltree):
+    if not re.search(r"(?im)^\s*E:\s*manifest(?=\s|\(|$)", xmltree):
         raise PolicyError("aapt xmltree output lacks a manifest root")
     return permissions, xmltree
+
+
+_XMLTREE_ELEMENT_LINE_RE = re.compile(r"^([ \t]*)E:\s*([^(\s]+)(?=\s|\(|$)")
+
+
+def _locate_application_manifest_span(xmltree: str) -> tuple[list[str], int, int, int]:
+    """Locate the unique top-level <application> element line span and indent."""
+    lines = xmltree.splitlines()
+    stack: list[tuple[int, str]] = []
+    manifest_roots = 0
+    app_matches: list[tuple[int, int]] = []
+    for index, line in enumerate(lines):
+        elem = _XMLTREE_ELEMENT_LINE_RE.match(line)
+        if elem is None:
+            continue
+        indent_len = len(elem.group(1))
+        tag = elem.group(2)
+        while stack and stack[-1][0] >= indent_len:
+            stack.pop()
+        if not stack and tag == "manifest":
+            manifest_roots += 1
+            if manifest_roots > 1:
+                raise PolicyError(
+                    "merged manifest contains multiple <manifest> elements"
+                )
+        if tag == "application" and (not stack or stack[-1][1] == "manifest"):
+            app_matches.append((index, indent_len))
+        stack.append((indent_len, tag))
+    if not app_matches:
+        raise PolicyError(
+            "merged manifest lacks an <application> element - the backup and "
+            "network security bindings cannot survive a manifest that has no "
+            "application to bind"
+        )
+    if len(app_matches) > 1:
+        raise PolicyError("merged manifest contains multiple <application> elements")
+    app_index, app_indent = app_matches[0]
+    end = len(lines)
+    for follow in range(app_index + 1, len(lines)):
+        sibling = _XMLTREE_ELEMENT_LINE_RE.match(lines[follow])
+        if sibling and len(sibling.group(1)) <= app_indent:
+            end = follow
+            break
+    return lines, app_index, end, app_indent
 
 
 def _application_manifest_block(xmltree: str) -> tuple[str, int]:
@@ -1070,6 +1184,8 @@ def _application_manifest_block(xmltree: str) -> tuple[str, int]:
     (``  E: application``); the block ends at the next ``E:`` element line of
     the same or shallower indentation. A manifest without an application
     element cannot carry either backup binding, so absence fails closed.
+    Duplicate top-level ``<manifest>`` or ``<application>`` elements also fail
+    closed so a second block cannot shadow bindings or hide components.
 
     Alongside the slice this returns the application element line's leading
     whitespace length so the binding gates can anchor their ``A:`` matches at
@@ -1079,24 +1195,8 @@ def _application_manifest_block(xmltree: str) -> tuple[str, int]:
     wears ``android:fullBackupContent`` / ``android:dataExtractionRules``
     while the ``<application>`` itself lost both bindings.
     """
-    lines = xmltree.splitlines()
-    for index, line in enumerate(lines):
-        match = re.match(r"^(\s*)E:\s*application\b", line)
-        if match is None:
-            continue
-        indent = match.group(1)
-        end = len(lines)
-        for follow in range(index + 1, len(lines)):
-            sibling = re.match(r"^(\s*)E:\s", lines[follow])
-            if sibling and len(sibling.group(1)) <= len(indent):
-                end = follow
-                break
-        return "\n".join(lines[index:end]), len(indent)
-    raise PolicyError(
-        "merged manifest lacks an <application> element - the backup and "
-        "network security bindings cannot survive a manifest that has no "
-        "application to bind"
-    )
+    lines, app_index, end, app_indent = _locate_application_manifest_span(xmltree)
+    return "\n".join(lines[app_index:end]), app_indent
 
 
 def _application_attr_anchor(app_indent: int) -> str:
@@ -1379,9 +1479,10 @@ def _xmltree_attr_value(raw_value: str, label: str) -> str:
 
     Measured aapt encodings (real APK dumps, build-tools 35/36):
       * booleans print without quotes as ``(type 0x12)0x0`` /
-        ``(type 0x12)0xffffffff``; a boolean exists only as these two values
-        in compiled binary XML, so any other typed encoding fails closed
-        instead of being guessed into the tree;
+        ``(type 0x12)0xffffffff``; a boolean exists only as these two exact
+        TYPE_INT_BOOLEAN (0x12) encodings in compiled binary XML, so any
+        other typed encoding fails closed instead of being guessed into
+        the tree;
       * strings print as ``"value" (Raw: "value")`` - the RAW payload wins
         when both spellings appear and both go through the escape decoder;
       * resource references print unquoted (``@0x…``, ``@res/0x…``,
@@ -1389,13 +1490,14 @@ def _xmltree_attr_value(raw_value: str, label: str) -> str:
         wherever non-string values are illegal.
     """
     value = raw_value.strip()
-    typed = re.match(r"^\(type\s+[^\s)]+\)(.*)$", value)
-    if typed is not None:
-        payload = typed.group(1).strip()
-        if payload == "0x0":
-            return "false"
-        if payload == "0xffffffff":
-            return "true"
+    typed_boolean = re.match(r"^\(type\s+0x12\)(0x0|0xffffffff)$", value)
+    if typed_boolean is not None:
+        return "false" if typed_boolean.group(1) == "0x0" else "true"
+    if re.match(r"^\(type\s+[^\s)]+\)(.*)$", value) is not None:
+        # Any OTHER typed encoding (integer 0x10, reference 0x01, ...) is not
+        # a boolean: accepting its payload as true/false would guess a type
+        # the artifact never proved. Fail closed with the attribute name
+        # (carried by `label`) and the original value fragment.
         raise PolicyError(
             f"{label}: unrecognized compiled attribute encoding {value!r}"
         )
@@ -1473,7 +1575,14 @@ def _parse_aapt_xmltree(dump: str, label: str) -> ET.Element:
             if not stack:
                 raise PolicyError(f"{label} has an attribute outside any element")
             name = _XMLTREE_ATTR_ID_PARENS.sub("", attribute_match.group(2).strip())
-            stack[-1][1].set(name, _xmltree_attr_value(attribute_match.group(3), label))
+            # Thread the attribute name into the decoder label so a
+            # fail-closed error names BOTH the attribute and the raw value.
+            stack[-1][1].set(
+                name,
+                _xmltree_attr_value(
+                    attribute_match.group(3), f"{label} android:{name}"
+                ),
+            )
             continue
         text_match = _XMLTREE_TEXT.match(line)
         if text_match is not None:
@@ -1559,7 +1668,7 @@ def _network_security_mode(application_block: str, app_indent: int | None = None
     indent = app_indent
     if indent is None:
         anchor_match = re.search(
-            r"^([ \t]*)E:\s*application\b", application_block, re.MULTILINE
+            r"^([ \t]*)E:\s*application(?=\s|\(|$)", application_block, re.MULTILINE
         )
         if anchor_match is not None:
             indent = len(anchor_match.group(1))
@@ -1732,6 +1841,32 @@ def _validate_dexdump(dexdump: str, dex_name: str, dex_bytes: bytes) -> None:
         raise PolicyError(f"native dexdump rejected {dex_name} (exit {return_code})")
 
 
+def _parse_root_dexes(
+    apk: Path, dex_infos: list[zipfile.ZipInfo], dexdump: str
+) -> list[ParsedDex]:
+    """Parse every root DEX shard with the shared bounded parser.
+
+    Shared by the play/foss modes and the github mode: same
+    ``MAX_SINGLE_DEX_BYTES`` read bound, the same ``_validate_dexdump``
+    parseability check, the same cumulative ``DescriptorBudget``. Behavior is
+    identical whichever caller drives it; the flavor class-table policies only
+    run for play/foss, but the github mode now parses the tables too so the
+    ShizukuProvider existence contract can see renamed subclasses.
+    """
+    parsed_dexes: list[ParsedDex] = []
+    descriptor_budget = DescriptorBudget()
+    with zipfile.ZipFile(apk, "r") as archive:
+        for info in dex_infos:
+            with archive.open(info, "r") as member:
+                dex_bytes = member.read(MAX_SINGLE_DEX_BYTES + 1)
+            if len(dex_bytes) != info.file_size or len(dex_bytes) > MAX_SINGLE_DEX_BYTES:
+                raise PolicyError(f"APK DEX expanded size mismatch: {info.filename}")
+            parsed = parse_dex_type_tables(dex_bytes, descriptor_budget=descriptor_budget)
+            _validate_dexdump(dexdump, info.filename, dex_bytes)
+            parsed_dexes.append(parsed)
+    return parsed_dexes
+
+
 def _check_common_permissions(permissions: str, xmltree: str) -> None:
     """Assert the COMMON flavor permission policy on the merged manifest.
 
@@ -1768,6 +1903,1220 @@ def _check_common_permissions(permissions: str, xmltree: str) -> None:
         )
 
 
+_ANDROID_NS = "http://schemas.android.com/apk/res/android"
+_SHIZUKU_PROVIDER_PERMISSION = "android.permission.INTERACT_ACROSS_USERS_FULL"
+_PROVIDER_BLOCK_START_RE = re.compile(r"^([ ]*)E:\s*provider(?=\s|\(|$)")
+_NS_DECL_LINE_RE = re.compile(
+    r"^([ \t]*)N:\s*([^\s=]+)=([^\s(]+)(?:\s*\(line=\d+\))?\s*$"
+)
+_PROVIDER_ATTR_LINE_RE = re.compile(r"^([ \t]*)A:\s+([^=]+)=(.*)$")
+# android:exported = 0x01010010, android:multiprocess = 0x01010013,
+# android:enabled = 0x0101000e (stable SDK definitions). ShizukuProvider
+# carries the hard upstream contract: exported=true (the Manager must reach
+# the binder), multiprocess=false (attachInfo() throws IllegalStateException
+# otherwise), and enabled=true (the binder channel cannot reach a disabled
+# provider), so the github artifact gate pins all three on the merged
+# manifest.
+_PROVIDER_ANDROID_ATTR_IDS = {
+    "0x01010003": "name",
+    "0x01010018": "authorities",
+    "0x01010006": "permission",
+    "0x01010007": "readPermission",
+    "0x01010008": "writePermission",
+    "0x0101001b": "grantUriPermissions",
+    "0x0101000e": "enabled",
+    "0x01010010": "exported",
+    "0x01010013": "multiprocess",
+}
+_PROVIDER_ATTR_NAMES = frozenset(_PROVIDER_ANDROID_ATTR_IDS.values())
+_SHIZUKU_MANIFEST_RE = re.compile(
+    r"rikka\.shizuku|moe\.shizuku|shizukuprovider", re.IGNORECASE
+)
+
+
+def _is_shizuku_provider(name: str, authorities: str) -> bool:
+    lower_name = name.lower()
+    if (
+        "shizukuprovider" in lower_name
+        or "rikka.shizuku" in lower_name
+        or "moe.shizuku" in lower_name
+    ):
+        return True
+    return any(
+        part.strip().lower().endswith(".shizuku") for part in authorities.split(";")
+    )
+
+
+def _push_xmltree_ns_decl(
+    ns_stack: list[tuple[int, str, str, int | None, int]],
+    elem_stack: list[tuple[int, str]],
+    n_indent: int,
+    prefix: str,
+    uri: str,
+) -> None:
+    ns_stack[:] = [
+        item for item in ns_stack if item[3] is None or item[3] < n_indent
+    ]
+    while elem_stack and elem_stack[-1][0] >= n_indent:
+        elem_stack.pop()
+    parent_indent = elem_stack[-1][0] if elem_stack else -1
+    ns_stack.append((n_indent, prefix, uri, None, parent_indent))
+
+
+def _resolve_xmltree_element_ns(
+    ns_stack: list[tuple[int, str, str, int | None, int]],
+    elem_stack: list[tuple[int, str]],
+    e_indent: int,
+    tag: str,
+) -> None:
+    resolved: list[tuple[int, str, str, int | None, int]] = []
+    for n_indent, prefix, uri, pop_at, parent_indent in ns_stack:
+        if pop_at is None:
+            pop_at = n_indent if e_indent > n_indent else parent_indent
+        if pop_at < e_indent:
+            resolved.append((n_indent, prefix, uri, pop_at, parent_indent))
+    ns_stack[:] = resolved
+    while elem_stack and elem_stack[-1][0] >= e_indent:
+        elem_stack.pop()
+    elem_stack.append((e_indent, tag))
+
+
+def _active_xmltree_namespaces(
+    ns_stack: list[tuple[int, str, str, int | None, int]],
+) -> dict[str, str]:
+    active = {"android": _ANDROID_NS}
+    for _n_indent, prefix, uri, _pop_at, _parent_indent in ns_stack:
+        active[prefix] = uri
+    return active
+
+
+# #166 blast-radius note (changelog-style): all providers now decode the
+# seven Shizuku security attributes in EVERY mode; decode failures fail closed
+# for runs whose providers are unrelated to Shizuku. Real compiled boolean
+# (type 0x12) attribute values are unaffected.
+def _iter_application_providers(
+    xmltree: str,
+) -> list[tuple[dict[str, str], set[str]]]:
+    """Extract Shizuku-relevant attributes and child tags per ``<provider>``.
+
+    Scans only ``<provider>`` blocks inside ``<application>`` without running
+    ``_parse_aapt_xmltree`` over unrelated manifest elements (a real
+    ``AndroidManifest.xml`` dump carries integer/enum attributes such as
+    ``versionCode=(type 0x10)0x1`` elsewhere). Own attributes sit at exact
+    two-space indent past the ``E: provider`` line and precede any child
+    element so child attributes (e.g. nested ``<meta-data android:name=...>``)
+    never overwrite them. The seven Shizuku-relevant security attributes are
+    decoded for EVERY provider (not only the name/authority-matched ones): a
+    DEX-evidenced renamed ShizukuProvider subclass can declare an arbitrary
+    authority, so the github artifact gate must be able to see its attribute
+    contract without the manifest-side name heuristic. ``N: <prefix>=<uri>``
+    namespace declarations are resolved across the xmltree so aliased Android
+    attributes cannot evade inspection, and unexpected prefixes on provider
+    security attributes fail closed instead of being silently dropped.
+
+    Fail-closed precondition: ``xmltree`` must carry a unique top-level
+    ``<application>`` element; otherwise ``_locate_application_manifest_span``
+    raises ``PolicyError`` (a manifest without an application has no provider
+    scope). Callers never observe a silent empty provider list for that case.
+    """
+    # Fail-closed precondition: a merged manifest without <application> has no
+    # provider scope at all. ``_locate_application_manifest_span`` raises the
+    # named "lacks an <application> element" PolicyError - never a silent
+    # empty provider list.
+    lines, app_index, app_end, _app_indent = _locate_application_manifest_span(xmltree)
+    elem_stack: list[tuple[int, str]] = []
+    ns_stack: list[tuple[int, str, str, int | None, int]] = []
+    for pre_line in lines[: app_index + 1]:
+        ns_match = _NS_DECL_LINE_RE.match(pre_line)
+        if ns_match is not None:
+            _push_xmltree_ns_decl(
+                ns_stack,
+                elem_stack,
+                len(ns_match.group(1)),
+                ns_match.group(2),
+                ns_match.group(3),
+            )
+            continue
+        elem = _XMLTREE_ELEMENT_LINE_RE.match(pre_line)
+        if elem is not None:
+            _resolve_xmltree_element_ns(
+                ns_stack, elem_stack, len(elem.group(1)), elem.group(2)
+            )
+
+    providers: list[tuple[dict[str, str], set[str]]] = []
+    index = app_index + 1
+    while index < app_end:
+        line = lines[index]
+        ns_match = _NS_DECL_LINE_RE.match(line)
+        if ns_match is not None:
+            _push_xmltree_ns_decl(
+                ns_stack,
+                elem_stack,
+                len(ns_match.group(1)),
+                ns_match.group(2),
+                ns_match.group(3),
+            )
+            index += 1
+            continue
+        elem = _XMLTREE_ELEMENT_LINE_RE.match(line)
+        if elem is None:
+            index += 1
+            continue
+        _resolve_xmltree_element_ns(
+            ns_stack, elem_stack, len(elem.group(1)), elem.group(2)
+        )
+        provider_match = _PROVIDER_BLOCK_START_RE.match(line)
+        if provider_match is None:
+            index += 1
+            continue
+
+        provider_indent = provider_match.group(1)
+        provider_indent_len = len(provider_indent)
+        end = app_end
+        for follow in range(index + 1, app_end):
+            follow_elem = _XMLTREE_ELEMENT_LINE_RE.match(lines[follow])
+            if follow_elem is not None and len(follow_elem.group(1)) <= provider_indent_len:
+                end = follow
+                break
+            follow_ns = _NS_DECL_LINE_RE.match(lines[follow])
+            if follow_ns is not None and len(follow_ns.group(1)) <= provider_indent_len:
+                end = follow
+                break
+
+        attr_prefix = provider_indent + "  "
+        raw_attrs: dict[str, str] = {}
+        child_tags: set[str] = set()
+        seen_child = False
+        active_ns = _active_xmltree_namespaces(ns_stack)
+
+        for body_line in lines[index + 1 : end]:
+            child_elem = _XMLTREE_ELEMENT_LINE_RE.match(body_line)
+            if child_elem is not None:
+                seen_child = True
+                child_tags.add(child_elem.group(2))
+                _resolve_xmltree_element_ns(
+                    ns_stack,
+                    elem_stack,
+                    len(child_elem.group(1)),
+                    child_elem.group(2),
+                )
+                continue
+            child_ns = _NS_DECL_LINE_RE.match(body_line)
+            if child_ns is not None:
+                _push_xmltree_ns_decl(
+                    ns_stack,
+                    elem_stack,
+                    len(child_ns.group(1)),
+                    child_ns.group(2),
+                    child_ns.group(3),
+                )
+                if not seen_child:
+                    active_ns = _active_xmltree_namespaces(ns_stack)
+                continue
+            if not body_line.strip():
+                continue
+
+            a_match = _PROVIDER_ATTR_LINE_RE.match(body_line)
+            if seen_child:
+                if a_match is not None and len(a_match.group(1)) <= len(attr_prefix):
+                    raise PolicyError(
+                        "merged manifest <provider> has attribute line after child element: "
+                        f"{body_line.strip()!r}"
+                    )
+                continue
+            if a_match is None:
+                if body_line.lstrip().startswith("A:"):
+                    raise PolicyError(
+                        "merged manifest <provider> has malformed attribute line: "
+                        f"{body_line.strip()!r}"
+                    )
+                continue
+            if a_match.group(1) != attr_prefix:
+                raise PolicyError(
+                    "merged manifest <provider> attribute has unexpected indentation "
+                    f"(expected {len(attr_prefix)} spaces, got {len(a_match.group(1))}): "
+                    f"{body_line.strip()!r}"
+                )
+
+            attr_lhs = a_match.group(2).strip()
+            attr_rhs = a_match.group(3).strip()
+            attr_id_match = re.search(r"\(\s*(0x[0-9a-fA-F]+)\s*\)\s*$", attr_lhs)
+            attr_id = attr_id_match.group(1).lower() if attr_id_match else None
+            attr_qname = (
+                attr_lhs[: attr_id_match.start()].strip()
+                if attr_id_match is not None
+                else attr_lhs
+            )
+            if ":" in attr_qname:
+                ns_prefix, attr_local = attr_qname.rsplit(":", 1)
+            else:
+                ns_prefix, attr_local = "", attr_qname
+
+            is_android_ns = ns_prefix == _ANDROID_NS or (
+                ns_prefix != "" and active_ns.get(ns_prefix) == _ANDROID_NS
+            )
+            if not is_android_ns:
+                if attr_local in _PROVIDER_ATTR_NAMES or (
+                    attr_id is not None and attr_id in _PROVIDER_ANDROID_ATTR_IDS
+                ):
+                    raise PolicyError(
+                        f"merged manifest <provider> attribute {attr_lhs!r} uses an "
+                        "unexpected or unbound namespace prefix"
+                    )
+                continue
+
+            if attr_id is not None and attr_id in _PROVIDER_ANDROID_ATTR_IDS:
+                expected_local = _PROVIDER_ANDROID_ATTR_IDS[attr_id]
+                if attr_local != expected_local:
+                    raise PolicyError(
+                        f"merged manifest <provider> attribute {attr_lhs!r} disagrees "
+                        f"with Android attribute ID {attr_id} "
+                        f"(that ID is {expected_local!r})"
+                    )
+                target_attr = expected_local
+            elif attr_local in _PROVIDER_ATTR_NAMES:
+                if attr_id is not None:
+                    raise PolicyError(
+                        f"merged manifest <provider> attribute {attr_lhs!r} has "
+                        f"unexpected resource ID {attr_id}"
+                    )
+                target_attr = attr_local
+            else:
+                continue
+
+            if target_attr in raw_attrs:
+                raise PolicyError(
+                    f"merged manifest <provider> declares duplicate attribute {target_attr!r}"
+                )
+            raw_attrs[target_attr] = attr_rhs
+
+        name = (
+            _xmltree_attr_value(
+                raw_attrs["name"], "merged manifest <provider> android:name"
+            )
+            if "name" in raw_attrs
+            else ""
+        )
+        authorities = (
+            _xmltree_attr_value(
+                raw_attrs["authorities"],
+                "merged manifest <provider> android:authorities",
+            )
+            if "authorities" in raw_attrs
+            else ""
+        )
+        decoded: dict[str, str] = {"name": name, "authorities": authorities}
+        # Decode the seven security attributes for EVERY provider: a renamed
+        # DEX-evidenced ShizukuProvider subclass can carry an arbitrary
+        # authority, so the attribute gate cannot rely on the name/authority
+        # heuristic to decide whose attrs to decode. Same decoding and error
+        # paths for all providers; the output shape only gains keys.
+        for attr_name in (
+            "permission",
+            "readPermission",
+            "writePermission",
+            "grantUriPermissions",
+            "enabled",
+            "exported",
+            "multiprocess",
+        ):
+            if attr_name in raw_attrs:
+                decoded[attr_name] = _xmltree_attr_value(
+                    raw_attrs[attr_name],
+                    f"merged manifest <provider> android:{attr_name}",
+                )
+        providers.append((decoded, child_tags))
+        index = end
+    return providers
+
+
+def _check_provider_attrs(
+    decoded: dict[str, str],
+    child_tags: set[str],
+    label: str,
+    expected_authority: str | None = None,
+    require_enabled: bool = True,
+) -> None:
+    """Enforce the ShizukuProvider permission & URI-grant attribute contract.
+
+    Shared per-provider validator used by both the manifest-detected path
+    (``_check_github_shizuku_provider``) and the DEX-evidenced path
+    (``_check_github_dex_shizuku_providers``). ``label`` names the provider
+    in error messages (``ShizukuProvider`` for the manifest-detected path,
+    ``DEX-evidenced ShizukuProvider subclass <java-name>`` otherwise).
+
+    ``expected_authority`` pins the merged-APK ``android:authorities``
+    value EXACTLY (not a suffix, not a set): pass
+    ``f"{merged_package}.shizuku"`` for the officially declared binder
+    channel, or ``None`` to leave the authority VALUE
+    recorded-but-unconstrained (the DEX-evidenced arbitrary-authority
+    design - the contract is the permission, not the name). ``None`` never
+    waives PRESENCE: every provider checked through this function -
+    official-FQN detected and DEX-evidenced alike - must carry at least one
+    non-empty, semicolon-separated, post-trim authority segment (a missing
+    attribute, ``""``, or a delimiter-only ``";; ; "`` value fails closed
+    with a dedicated PolicyError). Values beyond that presence minimum
+    remain unconstrained by design on the DEX-evidenced arbitrary-authority
+    path, and the official path's exact pin is unchanged (it subsumes the
+    presence check). ``require_enabled`` gates the
+    ``android:enabled`` check; it defaults to True and every current caller
+    keeps the default - both the manifest-detected and the DEX-evidenced
+    paths prove the same binder channel, which cannot reach a disabled
+    provider.
+
+    The base ``android:permission`` must resolve to
+    ``android.permission.INTERACT_ACROSS_USERS_FULL`` (the base permission is
+    the framework's only gate on ``ContentProvider.call()``; a missing or
+    weakened base permission fails closed, even when explicit read/write
+    permissions are set). Any explicitly declared ``readPermission`` /
+    ``writePermission`` must likewise resolve to
+    ``android.permission.INTERACT_ACROSS_USERS_FULL`` (an unset read/write
+    inherits the base permission, which is fine), ``grantUriPermissions``
+    is not enabled, and no ``<path-permission>`` / ``<grant-uri-permission>``
+    children exist.
+
+    The upstream ``ShizukuProvider.attachInfo()`` hard contract is pinned too:
+    ``android:exported`` must be exactly the compiled boolean true
+    (``(type 0x12)0xffffffff`` / ``"true"``) and ``android:multiprocess`` must
+    be absent (the default, false) or exactly the compiled boolean false -
+    anything else trips an IllegalStateException at runtime. A missing or
+    unproven ``exported`` fails closed: a merged manifest that cannot prove
+    the provider exported is treated as non-compliant.
+
+    ``android:enabled`` must likewise be exactly the compiled boolean true:
+    the Shizuku binder channel cannot reach a disabled provider, so a merged
+    manifest that cannot prove ``enabled=true`` is treated as non-compliant.
+    Resource references (``@0x…`` / ``?0x…``) pass through verbatim by design
+    of ``_xmltree_attr_value`` and are never equal to the compiled boolean
+    true, so a resource-unproven value fails closed here - that is the
+    desired behavior: the gate never guesses what an unresolved resource
+    resolves to.
+
+    The binder-channel contract checks (enabled, then the authorities
+    presence minimum, then - only when ``expected_authority`` is given -
+    the exact-authority pin) run LAST, after every pre-existing attribute
+    check: pre-existing contract failures keep their original,
+    specifically-asserted error messages, and the new checks fire only
+    once the rest of the attribute contract already holds.
+    """
+    perm = decoded.get("permission")
+    if perm != _SHIZUKU_PROVIDER_PERMISSION:
+        raise PolicyError(
+            f"github APK {label} must declare "
+            f"android:permission={_SHIZUKU_PROVIDER_PERMISSION} "
+            f"(got {perm!r})"
+        )
+    read_perm = decoded["readPermission"] if "readPermission" in decoded else perm
+    write_perm = decoded["writePermission"] if "writePermission" in decoded else perm
+    if (
+        read_perm != _SHIZUKU_PROVIDER_PERMISSION
+        or write_perm != _SHIZUKU_PROVIDER_PERMISSION
+    ):
+        raise PolicyError(
+            f"github APK {label} must enforce "
+            f"{_SHIZUKU_PROVIDER_PERMISSION} for both read and write "
+            f"(got readPermission={read_perm!r}, writePermission={write_perm!r})"
+        )
+    grant_uri = decoded.get("grantUriPermissions")
+    if grant_uri is not None and grant_uri != "false":
+        raise PolicyError(
+            f"github APK {label} must not enable "
+            f"android:grantUriPermissions (got {grant_uri!r})"
+        )
+    exported = decoded.get("exported")
+    if exported != "true":
+        raise PolicyError(
+            f"github APK {label} must declare android:exported "
+            f"as the exact boolean true (Shizuku attachInfo contract; "
+            f"got {exported!r})"
+        )
+    multiprocess = decoded.get("multiprocess")
+    if multiprocess is not None and multiprocess != "false":
+        raise PolicyError(
+            f"github APK {label} must not set android:multiprocess "
+            f"to true (Shizuku attachInfo contract; got {multiprocess!r})"
+        )
+    for forbidden_child in ("path-permission", "grant-uri-permission"):
+        if forbidden_child in child_tags:
+            raise PolicyError(
+                f"github APK {label} must not declare "
+                f"<{forbidden_child}> children"
+            )
+    # -- binder-channel contract (Re-review #10 Findings 2+3) --
+    if require_enabled:
+        # The merged manifest must prove android:enabled=true on the
+        # provider: the Shizuku binder resolves the provider by authority and
+        # the platform will not deliver to a disabled component, so a
+        # merged artifact without the compiled boolean true is not proven to
+        # serve the binder. Reference encodings (``@0x…`` / ``?0x…``) pass
+        # through verbatim (see _xmltree_attr_value) and therefore never
+        # equal "true" - resource-unproven values fail closed, deliberately.
+        enabled = decoded.get("enabled")
+        if enabled is None:
+            raise PolicyError(
+                f"github APK {label} must declare "
+                "android:enabled=true (Shizuku binder channel contract); "
+                "the merged attribute is missing"
+            )
+        if enabled != "true":
+            raise PolicyError(
+                f"github APK {label} must declare "
+                f"android:enabled=true (Shizuku binder channel contract; "
+                f"got {enabled!r})"
+            )
+    # -- authority presence minimum (Re-review #12 Finding 2) --
+    # Android's <provider> spec pins android:authorities as MANDATORY:
+    # no default exists and at least one authority MUST be declared. The
+    # shared decode carries "" whenever the attribute line is absent, so
+    # this is the one authority-level requirement the DEX-evidenced
+    # arbitrary-authority design adds on top of the attribute contract:
+    # AT LEAST ONE non-empty, semicolon-separated, post-trim segment.
+    # Segments with surrounding spaces are tolerated as long as at least
+    # one trimmed segment is non-empty; nothing about the VALUE is
+    # constrained beyond presence here. (Exact matching for the official
+    # path is unchanged - it subsumes presence - and the arbitrary-authority
+    # design keeps value-unconstrained authorities.)
+    authorities = decoded.get("authorities", "")
+    segments = [segment.strip() for segment in authorities.split(";")]
+    if not any(segments):
+        raise PolicyError(
+            f"github APK {label} must declare at least one non-empty "
+            "android:authorities value; the merged attribute is missing, "
+            "empty, or delimiter-only"
+        )
+    if expected_authority is not None:
+        # The Shizuku binder channel looks the provider up by the authority
+        # ``<merged package>.shizuku`` (the official Shizuku provider
+        # resolves its authority as ``getPackageName() + ".shizuku"``). Any
+        # other value - a rewritten authority, a foreign package, a
+        # multi-authority list, or a missing/empty one - is a surface the
+        # binder CANNOT reach, and a permission-gated surface the binder
+        # cannot reach is not "Shizuku binder availability proven".
+        # Exact-value comparison, not a suffix test: ``pkg.shizuku;extra``
+        # is an exact-string violation even though it starts with the
+        # expected channel.
+        #
+        # NOTE: ``_is_shizuku_provider`` is name-or-authority based, so a
+        # renamed subclass whose authorities end in ``.shizuku`` is ALSO
+        # subject to this exact check: the design pins "the contract is the
+        # permission" for ARBITRARY authorities, but as soon as the
+        # authority CLAIMS the binder-channel suffix it must equal the real
+        # channel. (The arbitrary-authority design stays for the
+        # DEX-evidenced path, which passes ``expected_authority=None``.)
+        if authorities != expected_authority:
+            raise PolicyError(
+                f"github APK {label} must declare android:authorities "
+                f"exactly {expected_authority!r} (the Shizuku binder "
+                f"channel resolves package+'.shizuku'; "
+                f"got {authorities!r})"
+            )
+
+
+def _check_github_shizuku_provider(xmltree: str, merged_package: str) -> None:
+    """Enforce the manifest-detected ShizukuProvider path.
+
+    In ``--mode github`` the real APK declares ``rikka.shizuku.ShizukuProvider``
+    (compact synthetic unit fixtures may omit ``<provider>`` elements).
+    Whenever a Shizuku provider appears in the merged manifest xmltree (by
+    name/authority heuristic), the full attribute contract enforced by
+    ``_check_provider_attrs`` is pinned on it. DEX-evidenced renamed
+    subclasses are enforced separately by ``_check_github_dex_shizuku_providers``
+    (canonical component-name resolution against the merged manifest
+    ``package`` - arbitrary suffix is never an alias, and only a canonical
+    exact-FQN match consumes a detected block in the counting path).
+
+    ``merged_package`` is the merged manifest package resolved by
+    ``_merged_manifest_package`` (threaded from ``inspect_apk`` - never
+    recomputed here). For every heuristic-detected provider the exact
+    binder-channel authority ``f"{merged_package}.shizuku"`` is pinned:
+    the Shizuku binder resolves the provider by the authority
+    ``<package>.shizuku``, so a merged ShizukuProvider whose authority is
+    anything else - rewritten, foreign-package, or missing - is a surface
+    the binder cannot reach, and a permission-gated surface the binder
+    cannot reach is not "Shizuku binder availability proven".
+    """
+    expected_authority = f"{merged_package}.shizuku"
+    for attrs, child_tags in _iter_application_providers(xmltree):
+        if not _is_shizuku_provider(
+            attrs.get("name", ""), attrs.get("authorities", "")
+        ):
+            continue
+        _check_provider_attrs(
+            attrs, child_tags, "ShizukuProvider",
+            expected_authority=expected_authority,
+        )
+
+
+def _shizuku_provider_evidenced_descriptors(parsed_dexes: list[ParsedDex]) -> set[str]:
+    """Descriptors of DEX-defined ShizukuProvider subclasses, any depth.
+
+    A class DEFINED in any root DEX shard whose ancestry bottoms out at
+    ``Lrikka/shizuku/ShizukuProvider;`` or ``Lmoe/shizuku/ShizukuProvider;``
+    is a ShizukuProvider subclass however many re-layered superclasses stand
+    in between (``Bridge extends Middle extends ShizukuProvider``). The
+    parent map is the UNION across parsed shards: a class descriptor that
+    shards disagree about contributes BOTH superclass edges - fail toward
+    more evidence, never less. Bounded by the shard/class-def budgets already
+    enforced at parse time; each class enters the worklist at most once.
+    """
+    children: dict[str, set[str]] = {}
+    for dex in parsed_dexes:
+        for class_descriptor, superclass_descriptor in dex.class_superclasses:
+            children.setdefault(superclass_descriptor, set()).add(class_descriptor)
+    evidenced = set(_SHIZUKU_PROVIDER_SUPERCLASSES)
+    worklist = list(evidenced)
+    while worklist:
+        for child in children.get(worklist.pop(), ()):
+            if child not in evidenced:
+                evidenced.add(child)
+                worklist.append(child)
+    return evidenced - _SHIZUKU_PROVIDER_SUPERCLASSES
+
+
+def _dex_shizuku_provider_java_names(parsed_dexes: list[ParsedDex]) -> set[str]:
+    """Java names of DEX-defined ShizukuProvider subclasses, official class aside.
+
+    Every DEX class whose ancestry bottoms out at
+    ``Lrikka/shizuku/ShizukuProvider;`` or ``Lmoe/shizuku/ShizukuProvider;``
+    (transitively, however many re-layered superclasses stand in between)
+    is a ShizukuProvider subclass however it is renamed in the manifest.
+    The official class itself (``Lrikka/shizuku/ShizukuProvider;``) is
+    excluded: it carries its own pinned contract. The closure never adds it
+    (its ancestry bottoms out at ContentProvider); the explicit exclusion is
+    kept as defense in depth. ``Lmoe/shizuku/ShizukuProvider;`` has no
+    official counterpart and is treated as suspicious like any renamed
+    subclass. Java names drop the leading ``L`` and trailing ``;`` and map
+    ``/`` to ``.``.
+    """
+    names: set[str] = set()
+    for descriptor in _shizuku_provider_evidenced_descriptors(parsed_dexes):
+        if descriptor == _OFFICIAL_SHIZUKU_PROVIDER_DESCRIPTOR:
+            continue
+        if not (descriptor.startswith("L") and descriptor.endswith(";")):
+            continue
+        names.add(descriptor[1:-1].replace("/", "."))
+    return names
+
+
+def _defined_java_names(parsed_dexes: list[ParsedDex]) -> set[str]:
+    """Java names of every class DEFINED in any root DEX shard.
+
+    Union of each parsed shard's ``defined_classes`` (the class_defs
+    table, never the type_ids mentions): a descriptor shaped ``L…;`` has its
+    ``L``/``;`` framing dropped and ``/`` mapped to ``.`` (e.g.
+    ``Lrikka/shizuku/ShizukuProvider;`` -> ``rikka.shizuku.ShizukuProvider``).
+    Descriptors that are not object-type shaped are skipped (the parser
+    already rejects non-object class_def descriptors, so this is defense in
+    depth). An empty set is a valid result.
+    """
+    names: set[str] = set()
+    for dex in parsed_dexes:
+        for descriptor in dex.defined_classes:
+            if not (descriptor.startswith("L") and descriptor.endswith(";")):
+                continue
+            names.add(descriptor[1:-1].replace("/", "."))
+    return names
+
+
+# Package-name shape for the FINAL merged-manifest package value: at
+# least one dot, letter/underscore-led identifier segments. The artifact
+# gate refuses a package it cannot attribute as a component-name base.
+_PACKAGE_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)+$")
+
+
+def _permissions_package(permissions: str) -> str | None:
+    """Package record from ``aapt dump permissions`` output, or ``None``.
+
+    Measured aapt prints exactly one ``package: <name>`` line
+    (``package: dev.librepocket.agent.github``). A line that is not a
+    package record is not treated as one: ``None`` lets the caller fall
+    back to the merged-manifest source (or fail closed when it too is
+    absent).
+    """
+    # Real aapt prints exactly one `package:` line; the first match is deterministic, and the downstream cross-check with the xmltree package catches divergence.
+    match = re.search(r"(?m)^package:\s*(\S+)", permissions)
+    if match is None:
+        return None
+    return match.group(1).strip()
+
+
+def _manifest_package_from_xmltree(xmltree: str) -> str | None:
+    """Package declared on the merged manifest's ``<manifest>`` element.
+
+    ``aapt dump xmltree`` prints the merged package as a PLAIN
+    (non-namespaced) ``A: package="..."`` attribute line directly under
+    ``E: manifest`` (the ``... (Raw: "...")`` spelling is tolerated). Parsing
+    is anchored at the manifest element's OWN attribute level (``indent + 2``,
+    aapt's two-space hierarchy step) and stops at the next element line at
+    that level or shallower (or EOF): attribute lines belonging to child
+    elements print deeper and are never read as the package.
+
+    ONLY quoted-string encodings are accepted for the package; the raw
+    value's shape is checked BEFORE the generic attribute decoder runs.
+    Typed encodings (``(type 0x12)0xffffffff``, ``(type 0x10)0x1``, ...)
+    and resource references (``@0x...``, ``?0x...``) fail closed with a
+    PolicyError naming the encoding kind instead of being guessed into a
+    string. A decoded value that is empty/whitespace is rejected too.
+
+    Fail closed with a PolicyError when the manifest element carries a
+    NAMESPACED ``package`` attribute (e.g. ``android:package``), a
+    malformed ``A:`` line at its own attribute level, a non-quoted value
+    encoding, or a value that decodes to empty - a package the gate
+    cannot attribute is never guessed. Returns ``None`` when the manifest
+    element or the attribute itself is absent (the caller falls back to
+    the permissions source / errors).
+    """
+    lines = xmltree.splitlines()
+    manifest_index: int | None = None
+    manifest_indent = 0
+    for index, line in enumerate(lines):
+        elem = _XMLTREE_ELEMENT_LINE_RE.match(line)
+        if elem is None:
+            continue
+        if elem.group(2) == "manifest":
+            manifest_index = index
+            manifest_indent = len(elem.group(1))
+            break
+    if manifest_index is None:
+        return None
+    attr_indent = manifest_indent + 2
+    package: str | None = None
+    for line in lines[manifest_index + 1 :]:
+        elem = _XMLTREE_ELEMENT_LINE_RE.match(line)
+        if elem is not None and len(elem.group(1)) <= attr_indent:
+            # Next element at same/higher indent than the attribute level:
+            # the manifest element's own attribute block is over.
+            break
+        a_match = _PROVIDER_ATTR_LINE_RE.match(line)
+        if a_match is not None:
+            if len(a_match.group(1)) != attr_indent:
+                # Not a DIRECT attribute line of <manifest> (belongs to a
+                # deeper descendant): never the package; skip.
+                continue
+            attr_lhs = a_match.group(2).strip()
+            attr_id_match = re.search(r"\(\s*0x[0-9a-fA-F]+\s*\)\s*$", attr_lhs)
+            attr_qname = (
+                attr_lhs[: attr_id_match.start()].strip()
+                if attr_id_match is not None
+                else attr_lhs
+            )
+            if ":" in attr_qname:
+                ns_prefix, attr_local = attr_qname.rsplit(":", 1)
+            else:
+                ns_prefix, attr_local = "", attr_qname
+            if attr_local != "package":
+                continue
+            if ns_prefix:
+                raise PolicyError(
+                    f"merged manifest <manifest> package attribute is namespaced "
+                    f"({attr_qname!r}) - expected a plain package attribute"
+                )
+            raw_value = a_match.group(3).strip()
+            # ONLY quoted-string encodings (plain "value" or
+            # "value" (Raw: "value")) may become the package: check the raw
+            # value's shape BEFORE the generic attribute decoder runs.
+            # Typed encodings and resource references never decode into a
+            # package string here - fail closed naming the encoding kind.
+            quoted = re.match(
+                r'^"((?:[^"\\]|\\.)*)"\s*'
+                r'(?:\(Raw:\s*"((?:[^"\\]|\\.)*)"\s*\))?(?:\s*)?$',
+                raw_value,
+            )
+            if quoted is None:
+                if raw_value.startswith("(type"):
+                    kind = "typed"
+                elif raw_value.startswith("@") or raw_value.startswith("?"):
+                    kind = "resource-reference"
+                else:
+                    kind = "unquoted"
+                raise PolicyError(
+                    f"merged manifest <manifest> package: unrecognized "
+                    f"compiled attribute encoding {raw_value!r} "
+                    f"({kind} encoding)"
+                )
+            decoded = _xmltree_attr_value(
+                raw_value, "merged manifest <manifest> package"
+            )
+            if decoded.strip() == "":
+                raise PolicyError(
+                    f"merged manifest <manifest> package: empty package "
+                    f"attribute (decoded from {raw_value!r})"
+                )
+            if package is not None:
+                raise PolicyError(
+                    "merged manifest <manifest> declares a duplicate plain "
+                    f"package attribute ({package!r} vs {decoded!r})"
+                )
+            package = decoded
+            continue
+        if line.lstrip().startswith("A:") and len(line) - len(line.lstrip()) == attr_indent:
+            # An attribute-shaped line at the manifest's OWN attribute level
+            # that does not parse: fail closed rather than skip past it.
+            raise PolicyError(
+                f"merged manifest <manifest> has malformed attribute line: "
+                f"{line.strip()!r}"
+            )
+    return package
+
+
+def _merged_manifest_package(xmltree: str, permissions: str) -> str:
+    """Resolve the merged manifest package from both aapt sources.
+
+    Both sources present and equal -> that package. Both present and
+    UNEQUAL -> PolicyError: the artifact disagrees with itself, and the
+    gate refuses to attribute component names on top of a contested base.
+    Only one source present -> use it. Neither -> PolicyError: the artifact
+    gate refuses to match provider names against DEX evidence without a
+    package. Whatever path produced the FINAL package value, it must
+    match the package-name grammar (at least one dot, letter/underscore-led
+    segments) or PolicyError.
+    """
+    permissions_package = _permissions_package(permissions)
+    manifest_package = _manifest_package_from_xmltree(xmltree)
+    if (
+        permissions_package is not None
+        and manifest_package is not None
+        and permissions_package != manifest_package
+    ):
+        raise PolicyError(
+            f"merged manifest package disagrees: permissions {permissions_package!r} "
+            f"vs manifest {manifest_package!r}"
+        )
+    final_package = (
+        permissions_package if permissions_package is not None else manifest_package
+    )
+    if final_package is None:
+        raise PolicyError(
+            "cannot determine the merged manifest package - the artifact gate "
+            "refuses to match provider names against DEX evidence without it"
+        )
+    if _PACKAGE_NAME_RE.match(final_package) is None:
+        raise PolicyError(
+            f"merged manifest package {final_package!r} fails package-name "
+            "validation - the artifact gate refuses a package it cannot attribute"
+        )
+    return final_package
+
+
+def _canonicalize_component_name(name: str, package: str) -> str:
+    """Resolve an ``android:name`` component string to its canonical FQN.
+
+    Android component-name resolution: a leading-dot name (``.Bridge``)
+    resolves inside the package (``<package>.Bridge``); a name with no dot
+    anywhere resolves inside the package too (``Bridge`` ->
+    ``<package>.Bridge``); anything containing a dot is already fully
+    qualified and stays as-is. Callers guarantee a non-empty package.
+    Empty/blank input resolves to ``""`` (never a class).
+    """
+    stripped = name.strip()
+    if not stripped:
+        return ""
+    if stripped.startswith("."):
+        return package + stripped
+    if "." not in stripped:
+        return package + "." + stripped
+    return stripped
+
+
+def _provider_name_matches_dex_class(name: str, java_name: str, package: str) -> bool:
+    """Manifest ``android:name`` match against a DEX-evidenced java name.
+
+    Canonical component-name resolution only: the ``android:name`` string
+    is resolved against the merged manifest ``package`` (leading dot or a
+    dot-free name resolve inside the package; anything with a dot is
+    already fully qualified) and compared by EXACT equality with the
+    evidenced java name. Arbitrary suffix matching is never an alias:
+    ``.Bridge`` is ``<package>.Bridge`` and ``internal.Bridge`` is the
+    literal ``internal.Bridge`` - neither can stand for a DEX class such
+    as ``com.evil.Bridge``. An empty name never matches.
+    """
+    return bool(name.strip()) and (
+        _canonicalize_component_name(name, package) == java_name
+    )
+
+
+def _check_github_application_enabled(xmltree: str) -> None:
+    """Pin the merged ``<application>``'s OWN ``android:enabled`` (github mode).
+
+    github-mode scope (deliberate, documented): this pin wires into the
+    ``--mode github`` branch of ``inspect_apk`` ONLY. play/foss artifacts
+    are untouched - the github artifact is the one whose Shizuku binder
+    surface this gate proves, and the foss/play contract split stays as it
+    is. No new CLI flag exists; both ``--expect-provider optional`` and
+    ``--expect-provider required`` runs get the pin.
+
+    Android's <provider> spec requires BOTH the application and the
+    provider to be enabled: a merged ``<application>`` carrying
+    ``android:enabled=false`` cannot instantiate ANY provider - the
+    compliant ShizukuProvider the provider-side gate certifies
+    (``_check_provider_attrs``) is never created, so the Shizuku binder
+    channel that resolves ``<package>.shizuku`` dead-ends on arrival,
+    even though the provider's own ``android:enabled`` is true. This is
+    an AVAILABILITY pin, not a privilege check: a merged artifact that
+    cannot prove application availability fails closed here. The two
+    requirements are independent and both hold.
+
+    Own-attribute isolation is by EXACT indent. aapt prints the
+    ``<application>`` element at ``app_indent`` and its own attributes at
+    ``app_indent + 2`` (two-space hierarchy steps), while every CHILD
+    element's attributes print at ``app_indent + 4`` or deeper. Only
+    ``A:`` lines at exactly ``app_indent + 2`` leading spaces are
+    considered, so a CHILD carrying a decoy
+    ``android:enabled=(type 0x12)0x0`` at child indent can neither trip
+    the gate nor satisfy it - child attributes never shadow the
+    application's own, and the application's own attribute is never
+    satisfied by a child's. Scanning covers EVERY own-level ``A:`` line
+    anywhere inside the application block, so a decoy cannot hide behind
+    child elements either. A tab-indented or shallower-than-own-level
+    ``A:`` line inside the application block fails closed as well: per
+    aapt's two-space hierarchy no such line can ever legitimately print
+    there (own-level is spaces at exactly ``app_indent + 2``; deeper
+    children print spaces-only and longer).
+
+    Absence is Android's documented default (``enabled=true``) and
+    PASSES - an application with no explicit ``android:enabled`` is not
+    treated as disabled. An explicit value must be the exact compiled
+    boolean true. Anything else fails closed: a compiled boolean false,
+    any other typed encoding (untypable values raise inside
+    ``_xmltree_attr_value``), or a resource reference (``@0x…`` /
+    ``?0x…`` passes through verbatim from ``_xmltree_attr_value`` and is
+    never equal to ``"true"`` - an unproven reference fails closed by
+    design; the gate never guesses what an unresolved resource resolves
+    to).
+
+    Namespace discipline is deliberately TIGHTER than the provider-side
+    gate: the compiled attribute print is accepted only under the
+    ``android`` prefix or the fully spelled
+    ``http://schemas.android.com/apk/res/android:`` qname; anything else
+    - including ``N:``-declared alias prefixes, which are NOT resolved
+    here - is rejected outright for the enabled attribute rather than
+    guessed. (Namespace aliases are legal XML but out of scope for this
+    compiled-attribute pin; the limitation is accepted and documented
+    rather than silently mis-resolved.)
+
+    id<->name agreement mirrors the provider-side shape: 0x0101000e is
+    ``android:enabled`` (see ``_PROVIDER_ANDROID_ATTR_IDS``). A different
+    id appearing with the local name ``enabled`` (or 0x0101000e appearing
+    with a different local name) fails closed naming both, and duplicate
+    application-level ``android:enabled`` declarations fail closed as
+    duplicates.
+    """
+    lines, app_index, end, app_indent = _locate_application_manifest_span(xmltree)
+    own_indent = app_indent + 2
+    attr_prefix = " " * own_indent
+    own_a_lines: list[tuple[str, str, str]] = []
+    for line in lines[app_index + 1 : end]:
+        stripped = line.lstrip(" \t")
+        if stripped.startswith("A:"):
+            leading = line[: len(line) - len(stripped)]
+            if "\t" in leading or len(leading) < own_indent:
+                raise PolicyError(
+                    "merged manifest <application> has an unexpectedly "
+                    f"indented or tab-indented attribute line: {line.strip()!r}"
+                )
+        a_match = _PROVIDER_ATTR_LINE_RE.match(line)
+        if a_match is None:
+            if line.startswith(attr_prefix + "A:"):
+                # Own-level attribute the provider line grammar cannot
+                # parse: fail closed rather than skip past an anomaly.
+                raise PolicyError(
+                    f"merged manifest <application> has malformed attribute line: "
+                    f"{line.strip()!r}"
+                )
+            continue  # child element lines / child A: lines (deeper) / chatter
+        if a_match.group(1) != attr_prefix:
+            continue  # a child's attribute prints deeper and is never ours
+        attr_lhs = a_match.group(2).strip()
+        attr_rhs = a_match.group(3).strip()
+        attr_id_match = re.search(r"\(\s*(0x[0-9a-fA-F]+)\s*\)\s*$", attr_lhs)
+        attr_id = attr_id_match.group(1).lower() if attr_id_match else None
+        attr_qname = (
+            attr_lhs[: attr_id_match.start()].strip()
+            if attr_id_match is not None
+            else attr_lhs
+        )
+        if ":" in attr_qname:
+            ns_prefix, attr_local = attr_qname.rsplit(":", 1)
+        else:
+            ns_prefix, attr_local = "", attr_qname
+        if attr_local != "enabled" and attr_id != "0x0101000e":
+            continue  # unrelated application-level attribute
+        # Namespace rule for `enabled` (fail closed on anything unbound):
+        # only the literal `android` prefix or the fully spelled Android
+        # res-android URI qname binds; anything else - including
+        # N:-declared aliases (aliases are out of scope for this pin and
+        # are NOT resolved) - is rejected rather than guessed.
+        if ns_prefix not in ("android", _ANDROID_NS):
+            raise PolicyError(
+                f"merged manifest <application> android:enabled attribute "
+                f"{attr_lhs!r} uses an unexpected or unbound namespace "
+                f"prefix (line: {line.strip()!r})"
+            )
+        # id<->name agreement, mirroring the provider-side shape:
+        # 0x0101000e IS android:enabled - a mismatch fails closed naming both.
+        if attr_id is not None and attr_id in _PROVIDER_ANDROID_ATTR_IDS:
+            expected_local = _PROVIDER_ANDROID_ATTR_IDS[attr_id]
+            if attr_local != expected_local:
+                raise PolicyError(
+                    f"merged manifest <application> android:enabled attribute "
+                    f"{attr_lhs!r} disagrees with Android attribute ID {attr_id} "
+                    f"(that ID is {expected_local!r})"
+                )
+        elif attr_local == "enabled":
+            if attr_id is not None:
+                # An id outside the known Android map is never a proof of
+                # android:enabled - mirror the provider-side refusal.
+                raise PolicyError(
+                    f"merged manifest <application> android:enabled attribute "
+                    f"{attr_lhs!r} has unexpected resource ID {attr_id}"
+                )
+            # Local name without an id is accepted (same tolerance as the
+            # provider-side gate for synthetic dumps); decoded below.
+        own_a_lines.append((attr_lhs, attr_id or "", attr_rhs))
+    if len(own_a_lines) > 1:
+        raise PolicyError(
+            f"merged manifest <application> android:enabled declared more than "
+            f"once (duplicate attribute): {own_a_lines[0][0]!r} / "
+            f"{own_a_lines[1][0]!r}"
+        )
+    if not own_a_lines:
+        # Absent at the application level: Android's documented default is
+        # enabled=true, so this PASSES (no fail-closed default flip here).
+        return
+    _attr_lhs, _attr_id, raw_rhs = own_a_lines[0]
+    # Resource references (@0x…/?0x…) pass through verbatim here (see
+    # _xmltree_attr_value) and therefore never equal "true":
+    # resource-unproven values fail closed, deliberately - the gate never
+    # guesses what an unresolved resource resolves to.
+    decoded = _xmltree_attr_value(
+        raw_rhs, "merged manifest <application> android:enabled"
+    )
+    if decoded != "true":
+        raise PolicyError(
+            f"merged manifest <application> android:enabled must be the "
+            f"exact boolean true (or absent, Android default); got {decoded!r}"
+        )
+
+
+def _check_github_dex_shizuku_providers(
+    xmltree: str, parsed_dexes: list[ParsedDex], package: str
+) -> set[str]:
+    """Enforce the attribute contract on DEX-evidenced renamed subclasses.
+
+    Every DEX class extending ``ShizukuProvider`` (transitively, however
+    many re-layered superclasses in between) must be declared in the merged
+    manifest as a ``<provider>``; otherwise PolicyError (a renamed subclass
+    injection ships an unpermissioned Shizuku binder IPC surface).
+    A matched provider must carry the FULL attribute contract of
+    ``_check_provider_attrs`` - the contract is the permission, not the name.
+
+    ``android:name`` values are resolved against the merged manifest
+    ``package`` with Android's canonical component-name rules (``.X`` and a
+    dot-free ``X`` resolve inside the package; anything containing a dot is
+    already fully qualified) and compared by EXACT equality against the
+    evidenced java name. Arbitrary suffix matching is never an alias for a
+    class: ``.Bridge`` is ``<package>.Bridge`` and ``internal.Bridge`` is
+    the literal ``internal.Bridge`` - neither stands for
+    ``com.evil.Bridge`` (canonical FQN exact match or no match at all).
+
+    Returns the java names of the DEX-evidenced subclasses that matched a
+    merged-manifest provider, for the caller's ``--expect-provider
+    required`` accounting. A provider that is both manifest-detected and
+    DEX-evidenced is ONE surface: only a canonical exact-FQN match against
+    an evidenced java name consumes a detected block; suffix-spelled names
+    never consume, because under canonical resolution there is no suffix
+    matching at all.
+
+    Uniqueness (exact): ONE evidenced java name matched by MORE than one
+    merged-manifest provider block fails closed as a PolicyError naming the
+    java name and the block count (``android:name`` values are reconstructed
+    for the message). Canonical component-name resolution collapses alias
+    spellings onto the same match set (``.Bridge`` and ``Bridge`` under one
+    package are one canonical class), so alias duplicates fail identically.
+    The uniqueness gate fires in BOTH optional and required modes and runs
+    BEFORE any per-match attribute-contract check, so the failure is always
+    the duplicate itself, deterministically - never a half-validated
+    duplicate pair, and never collapsed into one surface by the returned
+    set.
+
+    Semantic note (exact): a single compliant provider that happens to be a
+    renamed DEX-evidenced ShizukuProvider subclass is allowed through ONLY if
+    it carries the full attribute contract (INTERACT_ACROSS_USERS_FULL base
+    permission, exported exactly true, multiprocess absent|false, no
+    grantUriPermissions, no <path-permission>/<grant-uri-permission>). The
+    contract is the permission, not the name: the gate proves the surface is
+    permission-gated, NOT where the code came from (provenance is not
+    claimed - a renamed subclass that carries the full contract is
+    indistinguishable, by design, from a compliant official provider).
+    """
+    matched_java_names: set[str] = set()
+    java_names = _dex_shizuku_provider_java_names(parsed_dexes)
+    if not java_names:
+        return matched_java_names
+    providers = _iter_application_providers(xmltree)
+    for java_name in sorted(java_names):
+        matches = [
+            (decoded, child_tags)
+            for decoded, child_tags in providers
+            if _provider_name_matches_dex_class(
+                decoded.get("name", ""), java_name, package
+            )
+        ]
+        if not matches:
+            raise PolicyError(
+                f"github DEX-evidenced ShizukuProvider subclass {java_name} "
+                "is not declared in the merged manifest"
+            )
+        # -- uniqueness for the DEX-evidenced class (Re-review #12 Finding 1) --
+        # One evidenced java name matched by MORE than one merged-manifest
+        # provider block is not one surface: the blocks cannot all bind, and
+        # the artifact gate refuses duplicate provider declarations. Canonical
+        # component-name resolution already collapsed alias spellings into
+        # ``matches`` (``.Bridge`` and ``Bridge`` both resolve to
+        # ``<package>.Bridge``), so the rule covers every alias spelling.
+        # Uniqueness is an artifact-level validity check, not a
+        # required-only accounting gate: it fires in BOTH optional and
+        # required modes and regardless of the attribute contract, and it is
+        # detected FIRST for the class - before any per-match contract
+        # check - so the failure is always the duplicate, never a
+        # half-validated duplicate pair. The error names the evidenced java
+        # name and the count; ``dex_java_names`` must never collapse two
+        # declarations into one surface.
+        if len(matches) > 1:
+            names = ", ".join(
+                sorted(str(decoded.get("name", "")) for decoded, _child_tags in matches)
+            )
+            raise PolicyError(
+                f"github merged manifest declares {len(matches)} provider "
+                f"blocks for DEX-evidenced ShizukuProvider subclass {java_name} "
+                f"(android:name spellings: {names}) - duplicate "
+                "provider declarations cannot all bind, and the artifact gate "
+                "refuses them"
+            )
+        matched_java_names.add(java_name)
+        for decoded, child_tags in matches:
+            _check_provider_attrs(
+                decoded,
+                child_tags,
+                f"DEX-evidenced ShizukuProvider subclass {java_name}",
+                # Arbitrary authorities stay unconstrained on this path by
+                # design ("the contract is the permission, not the name"):
+                # authorities are recorded and equality-unpinned here (the
+                # shared presence minimum - at least one non-empty authority
+                # - still applies inside ``_check_provider_attrs``).
+                # The official-FQN/name heuristic path
+                # (``_check_github_shizuku_provider``) pins
+                # ``<package>.shizuku`` exactly. When the matched provider is
+                # ALSO heuristic-detected, it flows through BOTH validators:
+                # names/attribute contract by this one, the authority by the
+                # heuristic branch alone - no double error. The official
+                # detector handles the binder-channel proof; this path never
+                # guesses at an arbitrary authority.
+                expected_authority=None,
+            )
+    return matched_java_names
+
+
+def _github_required_provider_total(
+    xmltree: str,
+    dex_java_names: set[str],
+    package: str,
+    defined_java_names: set[str],
+) -> int:
+    """Distinct ShizukuProvider surfaces for ``--expect-provider required``.
+
+    Block-identity (multiset) accounting. ``detected_blocks`` are the
+    manifest ``<provider>`` blocks - identity is the positional index in the
+    parsed provider list - matched by ``_is_shizuku_provider``. The
+    merged-manifest provider identity is expected to be unique: BEFORE
+    counting anything, two detected blocks resolving to the same canonical
+    component name fail closed as a PolicyError, so merger accidents and
+    name-padding attacks go red instead of silently deduping to one.
+    Canonical identity is the pin: identical class, duplicate declaration,
+    whatever the spelling - ``.Bridge`` and ``Bridge``, or ``.Bridge`` and
+    the full ``{package}.Bridge`` FQN, both resolve to the same FQN, and
+    the attribute contract cannot keep two canonical-equal blocks apart.
+    An evidenced class must never be consumed twice.
+
+    AFTER the duplicate-identity guard, BEFORE the counting math: every
+    detected block's canonical FQN must correspond to a class actually
+    DEFINED in a root DEX shard (``defined_java_names``, the DEX class_defs
+    union), otherwise PolicyError naming the canonical FQN. A type_ids
+    mention is not a class definition and never satisfies this check.
+    Evidenced subclass java names are themselves DEX-defined, so membership
+    covers them; the official FQN must be genuinely defined too. With zero
+    detected blocks this check does not fire (the found-0 red semantics
+    stay at the counting layer). This existence contract fires only in the
+    github ``--expect-provider required`` path - the only caller of this
+    helper - so foss/play and the default ``optional`` contract are
+    untouched.
+
+    A canonical component-name match against an evidenced java name consumes
+    (one) detected block; a provider that is both manifest-detected and
+    DEX-evidenced is therefore ONE surface. ``android:name`` values are
+    resolved against the merged manifest ``package`` with Android's
+    canonical component-name rules (``.X`` / dot-free ``X`` resolve inside
+    the package; anything with a dot is already fully qualified) before the
+    exact-equality comparison against the evidenced java name - an
+    arbitrary suffix match is never an alias and never consumes.
+    Example: a manifest block spelled ``android:name=".Bridge"`` whose
+    authority is ``${applicationId}.shizuku``, with an evidenced java name
+    ``com.example.Bridge`` from a manifest package other than
+    ``com.example`` - the block is ``<package>.Bridge``, not
+    ``com.example.Bridge``, so it never consumes the evidenced name and
+    this assembly counts as "found 2" (fail-closed).
+
+    ``total = |{detected blocks NOT consumed by a canonical exact-FQN
+    evidenced match}| + |evidenced java names|``.
+
+    Semantic note (exact): a single compliant provider that happens to be a
+    renamed DEX-evidenced ShizukuProvider subclass is allowed through ONLY if
+    it carries the full attribute contract (see
+    ``_check_github_dex_shizuku_providers``). The contract is the permission,
+    not the name - provenance is not claimed.
+    """
+    detected_blocks = [
+        (index, attrs.get("name", ""))
+        for index, (attrs, _child_tags) in enumerate(
+            _iter_application_providers(xmltree)
+        )
+        if _is_shizuku_provider(attrs.get("name", ""), attrs.get("authorities", ""))
+    ]
+    counts_by_canonical: dict[str, int] = {}
+    # Duplicate identity is the CANONICAL component name, not the raw
+    # android:name string. Alias spellings of the same class (``.Bridge``
+    # and ``Bridge``, or ``.Bridge`` and the full ``{package}.Bridge`` FQN)
+    # resolve to one FQN; keying on the raw name would let both blocks
+    # through this guard and consume the same DEX-evidenced class twice,
+    # making two declarations count as one surface. Identical classes
+    # declared twice are one duplicate declaration however they are
+    # spelled: an evidenced class must never be consumed twice, and the
+    # attribute contract cannot keep two canonical-equal blocks apart.
+    for _index, name in detected_blocks:
+        canonical = _canonicalize_component_name(name, package)
+        counts_by_canonical[canonical] = counts_by_canonical.get(canonical, 0) + 1
+    for canonical in sorted(counts_by_canonical):
+        count = counts_by_canonical[canonical]
+        if count > 1:
+            raise PolicyError(
+                f"github merged manifest declares {count} ShizukuProvider "
+                f"blocks with the same canonical component name: {canonical}"
+            )
+    for _index, name in detected_blocks:
+        canonical = _canonicalize_component_name(name, package)
+        if canonical not in defined_java_names:
+            raise PolicyError(
+                f"github merged manifest declares ShizukuProvider {canonical!r} "
+                "but no root DEX shard defines that class"
+            )
+    consumed: set[int] = set()
+    for java_name in dex_java_names:
+        for index, name in detected_blocks:
+            if _provider_name_matches_dex_class(name, java_name, package):
+                consumed.add(index)
+    return (len(detected_blocks) - len(consumed)) + len(dex_java_names)
+
+
 def _check_play(permissions: str, xmltree: str, infos: Iterable[zipfile.ZipInfo], dexes: list[ParsedDex]) -> None:
     manifest_dump = (permissions + "\n" + xmltree).upper()
     for token in PLAY_FORBIDDEN_PERMISSIONS:
@@ -1775,11 +3124,20 @@ def _check_play(permissions: str, xmltree: str, infos: Iterable[zipfile.ZipInfo]
             raise PolicyError(f"Play APK declares forbidden permission/reference {token}")
     if re.search(r"accessibilityservice", xmltree, re.IGNORECASE):
         raise PolicyError("Play APK manifest registers an AccessibilityService")
+    if _SHIZUKU_MANIFEST_RE.search(manifest_dump):
+        raise PolicyError("Play APK manifest references Shizuku")
+    for attrs, _child_tags in _iter_application_providers(xmltree):
+        if _is_shizuku_provider(attrs.get("name", ""), attrs.get("authorities", "")):
+            raise PolicyError("Play APK manifest registers a Shizuku provider")
 
     for dex in dexes:
         for descriptor in dex.defined_classes:
             if any(descriptor.startswith(prefix) for prefix in PLAY_DEFINED_CLASS_PREFIXES):
                 raise PolicyError(f"Play APK defines self-install-only class {descriptor}")
+        for descriptor in dex.type_descriptors:
+            class_descriptor = descriptor.lstrip("[")
+            if any(class_descriptor.startswith(prefix) for prefix in PLAY_DEFINED_CLASS_PREFIXES):
+                raise PolicyError(f"Play APK DEX type_ids references self-install-only type {descriptor}")
         for superclass in dex.superclasses:
             if superclass in PLAY_FORBIDDEN_SUPERCLASSES:
                 raise PolicyError(f"Play APK subclasses forbidden service {superclass}")
@@ -1796,6 +3154,11 @@ def _check_foss(permissions: str, xmltree: str, dexes: list[ParsedDex]) -> None:
     for needle in FOSS_MANIFEST_NEEDLES:
         if needle in manifest_dump:
             raise PolicyError(f"Foss APK manifest references proprietary component {needle}")
+    if _SHIZUKU_MANIFEST_RE.search(manifest_dump):
+        raise PolicyError("Foss APK manifest references Shizuku")
+    for attrs, _child_tags in _iter_application_providers(xmltree):
+        if _is_shizuku_provider(attrs.get("name", ""), attrs.get("authorities", "")):
+            raise PolicyError("Foss APK manifest registers a Shizuku provider")
 
     for dex in dexes:
         for descriptor in dex.type_descriptors:
@@ -1804,7 +3167,11 @@ def _check_foss(permissions: str, xmltree: str, dexes: list[ParsedDex]) -> None:
                 raise PolicyError(f"Foss APK DEX type_ids references proprietary type {descriptor}")
 
 
-def inspect_apk(apk: Path, mode: str, aapt: str, dexdump: str) -> None:
+def inspect_apk(apk: Path, mode: str, aapt: str, dexdump: str, expect_provider: str = "optional") -> None:
+    if expect_provider not in ("required", "optional"):
+        raise PolicyError(f"unknown --expect-provider value: {expect_provider!r}")
+    if expect_provider == "required" and mode != "github":
+        raise PolicyError("--expect-provider required is only valid with --mode github")
     if apk.suffix.lower() == ".aab":
         raise PolicyError("AAB is unsupported by this APK-only policy scanner")
     if apk.suffix.lower() != ".apk":
@@ -1852,31 +3219,47 @@ def inspect_apk(apk: Path, mode: str, aapt: str, dexdump: str) -> None:
         # class-table policy applies. It already proved the mode-independent
         # artifact authorities (merged backup binding + compiled rules bytes
         # + NSC binding compiled check) plus the COMMON flavor permission
-        # policy above - that is the entire contract here. The aapt/dexdump
-        # tool contract is still enforced above, so a wrong tool invocation
-        # cannot silently degrade the mode.
+        # policy above - and it parses the root DEX shards with the same
+        # bounded parser as play/foss so a renamed ShizukuProvider subclass
+        # (an arbitrary manifest authority) cannot pass as invisible: every
+        # DEX-evidenced subclass must be declared in the merged manifest AND
+        # carry the full attribute contract. The aapt/dexdump tool contract
+        # is still enforced above, so a wrong tool invocation cannot silently
+        # degrade the mode.
+        parsed_dexes = _parse_root_dexes(apk, dex_infos, dexdump)
+        merged_package = _merged_manifest_package(xmltree, permissions)
+        # The merged <application>'s OWN android:enabled is pinned BEFORE
+        # any provider check: availability of the whole provider surface
+        # precedes the provider attribute contract. Applies in both
+        # optional and required modes (no extra flag).
+        _check_github_application_enabled(xmltree)
+        dex_java_names = _check_github_dex_shizuku_providers(
+            xmltree, parsed_dexes, merged_package
+        )
+        if expect_provider == "required":
+            defined_java_names = _defined_java_names(parsed_dexes)
+            total = _github_required_provider_total(
+                xmltree, dex_java_names, merged_package, defined_java_names
+            )
+            if total != 1:
+                raise PolicyError(
+                    "github APK must declare exactly one ShizukuProvider "
+                    f"(found {total})"
+                )
+        _check_github_shizuku_provider(xmltree, merged_package)
         print(
             f"  structure: APK ZIP/manifest OK ({len(dex_infos)} root DEX "
-            "shard(s), DEX tables not parsed)"
+            f"shard(s), DEX tables parsed: {len(parsed_dexes)} shard(s))"
         )
         print(
             "  policy: github OK (mode-independent artifact authorities "
-            "only: merged-manifest backup/NSC bindings + compiled backup "
-            "rules bytes + compiled NSC)"
+            "+ DEX ShizukuProvider subclass tables: merged-manifest "
+            "backup/NSC bindings + compiled backup rules bytes + compiled "
+            "NSC)"
         )
         return
 
-    parsed_dexes: list[ParsedDex] = []
-    descriptor_budget = DescriptorBudget()
-    with zipfile.ZipFile(apk, "r") as archive:
-        for info in dex_infos:
-            with archive.open(info, "r") as member:
-                dex_bytes = member.read(MAX_SINGLE_DEX_BYTES + 1)
-            if len(dex_bytes) != info.file_size or len(dex_bytes) > MAX_SINGLE_DEX_BYTES:
-                raise PolicyError(f"APK DEX expanded size mismatch: {info.filename}")
-            parsed = parse_dex_type_tables(dex_bytes, descriptor_budget=descriptor_budget)
-            _validate_dexdump(dexdump, info.filename, dex_bytes)
-            parsed_dexes.append(parsed)
+    parsed_dexes = _parse_root_dexes(apk, dex_infos, dexdump)
 
     if mode == "play":
         _check_play(permissions, xmltree, infos, parsed_dexes)
@@ -1894,9 +3277,25 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--apk", required=True)
     parser.add_argument("--aapt", required=True)
     parser.add_argument("--dexdump", required=True)
+    parser.add_argument(
+        "--expect-provider",
+        choices=("required", "optional"),
+        default="optional",
+        help=(
+            "github mode: 'required' demands exactly one ShizukuProvider "
+            "surface (manifest-detected or DEX-evidenced; block-identity "
+            "multiset counting - two detected blocks resolving to the same "
+            "canonical component name fail closed; suffix matches never "
+            "consume; canonical exact-FQN consumption; every detected "
+            "provider's canonical class must be DEX class_def-defined); "
+            "'optional' (default) checks provider attributes "
+            "only when a ShizukuProvider is present (including "
+            "DEX-evidenced renamed subclasses)"
+        ),
+    )
     args = parser.parse_args(argv)
     try:
-        inspect_apk(Path(args.apk), args.mode, args.aapt, args.dexdump)
+        inspect_apk(Path(args.apk), args.mode, args.aapt, args.dexdump, args.expect_provider)
         return 0
     except PolicyError as exc:
         print(f"FAIL: {exc}", file=sys.stderr)

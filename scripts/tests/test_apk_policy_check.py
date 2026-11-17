@@ -307,7 +307,7 @@ class ApkPolicyHarness(unittest.TestCase):
             "esac\n"
             "case \"${1:-} ${2:-}\" in\n"
             "  'dump permissions')\n"
-            "    printf '%s\\n' 'package:dev.librepocket.agent'\n"
+            "    printf '%s\\n' \"package:${FAKE_AAPT_PACKAGE:-dev.librepocket.agent.github}\"\n"
             "    # FAKE_AAPT_PERMISSIONS: comma-separated uses-permission token\n"
             "    # names appended in the measured aapt dump spelling, used by the\n"
             "    # common/play permission-policy negative fixtures only.\n"
@@ -516,7 +516,7 @@ class ApkPolicyHarness(unittest.TestCase):
             "        empty) : ;;\n"
             "        missing-one)\n"
             "          # The file/librepocket_keysets exclude drops out of EVERY\n"
-            "          # section (assistant_role retained to isolate the single miss):\n"
+            "          # section (device-bound excludes retained to isolate the single miss):\n"
             "          # the exact-set rule must reject the compiled\n"
             "          # bytes in both members (dump succeeds, content differs).\n"
             "          if [ \"${MEMBER}\" = \"res/xml/backup_rules.xml\" ]; then\n"
@@ -536,7 +536,19 @@ class ApkPolicyHarness(unittest.TestCase):
             "              '    A: path=\"librepocket_vault-shm\" (Raw: \"librepocket_vault-shm\")' \\\n"
             "              '  E: exclude' \\\n"
             "              '    A: domain=\"sharedpref\" (Raw: \"sharedpref\")' \\\n"
-            "              '    A: path=\"assistant_role.xml\" (Raw: \"assistant_role.xml\")'\n"
+            "              '    A: path=\"assistant_role.xml\" (Raw: \"assistant_role.xml\")' \\\n"
+            "              '  E: exclude' \\\n"
+            "              '    A: domain=\"file\" (Raw: \"file\")' \\\n"
+            "              '    A: path=\"datastore/librepocket_privilege_bridge.preferences_pb\" (Raw: \"datastore/librepocket_privilege_bridge.preferences_pb\")' \\\n"
+            "              '  E: exclude' \\\n"
+            "              '    A: domain=\"file\" (Raw: \"file\")' \\\n"
+            "              '    A: path=\"datastore/librepocket_privilege_bridge.preferences_pb.tmp\" (Raw: \"datastore/librepocket_privilege_bridge.preferences_pb.tmp\")' \\\n"
+            "              '  E: exclude' \\\n"
+            "              '    A: domain=\"file\" (Raw: \"file\")' \\\n"
+            "              '    A: path=\"datastore/librepocket_shizuku_grant.preferences_pb\" (Raw: \"datastore/librepocket_shizuku_grant.preferences_pb\")'\\\n"
+            "              '  E: exclude' \\\n"
+            "              '    A: domain=\"file\" (Raw: \"file\")' \\\n"
+            "              '    A: path=\"datastore/librepocket_shizuku_grant.preferences_pb.tmp\" (Raw: \"datastore/librepocket_shizuku_grant.preferences_pb.tmp\")'\n"
             "          else\n"
             "            printf '%s\\n' \\\n"
             "              'E: data-extraction-rules (line=1)' \\\n"
@@ -556,6 +568,18 @@ class ApkPolicyHarness(unittest.TestCase):
             "              '    E: exclude' \\\n"
             "              '      A: domain=\"sharedpref\" (Raw: \"sharedpref\")' \\\n"
             "              '      A: path=\"assistant_role.xml\" (Raw: \"assistant_role.xml\")' \\\n"
+            "              '    E: exclude' \\\n"
+            "              '      A: domain=\"file\" (Raw: \"file\")' \\\n"
+            "              '      A: path=\"datastore/librepocket_privilege_bridge.preferences_pb\" (Raw: \"datastore/librepocket_privilege_bridge.preferences_pb\")' \\\n"
+            "              '    E: exclude' \\\n"
+            "              '      A: domain=\"file\" (Raw: \"file\")' \\\n"
+            "              '      A: path=\"datastore/librepocket_privilege_bridge.preferences_pb.tmp\" (Raw: \"datastore/librepocket_privilege_bridge.preferences_pb.tmp\")' \\\n"
+            "              '    E: exclude' \\\n"
+            "              '      A: domain=\"file\" (Raw: \"file\")' \\\n"
+            "              '      A: path=\"datastore/librepocket_shizuku_grant.preferences_pb\" (Raw: \"datastore/librepocket_shizuku_grant.preferences_pb\")' \\\n"
+            "              '    E: exclude' \\\n"
+            "              '      A: domain=\"file\" (Raw: \"file\")' \\\n"
+            "              '      A: path=\"datastore/librepocket_shizuku_grant.preferences_pb.tmp\" (Raw: \"datastore/librepocket_shizuku_grant.preferences_pb.tmp\")' \\\n"
             "              '  E: device-transfer (line=7)' \\\n"
             "              '    E: exclude (line=8)' \\\n"
             "              '      A: domain=\"sharedpref\" (Raw: \"sharedpref\")' \\\n"
@@ -571,11 +595,23 @@ class ApkPolicyHarness(unittest.TestCase):
             "              '      A: path=\"librepocket_vault-shm\" (Raw: \"librepocket_vault-shm\")' \\\n"
             "              '    E: exclude' \\\n"
             "              '      A: domain=\"sharedpref\" (Raw: \"sharedpref\")' \\\n"
-            "              '      A: path=\"assistant_role.xml\" (Raw: \"assistant_role.xml\")'\n"
+            "              '      A: path=\"assistant_role.xml\" (Raw: \"assistant_role.xml\")' \\\n"
+            "              '    E: exclude' \\\n"
+            "              '      A: domain=\"file\" (Raw: \"file\")' \\\n"
+            "              '      A: path=\"datastore/librepocket_privilege_bridge.preferences_pb\" (Raw: \"datastore/librepocket_privilege_bridge.preferences_pb\")' \\\n"
+            "              '    E: exclude' \\\n"
+            "              '      A: domain=\"file\" (Raw: \"file\")' \\\n"
+            "              '      A: path=\"datastore/librepocket_privilege_bridge.preferences_pb.tmp\" (Raw: \"datastore/librepocket_privilege_bridge.preferences_pb.tmp\")' \\\n"
+            "              '    E: exclude' \\\n"
+            "              '      A: domain=\"file\" (Raw: \"file\")' \\\n"
+            "              '      A: path=\"datastore/librepocket_shizuku_grant.preferences_pb\" (Raw: \"datastore/librepocket_shizuku_grant.preferences_pb\")'\\\n"
+            "              '    E: exclude' \\\n"
+            "              '      A: domain=\"file\" (Raw: \"file\")' \\\n"
+            "              '      A: path=\"datastore/librepocket_shizuku_grant.preferences_pb.tmp\" (Raw: \"datastore/librepocket_shizuku_grant.preferences_pb.tmp\")'\n"
             "          fi ;;\n"
             "        extra-one)\n"
             "          # The mirror image of missing-one: every REQUIRED + DEVICE-BOUND\n"
-            "          # exclude stays and ONE entry beyond the pinned six adds itself\n"
+            "          # exclude stays and ONE entry beyond the pinned ten adds itself\n"
             "          # to EVERY section: the exact-set rule must reject the\n"
             "          # compiled bytes in both members (dump succeeds, content\n"
             "          # differs).\n"
@@ -597,6 +633,18 @@ class ApkPolicyHarness(unittest.TestCase):
             "              '  E: exclude' \\\n"
             "              '    A: domain=\"sharedpref\" (Raw: \"sharedpref\")' \\\n"
             "              '    A: path=\"assistant_role.xml\" (Raw: \"assistant_role.xml\")' \\\n"
+            "              '  E: exclude' \\\n"
+            "              '    A: domain=\"file\" (Raw: \"file\")' \\\n"
+            "              '    A: path=\"datastore/librepocket_privilege_bridge.preferences_pb\" (Raw: \"datastore/librepocket_privilege_bridge.preferences_pb\")' \\\n"
+            "              '  E: exclude' \\\n"
+            "              '    A: domain=\"file\" (Raw: \"file\")' \\\n"
+            "              '    A: path=\"datastore/librepocket_privilege_bridge.preferences_pb.tmp\" (Raw: \"datastore/librepocket_privilege_bridge.preferences_pb.tmp\")' \\\n"
+            "              '  E: exclude' \\\n"
+            "              '    A: domain=\"file\" (Raw: \"file\")' \\\n"
+            "              '    A: path=\"datastore/librepocket_shizuku_grant.preferences_pb\" (Raw: \"datastore/librepocket_shizuku_grant.preferences_pb\")' \\\n"
+            "              '  E: exclude' \\\n"
+            "              '    A: domain=\"file\" (Raw: \"file\")' \\\n"
+            "              '    A: path=\"datastore/librepocket_shizuku_grant.preferences_pb.tmp\" (Raw: \"datastore/librepocket_shizuku_grant.preferences_pb.tmp\")' \\\n"
             "              '  E: exclude (line=6)' \\\n"
             "              '    A: domain=\"file\" (Raw: \"file\")' \\\n"
             "              '    A: path=\"librepocket_keysets\" (Raw: \"librepocket_keysets\")' \\\n"
@@ -622,6 +670,18 @@ class ApkPolicyHarness(unittest.TestCase):
             "              '    E: exclude' \\\n"
             "              '      A: domain=\"sharedpref\" (Raw: \"sharedpref\")' \\\n"
             "              '      A: path=\"assistant_role.xml\" (Raw: \"assistant_role.xml\")' \\\n"
+            "              '    E: exclude' \\\n"
+            "              '      A: domain=\"file\" (Raw: \"file\")' \\\n"
+            "              '      A: path=\"datastore/librepocket_privilege_bridge.preferences_pb\" (Raw: \"datastore/librepocket_privilege_bridge.preferences_pb\")' \\\n"
+            "              '    E: exclude' \\\n"
+            "              '      A: domain=\"file\" (Raw: \"file\")' \\\n"
+            "              '      A: path=\"datastore/librepocket_privilege_bridge.preferences_pb.tmp\" (Raw: \"datastore/librepocket_privilege_bridge.preferences_pb.tmp\")' \\\n"
+            "              '    E: exclude' \\\n"
+            "              '      A: domain=\"file\" (Raw: \"file\")' \\\n"
+            "              '      A: path=\"datastore/librepocket_shizuku_grant.preferences_pb\" (Raw: \"datastore/librepocket_shizuku_grant.preferences_pb\")' \\\n"
+            "              '    E: exclude' \\\n"
+            "              '      A: domain=\"file\" (Raw: \"file\")' \\\n"
+            "              '      A: path=\"datastore/librepocket_shizuku_grant.preferences_pb.tmp\" (Raw: \"datastore/librepocket_shizuku_grant.preferences_pb.tmp\")' \\\n"
             "              '    E: exclude (line=7)' \\\n"
             "              '      A: domain=\"file\" (Raw: \"file\")' \\\n"
             "              '      A: path=\"librepocket_keysets\" (Raw: \"librepocket_keysets\")' \\\n"
@@ -644,6 +704,18 @@ class ApkPolicyHarness(unittest.TestCase):
             "              '    E: exclude' \\\n"
             "              '      A: domain=\"sharedpref\" (Raw: \"sharedpref\")' \\\n"
             "              '      A: path=\"assistant_role.xml\" (Raw: \"assistant_role.xml\")' \\\n"
+            "              '    E: exclude' \\\n"
+            "              '      A: domain=\"file\" (Raw: \"file\")' \\\n"
+            "              '      A: path=\"datastore/librepocket_privilege_bridge.preferences_pb\" (Raw: \"datastore/librepocket_privilege_bridge.preferences_pb\")' \\\n"
+            "              '    E: exclude' \\\n"
+            "              '      A: domain=\"file\" (Raw: \"file\")' \\\n"
+            "              '      A: path=\"datastore/librepocket_privilege_bridge.preferences_pb.tmp\" (Raw: \"datastore/librepocket_privilege_bridge.preferences_pb.tmp\")' \\\n"
+            "              '    E: exclude' \\\n"
+            "              '      A: domain=\"file\" (Raw: \"file\")' \\\n"
+            "              '      A: path=\"datastore/librepocket_shizuku_grant.preferences_pb\" (Raw: \"datastore/librepocket_shizuku_grant.preferences_pb\")' \\\n"
+            "              '    E: exclude' \\\n"
+            "              '      A: domain=\"file\" (Raw: \"file\")' \\\n"
+            "              '      A: path=\"datastore/librepocket_shizuku_grant.preferences_pb.tmp\" (Raw: \"datastore/librepocket_shizuku_grant.preferences_pb.tmp\")' \\\n"
             "              '    E: exclude (line=14)' \\\n"
             "              '      A: domain=\"file\" (Raw: \"file\")' \\\n"
             "              '      A: path=\"librepocket_keysets\" (Raw: \"librepocket_keysets\")' \\\n"
@@ -674,6 +746,18 @@ class ApkPolicyHarness(unittest.TestCase):
             "              '    E: exclude' \\\n"
             "              '      A: domain=\"sharedpref\" (Raw: \"sharedpref\")' \\\n"
             "              '      A: path=\"assistant_role.xml\" (Raw: \"assistant_role.xml\")' \\\n"
+            "              '    E: exclude' \\\n"
+            "              '      A: domain=\"file\" (Raw: \"file\")' \\\n"
+            "              '      A: path=\"datastore/librepocket_privilege_bridge.preferences_pb\" (Raw: \"datastore/librepocket_privilege_bridge.preferences_pb\")' \\\n"
+            "              '    E: exclude' \\\n"
+            "              '      A: domain=\"file\" (Raw: \"file\")' \\\n"
+            "              '      A: path=\"datastore/librepocket_privilege_bridge.preferences_pb.tmp\" (Raw: \"datastore/librepocket_privilege_bridge.preferences_pb.tmp\")' \\\n"
+            "              '    E: exclude' \\\n"
+            "              '      A: domain=\"file\" (Raw: \"file\")' \\\n"
+            "              '      A: path=\"datastore/librepocket_shizuku_grant.preferences_pb\" (Raw: \"datastore/librepocket_shizuku_grant.preferences_pb\")' \\\n"
+            "              '    E: exclude' \\\n"
+            "              '      A: domain=\"file\" (Raw: \"file\")' \\\n"
+            "              '      A: path=\"datastore/librepocket_shizuku_grant.preferences_pb.tmp\" (Raw: \"datastore/librepocket_shizuku_grant.preferences_pb.tmp\")' \\\n"
             "              '    E: exclude (line=7)' \\\n"
             "              '      A: domain=\"file\" (Raw: \"file\")' \\\n"
             "              '      A: path=\"librepocket_keysets\" (Raw: \"librepocket_keysets\")' \\\n"
@@ -693,6 +777,18 @@ class ApkPolicyHarness(unittest.TestCase):
             "              '    E: exclude' \\\n"
             "              '      A: domain=\"sharedpref\" (Raw: \"sharedpref\")' \\\n"
             "              '      A: path=\"assistant_role.xml\" (Raw: \"assistant_role.xml\")' \\\n"
+            "              '    E: exclude' \\\n"
+            "              '      A: domain=\"file\" (Raw: \"file\")' \\\n"
+            "              '      A: path=\"datastore/librepocket_privilege_bridge.preferences_pb\" (Raw: \"datastore/librepocket_privilege_bridge.preferences_pb\")' \\\n"
+            "              '    E: exclude' \\\n"
+            "              '      A: domain=\"file\" (Raw: \"file\")' \\\n"
+            "              '      A: path=\"datastore/librepocket_privilege_bridge.preferences_pb.tmp\" (Raw: \"datastore/librepocket_privilege_bridge.preferences_pb.tmp\")' \\\n"
+            "              '    E: exclude' \\\n"
+            "              '      A: domain=\"file\" (Raw: \"file\")' \\\n"
+            "              '      A: path=\"datastore/librepocket_shizuku_grant.preferences_pb\" (Raw: \"datastore/librepocket_shizuku_grant.preferences_pb\")' \\\n"
+            "              '    E: exclude' \\\n"
+            "              '      A: domain=\"file\" (Raw: \"file\")' \\\n"
+            "              '      A: path=\"datastore/librepocket_shizuku_grant.preferences_pb.tmp\" (Raw: \"datastore/librepocket_shizuku_grant.preferences_pb.tmp\")' \\\n"
             "              '    E: exclude (line=13)' \\\n"
             "              '      A: domain=\"file\" (Raw: \"file\")' \\\n"
             "              '      A: path=\"librepocket_keysets\" (Raw: \"librepocket_keysets\")' \\\n"
@@ -718,11 +814,23 @@ class ApkPolicyHarness(unittest.TestCase):
             "              '  E: exclude' \\\n"
             "              '    A: domain=\"sharedpref\" (Raw: \"sharedpref\")' \\\n"
             "              '    A: path=\"assistant_role.xml\" (Raw: \"assistant_role.xml\")' \\\n"
+            "              '  E: exclude' \\\n"
+            "              '    A: domain=\"file\" (Raw: \"file\")' \\\n"
+            "              '    A: path=\"datastore/librepocket_privilege_bridge.preferences_pb\" (Raw: \"datastore/librepocket_privilege_bridge.preferences_pb\")' \\\n"
+            "              '  E: exclude' \\\n"
+            "              '    A: domain=\"file\" (Raw: \"file\")' \\\n"
+            "              '    A: path=\"datastore/librepocket_privilege_bridge.preferences_pb.tmp\" (Raw: \"datastore/librepocket_privilege_bridge.preferences_pb.tmp\")' \\\n"
+            "              '  E: exclude' \\\n"
+            "              '    A: domain=\"file\" (Raw: \"file\")' \\\n"
+            "              '    A: path=\"datastore/librepocket_shizuku_grant.preferences_pb\" (Raw: \"datastore/librepocket_shizuku_grant.preferences_pb\")' \\\n"
+            "              '  E: exclude' \\\n"
+            "              '    A: domain=\"file\" (Raw: \"file\")' \\\n"
+            "              '    A: path=\"datastore/librepocket_shizuku_grant.preferences_pb.tmp\" (Raw: \"datastore/librepocket_shizuku_grant.preferences_pb.tmp\")' \\\n"
             "              '  E: exclude (line=6)' \\\n"
             "              '    A: domain=\"file\" (Raw: \"file\")' \\\n"
             "              '    A: path=\"librepocket_keysets\" (Raw: \"librepocket_keysets\")'\n"
             "          fi ;;\n"
-            "        *)  # *)  # ok (default): exactly the REQUIRED + DEVICE-BOUND set under\n"
+            "        *)  # ok (default): exactly the REQUIRED + DEVICE-BOUND set under\n"
             "            # both roots, so the default artifacts stay positive\n"
             "            # controls for the compiled-bytes authority\n"
             "          if [ \"${MEMBER}\" = \"res/xml/backup_rules.xml\" ]; then\n"
@@ -743,6 +851,18 @@ class ApkPolicyHarness(unittest.TestCase):
             "              '  E: exclude' \\\n"
             "              '    A: domain=\"sharedpref\" (Raw: \"sharedpref\")' \\\n"
             "              '    A: path=\"assistant_role.xml\" (Raw: \"assistant_role.xml\")' \\\n"
+            "              '  E: exclude' \\\n"
+            "              '    A: domain=\"file\" (Raw: \"file\")' \\\n"
+            "              '    A: path=\"datastore/librepocket_privilege_bridge.preferences_pb\" (Raw: \"datastore/librepocket_privilege_bridge.preferences_pb\")' \\\n"
+            "              '  E: exclude' \\\n"
+            "              '    A: domain=\"file\" (Raw: \"file\")' \\\n"
+            "              '    A: path=\"datastore/librepocket_privilege_bridge.preferences_pb.tmp\" (Raw: \"datastore/librepocket_privilege_bridge.preferences_pb.tmp\")' \\\n"
+            "              '  E: exclude' \\\n"
+            "              '    A: domain=\"file\" (Raw: \"file\")' \\\n"
+            "              '    A: path=\"datastore/librepocket_shizuku_grant.preferences_pb\" (Raw: \"datastore/librepocket_shizuku_grant.preferences_pb\")' \\\n"
+            "              '  E: exclude' \\\n"
+            "              '    A: domain=\"file\" (Raw: \"file\")' \\\n"
+            "              '    A: path=\"datastore/librepocket_shizuku_grant.preferences_pb.tmp\" (Raw: \"datastore/librepocket_shizuku_grant.preferences_pb.tmp\")' \\\n"
             "              '  E: exclude (line=6)' \\\n"
             "              '    A: domain=\"file\" (Raw: \"file\")' \\\n"
             "              '    A: path=\"librepocket_keysets\" (Raw: \"librepocket_keysets\")'\n"
@@ -765,6 +885,18 @@ class ApkPolicyHarness(unittest.TestCase):
             "              '    E: exclude' \\\n"
             "              '      A: domain=\"sharedpref\" (Raw: \"sharedpref\")' \\\n"
             "              '      A: path=\"assistant_role.xml\" (Raw: \"assistant_role.xml\")' \\\n"
+            "              '    E: exclude' \\\n"
+            "              '      A: domain=\"file\" (Raw: \"file\")' \\\n"
+            "              '      A: path=\"datastore/librepocket_privilege_bridge.preferences_pb\" (Raw: \"datastore/librepocket_privilege_bridge.preferences_pb\")' \\\n"
+            "              '    E: exclude' \\\n"
+            "              '      A: domain=\"file\" (Raw: \"file\")' \\\n"
+            "              '      A: path=\"datastore/librepocket_privilege_bridge.preferences_pb.tmp\" (Raw: \"datastore/librepocket_privilege_bridge.preferences_pb.tmp\")' \\\n"
+            "              '    E: exclude' \\\n"
+            "              '      A: domain=\"file\" (Raw: \"file\")' \\\n"
+            "              '      A: path=\"datastore/librepocket_shizuku_grant.preferences_pb\" (Raw: \"datastore/librepocket_shizuku_grant.preferences_pb\")' \\\n"
+            "              '    E: exclude' \\\n"
+            "              '      A: domain=\"file\" (Raw: \"file\")' \\\n"
+            "              '      A: path=\"datastore/librepocket_shizuku_grant.preferences_pb.tmp\" (Raw: \"datastore/librepocket_shizuku_grant.preferences_pb.tmp\")' \\\n"
             "              '    E: exclude (line=7)' \\\n"
             "              '      A: domain=\"file\" (Raw: \"file\")' \\\n"
             "              '      A: path=\"librepocket_keysets\" (Raw: \"librepocket_keysets\")' \\\n"
@@ -784,6 +916,18 @@ class ApkPolicyHarness(unittest.TestCase):
             "              '    E: exclude' \\\n"
             "              '      A: domain=\"sharedpref\" (Raw: \"sharedpref\")' \\\n"
             "              '      A: path=\"assistant_role.xml\" (Raw: \"assistant_role.xml\")' \\\n"
+            "              '    E: exclude' \\\n"
+            "              '      A: domain=\"file\" (Raw: \"file\")' \\\n"
+            "              '      A: path=\"datastore/librepocket_privilege_bridge.preferences_pb\" (Raw: \"datastore/librepocket_privilege_bridge.preferences_pb\")' \\\n"
+            "              '    E: exclude' \\\n"
+            "              '      A: domain=\"file\" (Raw: \"file\")' \\\n"
+            "              '      A: path=\"datastore/librepocket_privilege_bridge.preferences_pb.tmp\" (Raw: \"datastore/librepocket_privilege_bridge.preferences_pb.tmp\")' \\\n"
+            "              '    E: exclude' \\\n"
+            "              '      A: domain=\"file\" (Raw: \"file\")' \\\n"
+            "              '      A: path=\"datastore/librepocket_shizuku_grant.preferences_pb\" (Raw: \"datastore/librepocket_shizuku_grant.preferences_pb\")' \\\n"
+            "              '    E: exclude' \\\n"
+            "              '      A: domain=\"file\" (Raw: \"file\")' \\\n"
+            "              '      A: path=\"datastore/librepocket_shizuku_grant.preferences_pb.tmp\" (Raw: \"datastore/librepocket_shizuku_grant.preferences_pb.tmp\")' \\\n"
             "              '    E: exclude (line=13)' \\\n"
             "              '      A: domain=\"file\" (Raw: \"file\")' \\\n"
             "              '      A: path=\"librepocket_keysets\" (Raw: \"librepocket_keysets\")'\n"
@@ -955,6 +1099,920 @@ class ApkPolicyHarness(unittest.TestCase):
             "            '    E: service (line=4)' \\\n"
             "            '      A: android:name=\"decoy.Service\" (Raw: \"decoy.Service\")' \\\n"
             "            '      A: android:debuggable(0x0101000f)=(type 0x12)0xffffffff' ;;\n"
+            "        shizuku-ok)\n"
+            "          # Realistic github manifest excerpt: benign integer attrs\n"
+            "          # (type 0x10), InitializationProvider, Shizuku meta-data,\n"
+            "          # and ShizukuProvider guarded by INTERACT_ACROSS_USERS_FULL.\n"
+            "          # The manifest root carries the plain package attribute aapt\n"
+            "          # prints on the real github APK.\n"
+            "          printf '%s\\n' 'E: manifest' \\\n"
+            "            '  A: package=\"dev.librepocket.agent.github\"' \\\n"
+            "            '  A: android:versionCode(0x0101021b)=(type 0x10)0x1' \\\n"
+            "            '  E: application' \\\n"
+            "            '    A: android:fullBackupContent(0x010104eb)=@0x7f010000' \\\n"
+            "            '    A: android:dataExtractionRules(0x0101063e)=@0x7f010001' \\\n"
+            "            '    A: android:networkSecurityConfig(0x01010527)=@0x7f010002' \\\n"
+            "            '    E: meta-data (line=2)' \\\n"
+            "            '      A: android:name(0x01010003)=\"moe.shizuku.client.V3_SUPPORT\" (Raw: \"moe.shizuku.client.V3_SUPPORT\")' \\\n"
+            "            '      A: android:value(0x01010024)=(type 0x12)0xffffffff' \\\n"
+            "            '    E: provider (line=3)' \\\n"
+            "            '      A: android:name(0x01010003)=\"androidx.startup.InitializationProvider\" (Raw: \"androidx.startup.InitializationProvider\")' \\\n"
+            "            '      A: android:exported(0x01010010)=(type 0x12)0x0' \\\n"
+            "            '      A: android:authorities(0x01010018)=\"dev.librepocket.agent.github.androidx-startup\" (Raw: \"dev.librepocket.agent.github.androidx-startup\")' \\\n"
+            "            '      A: android:initOrder(0x010103a7)=(type 0x10)0x64' \\\n"
+            "            '    E: provider (line=4)' \\\n"
+            "            '      A: android:name(0x01010003)=\"rikka.shizuku.ShizukuProvider\" (Raw: \"rikka.shizuku.ShizukuProvider\")' \\\n"
+            "            '      A: android:permission(0x01010006)=\"android.permission.INTERACT_ACROSS_USERS_FULL\" (Raw: \"android.permission.INTERACT_ACROSS_USERS_FULL\")' \\\n"
+            "            '      A: android:enabled(0x0101000e)=(type 0x12)0xffffffff' \\\n"
+            "            '      A: android:exported(0x01010010)=(type 0x12)0xffffffff' \\\n"
+            "            '      A: android:multiprocess(0x01010013)=(type 0x12)0x0' \\\n"
+            "            '      A: android:authorities(0x01010018)=\"dev.librepocket.agent.github.shizuku\" (Raw: \"dev.librepocket.agent.github.shizuku\")' ;;\n"
+            "        shizuku-ok-app-enabled-false)\n"
+            "          # Re-review #11 Finding 3: the merged <application> carries its\n"
+            "          # OWN android:enabled=false (4-space attribute level) while the\n"
+            "          # ShizukuProvider block is UNCHANGED compliant - the Android\n"
+            "          # <provider> spec requires BOTH application and provider to be\n"
+            "          # enabled, so no provider can be instantiated and the binder\n"
+            "          # surface is dead on arrival. The binding gate +\n"
+            "          # InitializationProvider rows stay so the fixture is realistic.\n"
+            "          printf '%s\\n' 'E: manifest' \\\n"
+            "            '  A: package=\"dev.librepocket.agent.github\"' \\\n"
+            "            '  A: android:versionCode(0x0101021b)=(type 0x10)0x1' \\\n"
+            "            '  E: application' \\\n"
+            "            '    A: android:fullBackupContent(0x010104eb)=@0x7f010000' \\\n"
+            "            '    A: android:dataExtractionRules(0x0101063e)=@0x7f010001' \\\n"
+            "            '    A: android:networkSecurityConfig(0x01010527)=@0x7f010002' \\\n"
+            "            '    A: android:enabled(0x0101000e)=(type 0x12)0x0' \\\n"
+            "            '    E: meta-data (line=2)' \\\n"
+            "            '      A: android:name(0x01010003)=\"moe.shizuku.client.V3_SUPPORT\" (Raw: \"moe.shizuku.client.V3_SUPPORT\")' \\\n"
+            "            '      A: android:value(0x01010024)=(type 0x12)0xffffffff' \\\n"
+            "            '    E: provider (line=3)' \\\n"
+            "            '      A: android:name(0x01010003)=\"androidx.startup.InitializationProvider\" (Raw: \"androidx.startup.InitializationProvider\")' \\\n"
+            "            '      A: android:exported(0x01010010)=(type 0x12)0x0' \\\n"
+            "            '      A: android:authorities(0x01010018)=\"dev.librepocket.agent.github.androidx-startup\" (Raw: \"dev.librepocket.agent.github.androidx-startup\")' \\\n"
+            "            '      A: android:initOrder(0x010103a7)=(type 0x10)0x64' \\\n"
+            "            '    E: provider (line=4)' \\\n"
+            "            '      A: android:name(0x01010003)=\"rikka.shizuku.ShizukuProvider\" (Raw: \"rikka.shizuku.ShizukuProvider\")' \\\n"
+            "            '      A: android:permission(0x01010006)=\"android.permission.INTERACT_ACROSS_USERS_FULL\" (Raw: \"android.permission.INTERACT_ACROSS_USERS_FULL\")' \\\n"
+            "            '      A: android:enabled(0x0101000e)=(type 0x12)0xffffffff' \\\n"
+            "            '      A: android:exported(0x01010010)=(type 0x12)0xffffffff' \\\n"
+            "            '      A: android:multiprocess(0x01010013)=(type 0x12)0x0' \\\n"
+            "            '      A: android:authorities(0x01010018)=\"dev.librepocket.agent.github.shizuku\" (Raw: \"dev.librepocket.agent.github.shizuku\")' ;;\n"
+            "        shizuku-ok-app-enabled-true)\n"
+            "          # Re-review #11 Finding 3: same application-level own attribute\n"
+            "          # pinned to the exact compiled boolean true - must PASS with the\n"
+            "          # provider block unchanged.\n"
+            "          printf '%s\\n' 'E: manifest' \\\n"
+            "            '  A: package=\"dev.librepocket.agent.github\"' \\\n"
+            "            '  A: android:versionCode(0x0101021b)=(type 0x10)0x1' \\\n"
+            "            '  E: application' \\\n"
+            "            '    A: android:fullBackupContent(0x010104eb)=@0x7f010000' \\\n"
+            "            '    A: android:dataExtractionRules(0x0101063e)=@0x7f010001' \\\n"
+            "            '    A: android:networkSecurityConfig(0x01010527)=@0x7f010002' \\\n"
+            "            '    A: android:enabled(0x0101000e)=(type 0x12)0xffffffff' \\\n"
+            "            '    E: meta-data (line=2)' \\\n"
+            "            '      A: android:name(0x01010003)=\"moe.shizuku.client.V3_SUPPORT\" (Raw: \"moe.shizuku.client.V3_SUPPORT\")' \\\n"
+            "            '      A: android:value(0x01010024)=(type 0x12)0xffffffff' \\\n"
+            "            '    E: provider (line=3)' \\\n"
+            "            '      A: android:name(0x01010003)=\"androidx.startup.InitializationProvider\" (Raw: \"androidx.startup.InitializationProvider\")' \\\n"
+            "            '      A: android:exported(0x01010010)=(type 0x12)0x0' \\\n"
+            "            '      A: android:authorities(0x01010018)=\"dev.librepocket.agent.github.androidx-startup\" (Raw: \"dev.librepocket.agent.github.androidx-startup\")' \\\n"
+            "            '      A: android:initOrder(0x010103a7)=(type 0x10)0x64' \\\n"
+            "            '    E: provider (line=4)' \\\n"
+            "            '      A: android:name(0x01010003)=\"rikka.shizuku.ShizukuProvider\" (Raw: \"rikka.shizuku.ShizukuProvider\")' \\\n"
+            "            '      A: android:permission(0x01010006)=\"android.permission.INTERACT_ACROSS_USERS_FULL\" (Raw: \"android.permission.INTERACT_ACROSS_USERS_FULL\")' \\\n"
+            "            '      A: android:enabled(0x0101000e)=(type 0x12)0xffffffff' \\\n"
+            "            '      A: android:exported(0x01010010)=(type 0x12)0xffffffff' \\\n"
+            "            '      A: android:multiprocess(0x01010013)=(type 0x12)0x0' \\\n"
+            "            '      A: android:authorities(0x01010018)=\"dev.librepocket.agent.github.shizuku\" (Raw: \"dev.librepocket.agent.github.shizuku\")' ;;\n"
+            "        shizuku-ok-app-enabled-ref)\n"
+            "          # Re-review #11 Finding 3: a resource reference for the\n"
+            "          # application-level android:enabled is not provably true at the\n"
+            "          # artifact level - @0x... passes through _xmltree_attr_value\n"
+            "          # verbatim and fails closed against the exact compiled boolean.\n"
+            "          printf '%s\\n' 'E: manifest' \\\n"
+            "            '  A: package=\"dev.librepocket.agent.github\"' \\\n"
+            "            '  A: android:versionCode(0x0101021b)=(type 0x10)0x1' \\\n"
+            "            '  E: application' \\\n"
+            "            '    A: android:fullBackupContent(0x010104eb)=@0x7f010000' \\\n"
+            "            '    A: android:dataExtractionRules(0x0101063e)=@0x7f010001' \\\n"
+            "            '    A: android:networkSecurityConfig(0x01010527)=@0x7f010002' \\\n"
+            "            '    A: android:enabled(0x0101000e)=@0x7f010099' \\\n"
+            "            '    E: meta-data (line=2)' \\\n"
+            "            '      A: android:name(0x01010003)=\"moe.shizuku.client.V3_SUPPORT\" (Raw: \"moe.shizuku.client.V3_SUPPORT\")' \\\n"
+            "            '      A: android:value(0x01010024)=(type 0x12)0xffffffff' \\\n"
+            "            '    E: provider (line=3)' \\\n"
+            "            '      A: android:name(0x01010003)=\"androidx.startup.InitializationProvider\" (Raw: \"androidx.startup.InitializationProvider\")' \\\n"
+            "            '      A: android:exported(0x01010010)=(type 0x12)0x0' \\\n"
+            "            '      A: android:authorities(0x01010018)=\"dev.librepocket.agent.github.androidx-startup\" (Raw: \"dev.librepocket.agent.github.androidx-startup\")' \\\n"
+            "            '      A: android:initOrder(0x010103a7)=(type 0x10)0x64' \\\n"
+            "            '    E: provider (line=4)' \\\n"
+            "            '      A: android:name(0x01010003)=\"rikka.shizuku.ShizukuProvider\" (Raw: \"rikka.shizuku.ShizukuProvider\")' \\\n"
+            "            '      A: android:permission(0x01010006)=\"android.permission.INTERACT_ACROSS_USERS_FULL\" (Raw: \"android.permission.INTERACT_ACROSS_USERS_FULL\")' \\\n"
+            "            '      A: android:enabled(0x0101000e)=(type 0x12)0xffffffff' \\\n"
+            "            '      A: android:exported(0x01010010)=(type 0x12)0xffffffff' \\\n"
+            "            '      A: android:multiprocess(0x01010013)=(type 0x12)0x0' \\\n"
+            "            '      A: android:authorities(0x01010018)=\"dev.librepocket.agent.github.shizuku\" (Raw: \"dev.librepocket.agent.github.shizuku\")' ;;\n"
+            "        shizuku-ok-app-enabled-int-typed)\n"
+            "          # Re-review #11 Finding 3: a non-boolean typed encoding (integer\n"
+            "          # type 0x10) for the application-level android:enabled is not a\n"
+            "          # boolean at all - the decoder fails closed naming android:enabled.\n"
+            "          printf '%s\\n' 'E: manifest' \\\n"
+            "            '  A: package=\"dev.librepocket.agent.github\"' \\\n"
+            "            '  A: android:versionCode(0x0101021b)=(type 0x10)0x1' \\\n"
+            "            '  E: application' \\\n"
+            "            '    A: android:fullBackupContent(0x010104eb)=@0x7f010000' \\\n"
+            "            '    A: android:dataExtractionRules(0x0101063e)=@0x7f010001' \\\n"
+            "            '    A: android:networkSecurityConfig(0x01010527)=@0x7f010002' \\\n"
+            "            '    A: android:enabled(0x0101000e)=(type 0x10)0x1' \\\n"
+            "            '    E: meta-data (line=2)' \\\n"
+            "            '      A: android:name(0x01010003)=\"moe.shizuku.client.V3_SUPPORT\" (Raw: \"moe.shizuku.client.V3_SUPPORT\")' \\\n"
+            "            '      A: android:value(0x01010024)=(type 0x12)0xffffffff' \\\n"
+            "            '    E: provider (line=3)' \\\n"
+            "            '      A: android:name(0x01010003)=\"androidx.startup.InitializationProvider\" (Raw: \"androidx.startup.InitializationProvider\")' \\\n"
+            "            '      A: android:exported(0x01010010)=(type 0x12)0x0' \\\n"
+            "            '      A: android:authorities(0x01010018)=\"dev.librepocket.agent.github.androidx-startup\" (Raw: \"dev.librepocket.agent.github.androidx-startup\")' \\\n"
+            "            '      A: android:initOrder(0x010103a7)=(type 0x10)0x64' \\\n"
+            "            '    E: provider (line=4)' \\\n"
+            "            '      A: android:name(0x01010003)=\"rikka.shizuku.ShizukuProvider\" (Raw: \"rikka.shizuku.ShizukuProvider\")' \\\n"
+            "            '      A: android:permission(0x01010006)=\"android.permission.INTERACT_ACROSS_USERS_FULL\" (Raw: \"android.permission.INTERACT_ACROSS_USERS_FULL\")' \\\n"
+            "            '      A: android:enabled(0x0101000e)=(type 0x12)0xffffffff' \\\n"
+            "            '      A: android:exported(0x01010010)=(type 0x12)0xffffffff' \\\n"
+            "            '      A: android:multiprocess(0x01010013)=(type 0x12)0x0' \\\n"
+            "            '      A: android:authorities(0x01010018)=\"dev.librepocket.agent.github.shizuku\" (Raw: \"dev.librepocket.agent.github.shizuku\")' ;;\n"
+            "        shizuku-ok-app-enabled-decoy)\n"
+            "          # Re-review #11 Finding 3 (child-decoy isolation): the InitializationProvider\n"
+            "          # CHILD carries android:enabled=false at the 6-space child attribute\n"
+            "          # level - a CHILD attribute must never satisfy or trip the\n"
+            "          # application-level gate (exact own-indent isolation). The\n"
+            "          # application itself declares no enabled and stays compliant; the\n"
+            "          # provider-level gate does not require InitializationProvider to be\n"
+            "          # enabled (it is not heuristic-detected and not DEX-evidenced).\n"
+            "          printf '%s\\n' 'E: manifest' \\\n"
+            "            '  A: package=\"dev.librepocket.agent.github\"' \\\n"
+            "            '  A: android:versionCode(0x0101021b)=(type 0x10)0x1' \\\n"
+            "            '  E: application' \\\n"
+            "            '    A: android:fullBackupContent(0x010104eb)=@0x7f010000' \\\n"
+            "            '    A: android:dataExtractionRules(0x0101063e)=@0x7f010001' \\\n"
+            "            '    A: android:networkSecurityConfig(0x01010527)=@0x7f010002' \\\n"
+            "            '    E: meta-data (line=2)' \\\n"
+            "            '      A: android:name(0x01010003)=\"moe.shizuku.client.V3_SUPPORT\" (Raw: \"moe.shizuku.client.V3_SUPPORT\")' \\\n"
+            "            '      A: android:value(0x01010024)=(type 0x12)0xffffffff' \\\n"
+            "            '    E: provider (line=3)' \\\n"
+            "            '      A: android:name(0x01010003)=\"androidx.startup.InitializationProvider\" (Raw: \"androidx.startup.InitializationProvider\")' \\\n"
+            "            '      A: android:enabled(0x0101000e)=(type 0x12)0x0' \\\n"
+            "            '      A: android:exported(0x01010010)=(type 0x12)0x0' \\\n"
+            "            '      A: android:authorities(0x01010018)=\"dev.librepocket.agent.github.androidx-startup\" (Raw: \"dev.librepocket.agent.github.androidx-startup\")' \\\n"
+            "            '      A: android:initOrder(0x010103a7)=(type 0x10)0x64' \\\n"
+            "            '    E: provider (line=4)' \\\n"
+            "            '      A: android:name(0x01010003)=\"rikka.shizuku.ShizukuProvider\" (Raw: \"rikka.shizuku.ShizukuProvider\")' \\\n"
+            "            '      A: android:permission(0x01010006)=\"android.permission.INTERACT_ACROSS_USERS_FULL\" (Raw: \"android.permission.INTERACT_ACROSS_USERS_FULL\")' \\\n"
+            "            '      A: android:enabled(0x0101000e)=(type 0x12)0xffffffff' \\\n"
+            "            '      A: android:exported(0x01010010)=(type 0x12)0xffffffff' \\\n"
+            "            '      A: android:multiprocess(0x01010013)=(type 0x12)0x0' \\\n"
+            "            '      A: android:authorities(0x01010018)=\"dev.librepocket.agent.github.shizuku\" (Raw: \"dev.librepocket.agent.github.shizuku\")' ;;\n"
+            "        shizuku-arbitrary-fqn)\n"
+            "          # Arbitrary, non-official FQN detected via the name\n"
+            "          # heuristic only (ShizukuProvider token in\n"
+            "          # android:name); the authority carries no Shizuku\n"
+            "          # token. Minimal application: just the one provider,\n"
+            "          # FULL permission/enabled/exported/multiprocess bindings.\n"
+            "          printf '%s\\n' 'E: manifest' \\\n"
+            "            '  A: package=\"dev.librepocket.agent.github\"' \\\n"
+            "            '  A: android:versionCode(0x0101021b)=(type 0x10)0x1' \\\n"
+            "            '  E: application' \\\n"
+            "            '    A: android:fullBackupContent(0x010104eb)=@0x7f010000' \\\n"
+            "            '    A: android:dataExtractionRules(0x0101063e)=@0x7f010001' \\\n"
+            "            '    A: android:networkSecurityConfig(0x01010527)=@0x7f010002' \\\n"
+            "            '    E: provider (line=1)' \\\n"
+            "            '      A: android:name(0x01010003)=\"dev.librepocket.agent.github.GhostShizukuProvider\" (Raw: \"dev.librepocket.agent.github.GhostShizukuProvider\")' \\\n"
+            "            '      A: android:permission(0x01010006)=\"android.permission.INTERACT_ACROSS_USERS_FULL\" (Raw: \"android.permission.INTERACT_ACROSS_USERS_FULL\")' \\\n"
+            "            '      A: android:enabled(0x0101000e)=(type 0x12)0xffffffff' \\\n"
+            "            '      A: android:exported(0x01010010)=(type 0x12)0xffffffff' \\\n"
+            "            '      A: android:multiprocess(0x01010013)=(type 0x12)0x0' \\\n"
+            "            '      A: android:authorities(0x01010018)=\"dev.librepocket.agent.github.ghost\" (Raw: \"dev.librepocket.agent.github.ghost\")' ;;\n"
+            "        shizuku-ok-two)\n"
+            "          # Like shizuku-ok but with TWO ShizukuProvider elements\n"
+            "          # (two distinct canonical names, both detected as\n"
+            "          # ShizukuProviders); --expect-provider required must\n"
+            "          # fail closed with the found-count message.\n"
+            "          printf '%s\\n' 'E: manifest' \\\n"
+            "            '  A: android:versionCode(0x0101021b)=(type 0x10)0x1' \\\n"
+            "            '  E: application' \\\n"
+            "            '    A: android:fullBackupContent(0x010104eb)=@0x7f010000' \\\n"
+            "            '    A: android:dataExtractionRules(0x0101063e)=@0x7f010001' \\\n"
+            "            '    A: android:networkSecurityConfig(0x01010527)=@0x7f010002' \\\n"
+            "            '    E: provider (line=3)' \\\n"
+            "            '      A: android:name(0x01010003)=\"rikka.shizuku.ShizukuProvider\" (Raw: \"rikka.shizuku.ShizukuProvider\")' \\\n"
+            "            '      A: android:permission(0x01010006)=\"android.permission.INTERACT_ACROSS_USERS_FULL\" (Raw: \"android.permission.INTERACT_ACROSS_USERS_FULL\")' \\\n"
+            "            '      A: android:enabled(0x0101000e)=(type 0x12)0xffffffff' \\\n"
+            "            '      A: android:exported(0x01010010)=(type 0x12)0xffffffff' \\\n"
+            "            '      A: android:multiprocess(0x01010013)=(type 0x12)0x0' \\\n"
+            "            '      A: android:authorities(0x01010018)=\"dev.librepocket.agent.github.shizuku\" (Raw: \"dev.librepocket.agent.github.shizuku\")' \\\n"
+            "            '    E: provider (line=4)' \\\n"
+            "            '      A: android:name(0x01010003)=\"dev.librepocket.internal.ShizukuProvider\" (Raw: \"dev.librepocket.internal.ShizukuProvider\")' \\\n"
+            "            '      A: android:permission(0x01010006)=\"android.permission.INTERACT_ACROSS_USERS_FULL\" (Raw: \"android.permission.INTERACT_ACROSS_USERS_FULL\")' \\\n"
+            "            '      A: android:enabled(0x0101000e)=(type 0x12)0xffffffff' \\\n"
+            "            '      A: android:exported(0x01010010)=(type 0x12)0xffffffff' \\\n"
+            "            '      A: android:multiprocess(0x01010013)=(type 0x12)0x0' \\\n"
+            "            '      A: android:authorities(0x01010018)=\"dev.librepocket.agent.github.shizuku-two\" (Raw: \"dev.librepocket.agent.github.shizuku-two\")' ;;\n"
+            "        shizuku-ok-disabled)\n"
+            "          # Re-review #10 Finding 2: the compiled android:enabled=false must\n"
+            "          # FAIL the github artifact gate - the Shizuku binder cannot reach\n"
+            "          # a disabled provider. Every other attribute is compliant.\n"
+            "          printf '%s\\n' 'E: manifest' \\\n"
+            "            '  A: android:versionCode(0x0101021b)=(type 0x10)0x1' \\\n"
+            "            '  E: application' \\\n"
+            "            '    A: android:fullBackupContent(0x010104eb)=@0x7f010000' \\\n"
+            "            '    A: android:dataExtractionRules(0x0101063e)=@0x7f010001' \\\n"
+            "            '    A: android:networkSecurityConfig(0x01010527)=@0x7f010002' \\\n"
+            "            '    E: provider (line=4)' \\\n"
+            "            '      A: android:name(0x01010003)=\"rikka.shizuku.ShizukuProvider\" (Raw: \"rikka.shizuku.ShizukuProvider\")' \\\n"
+            "            '      A: android:permission(0x01010006)=\"android.permission.INTERACT_ACROSS_USERS_FULL\" (Raw: \"android.permission.INTERACT_ACROSS_USERS_FULL\")' \\\n"
+            "            '      A: android:enabled(0x0101000e)=(type 0x12)0x0' \\\n"
+            "            '      A: android:exported(0x01010010)=(type 0x12)0xffffffff' \\\n"
+            "            '      A: android:multiprocess(0x01010013)=(type 0x12)0x0' \\\n"
+            "            '      A: android:authorities(0x01010018)=\"dev.librepocket.agent.github.shizuku\" (Raw: \"dev.librepocket.agent.github.shizuku\")' ;;\n"
+            "        shizuku-ok-enabled-ref)\n"
+            "          # Re-review #10 Finding 2: a resource reference for android:enabled\n"
+            "          # is not provably true at the artifact level - @0x... passes through\n"
+            "          # verbatim and fails closed against the exact compiled boolean.\n"
+            "          printf '%s\\n' 'E: manifest' \\\n"
+            "            '  A: android:versionCode(0x0101021b)=(type 0x10)0x1' \\\n"
+            "            '  E: application' \\\n"
+            "            '    A: android:fullBackupContent(0x010104eb)=@0x7f010000' \\\n"
+            "            '    A: android:dataExtractionRules(0x0101063e)=@0x7f010001' \\\n"
+            "            '    A: android:networkSecurityConfig(0x01010527)=@0x7f010002' \\\n"
+            "            '    E: provider (line=4)' \\\n"
+            "            '      A: android:name(0x01010003)=\"rikka.shizuku.ShizukuProvider\" (Raw: \"rikka.shizuku.ShizukuProvider\")' \\\n"
+            "            '      A: android:permission(0x01010006)=\"android.permission.INTERACT_ACROSS_USERS_FULL\" (Raw: \"android.permission.INTERACT_ACROSS_USERS_FULL\")' \\\n"
+            "            '      A: android:enabled(0x0101000e)=@0x7f010000' \\\n"
+            "            '      A: android:exported(0x01010010)=(type 0x12)0xffffffff' \\\n"
+            "            '      A: android:multiprocess(0x01010013)=(type 0x12)0x0' \\\n"
+            "            '      A: android:authorities(0x01010018)=\"dev.librepocket.agent.github.shizuku\" (Raw: \"dev.librepocket.agent.github.shizuku\")' ;;\n"
+            "        shizuku-ok-enabled-missing)\n"
+            "          # Re-review #10 Finding 2: the merged attribute absent entirely must\n"
+            "          # FAIL closed - the gate never guesses the platform default for the\n"
+            "          # binder channel.\n"
+            "          printf '%s\\n' 'E: manifest' \\\n"
+            "            '  A: android:versionCode(0x0101021b)=(type 0x10)0x1' \\\n"
+            "            '  E: application' \\\n"
+            "            '    A: android:fullBackupContent(0x010104eb)=@0x7f010000' \\\n"
+            "            '    A: android:dataExtractionRules(0x0101063e)=@0x7f010001' \\\n"
+            "            '    A: android:networkSecurityConfig(0x01010527)=@0x7f010002' \\\n"
+            "            '    E: provider (line=4)' \\\n"
+            "            '      A: android:name(0x01010003)=\"rikka.shizuku.ShizukuProvider\" (Raw: \"rikka.shizuku.ShizukuProvider\")' \\\n"
+            "            '      A: android:permission(0x01010006)=\"android.permission.INTERACT_ACROSS_USERS_FULL\" (Raw: \"android.permission.INTERACT_ACROSS_USERS_FULL\")' \\\n"
+            "            '      A: android:exported(0x01010010)=(type 0x12)0xffffffff' \\\n"
+            "            '      A: android:multiprocess(0x01010013)=(type 0x12)0x0' \\\n"
+            "            '      A: android:authorities(0x01010018)=\"dev.librepocket.agent.github.shizuku\" (Raw: \"dev.librepocket.agent.github.shizuku\")' ;;\n"
+            "        shizuku-ok-wrong-authority)\n"
+            "          # Re-review #10 Finding 3: the merged authority must be EXACTLY\n"
+            "          # <package>.shizuku - the binder resolves the provider by that\n"
+            "          # authority. A rewritten near-miss cannot be reached.\n"
+            "          printf '%s\\n' 'E: manifest' \\\n"
+            "            '  A: android:versionCode(0x0101021b)=(type 0x10)0x1' \\\n"
+            "            '  E: application' \\\n"
+            "            '    A: android:fullBackupContent(0x010104eb)=@0x7f010000' \\\n"
+            "            '    A: android:dataExtractionRules(0x0101063e)=@0x7f010001' \\\n"
+            "            '    A: android:networkSecurityConfig(0x01010527)=@0x7f010002' \\\n"
+            "            '    E: provider (line=4)' \\\n"
+            "            '      A: android:name(0x01010003)=\"rikka.shizuku.ShizukuProvider\" (Raw: \"rikka.shizuku.ShizukuProvider\")' \\\n"
+            "            '      A: android:permission(0x01010006)=\"android.permission.INTERACT_ACROSS_USERS_FULL\" (Raw: \"android.permission.INTERACT_ACROSS_USERS_FULL\")' \\\n"
+            "            '      A: android:enabled(0x0101000e)=(type 0x12)0xffffffff' \\\n"
+            "            '      A: android:exported(0x01010010)=(type 0x12)0xffffffff' \\\n"
+            "            '      A: android:multiprocess(0x01010013)=(type 0x12)0x0' \\\n"
+            "            '      A: android:authorities(0x01010018)=\"dev.librepocket.agent.github.notshizuku\" (Raw: \"dev.librepocket.agent.github.notshizuku\")' ;;\n"
+            "        shizuku-ok-authority-missing)\n"
+            "          # Re-review #10 Finding 3: authority attribute ABSENT - the name\n"
+            "          # heuristic still detects the provider, so the authorities\n"
+            "          # presence minimum must fire first and fails closed\n"
+            "          # (official exact pin is never reached for the missing case).\n"
+            "          printf '%s\\n' 'E: manifest' \\\n"
+            "            '  A: android:versionCode(0x0101021b)=(type 0x10)0x1' \\\n"
+            "            '  E: application' \\\n"
+            "            '    A: android:fullBackupContent(0x010104eb)=@0x7f010000' \\\n"
+            "            '    A: android:dataExtractionRules(0x0101063e)=@0x7f010001' \\\n"
+            "            '    A: android:networkSecurityConfig(0x01010527)=@0x7f010002' \\\n"
+            "            '    E: provider (line=4)' \\\n"
+            "            '      A: android:name(0x01010003)=\"rikka.shizuku.ShizukuProvider\" (Raw: \"rikka.shizuku.ShizukuProvider\")' \\\n"
+            "            '      A: android:permission(0x01010006)=\"android.permission.INTERACT_ACROSS_USERS_FULL\" (Raw: \"android.permission.INTERACT_ACROSS_USERS_FULL\")' \\\n"
+            "            '      A: android:enabled(0x0101000e)=(type 0x12)0xffffffff' \\\n"
+            "            '      A: android:exported(0x01010010)=(type 0x12)0xffffffff' \\\n"
+            "            '      A: android:multiprocess(0x01010013)=(type 0x12)0x0' ;;\n"
+            "        shizuku-ok-authority-extra)\n"
+            "          # Re-review #10 Finding 3: a multi-authority list carrying the real\n"
+            "          # channel is an exact-string violation - the binder binds exactly\n"
+            "          # one authority and the contract is exact-value.\n"
+            "          printf '%s\\n' 'E: manifest' \\\n"
+            "            '  A: android:versionCode(0x0101021b)=(type 0x10)0x1' \\\n"
+            "            '  E: application' \\\n"
+            "            '    A: android:fullBackupContent(0x010104eb)=@0x7f010000' \\\n"
+            "            '    A: android:dataExtractionRules(0x0101063e)=@0x7f010001' \\\n"
+            "            '    A: android:networkSecurityConfig(0x01010527)=@0x7f010002' \\\n"
+            "            '    E: provider (line=4)' \\\n"
+            "            '      A: android:name(0x01010003)=\"rikka.shizuku.ShizukuProvider\" (Raw: \"rikka.shizuku.ShizukuProvider\")' \\\n"
+            "            '      A: android:permission(0x01010006)=\"android.permission.INTERACT_ACROSS_USERS_FULL\" (Raw: \"android.permission.INTERACT_ACROSS_USERS_FULL\")' \\\n"
+            "            '      A: android:enabled(0x0101000e)=(type 0x12)0xffffffff' \\\n"
+            "            '      A: android:exported(0x01010010)=(type 0x12)0xffffffff' \\\n"
+            "            '      A: android:multiprocess(0x01010013)=(type 0x12)0x0' \\\n"
+            "            '      A: android:authorities(0x01010018)=\"dev.librepocket.agent.github.shizuku;dev.librepocket.agent.github.extra\" (Raw: \"dev.librepocket.agent.github.shizuku;dev.librepocket.agent.github.extra\")' ;;\n"
+            "        shizuku-bridge-compliant-authority-exact)\n"
+            "          # Re-review #10 Finding 3 (documented edge): a renamed DEX-evidenced\n"
+            "          # subclass whose authority IS EXACTLY <package>.shizuku - heuristic\n"
+            "          # -detected (authority ends .shizuku), so the exact-authority check\n"
+            "          # applies and PASSES. The DEX path stays unconstrained; both layers\n"
+            "          # green, exactly one surface.\n"
+            "          printf '%s\\n' 'E: manifest' \\\n"
+            "            '  A: package=\"dev.librepocket.agent.github\" (Raw: \"dev.librepocket.agent.github\")' \\\n"
+            "            '  E: application' \\\n"
+            "            '    A: android:fullBackupContent(0x010104eb)=@0x7f010000' \\\n"
+            "            '    A: android:dataExtractionRules(0x0101063e)=@0x7f010001' \\\n"
+            "            '    A: android:networkSecurityConfig(0x01010527)=@0x7f010002' \\\n"
+            "            '    E: provider (line=4)' \\\n"
+            "            '      A: android:name(0x01010003)=\".Bridge\" (Raw: \".Bridge\")' \\\n"
+            "            '      A: android:permission(0x01010006)=\"android.permission.INTERACT_ACROSS_USERS_FULL\" (Raw: \"android.permission.INTERACT_ACROSS_USERS_FULL\")' \\\n"
+            "            '      A: android:enabled(0x0101000e)=(type 0x12)0xffffffff' \\\n"
+            "            '      A: android:exported(0x01010010)=(type 0x12)0xffffffff' \\\n"
+            "            '      A: android:multiprocess(0x01010013)=(type 0x12)0x0' \\\n"
+            "            '      A: android:authorities(0x01010018)=\"dev.librepocket.agent.github.shizuku\" (Raw: \"dev.librepocket.agent.github.shizuku\")' ;;\n"
+            "        shizuku-bridge-compliant-shizuku-suffix-wrong-package)\n"
+            "          # Re-review #10 Finding 3: a renamed subclass whose authority merely\n"
+            "          # ENDS in .shizuku but claims a foreign package is heuristic-detected\n"
+            "          # and must FAIL the exact-authority check.\n"
+            "          printf '%s\\n' 'E: manifest' \\\n"
+            "            '  A: package=\"dev.librepocket.agent.github\" (Raw: \"dev.librepocket.agent.github\")' \\\n"
+            "            '  E: application' \\\n"
+            "            '    A: android:fullBackupContent(0x010104eb)=@0x7f010000' \\\n"
+            "            '    A: android:dataExtractionRules(0x0101063e)=@0x7f010001' \\\n"
+            "            '    A: android:networkSecurityConfig(0x01010527)=@0x7f010002' \\\n"
+            "            '    E: provider (line=4)' \\\n"
+            "            '      A: android:name(0x01010003)=\".Bridge\" (Raw: \".Bridge\")' \\\n"
+            "            '      A: android:permission(0x01010006)=\"android.permission.INTERACT_ACROSS_USERS_FULL\" (Raw: \"android.permission.INTERACT_ACROSS_USERS_FULL\")' \\\n"
+            "            '      A: android:enabled(0x0101000e)=(type 0x12)0xffffffff' \\\n"
+            "            '      A: android:exported(0x01010010)=(type 0x12)0xffffffff' \\\n"
+            "            '      A: android:multiprocess(0x01010013)=(type 0x12)0x0' \\\n"
+            "            '      A: android:authorities(0x01010018)=\"com.other.agent.shizuku\" (Raw: \"com.other.agent.shizuku\")' ;;\n"
+            "        shizuku-bridge-weak)\n"
+            "          # Renamed renamed-ShizukuProvider injection:\n"
+            "          # com.librepocket.internal.Bridge extends\n"
+            "          # rikka.shizuku.ShizukuProvider but declares NO\n"
+            "          # android:permission and carries a non-.shizuku authority,\n"
+            "          # so only DEX evidence reveals it. github mode must\n"
+            "          # fail closed. Official provider NOT declared.\n"
+            "          printf '%s\\n' 'E: manifest' \\\n"
+            "            '  A: android:versionCode(0x0101021b)=(type 0x10)0x1' \\\n"
+            "            '  E: application' \\\n"
+            "            '    A: android:fullBackupContent(0x010104eb)=@0x7f010000' \\\n"
+            "            '    A: android:dataExtractionRules(0x0101063e)=@0x7f010001' \\\n"
+            "            '    A: android:networkSecurityConfig(0x01010527)=@0x7f010002' \\\n"
+            "            '    E: provider (line=4)' \\\n"
+            "            '      A: android:name(0x01010003)=\"com.librepocket.internal.Bridge\" (Raw: \"com.librepocket.internal.Bridge\")' \\\n"
+            "            '      A: android:exported(0x01010010)=(type 0x12)0xffffffff' \\\n"
+            "            '      A: android:authorities(0x01010018)=\"dev.librepocket.agent.github.bridge\" (Raw: \"dev.librepocket.agent.github.bridge\")' ;;\n"
+            "        shizuku-bridge-weak-relative)\n"
+            "          # Same injection declared with the .-relative spelling\n"
+            "          # (resolves inside the package); still no permission.\n"
+            "          printf '%s\\n' 'E: manifest' \\\n"
+            "            '  A: package=\"dev.librepocket.agent.github\" (Raw: \"dev.librepocket.agent.github\")' \\\n"
+            "            '  E: application' \\\n"
+            "            '    A: android:fullBackupContent(0x010104eb)=@0x7f010000' \\\n"
+            "            '    A: android:dataExtractionRules(0x0101063e)=@0x7f010001' \\\n"
+            "            '    A: android:networkSecurityConfig(0x01010527)=@0x7f010002' \\\n"
+            "            '    E: provider (line=4)' \\\n"
+            "            '      A: android:name(0x01010003)=\".Bridge\" (Raw: \".Bridge\")' \\\n"
+            "            '      A: android:exported(0x01010010)=(type 0x12)0xffffffff' \\\n"
+            "            '      A: android:authorities(0x01010018)=\"dev.librepocket.agent.github.bridge\" (Raw: \"dev.librepocket.agent.github.bridge\")' ;;\n"
+            "        shizuku-bridge-relative-positive)\n"
+            "          # Positive leading-dot control: the SAME .Bridge spelling\n"
+            "          # but WITH the full attribute contract, and a DEX\n"
+            "          # Ldev/librepocket/agent/github/Bridge; subclass: canonical\n"
+            "          # '.Bridge' resolves inside the merged package and\n"
+            "          # matches the exact FQN -> exactly one compliant surface.\n"
+            "          printf '%s\\n' 'E: manifest' \\\n"
+            "            '  A: package=\"dev.librepocket.agent.github\" (Raw: \"dev.librepocket.agent.github\")' \\\n"
+            "            '  E: application' \\\n"
+            "            '    A: android:fullBackupContent(0x010104eb)=@0x7f010000' \\\n"
+            "            '    A: android:dataExtractionRules(0x0101063e)=@0x7f010001' \\\n"
+            "            '    A: android:networkSecurityConfig(0x01010527)=@0x7f010002' \\\n"
+            "            '    E: provider (line=4)' \\\n"
+            "            '      A: android:name(0x01010003)=\".Bridge\" (Raw: \".Bridge\")' \\\n"
+            "            '      A: android:permission(0x01010006)=\"android.permission.INTERACT_ACROSS_USERS_FULL\" (Raw: \"android.permission.INTERACT_ACROSS_USERS_FULL\")' \\\n"
+            "            '      A: android:enabled(0x0101000e)=(type 0x12)0xffffffff' \\\n"
+            "            '      A: android:exported(0x01010010)=(type 0x12)0xffffffff' \\\n"
+            "            '      A: android:multiprocess(0x01010013)=(type 0x12)0x0' \\\n"
+            "            '      A: android:authorities(0x01010018)=\"dev.librepocket.agent.github.bridge\" (Raw: \"dev.librepocket.agent.github.bridge\")' ;;\n"
+            "        shizuku-bridge-compliant)\n"
+            "          # The same renamed subclass declared WITH the full\n"
+            "          # attribute contract; official provider NOT declared.\n"
+            "          # Counts as exactly one surface: github mode must PASS.\n"
+            "          printf '%s\\n' 'E: manifest' \\\n"
+            "            '  A: android:versionCode(0x0101021b)=(type 0x10)0x1' \\\n"
+            "            '  E: application' \\\n"
+            "            '    A: android:fullBackupContent(0x010104eb)=@0x7f010000' \\\n"
+            "            '    A: android:dataExtractionRules(0x0101063e)=@0x7f010001' \\\n"
+            "            '    A: android:networkSecurityConfig(0x01010527)=@0x7f010002' \\\n"
+            "            '    E: provider (line=4)' \\\n"
+            "            '      A: android:name(0x01010003)=\"com.librepocket.internal.Bridge\" (Raw: \"com.librepocket.internal.Bridge\")' \\\n"
+            "            '      A: android:permission(0x01010006)=\"android.permission.INTERACT_ACROSS_USERS_FULL\" (Raw: \"android.permission.INTERACT_ACROSS_USERS_FULL\")' \\\n"
+            "            '      A: android:enabled(0x0101000e)=(type 0x12)0xffffffff' \\\n"
+            "            '      A: android:exported(0x01010010)=(type 0x12)0xffffffff' \\\n"
+            "            '      A: android:multiprocess(0x01010013)=(type 0x12)0x0' \\\n"
+            "            '      A: android:authorities(0x01010018)=\"dev.librepocket.agent.github.bridge\" (Raw: \"dev.librepocket.agent.github.bridge\")' ;;\n"
+            "        shizuku-bridge-duplicate-arbitrary)\n"
+            "          # Re-review #12 Finding 1 pin: TWO merged-manifest\n"
+            "          # provider blocks BOTH named\n"
+            "          # com.librepocket.internal.Bridge (the DEX-evidenced\n"
+            "          # renamed ShizukuProvider subclass), with ARBITRARY\n"
+            "          # non-.shizuku authorities and the FULL attribute\n"
+            "          # contract on BOTH blocks (INTERACT_ACROSS_USERS_FULL,\n"
+            "          # enabled/exported exactly true, multiprocess false).\n"
+            "          # The manifest name/authority heuristic cannot see\n"
+            "          # either block; only DEX evidence reveals the class.\n"
+            "          # The uniqueness gate must fail closed on the\n"
+            "          # duplicate - required-provider accounting is never\n"
+            "          # reached, and both blocks are otherwise contract-\n"
+            "          # compliant so the duplicate message is provably the\n"
+            "          # failure owner.\n"
+            "          printf '%s\\n' 'E: manifest' \\\n"
+            "            '  A: android:versionCode(0x0101021b)=(type 0x10)0x1' \\\n"
+            "            '  E: application' \\\n"
+            "            '    A: android:fullBackupContent(0x010104eb)=@0x7f010000' \\\n"
+            "            '    A: android:dataExtractionRules(0x0101063e)=@0x7f010001' \\\n"
+            "            '    A: android:networkSecurityConfig(0x01010527)=@0x7f010002' \\\n"
+            "            '    E: provider (line=4)' \\\n"
+            "            '      A: android:name(0x01010003)=\"com.librepocket.internal.Bridge\" (Raw: \"com.librepocket.internal.Bridge\")' \\\n"
+            "            '      A: android:permission(0x01010006)=\"android.permission.INTERACT_ACROSS_USERS_FULL\" (Raw: \"android.permission.INTERACT_ACROSS_USERS_FULL\")' \\\n"
+            "            '      A: android:enabled(0x0101000e)=(type 0x12)0xffffffff' \\\n"
+            "            '      A: android:exported(0x01010010)=(type 0x12)0xffffffff' \\\n"
+            "            '      A: android:multiprocess(0x01010013)=(type 0x12)0x0' \\\n"
+            "            '      A: android:authorities(0x01010018)=\"dev.librepocket.agent.github.bridge1\" (Raw: \"dev.librepocket.agent.github.bridge1\")' \\\n"
+            "            '    E: provider (line=5)' \\\n"
+            "            '      A: android:name(0x01010003)=\"com.librepocket.internal.Bridge\" (Raw: \"com.librepocket.internal.Bridge\")' \\\n"
+            "            '      A: android:permission(0x01010006)=\"android.permission.INTERACT_ACROSS_USERS_FULL\" (Raw: \"android.permission.INTERACT_ACROSS_USERS_FULL\")' \\\n"
+            "            '      A: android:enabled(0x0101000e)=(type 0x12)0xffffffff' \\\n"
+            "            '      A: android:exported(0x01010010)=(type 0x12)0xffffffff' \\\n"
+            "            '      A: android:multiprocess(0x01010013)=(type 0x12)0x0' \\\n"
+            "            '      A: android:authorities(0x01010018)=\"dev.librepocket.agent.github.bridge2\" (Raw: \"dev.librepocket.agent.github.bridge2\")' ;;\n"
+            "        shizuku-bridge-duplicate-arbitrary-alias)\n"
+            "          # Re-review #12 Finding 1 pin, alias spelling pair:\n"
+            "          # '.Bridge' and 'Bridge' under the plain merged-\n"
+            "          # manifest package dev.librepocket.agent.github. Both\n"
+            "          # canonicalize to dev.librepocket.agent.github.Bridge\n"
+            "          # - the DEX-evidenced java name - so the uniqueness\n"
+            "          # gate must fail closed naming the FQN; the attribute\n"
+            "          # contract cannot keep the pair apart (authorities\n"
+            "          # arbitrary non-.shizuku; both blocks carry the FULL\n"
+            "          # contract).\n"
+            "          printf '%s\\n' 'E: manifest' \\\n"
+            "            '  A: package=\"dev.librepocket.agent.github\"' \\\n"
+            "            '  E: application' \\\n"
+            "            '    A: android:fullBackupContent(0x010104eb)=@0x7f010000' \\\n"
+            "            '    A: android:dataExtractionRules(0x0101063e)=@0x7f010001' \\\n"
+            "            '    A: android:networkSecurityConfig(0x01010527)=@0x7f010002' \\\n"
+            "            '    E: provider (line=3)' \\\n"
+            "            '      A: android:name(0x01010003)=\".Bridge\" (Raw: \".Bridge\")' \\\n"
+            "            '      A: android:permission(0x01010006)=\"android.permission.INTERACT_ACROSS_USERS_FULL\" (Raw: \"android.permission.INTERACT_ACROSS_USERS_FULL\")' \\\n"
+            "            '      A: android:enabled(0x0101000e)=(type 0x12)0xffffffff' \\\n"
+            "            '      A: android:exported(0x01010010)=(type 0x12)0xffffffff' \\\n"
+            "            '      A: android:multiprocess(0x01010013)=(type 0x12)0x0' \\\n"
+            "            '      A: android:authorities(0x01010018)=\"dev.librepocket.agent.github.bridge1\" (Raw: \"dev.librepocket.agent.github.bridge1\")' \\\n"
+            "            '    E: provider (line=4)' \\\n"
+            "            '      A: android:name(0x01010003)=\"Bridge\" (Raw: \"Bridge\")' \\\n"
+            "            '      A: android:permission(0x01010006)=\"android.permission.INTERACT_ACROSS_USERS_FULL\" (Raw: \"android.permission.INTERACT_ACROSS_USERS_FULL\")' \\\n"
+            "            '      A: android:enabled(0x0101000e)=(type 0x12)0xffffffff' \\\n"
+            "            '      A: android:exported(0x01010010)=(type 0x12)0xffffffff' \\\n"
+            "            '      A: android:multiprocess(0x01010013)=(type 0x12)0x0' \\\n"
+            "            '      A: android:authorities(0x01010018)=\"dev.librepocket.agent.github.bridge2\" (Raw: \"dev.librepocket.agent.github.bridge2\")' ;;\n"
+            "        shizuku-bridge-authority-missing-dex)\n"
+            "          # Re-review #12 Finding 2 pin: the DEX-evidenced renamed\n"
+            "          # subclass declares NO android:authorities anywhere -\n"
+            "          # the attribute line is ABSENT entirely. The name\n"
+            "          # heuristic cannot see the block; the DEX path's\n"
+            "          # expected_authority=None used to pass it. The shared\n"
+            "          # verifier's authorities presence minimum must fail\n"
+            "          # closed (Android's <provider> spec pins authorities\n"
+            "          # as MANDATORY; no default exists).\n"
+            "          printf '%s\\n' 'E: manifest' \\\n"
+            "            '  A: android:versionCode(0x0101021b)=(type 0x10)0x1' \\\n"
+            "            '  E: application' \\\n"
+            "            '    A: android:fullBackupContent(0x010104eb)=@0x7f010000' \\\n"
+            "            '    A: android:dataExtractionRules(0x0101063e)=@0x7f010001' \\\n"
+            "            '    A: android:networkSecurityConfig(0x01010527)=@0x7f010002' \\\n"
+            "            '    E: provider (line=4)' \\\n"
+            "            '      A: android:name(0x01010003)=\"com.librepocket.internal.Bridge\" (Raw: \"com.librepocket.internal.Bridge\")' \\\n"
+            "            '      A: android:permission(0x01010006)=\"android.permission.INTERACT_ACROSS_USERS_FULL\" (Raw: \"android.permission.INTERACT_ACROSS_USERS_FULL\")' \\\n"
+            "            '      A: android:enabled(0x0101000e)=(type 0x12)0xffffffff' \\\n"
+            "            '      A: android:exported(0x01010010)=(type 0x12)0xffffffff' \\\n"
+            "            '      A: android:multiprocess(0x01010013)=(type 0x12)0x0' ;;\n"
+            "        shizuku-bridge-authority-empty-dex)\n"
+            "          # Re-review #12 Finding 2 pin: android:authorities present\n"
+            "          # but DECODES TO \"\" - no authority at all. Same red\n"
+            "          # shape as the missing-attribute case; the DEX path must\n"
+            "          # not treat the empty string as a proven authority list.\n"
+            "          printf '%s\\n' 'E: manifest' \\\n"
+            "            '  A: android:versionCode(0x0101021b)=(type 0x10)0x1' \\\n"
+            "            '  E: application' \\\n"
+            "            '    A: android:fullBackupContent(0x010104eb)=@0x7f010000' \\\n"
+            "            '    A: android:dataExtractionRules(0x0101063e)=@0x7f010001' \\\n"
+            "            '    A: android:networkSecurityConfig(0x01010527)=@0x7f010002' \\\n"
+            "            '    E: provider (line=4)' \\\n"
+            "            '      A: android:name(0x01010003)=\"com.librepocket.internal.Bridge\" (Raw: \"com.librepocket.internal.Bridge\")' \\\n"
+            "            '      A: android:permission(0x01010006)=\"android.permission.INTERACT_ACROSS_USERS_FULL\" (Raw: \"android.permission.INTERACT_ACROSS_USERS_FULL\")' \\\n"
+            "            '      A: android:enabled(0x0101000e)=(type 0x12)0xffffffff' \\\n"
+            "            '      A: android:exported(0x01010010)=(type 0x12)0xffffffff' \\\n"
+            "            '      A: android:multiprocess(0x01010013)=(type 0x12)0x0' \\\n"
+            "            '      A: android:authorities(0x01010018)=\"\"' ;;\n"
+            "        shizuku-bridge-authority-delimiter-only-dex)\n"
+            "          # Re-review #12 Finding 2 pin: android:authorities carries\n"
+            "          # ONLY separators and whitespace - no non-empty,\n"
+            "          # post-trim authority segment exists. Same red shape;\n"
+            "          # the presence minimum must refuse delimiter-only\n"
+            "          # values even though the attribute is present.\n"
+            "          printf '%s\\n' 'E: manifest' \\\n"
+            "            '  A: android:versionCode(0x0101021b)=(type 0x10)0x1' \\\n"
+            "            '  E: application' \\\n"
+            "            '    A: android:fullBackupContent(0x010104eb)=@0x7f010000' \\\n"
+            "            '    A: android:dataExtractionRules(0x0101063e)=@0x7f010001' \\\n"
+            "            '    A: android:networkSecurityConfig(0x01010527)=@0x7f010002' \\\n"
+            "            '    E: provider (line=4)' \\\n"
+            "            '      A: android:name(0x01010003)=\"com.librepocket.internal.Bridge\" (Raw: \"com.librepocket.internal.Bridge\")' \\\n"
+            "            '      A: android:permission(0x01010006)=\"android.permission.INTERACT_ACROSS_USERS_FULL\" (Raw: \"android.permission.INTERACT_ACROSS_USERS_FULL\")' \\\n"
+            "            '      A: android:enabled(0x0101000e)=(type 0x12)0xffffffff' \\\n"
+            "            '      A: android:exported(0x01010010)=(type 0x12)0xffffffff' \\\n"
+            "            '      A: android:multiprocess(0x01010013)=(type 0x12)0x0' \\\n"
+            "            '      A: android:authorities(0x01010018)=\";;  ; \"' ;;\n"
+            "        shizuku-bridge-authority-spaced-list-dex)\n"
+            "          # Re-review #12 Finding 2 follow-up pin: android:authorities\n"
+            "          # carries TWO arbitrary segments with spaces AROUND the\n"
+            "          # semicolon separator. The authorities presence minimum\n"
+            "          # is presence-only and post-trim (surrounding spaces on\n"
+            "          # each semicolon-separated segment are TOLERATED as long\n"
+            "          # as at least one trimmed segment is non-empty);\n"
+            "          # the values themselves remain unconstrained by design.\n"
+            "          # This GREEN fixture pins that tolerance - a regression\n"
+            "          # that rejects surrounding spaces would fail here.\n"
+            "          printf '%s\\n' 'E: manifest' \\\n"
+            "            '  A: android:versionCode(0x0101021b)=(type 0x10)0x1' \\\n"
+            "            '  E: application' \\\n"
+            "            '    A: android:fullBackupContent(0x010104eb)=@0x7f010000' \\\n"
+            "            '    A: android:dataExtractionRules(0x0101063e)=@0x7f010001' \\\n"
+            "            '    A: android:networkSecurityConfig(0x01010527)=@0x7f010002' \\\n"
+            "            '    E: provider (line=4)' \\\n"
+            "            '      A: android:name(0x01010003)=\"com.librepocket.internal.Bridge\" (Raw: \"com.librepocket.internal.Bridge\")' \\\n"
+            "            '      A: android:permission(0x01010006)=\"android.permission.INTERACT_ACROSS_USERS_FULL\" (Raw: \"android.permission.INTERACT_ACROSS_USERS_FULL\")' \\\n"
+            "            '      A: android:enabled(0x0101000e)=(type 0x12)0xffffffff' \\\n"
+            "            '      A: android:exported(0x01010010)=(type 0x12)0xffffffff' \\\n"
+            "            '      A: android:multiprocess(0x01010013)=(type 0x12)0x0' \\\n"
+            "            '      A: android:authorities(0x01010018)=\"dev.librepocket.agent.github.bridge ;  dev.librepocket.agent.github.extra\" (Raw: \"dev.librepocket.agent.github.bridge ;  dev.librepocket.agent.github.extra\")' ;;\n"
+            "        shizuku-bridge-dex-missing-enabled)\n"
+            "          # DEX-evidenced renamed subclass (.Bridge resolves to\n"
+            "          # <merged package>.Bridge) carrying the FULL attribute\n"
+            "          # contract EXCEPT android:enabled: every contract check\n"
+            "          # before the binder-channel one holds, so the missing\n"
+            "          # android:enabled is the failure owner. The subclass is\n"
+            "          # revealable only via DEX evidence (name and arbitrary\n"
+            "          # non-.shizuku authority look nothing like a\n"
+            "          # ShizukuProvider), so the DEX path's default\n"
+            "          # require_enabled=True is what fails closed.\n"
+            "          printf '%s\\n' 'E: manifest' \\\n"
+            "            '  A: android:versionCode(0x0101021b)=(type 0x10)0x1' \\\n"
+            "            '  E: application' \\\n"
+            "            '    A: android:fullBackupContent(0x010104eb)=@0x7f010000' \\\n"
+            "            '    A: android:dataExtractionRules(0x0101063e)=@0x7f010001' \\\n"
+            "            '    A: android:networkSecurityConfig(0x01010527)=@0x7f010002' \\\n"
+            "            '    E: provider (line=4)' \\\n"
+            "            '      A: android:name(0x01010003)=\".Bridge\" (Raw: \".Bridge\")' \\\n"
+            "            '      A: android:permission(0x01010006)=\"android.permission.INTERACT_ACROSS_USERS_FULL\" (Raw: \"android.permission.INTERACT_ACROSS_USERS_FULL\")' \\\n"
+            "            '      A: android:exported(0x01010010)=(type 0x12)0xffffffff' \\\n"
+            "            '      A: android:multiprocess(0x01010013)=(type 0x12)0x0' \\\n"
+            "            '      A: android:authorities(0x01010018)=\"dev.librepocket.agent.github.bridge\" (Raw: \"dev.librepocket.agent.github.bridge\")' ;;\n"
+            "        shizuku-bridge-partial)\n"
+            "          # Partial (no leading dot) suffix spelling of the same\n"
+            "          # renamed subclass, WITH the full attribute contract.\n"
+            "          printf '%s\\n' 'E: manifest' \\\n"
+            "            '  A: android:versionCode(0x0101021b)=(type 0x10)0x1' \\\n"
+            "            '  E: application' \\\n"
+            "            '    A: android:fullBackupContent(0x010104eb)=@0x7f010000' \\\n"
+            "            '    A: android:dataExtractionRules(0x0101063e)=@0x7f010001' \\\n"
+            "            '    A: android:networkSecurityConfig(0x01010527)=@0x7f010002' \\\n"
+            "            '    E: provider (line=4)' \\\n"
+            "            '      A: android:name(0x01010003)=\"internal.Bridge\" (Raw: \"internal.Bridge\")' \\\n"
+            "            '      A: android:permission(0x01010006)=\"android.permission.INTERACT_ACROSS_USERS_FULL\" (Raw: \"android.permission.INTERACT_ACROSS_USERS_FULL\")' \\\n"
+            "            '      A: android:enabled(0x0101000e)=(type 0x12)0xffffffff' \\\n"
+            "            '      A: android:exported(0x01010010)=(type 0x12)0xffffffff' \\\n"
+            "            '      A: android:multiprocess(0x01010013)=(type 0x12)0x0' \\\n"
+            "            '      A: android:authorities(0x01010018)=\"dev.librepocket.agent.github.bridge\" (Raw: \"dev.librepocket.agent.github.bridge\")' ;;\n"
+            "        shizuku-bridge-compliant-plus-official)\n"
+            "          # The renamed compliant subclass PLUS the official\n"
+            "          # rikka.shizuku.ShizukuProvider: two distinct surfaces,\n"
+            "          # so --expect-provider required must fail with found 2.\n"
+            "          printf '%s\\n' 'E: manifest' \\\n"
+            "            '  A: android:versionCode(0x0101021b)=(type 0x10)0x1' \\\n"
+            "            '  E: application' \\\n"
+            "            '    A: android:fullBackupContent(0x010104eb)=@0x7f010000' \\\n"
+            "            '    A: android:dataExtractionRules(0x0101063e)=@0x7f010001' \\\n"
+            "            '    A: android:networkSecurityConfig(0x01010527)=@0x7f010002' \\\n"
+            "            '    E: provider (line=3)' \\\n"
+            "            '      A: android:name(0x01010003)=\"rikka.shizuku.ShizukuProvider\" (Raw: \"rikka.shizuku.ShizukuProvider\")' \\\n"
+            "            '      A: android:permission(0x01010006)=\"android.permission.INTERACT_ACROSS_USERS_FULL\" (Raw: \"android.permission.INTERACT_ACROSS_USERS_FULL\")' \\\n"
+            "            '      A: android:enabled(0x0101000e)=(type 0x12)0xffffffff' \\\n"
+            "            '      A: android:exported(0x01010010)=(type 0x12)0xffffffff' \\\n"
+            "            '      A: android:multiprocess(0x01010013)=(type 0x12)0x0' \\\n"
+            "            '      A: android:authorities(0x01010018)=\"dev.librepocket.agent.github.shizuku\" (Raw: \"dev.librepocket.agent.github.shizuku\")' \\\n"
+            "            '    E: provider (line=4)' \\\n"
+            "            '      A: android:name(0x01010003)=\"com.librepocket.internal.Bridge\" (Raw: \"com.librepocket.internal.Bridge\")' \\\n"
+            "            '      A: android:permission(0x01010006)=\"android.permission.INTERACT_ACROSS_USERS_FULL\" (Raw: \"android.permission.INTERACT_ACROSS_USERS_FULL\")' \\\n"
+            "            '      A: android:enabled(0x0101000e)=(type 0x12)0xffffffff' \\\n"
+            "            '      A: android:exported(0x01010010)=(type 0x12)0xffffffff' \\\n"
+            "            '      A: android:multiprocess(0x01010013)=(type 0x12)0x0' \\\n"
+            "            '      A: android:authorities(0x01010018)=\"dev.librepocket.agent.github.bridge\" (Raw: \"dev.librepocket.agent.github.bridge\")' ;;\n"
+            "        shizuku-bridge-grandchild)\n"
+            "          # #166 FIX 1: grandchild of the base - Lcom/evil/Bridge\n"
+            "          # extends Lcom/evil/Middle; which extends\n"
+            "          # rikka.shizuku.ShizukuProvider. Middle is declared\n"
+            "          # compliant; Bridge is declared with exported=true and\n"
+            "          # NO android:permission. Only transitive DEX evidence\n"
+            "          # reveals Bridge; github mode must fail closed.\n"
+            "          # Official provider NOT declared.\n"
+            "          printf '%s\\n' 'E: manifest' \\\n"
+            "            '  A: android:versionCode(0x0101021b)=(type 0x10)0x1' \\\n"
+            "            '  E: application' \\\n"
+            "            '    A: android:fullBackupContent(0x010104eb)=@0x7f010000' \\\n"
+            "            '    A: android:dataExtractionRules(0x0101063e)=@0x7f010001' \\\n"
+            "            '    A: android:networkSecurityConfig(0x01010527)=@0x7f010002' \\\n"
+            "            '    E: provider (line=4)' \\\n"
+            "            '      A: android:name(0x01010003)=\"com.evil.Middle\" (Raw: \"com.evil.Middle\")' \\\n"
+            "            '      A: android:permission(0x01010006)=\"android.permission.INTERACT_ACROSS_USERS_FULL\" (Raw: \"android.permission.INTERACT_ACROSS_USERS_FULL\")' \\\n"
+            "            '      A: android:enabled(0x0101000e)=(type 0x12)0xffffffff' \\\n"
+            "            '      A: android:exported(0x01010010)=(type 0x12)0xffffffff' \\\n"
+            "            '      A: android:multiprocess(0x01010013)=(type 0x12)0x0' \\\n"
+            "            '      A: android:authorities(0x01010018)=\"dev.librepocket.agent.github.middle\" (Raw: \"dev.librepocket.agent.github.middle\")' \\\n"
+            "            '    E: provider (line=5)' \\\n"
+            "            '      A: android:name(0x01010003)=\"com.evil.Bridge\" (Raw: \"com.evil.Bridge\")' \\\n"
+            "            '      A: android:exported(0x01010010)=(type 0x12)0xffffffff' \\\n"
+            "            '      A: android:authorities(0x01010018)=\"dev.librepocket.agent.github.bridge\" (Raw: \"dev.librepocket.agent.github.bridge\")' ;;\n"
+            "        shizuku-bridge-grandchild-compliant)\n"
+            "          # Positive control: same two classes, but Bridge now\n"
+            "          # carries the FULL attribute contract; official\n"
+            "          # provider NOT declared.\n"
+            "          printf '%s\\n' 'E: manifest' \\\n"
+            "            '  A: android:versionCode(0x0101021b)=(type 0x10)0x1' \\\n"
+            "            '  E: application' \\\n"
+            "            '    A: android:fullBackupContent(0x010104eb)=@0x7f010000' \\\n"
+            "            '    A: android:dataExtractionRules(0x0101063e)=@0x7f010001' \\\n"
+            "            '    A: android:networkSecurityConfig(0x01010527)=@0x7f010002' \\\n"
+            "            '    E: provider (line=4)' \\\n"
+            "            '      A: android:name(0x01010003)=\"com.evil.Middle\" (Raw: \"com.evil.Middle\")' \\\n"
+            "            '      A: android:permission(0x01010006)=\"android.permission.INTERACT_ACROSS_USERS_FULL\" (Raw: \"android.permission.INTERACT_ACROSS_USERS_FULL\")' \\\n"
+            "            '      A: android:enabled(0x0101000e)=(type 0x12)0xffffffff' \\\n"
+            "            '      A: android:exported(0x01010010)=(type 0x12)0xffffffff' \\\n"
+            "            '      A: android:multiprocess(0x01010013)=(type 0x12)0x0' \\\n"
+            "            '      A: android:authorities(0x01010018)=\"dev.librepocket.agent.github.middle\" (Raw: \"dev.librepocket.agent.github.middle\")' \\\n"
+            "            '    E: provider (line=5)' \\\n"
+            "            '      A: android:name(0x01010003)=\"com.evil.Bridge\" (Raw: \"com.evil.Bridge\")' \\\n"
+            "            '      A: android:permission(0x01010006)=\"android.permission.INTERACT_ACROSS_USERS_FULL\" (Raw: \"android.permission.INTERACT_ACROSS_USERS_FULL\")' \\\n"
+            "            '      A: android:enabled(0x0101000e)=(type 0x12)0xffffffff' \\\n"
+            "            '      A: android:exported(0x01010010)=(type 0x12)0xffffffff' \\\n"
+            "            '      A: android:multiprocess(0x01010013)=(type 0x12)0x0' \\\n"
+            "            '      A: android:authorities(0x01010018)=\"dev.librepocket.agent.github.bridge\" (Raw: \"dev.librepocket.agent.github.bridge\")' ;;\n"
+            "        shizuku-duplicate-same-name)\n"
+            "          # #166 FIX 2 pin: TWO detected ShizukuProvider blocks\n"
+            "          # resolving to the SAME canonical component name (identical\n"
+            "          # android:name, both compliant). Merger accidents / name\n"
+            "          # padding must fail closed as a PolicyError instead of\n"
+            "          # silently deduping to one - regardless of DEX evidence.\n"
+            "          printf '%s\\n' 'E: manifest' \\\n"
+            "            '  A: android:versionCode(0x0101021b)=(type 0x10)0x1' \\\n"
+            "            '  E: application' \\\n"
+            "            '    A: android:fullBackupContent(0x010104eb)=@0x7f010000' \\\n"
+            "            '    A: android:dataExtractionRules(0x0101063e)=@0x7f010001' \\\n"
+            "            '    A: android:networkSecurityConfig(0x01010527)=@0x7f010002' \\\n"
+            "            '    E: provider (line=3)' \\\n"
+            "            '      A: android:name(0x01010003)=\"rikka.shizuku.ShizukuProvider\" (Raw: \"rikka.shizuku.ShizukuProvider\")' \\\n"
+            "            '      A: android:permission(0x01010006)=\"android.permission.INTERACT_ACROSS_USERS_FULL\" (Raw: \"android.permission.INTERACT_ACROSS_USERS_FULL\")' \\\n"
+            "            '      A: android:enabled(0x0101000e)=(type 0x12)0xffffffff' \\\n"
+            "            '      A: android:exported(0x01010010)=(type 0x12)0xffffffff' \\\n"
+            "            '      A: android:multiprocess(0x01010013)=(type 0x12)0x0' \\\n"
+            "            '      A: android:authorities(0x01010018)=\"dev.librepocket.agent.github.shizuku\" (Raw: \"dev.librepocket.agent.github.shizuku\")' \\\n"
+            "            '    E: provider (line=4)' \\\n"
+            "            '      A: android:name(0x01010003)=\"rikka.shizuku.ShizukuProvider\" (Raw: \"rikka.shizuku.ShizukuProvider\")' \\\n"
+            "            '      A: android:permission(0x01010006)=\"android.permission.INTERACT_ACROSS_USERS_FULL\" (Raw: \"android.permission.INTERACT_ACROSS_USERS_FULL\")' \\\n"
+            "            '      A: android:enabled(0x0101000e)=(type 0x12)0xffffffff' \\\n"
+            "            '      A: android:exported(0x01010010)=(type 0x12)0xffffffff' \\\n"
+            "            '      A: android:multiprocess(0x01010013)=(type 0x12)0x0' \\\n"
+            "            '      A: android:authorities(0x01010018)=\"dev.librepocket.agent.github.shizuku-dup\" (Raw: \"dev.librepocket.agent.github.shizuku-dup\")' ;;\n"
+            "        shizuku-alias-dot-and-dotfree)\n"
+            "          # Re-review #11 Finding 2 pin: TWO detected ShizukuProvider\n"
+            "          # blocks spelled '.Bridge' and 'Bridge' (alias spellings of\n"
+            "          # the SAME class), both carrying the full attribute contract\n"
+            "          # (INTERACT_ACROSS_USERS_FULL base permission, enabled/exported\n"
+            "          # exactly true, multiprocess absent|false, authorities exactly\n"
+            "          # dev.librepocket.agent.github.shizuku). Under canonical\n"
+            "          # component-name resolution both resolve to\n"
+            "          # dev.librepocket.agent.github.Bridge, so the duplicate-identity\n"
+            "          # guard in the required-provider total must fail closed with the\n"
+            "          # canonical FQN - the attribute contract cannot keep the two\n"
+            "          # canonical-equal blocks apart. The pinning test DEX carries\n"
+            "          # NO ShizukuProvider subclass class_def, so only the heuristic\n"
+            "          # detects the blocks (see the test's comment).\n"
+            "          printf '%s\\n' 'E: manifest' \\\n"
+            "            '  E: application' \\\n"
+            "            '    A: android:fullBackupContent(0x010104eb)=@0x7f010000' \\\n"
+            "            '    A: android:dataExtractionRules(0x0101063e)=@0x7f010001' \\\n"
+            "            '    A: android:networkSecurityConfig(0x01010527)=@0x7f010002' \\\n"
+            "            '    E: provider (line=3)' \\\n"
+            "            '      A: android:name(0x01010003)=\".Bridge\" (Raw: \".Bridge\")' \\\n"
+            "            '      A: android:permission(0x01010006)=\"android.permission.INTERACT_ACROSS_USERS_FULL\" (Raw: \"android.permission.INTERACT_ACROSS_USERS_FULL\")' \\\n"
+            "            '      A: android:enabled(0x0101000e)=(type 0x12)0xffffffff' \\\n"
+            "            '      A: android:exported(0x01010010)=(type 0x12)0xffffffff' \\\n"
+            "            '      A: android:multiprocess(0x01010013)=(type 0x12)0x0' \\\n"
+            "            '      A: android:authorities(0x01010018)=\"dev.librepocket.agent.github.shizuku\" (Raw: \"dev.librepocket.agent.github.shizuku\")' \\\n"
+            "            '    E: provider (line=4)' \\\n"
+            "            '      A: android:name(0x01010003)=\"Bridge\" (Raw: \"Bridge\")' \\\n"
+            "            '      A: android:permission(0x01010006)=\"android.permission.INTERACT_ACROSS_USERS_FULL\" (Raw: \"android.permission.INTERACT_ACROSS_USERS_FULL\")' \\\n"
+            "            '      A: android:enabled(0x0101000e)=(type 0x12)0xffffffff' \\\n"
+            "            '      A: android:exported(0x01010010)=(type 0x12)0xffffffff' \\\n"
+            "            '      A: android:multiprocess(0x01010013)=(type 0x12)0x0' \\\n"
+            "            '      A: android:authorities(0x01010018)=\"dev.librepocket.agent.github.shizuku\" (Raw: \"dev.librepocket.agent.github.shizuku\")' ;;\n"
+            "        shizuku-alias-dot-and-fqn)\n"
+            "          # Re-review #11 Finding 2 pin, second alias pair: '.Bridge' and\n"
+            "          # the full 'dev.librepocket.agent.github.Bridge' FQN - again\n"
+            "          # two spellings of the SAME canonical class, both compliant;\n"
+            "          # the canonical duplicate-identity guard must fail closed.\n"
+            "          # The pinning test DEX carries NO ShizukuProvider subclass\n"
+            "          # class_def, so only the heuristic detects the blocks.\n"
+            "          printf '%s\\n' 'E: manifest' \\\n"
+            "            '  E: application' \\\n"
+            "            '    A: android:fullBackupContent(0x010104eb)=@0x7f010000' \\\n"
+            "            '    A: android:dataExtractionRules(0x0101063e)=@0x7f010001' \\\n"
+            "            '    A: android:networkSecurityConfig(0x01010527)=@0x7f010002' \\\n"
+            "            '    E: provider (line=3)' \\\n"
+            "            '      A: android:name(0x01010003)=\".Bridge\" (Raw: \".Bridge\")' \\\n"
+            "            '      A: android:permission(0x01010006)=\"android.permission.INTERACT_ACROSS_USERS_FULL\" (Raw: \"android.permission.INTERACT_ACROSS_USERS_FULL\")' \\\n"
+            "            '      A: android:enabled(0x0101000e)=(type 0x12)0xffffffff' \\\n"
+            "            '      A: android:exported(0x01010010)=(type 0x12)0xffffffff' \\\n"
+            "            '      A: android:multiprocess(0x01010013)=(type 0x12)0x0' \\\n"
+            "            '      A: android:authorities(0x01010018)=\"dev.librepocket.agent.github.shizuku\" (Raw: \"dev.librepocket.agent.github.shizuku\")' \\\n"
+            "            '    E: provider (line=4)' \\\n"
+            "            '      A: android:name(0x01010003)=\"dev.librepocket.agent.github.Bridge\" (Raw: \"dev.librepocket.agent.github.Bridge\")' \\\n"
+            "            '      A: android:permission(0x01010006)=\"android.permission.INTERACT_ACROSS_USERS_FULL\" (Raw: \"android.permission.INTERACT_ACROSS_USERS_FULL\")' \\\n"
+            "            '      A: android:enabled(0x0101000e)=(type 0x12)0xffffffff' \\\n"
+            "            '      A: android:exported(0x01010010)=(type 0x12)0xffffffff' \\\n"
+            "            '      A: android:multiprocess(0x01010013)=(type 0x12)0x0' \\\n"
+            "            '      A: android:authorities(0x01010018)=\"dev.librepocket.agent.github.shizuku\" (Raw: \"dev.librepocket.agent.github.shizuku\")' ;;\n"
+            "        shizuku-weak-perm)\n"
+            "          printf '%s\\n' 'E: manifest' '  E: application' \\\n"
+            "            '    A: android:fullBackupContent(0x010104eb)=@0x7f010000' \\\n"
+            "            '    A: android:dataExtractionRules(0x0101063e)=@0x7f010001' \\\n"
+            "            '    A: android:networkSecurityConfig(0x01010527)=@0x7f010002' \\\n"
+            "            '    E: provider (line=4)' \\\n"
+            "            '      A: android:name(0x01010003)=\"rikka.shizuku.ShizukuProvider\" (Raw: \"rikka.shizuku.ShizukuProvider\")' \\\n"
+            "            '      A: android:permission(0x01010006)=\"android.permission.INTERNET\" (Raw: \"android.permission.INTERNET\")' \\\n"
+            "            '      A: android:authorities(0x01010018)=\"dev.librepocket.agent.github.shizuku\" (Raw: \"dev.librepocket.agent.github.shizuku\")' ;;\n"
+            "        shizuku-grant-uri)\n"
+            "          printf '%s\\n' 'E: manifest' '  E: application' \\\n"
+            "            '    A: android:fullBackupContent(0x010104eb)=@0x7f010000' \\\n"
+            "            '    A: android:dataExtractionRules(0x0101063e)=@0x7f010001' \\\n"
+            "            '    A: android:networkSecurityConfig(0x01010527)=@0x7f010002' \\\n"
+            "            '    E: provider (line=4)' \\\n"
+            "            '      A: android:name(0x01010003)=\"rikka.shizuku.ShizukuProvider\" (Raw: \"rikka.shizuku.ShizukuProvider\")' \\\n"
+            "            '      A: android:permission(0x01010006)=\"android.permission.INTERACT_ACROSS_USERS_FULL\" (Raw: \"android.permission.INTERACT_ACROSS_USERS_FULL\")' \\\n"
+            "            '      A: android:grantUriPermissions(0x0101001b)=(type 0x12)0xffffffff' \\\n"
+            "            '      A: android:authorities(0x01010018)=\"dev.librepocket.agent.github.shizuku\" (Raw: \"dev.librepocket.agent.github.shizuku\")' ;;\n"
+            "        shizuku-grant-uri-ref)\n"
+            "          printf '%s\\n' 'E: manifest' '  E: application' \\\n"
+            "            '    A: android:fullBackupContent(0x010104eb)=@0x7f010000' \\\n"
+            "            '    A: android:dataExtractionRules(0x0101063e)=@0x7f010001' \\\n"
+            "            '    A: android:networkSecurityConfig(0x01010527)=@0x7f010002' \\\n"
+            "            '    E: provider (line=4)' \\\n"
+            "            '      A: android:name(0x01010003)=\"rikka.shizuku.ShizukuProvider\" (Raw: \"rikka.shizuku.ShizukuProvider\")' \\\n"
+            "            '      A: android:permission(0x01010006)=\"android.permission.INTERACT_ACROSS_USERS_FULL\" (Raw: \"android.permission.INTERACT_ACROSS_USERS_FULL\")' \\\n"
+            "            '      A: android:grantUriPermissions(0x0101001b)=@0x7f030001' \\\n"
+            "            '      A: android:authorities(0x01010018)=\"dev.librepocket.agent.github.shizuku\" (Raw: \"dev.librepocket.agent.github.shizuku\")' ;;\n"
+            "        shizuku-grant-uri-attr)\n"
+            "          printf '%s\\n' 'E: manifest' '  E: application' \\\n"
+            "            '    A: android:fullBackupContent(0x010104eb)=@0x7f010000' \\\n"
+            "            '    A: android:dataExtractionRules(0x0101063e)=@0x7f010001' \\\n"
+            "            '    A: android:networkSecurityConfig(0x01010527)=@0x7f010002' \\\n"
+            "            '    E: provider (line=4)' \\\n"
+            "            '      A: android:name(0x01010003)=\"rikka.shizuku.ShizukuProvider\" (Raw: \"rikka.shizuku.ShizukuProvider\")' \\\n"
+            "            '      A: android:permission(0x01010006)=\"android.permission.INTERACT_ACROSS_USERS_FULL\" (Raw: \"android.permission.INTERACT_ACROSS_USERS_FULL\")' \\\n"
+            "            '      A: android:grantUriPermissions(0x0101001b)=?0x01010000' \\\n"
+            "            '      A: android:authorities(0x01010018)=\"dev.librepocket.agent.github.shizuku\" (Raw: \"dev.librepocket.agent.github.shizuku\")' ;;\n"
+            "        shizuku-grant-uri-upper)\n"
+            "          printf '%s\\n' 'E: manifest' '  E: application' \\\n"
+            "            '    A: android:fullBackupContent(0x010104eb)=@0x7f010000' \\\n"
+            "            '    A: android:dataExtractionRules(0x0101063e)=@0x7f010001' \\\n"
+            "            '    A: android:networkSecurityConfig(0x01010527)=@0x7f010002' \\\n"
+            "            '    E: provider (line=4)' \\\n"
+            "            '      A: android:name(0x01010003)=\"rikka.shizuku.ShizukuProvider\" (Raw: \"rikka.shizuku.ShizukuProvider\")' \\\n"
+            "            '      A: android:permission(0x01010006)=\"android.permission.INTERACT_ACROSS_USERS_FULL\" (Raw: \"android.permission.INTERACT_ACROSS_USERS_FULL\")' \\\n"
+            "            '      A: android:grantUriPermissions(0x0101001b)=\"TRUE\" (Raw: \"TRUE\")' \\\n"
+            "            '      A: android:authorities(0x01010018)=\"dev.librepocket.agent.github.shizuku\" (Raw: \"dev.librepocket.agent.github.shizuku\")' ;;\n"
+            "        duplicate-application)\n"
+            "          printf '%s\\n' 'E: manifest' '  E: application' \\\n"
+            "            '    A: android:fullBackupContent(0x010104eb)=@0x7f010000' \\\n"
+            "            '    A: android:dataExtractionRules(0x0101063e)=@0x7f010001' \\\n"
+            "            '    A: android:networkSecurityConfig(0x01010527)=@0x7f010002' \\\n"
+            "            '  E: application' \\\n"
+            "            '    E: provider (line=4)' \\\n"
+            "            '      A: android:name(0x01010003)=\"rikka.shizuku.ShizukuProvider\" (Raw: \"rikka.shizuku.ShizukuProvider\")' \\\n"
+            "            '      A: android:authorities(0x01010018)=\"dev.librepocket.agent.github.shizuku\" (Raw: \"dev.librepocket.agent.github.shizuku\")' ;;\n"
+            "        shizuku-ns-alias-weak)\n"
+            "          printf '%s\\n' 'N: p=http://schemas.android.com/apk/res/android' \\\n"
+            "            '  E: manifest' '    E: application' \\\n"
+            "            '      A: android:fullBackupContent(0x010104eb)=@0x7f010000' \\\n"
+            "            '      A: android:dataExtractionRules(0x0101063e)=@0x7f010001' \\\n"
+            "            '      A: android:networkSecurityConfig(0x01010527)=@0x7f010002' \\\n"
+            "            '      E: provider (line=4)' \\\n"
+            "            '        A: p:name(0x01010003)=\"rikka.shizuku.ShizukuProvider\" (Raw: \"rikka.shizuku.ShizukuProvider\")' \\\n"
+            "            '        A: p:permission(0x01010006)=\"android.permission.INTERACT_ACROSS_USERS_FULL\" (Raw: \"android.permission.INTERACT_ACROSS_USERS_FULL\")' \\\n"
+            "            '        A: p:writePermission(0x01010008)=\"android.permission.INTERNET\" (Raw: \"android.permission.INTERNET\")' \\\n"
+            "            '        A: p:authorities(0x01010018)=\"dev.librepocket.agent.github.shizuku\" (Raw: \"dev.librepocket.agent.github.shizuku\")' ;;\n"
+            "        shizuku-read-write-only)\n"
+            "          # Negative control: provider guarded ONLY by explicit\n"
+            "          # readPermission+writePermission (no 'permission' attr),\n"
+            "          # exported=true/multiprocess=false. The base\n"
+            "          # android:permission is the framework's only gate on\n"
+            "          # ContentProvider.call(), so a missing base permission\n"
+            "          # must FAIL closed even with FULL read/write.\n"
+            "          printf '%s\\n' 'E: manifest' '  E: application' \\\n"
+            "            '    A: android:fullBackupContent(0x010104eb)=@0x7f010000' \\\n"
+            "            '    A: android:dataExtractionRules(0x0101063e)=@0x7f010001' \\\n"
+            "            '    A: android:networkSecurityConfig(0x01010527)=@0x7f010002' \\\n"
+            "            '    E: provider (line=4)' \\\n"
+            "            '      A: android:name(0x01010003)=\"rikka.shizuku.ShizukuProvider\" (Raw: \"rikka.shizuku.ShizukuProvider\")' \\\n"
+            "            '      A: android:readPermission(0x01010007)=\"android.permission.INTERACT_ACROSS_USERS_FULL\" (Raw: \"android.permission.INTERACT_ACROSS_USERS_FULL\")' \\\n"
+            "            '      A: android:writePermission(0x01010008)=\"android.permission.INTERACT_ACROSS_USERS_FULL\" (Raw: \"android.permission.INTERACT_ACROSS_USERS_FULL\")' \\\n"
+            "            '      A: android:exported(0x01010010)=(type 0x12)0xffffffff' \\\n"
+            "            '      A: android:multiprocess(0x01010013)=(type 0x12)0x0' \\\n"
+            "            '      A: android:authorities(0x01010018)=\"dev.librepocket.agent.github.shizuku\" (Raw: \"dev.librepocket.agent.github.shizuku\")' ;;\n"
+            "        shizuku-base-weak)\n"
+            "          # Negative control: base 'permission' weakened to\n"
+            "          # INTERACT_ACROSS_USERS (the non-FULL sibling); read/write\n"
+            "          # unset. Must FAIL closed: the base permission alone\n"
+            "          # guards ContentProvider.call().\n"
+            "          printf '%s\\n' 'E: manifest' '  E: application' \\\n"
+            "            '    A: android:fullBackupContent(0x010104eb)=@0x7f010000' \\\n"
+            "            '    A: android:dataExtractionRules(0x0101063e)=@0x7f010001' \\\n"
+            "            '    A: android:networkSecurityConfig(0x01010527)=@0x7f010002' \\\n"
+            "            '    E: provider (line=4)' \\\n"
+            "            '      A: android:name(0x01010003)=\"rikka.shizuku.ShizukuProvider\" (Raw: \"rikka.shizuku.ShizukuProvider\")' \\\n"
+            "            '      A: android:permission(0x01010006)=\"android.permission.INTERACT_ACROSS_USERS\" (Raw: \"android.permission.INTERACT_ACROSS_USERS\")' \\\n"
+            "            '      A: android:exported(0x01010010)=(type 0x12)0xffffffff' \\\n"
+            "            '      A: android:multiprocess(0x01010013)=(type 0x12)0x0' \\\n"
+            "            '      A: android:authorities(0x01010018)=\"dev.librepocket.agent.github.shizuku\" (Raw: \"dev.librepocket.agent.github.shizuku\")' ;;\n"
+            "        shizuku-exported-false)\n"
+            "          # Shizuku attachInfo() hard contract: exported must be\n"
+            "          # exactly true. exported=false must FAIL.\n"
+            "          printf '%s\\n' 'E: manifest' '  E: application' \\\n"
+            "            '    A: android:fullBackupContent(0x010104eb)=@0x7f010000' \\\n"
+            "            '    A: android:dataExtractionRules(0x0101063e)=@0x7f010001' \\\n"
+            "            '    A: android:networkSecurityConfig(0x01010527)=@0x7f010002' \\\n"
+            "            '    E: provider (line=4)' \\\n"
+            "            '      A: android:name(0x01010003)=\"rikka.shizuku.ShizukuProvider\" (Raw: \"rikka.shizuku.ShizukuProvider\")' \\\n"
+            "            '      A: android:permission(0x01010006)=\"android.permission.INTERACT_ACROSS_USERS_FULL\" (Raw: \"android.permission.INTERACT_ACROSS_USERS_FULL\")' \\\n"
+            "            '      A: android:exported(0x01010010)=(type 0x12)0x0' \\\n"
+            "            '      A: android:authorities(0x01010018)=\"dev.librepocket.agent.github.shizuku\" (Raw: \"dev.librepocket.agent.github.shizuku\")' ;;\n"
+            "        shizuku-multiprocess-true)\n"
+            "          # Shizuku attachInfo() hard contract: multiprocess must\n"
+            "          # be absent or false. multiprocess=true must FAIL.\n"
+            "          printf '%s\\n' 'E: manifest' '  E: application' \\\n"
+            "            '    A: android:fullBackupContent(0x010104eb)=@0x7f010000' \\\n"
+            "            '    A: android:dataExtractionRules(0x0101063e)=@0x7f010001' \\\n"
+            "            '    A: android:networkSecurityConfig(0x01010527)=@0x7f010002' \\\n"
+            "            '    E: provider (line=4)' \\\n"
+            "            '      A: android:name(0x01010003)=\"rikka.shizuku.ShizukuProvider\" (Raw: \"rikka.shizuku.ShizukuProvider\")' \\\n"
+            "            '      A: android:permission(0x01010006)=\"android.permission.INTERACT_ACROSS_USERS_FULL\" (Raw: \"android.permission.INTERACT_ACROSS_USERS_FULL\")' \\\n"
+            "            '      A: android:exported(0x01010010)=(type 0x12)0xffffffff' \\\n"
+            "            '      A: android:multiprocess(0x01010013)=(type 0x12)0xffffffff' \\\n"
+            "            '      A: android:authorities(0x01010018)=\"dev.librepocket.agent.github.shizuku\" (Raw: \"dev.librepocket.agent.github.shizuku\")' ;;\n"
+            "        shizuku-no-exported)\n"
+            "          # Merged manifest must prove exported on the provider;\n"
+            "          # absent exported fails closed.\n"
+            "          printf '%s\\n' 'E: manifest' '  E: application' \\\n"
+            "            '    A: android:fullBackupContent(0x010104eb)=@0x7f010000' \\\n"
+            "            '    A: android:dataExtractionRules(0x0101063e)=@0x7f010001' \\\n"
+            "            '    A: android:networkSecurityConfig(0x01010527)=@0x7f010002' \\\n"
+            "            '    E: provider (line=4)' \\\n"
+            "            '      A: android:name(0x01010003)=\"rikka.shizuku.ShizukuProvider\" (Raw: \"rikka.shizuku.ShizukuProvider\")' \\\n"
+            "            '      A: android:permission(0x01010006)=\"android.permission.INTERACT_ACROSS_USERS_FULL\" (Raw: \"android.permission.INTERACT_ACROSS_USERS_FULL\")' \\\n"
+            "            '      A: android:multiprocess(0x01010013)=(type 0x12)0x0' \\\n"
+            "            '      A: android:authorities(0x01010018)=\"dev.librepocket.agent.github.shizuku\" (Raw: \"dev.librepocket.agent.github.shizuku\")' ;;\n"
+            "        shizuku-grant-uri-int)\n"
+            "          # grantUriPermissions is a boolean by binary-XML type;\n"
+            "          # (type 0x12)0x1 is not a boolean false and must fail.\n"
+            "          printf '%s\\n' 'E: manifest' '  E: application' \\\n"
+            "            '    A: android:fullBackupContent(0x010104eb)=@0x7f010000' \\\n"
+            "            '    A: android:dataExtractionRules(0x0101063e)=@0x7f010001' \\\n"
+            "            '    A: android:networkSecurityConfig(0x01010527)=@0x7f010002' \\\n"
+            "            '    E: provider (line=4)' \\\n"
+            "            '      A: android:name(0x01010003)=\"rikka.shizuku.ShizukuProvider\" (Raw: \"rikka.shizuku.ShizukuProvider\")' \\\n"
+            "            '      A: android:permission(0x01010006)=\"android.permission.INTERACT_ACROSS_USERS_FULL\" (Raw: \"android.permission.INTERACT_ACROSS_USERS_FULL\")' \\\n"
+            "            '      A: android:exported(0x01010010)=(type 0x12)0xffffffff' \\\n"
+            "            '      A: android:grantUriPermissions(0x0101001b)=(type 0x12)0x1' \\\n"
+            "            '      A: android:authorities(0x01010018)=\"dev.librepocket.agent.github.shizuku\" (Raw: \"dev.librepocket.agent.github.shizuku\")' ;;\n"
             "        *)  # bindings (the default, realistic merged manifest)\n"
             "          printf '%s\\n' 'E: manifest' '  E: application' \\\n"
             "            '    A: android:fullBackupContent(0x010104eb)=@0x7f010000' \\\n"
@@ -1115,6 +2173,7 @@ class ApkPolicyHarness(unittest.TestCase):
         rules_mode: str = "ok",
         permissions: str = "",
         resources_count_file: Path | None = None,
+        aapt_package: str | None = None,
     ) -> dict[str, str]:
         env = os.environ.copy()
         env.update(
@@ -1135,6 +2194,8 @@ class ApkPolicyHarness(unittest.TestCase):
         )
         if resources_count_file is not None:
             env["FAKE_AAPT_RESOURCES_COUNT_FILE"] = str(resources_count_file)
+        if aapt_package is not None:
+            env["FAKE_AAPT_PACKAGE"] = aapt_package
         return env
 
     def run_policy(
@@ -1154,6 +2215,7 @@ class ApkPolicyHarness(unittest.TestCase):
         path: str | None = None,
         permissions: str = "",
         resources_count_file: Path | None = None,
+        aapt_package: str | None = None,
     ) -> subprocess.CompletedProcess[str]:
         command = ["sh", str(POLICY_CHECK)]
         if foss:
@@ -1178,6 +2240,7 @@ class ApkPolicyHarness(unittest.TestCase):
                 rules_mode=rules_mode,
                 permissions=permissions,
                 resources_count_file=resources_count_file,
+                aapt_package=aapt_package,
             ),
             text=True,
             stdout=subprocess.PIPE,
@@ -1857,8 +2920,8 @@ class ApkPolicyHarness(unittest.TestCase):
     def test_compiled_backup_rules_missing_exclude_rejected(self) -> None:
         # A resources-overlay/merger rewrite can change the COMPILED rule
         # content while every source file and the manifest binding stay
-        # faithful. The artifact bytes must still carry the EXACT six
-        # excludes (5 key + 1 device-bound): dropping one entry fails the
+        # faithful. The artifact bytes must still carry the EXACT ten
+        # excludes (5 key + 5 device-bound): dropping one entry fails the
         # run even though the dump
         # succeeded and the binding survived.
         apk = complete_apk(
@@ -1875,8 +2938,8 @@ class ApkPolicyHarness(unittest.TestCase):
     def test_compiled_backup_rules_unexpected_exclude_rejected(self) -> None:
         # The mirror image of the missing-one control: a resources-overlay /
         # merger rewrite can also ADD an exclude to the COMPILED rule
-        # content. The artifact bytes must still carry EXACTLY the six
-        # excludes (5 key + 1 device-bound): adding one entry
+        # content. The artifact bytes must still carry EXACTLY the ten
+        # excludes (5 key + 5 device-bound): adding one entry
         # (domain="path", path="extra.xml") fails
         # the run even though every required entry survives and the dump
         # succeeded.
@@ -1892,8 +2955,8 @@ class ApkPolicyHarness(unittest.TestCase):
         self.assertIn("compiled res/xml/", result.stdout)
 
     def test_compiled_backup_rules_valid_bytes_accepted(self) -> None:
-        # Positive control: the exactly-pinned six-exclude set (5 key +
-        # 1 device-bound, any order)
+        # Positive control: the exactly-pinned ten-exclude set (5 key +
+        # 5 device-bound, any order)
         # passes both members, keeping the default artifact runs positive.
         apk = complete_apk(
             self.tmp / "rules-ok.apk",
@@ -1949,8 +3012,8 @@ class ApkPolicyHarness(unittest.TestCase):
         ):
             self.assertEqual(engine_call.args[1], member)
             self.assertEqual(engine_call.args[2], expected_root)
-            # Exact-set mode is ON at artifact level: extras beyond the six
-            # required excludes (5 key + 1 device-bound) are refused,
+            # Exact-set mode is ON at artifact level: extras beyond the ten
+            # required excludes (5 key + 5 device-bound) are refused,
             # not tolerated.
             self.assertIs(engine_call.kwargs.get("exact_excludes"), True)
 
@@ -2281,7 +3344,7 @@ class ApkPolicyHarness(unittest.TestCase):
         ]
         self.assertEqual(dumped, ["res/Qq.xml", "res/4j.xml", "res/8G.xml"])
 
-    # -- github artifact mode (mode-independent authorities only) --
+    # -- github artifact mode (authorities + ShizukuProvider contract) --
 
     def _run_scanner_cli(
         self,
@@ -2294,6 +3357,8 @@ class ApkPolicyHarness(unittest.TestCase):
         nsc_mode: str = "ok",
         permissions: str = "",
         aapt2_mode: str = "ok",
+        expect_provider: str | None = None,
+        aapt_package: str | None = None,
     ) -> subprocess.CompletedProcess[str]:
         env = self._env(
             rules_mode=rules_mode,
@@ -2302,20 +3367,24 @@ class ApkPolicyHarness(unittest.TestCase):
             nsc_mode=nsc_mode,
             permissions=permissions,
             aapt2_mode=aapt2_mode,
+            aapt_package=aapt_package,
         )
+        command = [
+            sys.executable,
+            str(ROOT / "scripts" / "apk_policy_inspect.py"),
+            "--mode",
+            mode,
+            "--apk",
+            str(apk),
+            "--aapt",
+            str(self.build_tools / "aapt"),
+            "--dexdump",
+            str(self.dexdump_path),
+        ]
+        if expect_provider is not None:
+            command.extend(("--expect-provider", expect_provider))
         return subprocess.run(
-            [
-                sys.executable,
-                str(ROOT / "scripts" / "apk_policy_inspect.py"),
-                "--mode",
-                mode,
-                "--apk",
-                str(apk),
-                "--aapt",
-                str(self.build_tools / "aapt"),
-                "--dexdump",
-                str(self.dexdump_path),
-            ],
+            command,
             env=env,
             text=True,
             stdout=subprocess.PIPE,
@@ -2544,6 +3613,1853 @@ class ApkPolicyHarness(unittest.TestCase):
             'E: service\n'
             '  A: android:name="android.accessibilityservice.AccessibilityService"\n',
         )
+
+    def test_play_mode_rejects_shizuku_manifest_and_provider_references(self) -> None:
+        apk = complete_apk(
+            self.tmp / "play-shizuku.apk",
+            minimal_dex(type_descriptors=("Ljava/lang/Object;",)),
+        )
+        result = self.run_policy(apk, xmltree_mode="shizuku-ok")
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("Shizuku", result.stdout)
+
+        for label, permissions, xmltree in (
+            (
+                "rikka-xmltree",
+                "",
+                '  E: application\n'
+                '    E: provider\n'
+                '      A: android:name="rikka.shizuku.ShizukuProvider"\n',
+            ),
+            (
+                "moe-permissions",
+                "uses-permission: name='moe.shizuku.manager.permission.API_V23'\n",
+                "  E: application\n",
+            ),
+            (
+                "moe-metadata",
+                "",
+                '  E: application\n'
+                '    E: meta-data\n'
+                '      A: android:name="moe.shizuku.client.V3_SUPPORT"\n',
+            ),
+            (
+                "shizuku-authority-only",
+                "",
+                '  E: application\n'
+                '    E: provider\n'
+                '      A: android:name="com.example.RenamedProvider"\n'
+                '      A: android:authorities="dev.librepocket.agent.shizuku"\n',
+            ),
+        ):
+            with self.subTest(case=label):
+                with self.assertRaisesRegex(policy_inspect.PolicyError, "Shizuku"):
+                    policy_inspect._check_play(permissions, xmltree, (), [])
+
+    def test_github_mode_enforces_shizuku_provider_permission_and_uri_grants(self) -> None:
+        apk = complete_apk(
+            self.tmp / "github-shizuku.apk",
+            minimal_dex(type_descriptors=("Ljava/lang/Object;",)),
+        )
+        ok = self._run_scanner_cli(apk, "github", xmltree_mode="shizuku-ok")
+        self.assertEqual(ok.returncode, 0, ok.stderr + ok.stdout)
+        self.assertIn("policy: github OK", ok.stdout)
+
+        weak = self._run_scanner_cli(apk, "github", xmltree_mode="shizuku-weak-perm")
+        self.assertNotEqual(weak.returncode, 0, weak.stderr + weak.stdout)
+        self.assertIn("INTERACT_ACROSS_USERS_FULL", weak.stderr)
+
+        uri_grant = self._run_scanner_cli(apk, "github", xmltree_mode="shizuku-grant-uri")
+        self.assertNotEqual(uri_grant.returncode, 0, uri_grant.stderr + uri_grant.stdout)
+        self.assertIn("grantUriPermissions", uri_grant.stderr)
+
+        # Positive controls: explicit base + read+write permissions and nested child meta-data
+        # under <provider> (child attributes at +4 must not shadow provider attrs at +2).
+        # exported=true rides along: the upstream attachInfo() hard contract is pinned.
+        policy_inspect._check_github_shizuku_provider(
+            "  E: application\n"
+            "    E: provider\n"
+            '      A: android:name(0x01010003)="rikka.shizuku.ShizukuProvider" (Raw: "rikka.shizuku.ShizukuProvider")\n'
+            '      A: android:permission(0x01010006)="android.permission.INTERACT_ACROSS_USERS_FULL" (Raw: "android.permission.INTERACT_ACROSS_USERS_FULL")\n'
+            '      A: android:enabled(0x0101000e)=(type 0x12)0xffffffff\n'
+            '      A: android:exported(0x01010010)=(type 0x12)0xffffffff\n'
+            '      A: android:grantUriPermissions(0x0101001b)=(type 0x12)0x0\n'
+            '      A: android:authorities(0x01010018)="dev.librepocket.agent.github.shizuku" (Raw: "dev.librepocket.agent.github.shizuku")\n'
+            "      E: meta-data\n"
+            '        A: android:name="child.Meta"\n',
+            "dev.librepocket.agent.github",
+        )
+        policy_inspect._check_github_shizuku_provider(
+            "  E: application\n"
+            "    E: provider\n"
+            '      A: http://schemas.android.com/apk/res/android:name="rikka.shizuku.ShizukuProvider"\n'
+            '      A: http://schemas.android.com/apk/res/android:permission="android.permission.INTERACT_ACROSS_USERS_FULL"\n'
+            '      A: http://schemas.android.com/apk/res/android:readPermission="android.permission.INTERACT_ACROSS_USERS_FULL"\n'
+            '      A: http://schemas.android.com/apk/res/android:writePermission="android.permission.INTERACT_ACROSS_USERS_FULL"\n'
+            '      A: http://schemas.android.com/apk/res/android:enabled="true"\n'
+            '      A: http://schemas.android.com/apk/res/android:exported="true"\n'
+            '      A: http://schemas.android.com/apk/res/android:authorities="dev.librepocket.agent.github.shizuku"\n',
+            "dev.librepocket.agent.github",
+        )
+
+        # Negative controls: missing permission, weakened read/write override,
+        # grantUriPermissions=true, <path-permission>, <grant-uri-permission>.
+        for label, bad_tree, msg in (
+            (
+                "missing-permission",
+                "  E: application\n"
+                "    E: provider\n"
+                '      A: android:name="rikka.shizuku.ShizukuProvider"\n'
+                '      A: android:authorities="dev.librepocket.agent.github.shizuku"\n',
+                "INTERACT_ACROSS_USERS_FULL",
+            ),
+            (
+                "weak-write-override",
+                "  E: application\n"
+                "    E: provider\n"
+                '      A: android:name="rikka.shizuku.ShizukuProvider"\n'
+                '      A: android:permission="android.permission.INTERACT_ACROSS_USERS_FULL"\n'
+                '      A: android:writePermission="android.permission.INTERNET"\n',
+                "INTERACT_ACROSS_USERS_FULL",
+            ),
+            (
+                "weak-read-override",
+                "  E: application\n"
+                "    E: provider\n"
+                '      A: android:name="rikka.shizuku.ShizukuProvider"\n'
+                '      A: android:permission="android.permission.INTERACT_ACROSS_USERS_FULL"\n'
+                '      A: android:readPermission=""\n',
+                "INTERACT_ACROSS_USERS_FULL",
+            ),
+            (
+                "path-permission-child",
+                "  E: application\n"
+                "    E: provider\n"
+                '      A: android:name="rikka.shizuku.ShizukuProvider"\n'
+                '      A: android:permission="android.permission.INTERACT_ACROSS_USERS_FULL"\n'
+                '      A: android:exported="true"\n'
+                "      E: path-permission\n"
+                '        A: android:path="/"\n',
+                "path-permission",
+            ),
+            (
+                "grant-uri-permission-child",
+                "  E: application\n"
+                "    E: provider\n"
+                '      A: android:name="rikka.shizuku.ShizukuProvider"\n'
+                '      A: android:permission="android.permission.INTERACT_ACROSS_USERS_FULL"\n'
+                '      A: android:exported="true"\n'
+                "      E: grant-uri-permission\n"
+                '        A: android:path="/"\n',
+                "grant-uri-permission",
+            ),
+            (
+                "authority-only-shizuku",
+                "  E: application\n"
+                "    E: provider\n"
+                '      A: android:name="com.example.AliasProvider"\n'
+                '      A: android:authorities="a;dev.librepocket.agent.github.shizuku"\n',
+                "INTERACT_ACROSS_USERS_FULL",
+            ),
+        ):
+            with self.subTest(case=label):
+                with self.assertRaisesRegex(policy_inspect.PolicyError, msg):
+                    policy_inspect._check_github_shizuku_provider(
+                        bad_tree, "dev.librepocket.agent.github"
+                    )
+
+    def test_github_mode_rejects_non_false_grant_uri_permissions_encodings(self) -> None:
+        apk = complete_apk(
+            self.tmp / "github-grant-uri-encodings.apk",
+            minimal_dex(type_descriptors=("Ljava/lang/Object;",)),
+        )
+        for xmltree_mode in (
+            "shizuku-grant-uri-ref",
+            "shizuku-grant-uri-attr",
+            "shizuku-grant-uri-upper",
+        ):
+            with self.subTest(xmltree_mode=xmltree_mode):
+                result = self._run_scanner_cli(apk, "github", xmltree_mode=xmltree_mode)
+                self.assertNotEqual(result.returncode, 0, result.stderr + result.stdout)
+                self.assertIn("grantUriPermissions", result.stderr)
+
+        # Direct positive control for explicit string "false" and typed false.
+        # exported=true rides along: the upstream attachInfo() hard contract is pinned.
+        for false_encoding in ('"false" (Raw: "false")', "(type 0x12)0x0"):
+            policy_inspect._check_github_shizuku_provider(
+                "  E: application\n"
+                "    E: provider\n"
+                '      A: android:name="rikka.shizuku.ShizukuProvider"\n'
+                '      A: android:permission="android.permission.INTERACT_ACROSS_USERS_FULL"\n'
+                '      A: android:enabled=(type 0x12)0xffffffff\n'
+                '      A: android:exported=(type 0x12)0xffffffff\n'
+                '      A: android:authorities="dev.librepocket.agent.github.shizuku"\n'
+                f"      A: android:grantUriPermissions={false_encoding}\n",
+                "dev.librepocket.agent.github",
+            )
+
+        for label, bad_encoding in (
+            ("resource-ref", "@0x7f030001"),
+            ("theme-attr-ref", "?0x01010000"),
+            ("uppercase-true", '"TRUE" (Raw: "TRUE")'),
+            ("empty-string", '""'),
+        ):
+            with self.subTest(encoding=label):
+                with self.assertRaisesRegex(
+                    policy_inspect.PolicyError, "grantUriPermissions"
+                ):
+                    policy_inspect._check_github_shizuku_provider(
+                        "  E: application\n"
+                        "    E: provider\n"
+                        '      A: android:name="rikka.shizuku.ShizukuProvider"\n'
+                        '      A: android:permission="android.permission.INTERACT_ACROSS_USERS_FULL"\n'
+                        f"      A: android:grantUriPermissions={bad_encoding}\n",
+                        "dev.librepocket.agent.github",
+                    )
+
+    def test_duplicate_application_block_and_decoy_tags_fail_closed(self) -> None:
+        apk = complete_apk(
+            self.tmp / "duplicate-application.apk",
+            minimal_dex(type_descriptors=("Ljava/lang/Object;",)),
+        )
+        for mode in ("github", "play", "foss"):
+            with self.subTest(mode=mode):
+                result = self._run_scanner_cli(
+                    apk, mode, xmltree_mode="duplicate-application"
+                )
+                self.assertNotEqual(result.returncode, 0, result.stderr + result.stdout)
+                self.assertIn("multiple <application>", result.stderr)
+
+        with self.assertRaisesRegex(
+            policy_inspect.PolicyError, r"multiple <application>"
+        ):
+            policy_inspect._application_manifest_block(
+                "E: manifest\n"
+                "  E: application\n"
+                "    A: android:fullBackupContent(0x010104eb)=@0x7f010000\n"
+                "  E: application\n"
+                "    E: provider\n"
+                '      A: android:name="rikka.shizuku.ShizukuProvider"\n'
+            )
+
+        with self.assertRaisesRegex(
+            policy_inspect.PolicyError, r"multiple <application>"
+        ):
+            policy_inspect._check_github_shizuku_provider(
+                "  E: application\n"
+                "    E: provider\n"
+                '      A: android:name="androidx.startup.InitializationProvider"\n'
+                "  E: application\n"
+                "    E: provider\n"
+                '      A: android:name="rikka.shizuku.ShizukuProvider"\n',
+                "dev.librepocket.agent.github",
+            )
+
+        # Tag boundary: E: application-decoy and E: provider-decoy must never match.
+        with self.assertRaisesRegex(
+            policy_inspect.PolicyError, r"lacks an <application> element"
+        ):
+            policy_inspect._application_manifest_block(
+                "E: manifest\n"
+                "  E: application-decoy\n"
+                "    A: android:fullBackupContent(0x010104eb)=@0x7f010000\n"
+            )
+        policy_inspect._check_github_shizuku_provider(
+            "E: manifest\n"
+            "  E: application\n"
+            "    E: provider-decoy\n"
+            '      A: android:name="rikka.shizuku.ShizukuProvider"\n',
+            "dev.librepocket.agent.github",
+        )
+
+    def test_shizuku_provider_namespace_aliases_and_boundaries(self) -> None:
+        apk = complete_apk(
+            self.tmp / "github-ns-alias.apk",
+            minimal_dex(type_descriptors=("Ljava/lang/Object;",)),
+        )
+        cli_weak = self._run_scanner_cli(
+            apk, "github", xmltree_mode="shizuku-ns-alias-weak"
+        )
+        self.assertNotEqual(cli_weak.returncode, 0, cli_weak.stderr + cli_weak.stdout)
+        self.assertIn("INTERACT_ACROSS_USERS_FULL", cli_weak.stderr)
+
+        # Bound alias `N: p=http://schemas.android.com/apk/res/android` with valid attrs passes.
+        # exported=true rides along: the upstream attachInfo() hard contract is pinned.
+        policy_inspect._check_github_shizuku_provider(
+            "N: p=http://schemas.android.com/apk/res/android\n"
+            "  E: manifest\n"
+            "    E: application\n"
+            "      E: provider\n"
+            '        A: p:name="rikka.shizuku.ShizukuProvider"\n'
+            '        A: p:permission="android.permission.INTERACT_ACROSS_USERS_FULL"\n'
+            '        A: p:enabled="true"\n'
+            '        A: p:authorities="dev.librepocket.agent.github.shizuku"\n'
+            '        A: p:exported="true"\n',
+            "dev.librepocket.agent.github",
+        )
+
+        # Bound alias catching weak writePermission and grantUriPermissions=true.
+        for label, bad_tree, msg in (
+            (
+                "ns-alias-weak-write",
+                "N: p=http://schemas.android.com/apk/res/android\n"
+                "  E: manifest\n"
+                "    E: application\n"
+                "      E: provider\n"
+                '        A: android:name="rikka.shizuku.ShizukuProvider"\n'
+                '        A: android:permission="android.permission.INTERACT_ACROSS_USERS_FULL"\n'
+                '        A: p:writePermission="android.permission.INTERNET"\n',
+                "INTERACT_ACROSS_USERS_FULL",
+            ),
+            (
+                "ns-alias-grant-uri",
+                "E: manifest\n"
+                "  E: application\n"
+                "    N: p=http://schemas.android.com/apk/res/android\n"
+                "      E: provider\n"
+                '        A: android:name="rikka.shizuku.ShizukuProvider"\n'
+                '        A: android:permission="android.permission.INTERACT_ACROSS_USERS_FULL"\n'
+                "        A: p:grantUriPermissions=(type 0x12)0xffffffff\n",
+                "grantUriPermissions",
+            ),
+            (
+                "ns-alias-grant-uri-literal-true",
+                "N: p=http://schemas.android.com/apk/res/android\n"
+                "E: manifest\n"
+                "  E: application\n"
+                "    E: provider\n"
+                '      A: android:name="rikka.shizuku.ShizukuProvider"\n'
+                '      A: android:permission="android.permission.INTERACT_ACROSS_USERS_FULL"\n'
+                "      A: p:grantUriPermissions=true\n",
+                "unrecognized attribute value encoding",
+            ),
+            (
+                "unbound-unexpected-prefix-write-perm",
+                "  E: application\n"
+                "    E: provider\n"
+                '      A: android:name="rikka.shizuku.ShizukuProvider"\n'
+                '      A: android:permission="android.permission.INTERACT_ACROSS_USERS_FULL"\n'
+                '      A: p:writePermission="android.permission.INTERNET"\n',
+                "unexpected or unbound namespace prefix",
+            ),
+            (
+                "unbound-unexpected-prefix-grant-uri",
+                "  E: application\n"
+                "    E: provider\n"
+                '      A: android:name="rikka.shizuku.ShizukuProvider"\n'
+                '      A: android:permission="android.permission.INTERACT_ACROSS_USERS_FULL"\n'
+                "      A: custom:grantUriPermissions=(type 0x12)0xffffffff\n",
+                "unexpected or unbound namespace prefix",
+            ),
+            (
+                "attr-after-child-element",
+                "  E: application\n"
+                "    E: provider\n"
+                '      A: android:name="rikka.shizuku.ShizukuProvider"\n'
+                '      A: android:permission="android.permission.INTERACT_ACROSS_USERS_FULL"\n'
+                "      E: meta-data\n"
+                '        A: android:name="child.Meta"\n'
+                "      A: android:grantUriPermissions=(type 0x12)0xffffffff\n",
+                "attribute line after child element",
+            ),
+        ):
+            with self.subTest(case=label):
+                with self.assertRaisesRegex(policy_inspect.PolicyError, msg):
+                    policy_inspect._check_github_shizuku_provider(
+                        bad_tree, "dev.librepocket.agent.github"
+                    )
+
+    def test_foss_and_play_shizuku_parity_and_moe_shizuku_dex(self) -> None:
+        # Both play and foss modes must reject Shizuku manifest/provider references
+        # and both rikka.shizuku and moe.shizuku DEX type references.
+        apk_clean_dex = complete_apk(
+            self.tmp / "shizuku-manifest.apk",
+            minimal_dex(type_descriptors=("Ljava/lang/Object;",)),
+        )
+        for mode in ("play", "foss"):
+            with self.subTest(mode=mode, vector="manifest"):
+                result = self._run_scanner_cli(
+                    apk_clean_dex, mode, xmltree_mode="shizuku-ok"
+                )
+                self.assertNotEqual(result.returncode, 0, result.stderr + result.stdout)
+
+        for label, permissions, xmltree in (
+            (
+                "rikka-xmltree",
+                "",
+                '  E: application\n'
+                '    E: provider\n'
+                '      A: android:name="rikka.shizuku.ShizukuProvider"\n',
+            ),
+            (
+                "moe-permissions",
+                "uses-permission: name='moe.shizuku.manager.permission.API_V23'\n",
+                "  E: application\n",
+            ),
+            (
+                "shizuku-authority-only",
+                "",
+                '  E: application\n'
+                '    E: provider\n'
+                '      A: android:name="com.example.RenamedProvider"\n'
+                '      A: android:authorities="dev.librepocket.agent.foss.shizuku"\n',
+            ),
+        ):
+            with self.subTest(mode="foss", case=label):
+                with self.assertRaisesRegex(policy_inspect.PolicyError, r"(?i)shizuku"):
+                    policy_inspect._check_foss(permissions, xmltree, [])
+
+        for idx, descriptor in enumerate((
+            "Lrikka/shizuku/Shizuku;",
+            "Lmoe/shizuku/api/BinderContainer;",
+            "[Lmoe/shizuku/api/BinderContainer;",
+        )):
+            dex_ref_only = minimal_dex(type_descriptors=(descriptor,))
+            apk_ref = complete_apk(
+                self.tmp / f"shizuku-ref-{idx}.apk", dex_ref_only
+            )
+            for mode in ("play", "foss"):
+                with self.subTest(descriptor=descriptor, mode=mode):
+                    result = self._run_scanner_cli(apk_ref, mode)
+                    self.assertNotEqual(
+                        result.returncode, 0, result.stderr + result.stdout
+                    )
+
+        # Also test defined_classes for Lmoe/shizuku/ in play mode.
+        dex_defined = minimal_dex(
+            class_definitions=(("Lmoe/shizuku/api/BinderContainer;", None),)
+        )
+        defined_result = self._run_scanner_cli(
+            complete_apk(self.tmp / "play-moe-defined.apk", dex_defined), "play"
+        )
+        self.assertNotEqual(
+            defined_result.returncode, 0, defined_result.stderr + defined_result.stdout
+        )
+
+    # -- github --expect-provider contract + provider parser fail-closed branches --
+
+    def test_provider_attribute_parser_fail_closed_branches(self) -> None:
+        # Direct pins of the five parser fail-closed branches in
+        # _iter_application_providers (duplicate attribute, unexpected
+        # indentation, malformed attribute line, ID/local-name mismatch,
+        # unexpected resource ID) plus the F4 fail-closed precondition
+        # (no <application> => PolicyError, never a silent empty list).
+        base = "E: manifest\n  E: application\n    E: provider\n"
+        cases = (
+            (
+                "duplicate-attribute",
+                base
+                + '      A: android:name="rikka.shizuku.ShizukuProvider"\n'
+                + '      A: android:permission(0x01010006)="android.permission.INTERACT_ACROSS_USERS_FULL"\n'
+                + '      A: android:permission="android.permission.INTERNET"\n',
+                r"declares duplicate attribute 'permission'",
+            ),
+            (
+                "unexpected-indentation",
+                base
+                + '        A: android:name="rikka.shizuku.ShizukuProvider"\n',
+                r"unexpected indentation",
+            ),
+            (
+                "malformed-attribute-line",
+                base
+                + '      A:android:name="rikka.shizuku.ShizukuProvider"\n',
+                r"malformed attribute line",
+            ),
+            (
+                "attribute-id-disagrees-with-local-name",
+                base
+                + '      A: android:name(0x01010008)="rikka.shizuku.ShizukuProvider"\n',
+                r"disagrees with Android attribute ID 0x01010008",
+            ),
+            (
+                "unexpected-resource-id",
+                base
+                + '      A: android:grantUriPermissions(0x01015555)="false"\n',
+                r"unexpected resource ID 0x01015555",
+            ),
+        )
+        for label, tree, msg in cases:
+            with self.subTest(case=label):
+                with self.assertRaisesRegex(policy_inspect.PolicyError, msg):
+                    policy_inspect._iter_application_providers(tree)
+
+    def test_github_application_enabled_fail_closed_branches(self) -> None:
+        # Direct pins of the fail-closed branches in
+        # _check_github_application_enabled (own-level scan, namespace
+        # discipline, id<->name agreement, duplicate detection, and the
+        # tab/shallow-indent hardening) fed crafted xmltree STRINGS - no APK
+        # fixture: the gate only locates the <application> span and scans
+        # its OWN attribute level, so the manifest skeleton is all it needs.
+        def _app_tree(attr_lines: list[str]) -> str:
+            # <manifest> > <application> with the given body lines. Bare
+            # lines print at the application's OWN attribute indent (4
+            # spaces, aapt's two-space hierarchy step); lines given with
+            # their own leading whitespace are used verbatim (child lines,
+            # or the tab/shallow-indent lines under test).
+            body = "\n".join(
+                line if line[:1] in (" ", "\t") else "    " + line
+                for line in attr_lines
+            )
+            return f"E: manifest\n  E: application\n{body}\n"
+
+        cases = (
+            (
+                "duplicate-own-level-enabled",
+                _app_tree([
+                    "A: android:enabled(0x0101000e)=(type 0x12)0xffffffff",
+                    "A: android:enabled(0x0101000e)=(type 0x12)0xffffffff",
+                ]),
+                r"declared more than once \(duplicate attribute\)",
+            ),
+            (
+                "aliased-namespace-prefix",
+                _app_tree([
+                    "A: ns1:enabled(0x0101000e)=(type 0x12)0xffffffff",
+                ]),
+                r"unexpected or unbound namespace prefix",
+            ),
+            (
+                "bare-enabled-unbound-namespace",
+                _app_tree([
+                    "A: enabled(0x0101000e)=(type 0x12)0xffffffff",
+                ]),
+                r"unexpected or unbound namespace prefix",
+            ),
+            (
+                "foreign-uri-namespace",
+                _app_tree([
+                    "A: http://evil.example/android:enabled(0x0101000e)=(type 0x12)0xffffffff",
+                ]),
+                r"unexpected or unbound namespace prefix",
+            ),
+            (
+                "caps-namespace-prefix",
+                _app_tree([
+                    "A: Android:enabled(0x0101000e)=(type 0x12)0xffffffff",
+                ]),
+                r"unexpected or unbound namespace prefix",
+            ),
+            (
+                "enabled-local-name-with-exported-id",
+                _app_tree([
+                    "A: android:enabled(0x01010010)=(type 0x12)0xffffffff",
+                ]),
+                r"disagrees with Android attribute ID 0x01010010 \(that ID is 'exported'\)",
+            ),
+            (
+                "exported-local-name-with-enabled-id",
+                _app_tree([
+                    "A: android:exported(0x0101000e)=(type 0x12)0xffffffff",
+                ]),
+                r"disagrees with Android attribute ID 0x0101000e \(that ID is 'enabled'\)",
+            ),
+            (
+                "enabled-with-unexpected-resource-id",
+                _app_tree([
+                    "A: android:enabled(0x7f010099)=(type 0x12)0xffffffff",
+                ]),
+                r"has unexpected resource ID 0x7f010099",
+            ),
+            (
+                "malformed-own-level-line",
+                _app_tree([
+                    "A: enabled",
+                ]),
+                r"malformed attribute line",
+            ),
+            (
+                "no-space-after-colon",
+                _app_tree([
+                    "A:android:enabled(0x0101000e)=(type 0x12)0xffffffff",
+                ]),
+                r"malformed attribute line",
+            ),
+            (
+                "tab-indented-own-level-line",
+                _app_tree([
+                    "\tA: android:enabled(0x0101000e)=(type 0x12)0x0",
+                ]),
+                r"unexpectedly indented or tab-indented",
+            ),
+            (
+                "shallow-indent-own-level-line",
+                _app_tree([
+                    "  A: android:enabled(0x0101000e)=(type 0x12)0x0",
+                ]),
+                r"unexpectedly indented or tab-indented",
+            ),
+            (
+                # Order irrelevance: the single own-level enabled line is
+                # scanned even AFTER a child provider block carrying its own
+                # compliant 6-space attributes; not a duplicate.
+                "own-level-enabled-after-child-block",
+                _app_tree([
+                    "E: provider",
+                    '      A: android:name="rikka.shizuku.ShizukuProvider"',
+                    "      A: android:enabled=(type 0x12)0xffffffff",
+                    "A: android:enabled=(type 0x12)0x0",
+                ]),
+                r"must be the exact boolean true",
+            ),
+            (
+                # N:-declared alias is deliberately NOT resolved by this pin.
+                "n-declared-alias-not-resolved",
+                'N: foo="http://schemas.android.com/apk/res/android"\n'
+                + _app_tree([
+                    "E: provider",
+                    '      A: android:name="rikka.shizuku.ShizukuProvider"',
+                    "A: foo:enabled(0x0101000e)=(type 0x12)0xffffffff",
+                ]),
+                r"unexpected or unbound namespace prefix",
+            ),
+        )
+        for label, tree, msg in cases:
+            with self.subTest(case=label):
+                with self.assertRaisesRegex(policy_inspect.PolicyError, msg):
+                    policy_inspect._check_github_application_enabled(tree)
+
+        # Positive controls: absence (Android default true), the exact
+        # compiled boolean true, and a compliant-absent own level with a
+        # DISABLED child attribute (child lines never shadow or trip the
+        # application's own level) all PASS with no exception.
+        with self.subTest(case="absent-enabled-defaults-true"):
+            policy_inspect._check_github_application_enabled(_app_tree([]))
+        with self.subTest(case="exact-boolean-true-accepted"):
+            policy_inspect._check_github_application_enabled(
+                _app_tree([
+                    "A: android:enabled(0x0101000e)=(type 0x12)0xffffffff",
+                ])
+            )
+        with self.subTest(case="child-enabled-false-ignored-when-own-level-absent"):
+            policy_inspect._check_github_application_enabled(
+                _app_tree([
+                    "E: provider",
+                    '      A: android:name="rikka.shizuku.ShizukuProvider"',
+                    "      A: android:enabled=(type 0x12)0x0",
+                ])
+            )
+
+    def test_iter_application_providers_requires_application_element(self) -> None:
+        # F4: a merged manifest without <application> has no provider scope;
+        # the iterator must fail closed with the named PolicyError, never a
+        # silent empty list (the old behavior masked merger-stripped manifests).
+        with self.assertRaisesRegex(
+            policy_inspect.PolicyError, r"lacks an <application> element"
+        ):
+            policy_inspect._iter_application_providers("E: manifest\n")
+        with self.assertRaisesRegex(
+            policy_inspect.PolicyError, r"lacks an <application> element"
+        ):
+            policy_inspect._check_github_shizuku_provider("E: manifest\n", "dev.librepocket.agent.github")
+
+    def test_github_mode_provider_base_permission_fail_closed(self) -> None:
+        # The base android:permission is the framework's only gate on
+        # ContentProvider.call(): a missing or weakened base permission must
+        # FAIL closed even when explicit read/write permissions are set to
+        # FULL. shizuku-ok covers the positive control (base FULL, no
+        # explicit read/write).
+        apk = complete_apk(
+            self.tmp / "github-base-permission.apk",
+            minimal_dex(type_descriptors=("Ljava/lang/Object;",)),
+        )
+        # No base permission, read/write FULL => exit 1, stderr mentions permission.
+        missing = self._run_scanner_cli(
+            apk, "github", xmltree_mode="shizuku-read-write-only"
+        )
+        self.assertEqual(missing.returncode, 1, missing.stderr + missing.stdout)
+        self.assertIn("permission", missing.stderr)
+        # Base weakened to INTERACT_ACROSS_USERS (no read/write) => exit 1.
+        weak = self._run_scanner_cli(
+            apk, "github", xmltree_mode="shizuku-base-weak"
+        )
+        self.assertEqual(weak.returncode, 1, weak.stderr + weak.stdout)
+        self.assertIn("INTERACT_ACROSS_USERS_FULL", weak.stderr)
+        # Positive control: base FULL, no read/write => exit 0.
+        base_only = self._run_scanner_cli(
+            apk, "github", xmltree_mode="shizuku-ok"
+        )
+        self.assertEqual(base_only.returncode, 0, base_only.stderr + base_only.stdout)
+        self.assertIn("policy: github OK", base_only.stdout)
+
+    def test_github_mode_rejects_non_boolean_typed_grant_uri_permission(self) -> None:
+        # grantUriPermissions is a boolean by binary-XML type; (type 0x12)0x1
+        # is not a boolean false and must fail closed, never pass as false.
+        apk = complete_apk(
+            self.tmp / "github-grant-uri-int.apk",
+            minimal_dex(type_descriptors=("Ljava/lang/Object;",)),
+        )
+        result = self._run_scanner_cli(
+            apk, "github", xmltree_mode="shizuku-grant-uri-int"
+        )
+        self.assertNotEqual(result.returncode, 0, result.stderr + result.stdout)
+        self.assertIn("grantUriPermissions", result.stderr)
+
+    def test_github_expect_provider_required_fail_closed(self) -> None:
+        # class_definitions carry the official provider class (and the
+        # second heuristic-detected surface's class): the github
+        # required-provider gate now demands every detected provider's
+        # canonical class be DEX class_def-defined, so the green cases
+        # below must ship a DEX that actually defines those classes.
+        apk = complete_apk(
+            self.tmp / "github-expect-provider.apk",
+            minimal_dex(
+                class_definitions=(
+                    ("Lrikka/shizuku/ShizukuProvider;", None),
+                    ("Ldev/librepocket/internal/ShizukuProvider;", None),
+                )
+            ),
+        )
+        # required + merged manifest with NO ShizukuProvider => exit 1.
+        result = self._run_scanner_cli(
+            apk, "github", xmltree_mode="bindings", expect_provider="required"
+        )
+        self.assertEqual(result.returncode, 1, result.stderr + result.stdout)
+        self.assertIn("exactly one ShizukuProvider", result.stderr)
+
+        # required + TWO ShizukuProviders (both are detected as
+        # ShizukuProviders - one by authority suffix, one by the name heuristic)
+        # => exit 1 with the found-count message (first-match must never win).
+        # Both canonical classes are DEX class_def-defined above so the
+        # required-provider gate reaches the counting layer.
+        result = self._run_scanner_cli(
+            apk, "github", xmltree_mode="shizuku-ok-two", expect_provider="required"
+        )
+        self.assertEqual(result.returncode, 1, result.stderr + result.stdout)
+        self.assertIn("found 2", result.stderr)
+
+        # required + valid ShizukuProvider => exit 0.
+        result = self._run_scanner_cli(
+            apk, "github", xmltree_mode="shizuku-ok", expect_provider="required"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+
+        # optional (the default) + missing provider => exit 0 (backward compat).
+        result = self._run_scanner_cli(apk, "github", xmltree_mode="bindings")
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        result = self._run_scanner_cli(
+            apk, "github", xmltree_mode="bindings", expect_provider="optional"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+
+    def test_github_application_enabled_contract(self) -> None:
+        # Re-review #11 Finding 3: the merged <application>'s OWN
+        # android:enabled is pinned (github mode only) - the Android
+        # <provider> spec requires BOTH application and provider to be
+        # enabled; an application-disabled artifact cannot instantiate any
+        # provider, Shizuku binder surface dead on arrival. Expected owner
+        # of every red in this test: _check_github_application_enabled
+        # (wired into the github branch BEFORE the DEX/provider checks);
+        # the provider-side android:enabled pin stays with
+        # _check_provider_attrs. Every required-green APK below ships a
+        # DEX that class_def-defines the official provider class so the
+        # required-provider counting layer (11A) is satisfied.
+        official_dex = minimal_dex(
+            class_definitions=(("Lrikka/shizuku/ShizukuProvider;", None),),
+        )
+
+        # (1) application own android:enabled=false, provider block UNCHANGED
+        #     compliant => red; the provider-side gate is green by design,
+        #     so the owner of this rejection is the application-level pin.
+        with self.subTest(case="application-enabled-false-rejected"):
+            apk = complete_apk(
+                self.tmp / "app-enabled-false.apk",
+                minimal_dex(type_descriptors=("Ljava/lang/Object;",)),
+            )
+            result = self._run_scanner_cli(
+                apk,
+                "github",
+                xmltree_mode="shizuku-ok-app-enabled-false",
+                expect_provider="required",
+            )
+            self.assertNotEqual(result.returncode, 0, result.stderr + result.stdout)
+            self.assertIn("<application>", result.stderr)
+            self.assertIn("android:enabled", result.stderr)
+
+        # (2) application own android:enabled=(type 0x12)0xffffffff => green.
+        #     Owner of the pass: the application-level pin (exact compiled
+        #     boolean true); required-green needs the official class_def.
+        with self.subTest(case="application-enabled-true-allowed"):
+            apk = complete_apk(self.tmp / "app-enabled-true.apk", official_dex)
+            result = self._run_scanner_cli(
+                apk,
+                "github",
+                xmltree_mode="shizuku-ok-app-enabled-true",
+                expect_provider="required",
+            )
+            self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+
+        # (3) application-level enabled ABSENT = Android default true => green.
+        #     Fixture: the existing shizuku-ok (no own-level enabled); the
+        #     owner of the pass is the absence default-true branch.
+        with self.subTest(case="application-enabled-absent-allowed"):
+            apk = complete_apk(self.tmp / "app-enabled-absent.apk", official_dex)
+            result = self._run_scanner_cli(
+                apk,
+                "github",
+                xmltree_mode="shizuku-ok",
+                expect_provider="required",
+            )
+            self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+
+        # (4) application own android:enabled=@0x7f010099 (resource ref) =>
+        #     red; refs pass through _xmltree_attr_value verbatim and fail
+        #     closed against the exact compiled boolean true.
+        with self.subTest(case="application-enabled-reference-rejected"):
+            apk = complete_apk(
+                self.tmp / "app-enabled-ref.apk",
+                minimal_dex(type_descriptors=("Ljava/lang/Object;",)),
+            )
+            result = self._run_scanner_cli(
+                apk,
+                "github",
+                xmltree_mode="shizuku-ok-app-enabled-ref",
+                expect_provider="required",
+            )
+            self.assertNotEqual(result.returncode, 0, result.stderr + result.stdout)
+            self.assertIn("<application>", result.stderr)
+            self.assertIn("android:enabled", result.stderr)
+
+        # (5) application own android:enabled=(type 0x10)0x1 (integer typed)
+        #     => red; typed non-boolean encodings raise inside
+        #     _xmltree_attr_value with the android:enabled-carrying label.
+        with self.subTest(case="application-enabled-int-typed-rejected"):
+            apk = complete_apk(
+                self.tmp / "app-enabled-int-typed.apk",
+                minimal_dex(type_descriptors=("Ljava/lang/Object;",)),
+            )
+            result = self._run_scanner_cli(
+                apk,
+                "github",
+                xmltree_mode="shizuku-ok-app-enabled-int-typed",
+                expect_provider="required",
+            )
+            self.assertNotEqual(result.returncode, 0, result.stderr + result.stdout)
+            self.assertIn("<application>", result.stderr)
+            self.assertIn("android:enabled", result.stderr)
+
+        # (6) InitializationProvider CHILD carries enabled=(type 0x12)0x0 at
+        #     the 6-space child attribute level; application declares NO own
+        #     enabled => green. Owner isolation: exact own-indent scan; the
+        #     provider-level gate does not require InitializationProvider to
+        #     be enabled (not heuristic-detected, not DEX-evidenced).
+        with self.subTest(case="child-decoy-does-not-trip-application-gate"):
+            apk = complete_apk(self.tmp / "app-enabled-decoy.apk", official_dex)
+            result = self._run_scanner_cli(
+                apk,
+                "github",
+                xmltree_mode="shizuku-ok-app-enabled-decoy",
+                expect_provider="required",
+            )
+            self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+
+    def test_github_required_provider_must_have_dex_class_def(self) -> None:
+        # Re-review #11 Finding 1: the github required-provider gate must
+        # demand the declared provider's canonical class be DEX
+        # class_def-defined - a type_ids mention is NOT a class definition.
+        # (a) type_ids mentions the descriptor but it is never defined.
+        mention_apk = complete_apk(
+            self.tmp / "github-mention-not-defined.apk",
+            minimal_dex(type_descriptors=("Lrikka/shizuku/ShizukuProvider;",)),
+        )
+        result = self._run_scanner_cli(
+            mention_apk,
+            "github",
+            xmltree_mode="shizuku-ok",
+            expect_provider="required",
+        )
+        self.assertNotEqual(result.returncode, 0, result.stderr + result.stdout)
+        self.assertIn(
+            "but no root DEX shard defines that class", result.stderr
+        )
+        self.assertIn("rikka.shizuku.ShizukuProvider", result.stderr)
+
+        # (b) Empty DEX (no such type at all): same failure shape.
+        empty_apk = complete_apk(
+            self.tmp / "github-empty-dex-provider.apk",
+            minimal_dex(type_descriptors=("Ljava/lang/Object;",)),
+        )
+        result = self._run_scanner_cli(
+            empty_apk,
+            "github",
+            xmltree_mode="shizuku-ok",
+            expect_provider="required",
+        )
+        self.assertNotEqual(result.returncode, 0, result.stderr + result.stdout)
+        self.assertIn(
+            "but no root DEX shard defines that class", result.stderr
+        )
+        self.assertIn("rikka.shizuku.ShizukuProvider", result.stderr)
+
+        # (c) Positive control: the DEX really class_def-defines the official
+        # provider class (class_definitions carries the official class here).
+        defined_apk = complete_apk(
+            self.tmp / "github-defined-provider.apk",
+            minimal_dex(
+                class_definitions=(("Lrikka/shizuku/ShizukuProvider;", None),)
+            ),
+        )
+        result = self._run_scanner_cli(
+            defined_apk,
+            "github",
+            xmltree_mode="shizuku-ok",
+            expect_provider="required",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+
+        # (d) Arbitrary, non-official FQN detected via the name heuristic
+        # (ShizukuProvider token in android:name); the authority carries no
+        # Shizuku token. The DEX defines nothing, so the class-def gate
+        # must fire for detected non-official names too.
+        with self.subTest(case="d"):
+            ghost_apk = complete_apk(
+                self.tmp / "github-arbitrary-fqn.apk",
+                minimal_dex(type_descriptors=("Ljava/lang/Object;",)),
+            )
+            result = self._run_scanner_cli(
+                ghost_apk,
+                "github",
+                xmltree_mode="shizuku-arbitrary-fqn",
+                expect_provider="required",
+            )
+            self.assertNotEqual(
+                result.returncode, 0, result.stderr + result.stdout
+            )
+            self.assertIn(
+                "but no root DEX shard defines that class", result.stderr
+            )
+            self.assertIn(
+                "dev.librepocket.agent.github.GhostShizukuProvider",
+                result.stderr,
+            )
+
+    def test_github_canonical_alias_duplicate_provider_rejected(self) -> None:
+        # Re-review #11 Finding 2: alias spellings of the SAME provider class
+        # under Android's canonical component-name resolution ('.Bridge' and
+        # dot-free 'Bridge', or '.Bridge' and the full
+        # '{package}.Bridge' FQN) resolve to one canonical FQN. Two detected
+        # blocks with the same canonical name must fail closed - a
+        # DEX-evidenced class must never be consumed twice. The fixture
+        # blocks are otherwise fully contract-compliant (INTERACT_ACROSS_
+        # USERS_FULL, enabled/exported exactly true, multiprocess false,
+        # authorities exactly dev.librepocket.agent.github.shizuku), so the
+        # canonical duplicate-identity guard in the required-provider total
+        # is the gate under test. NOTE (Re-review #12 Finding 1): the
+        # DEX-evidenced uniqueness gate fires FIRST for classes defined as
+        # ShizukuProvider subclasses - so to keep this test pinning the
+        # required-total canonical duplicate-identity guard (heuristic
+        # route), the DEX below intentionally carries NO ShizukuProvider
+        # subclass class_def; only the name/authority heuristic detects the
+        # two blocks. The DEX-evidenced duplicate pair is pinned separately
+        # by test_github_dex_only_duplicate_provider_fails_closed.
+        bridge_dex = minimal_dex(type_descriptors=("Ljava/lang/Object;",))
+        for mode in ("shizuku-alias-dot-and-dotfree", "shizuku-alias-dot-and-fqn"):
+            with self.subTest(xmltree_mode=mode):
+                apk = complete_apk(
+                    self.tmp / f"github-alias-{mode}.apk", bridge_dex
+                )
+                result = self._run_scanner_cli(
+                    apk,
+                    "github",
+                    xmltree_mode=mode,
+                    expect_provider="required",
+                )
+                self.assertNotEqual(
+                    result.returncode, 0, result.stderr + result.stdout
+                )
+                self.assertIn(
+                    "github merged manifest declares 2 ShizukuProvider blocks "
+                    "with the same canonical component name: "
+                    "dev.librepocket.agent.github.Bridge",
+                    result.stderr,
+                )
+
+    def test_github_dex_only_duplicate_provider_fails_closed(self) -> None:
+        # Re-review #12 Finding 1 pin: TWO merged-manifest provider blocks
+        # both resolving to ONE DEX-evidenced renamed ShizukuProvider subclass
+        # are NOT one surface - the uniqueness gate fails closed on the
+        # duplicate declaration before required-provider accounting ever
+        # runs. The manifest name/authority heuristic cannot see either
+        # block (arbitrary non-.shizuku authorities), and BOTH blocks carry
+        # the FULL attribute contract (INTERACT_ACROSS_USERS_FULL, enabled/
+        # exported exactly true, multiprocess false), so all else being
+        # equal the duplicate message is provably the failure owner.
+        # Uniqueness is universal (both optional and required modes), not a
+        # required-only accounting rule. The existing
+        # shizuku-bridge-compliant fixture (single arbitrary-authority
+        # DEX-only subclass) remains the green positive control, unchanged.
+        same_fqn_dex = minimal_dex(
+            class_definitions=(
+                (
+                    "Lcom/librepocket/internal/Bridge;",
+                    "Lrikka/shizuku/ShizukuProvider;",
+                ),
+            )
+        )
+        same_fqn_apk = complete_apk(self.tmp / "github-dup-same-fqn.apk", same_fqn_dex)
+        # (1) Same raw FQN twice (arbitrary, non-.shizuku authorities):
+        # red in BOTH required and optional modes - uniqueness is not a
+        # required-only rule.
+        for expect in ("required", "optional"):
+            with self.subTest(expect_provider=expect):
+                result = self._run_scanner_cli(
+                    same_fqn_apk,
+                    "github",
+                    xmltree_mode="shizuku-bridge-duplicate-arbitrary",
+                    expect_provider=expect,
+                )
+                self.assertNotEqual(
+                    result.returncode, 0, result.stderr + result.stdout
+                )
+                self.assertIn(
+                    "github merged manifest declares 2 provider blocks "
+                    "for DEX-evidenced ShizukuProvider subclass "
+                    "com.librepocket.internal.Bridge",
+                    result.stderr,
+                )
+                self.assertIn("2", result.stderr)
+        # (2) Alias pair ('.Bridge' and dot-free 'Bridge' under the merged
+        # package): both canonicalize to dev.librepocket.agent.github.Bridge,
+        # so the uniqueness gate fails closed naming the evidenced java
+        # name; red in BOTH modes as well.
+        alias_dex = minimal_dex(
+            class_definitions=(
+                (
+                    "Ldev/librepocket/agent/github/Bridge;",
+                    "Lrikka/shizuku/ShizukuProvider;",
+                ),
+            )
+        )
+        alias_apk = complete_apk(self.tmp / "github-dup-alias.apk", alias_dex)
+        for expect in ("required", "optional"):
+            with self.subTest(alias_expect_provider=expect):
+                result = self._run_scanner_cli(
+                    alias_apk,
+                    "github",
+                    xmltree_mode="shizuku-bridge-duplicate-arbitrary-alias",
+                    expect_provider=expect,
+                )
+                self.assertNotEqual(
+                    result.returncode, 0, result.stderr + result.stdout
+                )
+                self.assertIn(
+                    "github merged manifest declares 2 provider blocks "
+                    "for DEX-evidenced ShizukuProvider subclass "
+                    "dev.librepocket.agent.github.Bridge",
+                    result.stderr,
+                )
+                self.assertIn("2", result.stderr)
+        # (3) Positive control (unchanged): the single arbitrary-authority
+        # DEX-only subclass stays green under required - the duplicate
+        # uniqueness gate never weakens the single-compliant case.
+        result = self._run_scanner_cli(
+            same_fqn_apk,
+            "github",
+            xmltree_mode="shizuku-bridge-compliant",
+            expect_provider="required",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        # (4) Attribute-contract regression intact: the same compliant
+        # fixture remains green, untouched by the duplicate gate (its
+        # single block still flows through the full contract and the
+        # optional-mode gate).
+        result = self._run_scanner_cli(
+            same_fqn_apk,
+            "github",
+            xmltree_mode="shizuku-bridge-compliant",
+            expect_provider="optional",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+
+    def test_github_dex_evidenced_authority_minimum(self) -> None:
+        # Re-review #12 Finding 2 pin: the DEX-evidenced arbitrary-authority
+        # path no longer accepts a missing, empty, or delimiter-only
+        # android:authorities - Android's <provider> spec pins authorities
+        # as MANDATORY (no default; at least one authority required). The
+        # arbitrary-authority VALUES stay unconstrained by design; the
+        # presence minimum (at least one non-empty, semicolon-separated,
+        # post-trim segment) is the ONLY authority-level addition on the
+        # arbitrary-authority path. The official path's exact pin is
+        # unchanged and subsumes presence. The existing
+        # shizuku-bridge-compliant fixture stays the green positive control.
+        bridge_dex = minimal_dex(
+            class_definitions=(
+                (
+                    "Lcom/librepocket/internal/Bridge;",
+                    "Lrikka/shizuku/ShizukuProvider;",
+                ),
+            )
+        )
+        apk = complete_apk(self.tmp / "github-authority-minimum.apk", bridge_dex)
+        # (1) Missing / empty / delimiter-only authorities on the
+        # DEX-evidenced renamed subclass: red in BOTH required and optional
+        # modes - the presence minimum lives in the shared verifier.
+        for mode in (
+            "shizuku-bridge-authority-missing-dex",
+            "shizuku-bridge-authority-empty-dex",
+            "shizuku-bridge-authority-delimiter-only-dex",
+        ):
+            with self.subTest(xmltree_mode=mode):
+                for expect in ("required", "optional"):
+                    with self.subTest(expect_provider=expect):
+                        result = self._run_scanner_cli(
+                            apk,
+                            "github",
+                            xmltree_mode=mode,
+                            expect_provider=expect,
+                        )
+                        self.assertNotEqual(
+                            result.returncode, 0, result.stderr + result.stdout
+                        )
+                        self.assertIn("android:authorities", result.stderr)
+                        self.assertIn("at least one", result.stderr)
+                        self.assertIn(
+                            "must declare at least one non-empty "
+                            "android:authorities value",
+                            result.stderr,
+                        )
+        # (2) Positive control (unchanged): the valid arbitrary authority
+        # (dev.librepocket.agent.github.bridge) stays green under required.
+        result = self._run_scanner_cli(
+            apk,
+            "github",
+            xmltree_mode="shizuku-bridge-compliant",
+            expect_provider="required",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        # (3) Spaced multi-authority list stays green under required: the
+        # presence minimum tolerates surrounding spaces (post-trim per
+        # segment, at least one non-empty segment); the arbitrary VALUES
+        # remain unconstrained by design. Pinned via the
+        # shizuku-bridge-authority-spaced-list-dex fixture - the comment
+        # there records the post-trim, segments>=1 tolerance being pinned.
+        with self.subTest(spaced_list_authority_green="whitespace-tolerated-segments"):
+            result = self._run_scanner_cli(
+                apk,
+                "github",
+                xmltree_mode="shizuku-bridge-authority-spaced-list-dex",
+                expect_provider="required",
+            )
+            self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+
+    def test_github_dex_evidenced_renamed_shizuku_subclass(self) -> None:
+        # #166-D-WARN repro: com.librepocket.internal.Bridge extends
+        # rikka.shizuku.ShizukuProvider but carries an arbitrary (non-.shizuku)
+        # authority, so the manifest name/authority heuristic never sees it.
+        # Only the DEX superclass evidence can pin the surface; the merged
+        # manifest must declare it AND it must carry the full attribute
+        # contract. DEX: Lcom/librepocket/internal/Bridge; superclass
+        # Lrikka/shizuku/ShizukuProvider; (reuses the minimal_dex builder).
+        # The official provider class is class_def-defined too: the
+        # required-provider gate demands every heuristic-detected provider's
+        # canonical class be DEX-defined, and the "found 2" counting case
+        # below declares the official provider.
+        bridge_dex = minimal_dex(
+            class_definitions=(
+                (
+                    "Lcom/librepocket/internal/Bridge;",
+                    "Lrikka/shizuku/ShizukuProvider;",
+                ),
+                (
+                    "Lrikka/shizuku/ShizukuProvider;",
+                    None,
+                ),
+            )
+        )
+        apk = complete_apk(self.tmp / "github-bridge.apk", bridge_dex)
+
+        # (1) Renamed subclass declared WITHOUT android:permission => RED in
+        # both required and optional modes (attribute contract applies even
+        # though the name looks nothing like a ShizukuProvider).
+        for expect in ("required", "optional"):
+            with self.subTest(expect_provider=expect):
+                result = self._run_scanner_cli(
+                    apk, "github", xmltree_mode="shizuku-bridge-weak",
+                    expect_provider=expect,
+                )
+                self.assertNotEqual(result.returncode, 0, result.stderr + result.stdout)
+                self.assertIn(
+                    "DEX-evidenced ShizukuProvider subclass "
+                    "com.librepocket.internal.Bridge",
+                    result.stderr,
+                )
+        # ... and the .-relative spelling fails the same gate.
+        result = self._run_scanner_cli(
+            apk, "github", xmltree_mode="shizuku-bridge-weak-relative",
+            expect_provider="required",
+        )
+        self.assertNotEqual(result.returncode, 0, result.stderr + result.stdout)
+        self.assertIn("com.librepocket.internal.Bridge", result.stderr)
+
+        # (2) Compliant renamed subclass + official provider present => two
+        # distinct surfaces => required fails with found 2.
+        result = self._run_scanner_cli(
+            apk, "github", xmltree_mode="shizuku-bridge-compliant-plus-official",
+            expect_provider="required",
+        )
+        self.assertEqual(result.returncode, 1, result.stderr + result.stdout)
+        self.assertIn("found 2", result.stderr)
+
+        # (3) Compliant renamed subclass, official provider ABSENT => total 1
+        # => exit 0 (the contract is the permission, not the name).
+        result = self._run_scanner_cli(
+            apk, "github", xmltree_mode="shizuku-bridge-compliant",
+            expect_provider="required",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        # ... but the partial (no leading dot) "internal.Bridge" spelling is
+        # NOT an alias for com.librepocket.internal.Bridge under canonical
+        # component-name resolution: "internal.Bridge" contains a dot, so it
+        # is already fully qualified and can never stand for the DEX-evidenced
+        # class. The subclass is therefore NOT declared in the merged manifest
+        # => RED (previously this spelling passed via arbitrary suffix match).
+        result = self._run_scanner_cli(
+            apk, "github", xmltree_mode="shizuku-bridge-partial",
+            expect_provider="required",
+        )
+        self.assertNotEqual(result.returncode, 0, result.stderr + result.stdout)
+        self.assertIn("is not declared in the merged manifest", result.stderr)
+
+        # (4) DEX-evidenced subclass NOT declared in the merged manifest =>
+        # RED in both required and optional modes.
+        for expect in ("required", "optional"):
+            with self.subTest(expect_provider=expect):
+                result = self._run_scanner_cli(
+                    apk, "github", xmltree_mode="bindings",
+                    expect_provider=expect,
+                )
+                self.assertNotEqual(result.returncode, 0, result.stderr + result.stdout)
+                self.assertIn(
+                    "github DEX-evidenced ShizukuProvider subclass "
+                    "com.librepocket.internal.Bridge is not declared in the "
+                    "merged manifest",
+                    result.stderr,
+                )
+
+        # (5) Positive control unchanged: official declared properly => green.
+        # class_definitions carry the official provider class: the
+        # required-provider gate demands the declared provider's canonical
+        # class be DEX class_def-defined.
+        official_dex = minimal_dex(
+            class_definitions=(("Lrikka/shizuku/ShizukuProvider;", None),)
+        )
+        official_apk = complete_apk(self.tmp / "github-official-control.apk", official_dex)
+        result = self._run_scanner_cli(
+            official_apk, "github", xmltree_mode="shizuku-ok",
+            expect_provider="required",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+
+        # (6) foss mode with a ShizukuProvider subclass in DEX: unchanged
+        # behavior (foss rejects Shizuku DEX type references; no regression).
+        result = self._run_scanner_cli(apk, "foss", xmltree_mode="shizuku-ok")
+        self.assertNotEqual(result.returncode, 0, result.stderr + result.stdout)
+
+        # (7) #166-D grandchild: Lcom/evil/Bridge extends Lcom/evil/Middle;
+        # extends rikka.shizuku.ShizukuProvider. Direct-superclass-only
+        # evidence used to miss Bridge entirely; the transitive DEX closure
+        # must catch it. Middle is declared compliant; Bridge carries
+        # exported=true and NO android:permission. Official ABSENT.
+        grandchild_dex = minimal_dex(
+            class_definitions=(
+                (
+                    "Lcom/evil/Middle;",
+                    "Lrikka/shizuku/ShizukuProvider;",
+                ),
+                (
+                    "Lcom/evil/Bridge;",
+                    "Lcom/evil/Middle;",
+                ),
+            )
+        )
+        grandchild_apk = complete_apk(
+            self.tmp / "github-bridge-grandchild.apk", grandchild_dex
+        )
+        for expect in ("required", "optional"):
+            with self.subTest(grandchild_expect_provider=expect):
+                result = self._run_scanner_cli(
+                    grandchild_apk, "github",
+                    xmltree_mode="shizuku-bridge-grandchild",
+                    expect_provider=expect,
+                )
+                self.assertNotEqual(
+                    result.returncode, 0, result.stderr + result.stdout
+                )
+                self.assertIn("com.evil.Bridge", result.stderr)
+        # Positive control: same two classes, Bridge declared WITH the full
+        # attribute contract, official ABSENT. NOTE (see report to the
+        # orchestrator): the #166-D fix text asked to pin "required exits 0
+        # (counted as 1)", but the same document's counting rule
+        # (total = unconsumed detected blocks + |evidenced java names|)
+        # yields 0 + 2 = 2 here - two DEX-evidenced classes, two declared
+        # surfaces. The gate is pinned to the documented counting rule; the
+        # discrepancy is reported rather than silently absorbed.
+        result = self._run_scanner_cli(
+            grandchild_apk, "github",
+            xmltree_mode="shizuku-bridge-grandchild-compliant",
+            expect_provider="required",
+        )
+        self.assertNotEqual(result.returncode, 0, result.stderr + result.stdout)
+        self.assertIn("found 2", result.stderr)
+        # Optional mode has no exact-one requirement: two compliant declared
+        # surfaces pass.
+        result = self._run_scanner_cli(
+            grandchild_apk, "github",
+            xmltree_mode="shizuku-bridge-grandchild-compliant",
+            expect_provider="optional",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+
+        # (8) #166-D mechanism B: the evidenced java name merely
+        # suffix-resembles the official block (com.evil.rikka.shizuku.
+        # ShizukuProvider vs rikka.shizuku.ShizukuProvider) - under canonical
+        # component-name resolution it is NOT an alias for it, so the rogue
+        # subclass is NOT declared in the merged manifest => RED in the
+        # declaration check (never reaches the counting rule; the official
+        # block can no longer smuggle as the rogue's declaration).
+        rogue_dex = minimal_dex(
+            class_definitions=(
+                (
+                    "Lcom/evil/rikka/shizuku/ShizukuProvider;",
+                    "Lrikka/shizuku/ShizukuProvider;",
+                ),
+            )
+        )
+        rogue_apk = complete_apk(
+            self.tmp / "github-rogue-suffix.apk", rogue_dex
+        )
+        result = self._run_scanner_cli(
+            rogue_apk, "github", xmltree_mode="shizuku-ok",
+            expect_provider="required",
+        )
+        self.assertNotEqual(result.returncode, 0, result.stderr + result.stdout)
+        self.assertIn("is not declared in the merged manifest", result.stderr)
+
+        # (9) #166-D duplicate-name fail: TWO detected ShizukuProvider
+        # blocks resolving to the same CANONICAL component name must go RED
+        # with the named PolicyError. DEX evidence is consulted earlier
+        # (the DEX-evidenced attribute contract runs before the total) but
+        # yields no match here; the canonical duplicate guard fires before
+        # the class-def backing check and the counting math - regardless of
+        # whether the DEX carries evidence (here: none). The same-canonical
+        # failure is the owner even though this DEX defines no classes at
+        # all.
+        dup_apk = complete_apk(
+            self.tmp / "github-duplicate-same-name.apk",
+            minimal_dex(type_descriptors=("Ljava/lang/Object;",)),
+        )
+        result = self._run_scanner_cli(
+            dup_apk, "github", xmltree_mode="shizuku-duplicate-same-name",
+            expect_provider="required",
+        )
+        self.assertNotEqual(result.returncode, 0, result.stderr + result.stdout)
+        self.assertIn(
+            "github merged manifest declares 2 ShizukuProvider blocks with "
+            "the same canonical component name: rikka.shizuku.ShizukuProvider",
+            result.stderr,
+        )
+
+    def test_github_canonical_component_name_resolution(self) -> None:
+        # Re-review #10 Finding 1: android:name must resolve with Android's
+        # canonical component-name rules against the MERGED MANIFEST PACKAGE
+        # (leading-dot concat, dot-free bare-name concat, full-FQN as-is) and
+        # the resolved FQN must EXACTLY equal the DEX-evidenced java name.
+        # Arbitrary suffix matching is never an alias for a class.
+        bridge_dex = minimal_dex(
+            class_definitions=(
+                (
+                    "Lcom/librepocket/internal/Bridge;",
+                    "Lrikka/shizuku/ShizukuProvider;",
+                ),
+            )
+        )
+        apk = complete_apk(self.tmp / "github-canonical-name.apk", bridge_dex)
+
+        # (1) Leading-dot spelling resolves against the manifest package
+        # (dev.librepocket.agent.github.Bridge), NOT against the DEX-evidenced
+        # com.librepocket.internal.Bridge => RED via the DEX declaration gate.
+        result = self._run_scanner_cli(
+            apk, "github", xmltree_mode="shizuku-bridge-weak-relative",
+            expect_provider="required",
+        )
+        self.assertNotEqual(result.returncode, 0, result.stderr + result.stdout)
+        self.assertIn("com.librepocket.internal.Bridge", result.stderr)
+        self.assertIn("is not declared in the merged manifest", result.stderr)
+
+        # (2) Partial (no leading dot) spelling contains a dot, so it is
+        # already fully qualified and can never alias the DEX-evidenced
+        # class => RED via the same declaration gate.
+        result = self._run_scanner_cli(
+            apk, "github", xmltree_mode="shizuku-bridge-partial",
+            expect_provider="required",
+        )
+        self.assertNotEqual(result.returncode, 0, result.stderr + result.stdout)
+        self.assertIn("com.librepocket.internal.Bridge", result.stderr)
+        self.assertIn("is not declared in the merged manifest", result.stderr)
+
+        # (3) Positive leading-dot control: the DEX class lives INSIDE the
+        # merged package; '.Bridge' resolves to dev.librepocket.agent.github.
+        # Bridge and matches the exact FQN; the fixture carries the FULL
+        # attribute contract => exit 0.
+        in_package_dex = minimal_dex(
+            class_definitions=(
+                (
+                    "Ldev/librepocket/agent/github/Bridge;",
+                    "Lrikka/shizuku/ShizukuProvider;",
+                ),
+            )
+        )
+        in_package_apk = complete_apk(
+            self.tmp / "github-canonical-relative.apk", in_package_dex
+        )
+        result = self._run_scanner_cli(
+            in_package_apk, "github",
+            xmltree_mode="shizuku-bridge-relative-positive",
+            expect_provider="required",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+
+        # (4) Positive FQN control: reuse the existing compliant FQN fixture
+        # => already green; pinned here to document the exact-FQN path.
+        result = self._run_scanner_cli(
+            apk, "github", xmltree_mode="shizuku-bridge-compliant",
+            expect_provider="required",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+
+        # (5) Package disagreement between the two aapt sources => RED with
+        # the named PolicyError: the gate fails closed rather than attributing
+        # component names on top of a contested base package.
+        mismatch_apk = complete_apk(
+            self.tmp / "github-canonical-mismatch.apk",
+            minimal_dex(type_descriptors=("Ljava/lang/Object;",)),
+        )
+        result = self._run_scanner_cli(
+            mismatch_apk, "github", xmltree_mode="shizuku-ok",
+            aapt_package="other.pkg",
+        )
+        self.assertNotEqual(result.returncode, 0, result.stderr + result.stdout)
+        # FAIL reporting goes to stderr.
+        self.assertIn("merged manifest package disagrees", result.stderr)
+
+        # Direct unit coverage of the merged-package resolution helpers.
+        permissions = "package:dev.librepocket.agent.github\n"
+        xmltree_with_pkg = (
+            "E: manifest\n"
+            '  A: package="dev.librepocket.agent.github" '
+            '(Raw: "dev.librepocket.agent.github")\n'
+            "  E: application\n"
+        )
+        # Both sources present and equal => that package.
+        self.assertEqual(
+            policy_inspect._merged_manifest_package(xmltree_with_pkg, permissions),
+            "dev.librepocket.agent.github",
+        )
+        # xmltree-only => the manifest source wins by absence of contest.
+        self.assertEqual(
+            policy_inspect._merged_manifest_package(
+                xmltree_with_pkg,
+                "uses-permission: android.permission.INTERNET\n",
+            ),
+            "dev.librepocket.agent.github",
+        )
+        # permissions-only => falls back to the permissions source.
+        self.assertEqual(
+            policy_inspect._merged_manifest_package(
+                "E: manifest\n  E: application\n", permissions
+            ),
+            "dev.librepocket.agent.github",
+        )
+        # Both present and unequal => PolicyError naming the disagreement.
+        mismatch_tree = (
+            "E: manifest\n"
+            '  A: package="other.pkg" (Raw: "other.pkg")\n'
+            "  E: application\n"
+        )
+        with self.assertRaisesRegex(policy_inspect.PolicyError, "disagrees"):
+            policy_inspect._merged_manifest_package(mismatch_tree, permissions)
+        # Neither source => PolicyError (no package, no name matching).
+        with self.assertRaisesRegex(policy_inspect.PolicyError, "cannot determine"):
+            policy_inspect._merged_manifest_package(
+                "E: manifest\n  E: application\n", ""
+            )
+        # Remaining fail-closed branches of _manifest_package_from_xmltree,
+        # exercised through _merged_manifest_package: the raise fires before
+        # any comparison with the permissions source.
+        for case, tree, pattern in (
+            (
+                # Namespaced package attribute (qualified-namespace prefix):
+                # a package the gate cannot attribute is never guessed.
+                "namespaced package attribute",
+                "E: manifest\n"
+                '  A: android:package="dev.librepocket.agent.github" '
+                '(Raw: "dev.librepocket.agent.github")\n'
+                "  E: application\n",
+                "package attribute is namespaced",
+            ),
+            (
+                # Duplicate plain package attribute at the manifest element's
+                # own attribute level.
+                "duplicate plain package attribute",
+                "E: manifest\n"
+                '  A: package="dev.librepocket.agent.github" '
+                '(Raw: "dev.librepocket.agent.github")\n'
+                '  A: package="other.pkg" (Raw: "other.pkg")\n'
+                "  E: application\n",
+                "duplicate plain package attribute",
+            ),
+            (
+                # Typed boolean encoding: a boolean is not a package name;
+                # the raw value never reaches the string decoder.
+                "typed boolean package encoding",
+                "E: manifest\n"
+                "  A: package=(type 0x12)0xffffffff\n"
+                "  E: application\n",
+                r"merged manifest <manifest> package: unrecognized compiled attribute encoding",
+            ),
+            (
+                # Resource-reference encoding: a reference is not a package
+                # name; fail closed naming the encoding kind.
+                "resource reference package encoding",
+                "E: manifest\n"
+                "  A: package=@0x7f010000\n"
+                "  E: application\n",
+                r"merged manifest <manifest> package: unrecognized compiled attribute encoding",
+            ),
+            (
+                # Integer-typed encoding: fail closed, never guessed into a
+                # string (this branch raised before; the message is pinned).
+                "int-typed package encoding",
+                "E: manifest\n"
+                "  A: package=(type 0x10)0x1\n"
+                "  E: application\n",
+                r"merged manifest <manifest> package: unrecognized compiled attribute encoding",
+            ),
+            (
+                # Decoded-empty package attribute: rejected, not treated as
+                # absent (absence would fall back to the permissions source).
+                "empty package attribute",
+                "E: manifest\n"
+                '  A: package="" (Raw: "")\n'
+                "  E: application\n",
+                "empty package attribute",
+            ),
+            (
+                # Attribute-shaped line with no '=' at the manifest's own
+                # attribute level: malformed, not skipped past.
+                "malformed package attribute line",
+                "E: manifest\n"
+                "  A: package\n"
+                "  E: application\n",
+                "malformed attribute line",
+            ),
+        ):
+            with self.subTest(case=case):
+                with self.assertRaisesRegex(policy_inspect.PolicyError, pattern):
+                    policy_inspect._merged_manifest_package(tree, permissions)
+        # Child-decoy isolation: a `package` attribute on a CHILD element
+        # (here <application>) is never read as the manifest package - the
+        # scan stops at the child element line, so no error fires from the
+        # manifest attribute scan and the permissions fallback wins.
+        decoy_tree = (
+            "E: manifest\n"
+            "  E: application\n"
+            '    A: package="decoy.pkg" (Raw: "decoy.pkg")\n'
+        )
+        with self.subTest(case="child decoy package is not picked up"):
+            self.assertEqual(
+                policy_inspect._merged_manifest_package(decoy_tree, permissions),
+                "dev.librepocket.agent.github",
+            )
+        # Package-name validation (O4): a FINAL package value from the
+        # permissions source that fails the package-name grammar fails
+        # closed instead of being used as a component-name base.
+        with self.subTest(case="package-name validation reject"):
+            with self.assertRaisesRegex(
+                policy_inspect.PolicyError, "package-name validation"
+            ):
+                policy_inspect._merged_manifest_package(
+                    "E: manifest\n  E: application\n", "package: EVIL||\n"
+                )
+
+        # _canonicalize_component_name table.
+        pkg = "dev.librepocket.agent.github"
+        for raw, expected in (
+            (".Bridge", f"{pkg}.Bridge"),
+            ("Internal.Bridge", "Internal.Bridge"),
+            ("Bridge", f"{pkg}.Bridge"),
+            ("", ""),
+            ("   ", ""),
+            (" com.example.Bridge ", "com.example.Bridge"),
+        ):
+            with self.subTest(name=raw):
+                self.assertEqual(
+                    policy_inspect._canonicalize_component_name(raw, pkg),
+                    expected,
+                )
+
+        # _provider_name_matches_dex_class: exact-FQN-only table.
+        for present, java_name, expected in (
+            (".Bridge", f"{pkg}.Bridge", True),
+            ("Bridge", f"{pkg}.Bridge", True),
+            (".Bridge", "com.librepocket.internal.Bridge", False),
+            ("internal.Bridge", "com.librepocket.internal.Bridge", False),
+            ("Internal.Bridge", "Internal.Bridge", True),
+            ("evil.Bridge", "com.evil.Bridge", False),
+            (
+                "com.librepocket.internal.Bridge",
+                "com.librepocket.internal.Bridge",
+                True,
+            ),
+            ("", "com.librepocket.internal.Bridge", False),
+            ("   ", f"{pkg}.Bridge", False),
+        ):
+            with self.subTest(name=present, java_name=java_name):
+                self.assertEqual(
+                    policy_inspect._provider_name_matches_dex_class(
+                        present, java_name, pkg
+                    ),
+                    expected,
+                )
+
+    def test_foss_expect_provider_required_rejected(self) -> None:
+        # §--expect-provider required is a github-mode-only contract; any
+        # other mode must fail closed (exit 1) before the artifact is read.
+        apk = complete_apk(
+            self.tmp / "foss-expect-provider-required.apk",
+            minimal_dex(type_descriptors=("Ljava/lang/Object;",)),
+        )
+        result = self._run_scanner_cli(apk, "foss", expect_provider="required")
+        self.assertEqual(result.returncode, 1, result.stderr + result.stdout)
+        self.assertIn(
+            "--expect-provider required is only valid with --mode github",
+            result.stderr,
+        )
+
+    def test_github_mode_exported_and_multiprocess_contract(self) -> None:
+        # Upstream ShizukuProvider.attachInfo() hard contract pinned at the
+        # artifact level: exported must be the exact boolean true; multiprocess
+        # must be absent or the exact boolean false.
+        apk = complete_apk(
+            self.tmp / "github-exported-contract.apk",
+            minimal_dex(type_descriptors=("Ljava/lang/Object;",)),
+        )
+        for xmltree_mode, msg in (
+            ("shizuku-exported-false", "exported"),
+            ("shizuku-multiprocess-true", "multiprocess"),
+            ("shizuku-no-exported", "exported"),
+        ):
+            with self.subTest(xmltree_mode=xmltree_mode):
+                result = self._run_scanner_cli(apk, "github", xmltree_mode=xmltree_mode)
+                self.assertNotEqual(
+                    result.returncode, 0, result.stderr + result.stdout
+                )
+                self.assertIn(msg, result.stderr)
+        # Direct-call negative controls for the same contract at function level.
+        for tree, msg in (
+            (
+                "  E: application\n"
+                "    E: provider\n"
+                '      A: android:name="rikka.shizuku.ShizukuProvider"\n'
+                '      A: android:permission="android.permission.INTERACT_ACROSS_USERS_FULL"\n'
+                '      A: android:exported=(type 0x12)0x0\n',
+                "exported",
+            ),
+            (
+                "  E: application\n"
+                "    E: provider\n"
+                '      A: android:name="rikka.shizuku.ShizukuProvider"\n'
+                '      A: android:permission="android.permission.INTERACT_ACROSS_USERS_FULL"\n'
+                '      A: android:exported=(type 0x12)0xffffffff\n'
+                '      A: android:multiprocess="true"\n',
+                "multiprocess",
+            ),
+        ):
+            with self.subTest(tree_case=msg):
+                with self.assertRaisesRegex(policy_inspect.PolicyError, msg):
+                    policy_inspect._check_github_shizuku_provider(
+                        tree, "dev.librepocket.agent.github"
+                    )
+
+    def test_github_enabled_and_authority_contract(self) -> None:
+        # Re-review #10 Findings 2+3 (P2/P2): the artifact gate must pin
+        # (a) android:enabled on every Shizuku provider (the Shizuku binder
+        #     cannot reach a disabled provider), and
+        # (b) the android:authorities value on the officially declared
+        #     surface EXACTLY equal to "<merged package>.shizuku" - the
+        #     Shizuku binder resolves the provider by that authority
+        #     (getPackageName() + ".shizuku"), so a permission-gated surface
+        #     the binder cannot reach is not "Shizuku binder availability
+        #     proven". The DEX-evidenced arbitrary-authority design
+        #     ("the contract is the permission, not the name") is unaffected
+        #     - expected_authority is None on that path by design.
+        apk = complete_apk(
+            self.tmp / "github-enabled-authority.apk",
+            minimal_dex(type_descriptors=("Ljava/lang/Object;",)),
+        )
+        # (1) android:enabled must be exactly the compiled boolean true.
+        # Each fixture carries the full permission contract and the official
+        # FQN provider, so the enabled check is the failure mode reached.
+        for xmltree_mode in (
+            "shizuku-ok-disabled",       # (type 0x12)0x0
+            "shizuku-ok-enabled-ref",    # @0x7f010000 - resource-unproven ref
+            "shizuku-ok-enabled-missing",# attribute absent
+        ):
+            with self.subTest(enabled_case=xmltree_mode):
+                result = self._run_scanner_cli(
+                    apk, "github", xmltree_mode=xmltree_mode
+                )
+                self.assertNotEqual(
+                    result.returncode, 0, result.stderr + result.stdout
+                )
+                self.assertIn("android:enabled", result.stderr)
+                # Owner pin: the failure mode reached is the enabled check
+                # itself, not an earlier contract failure - the message
+                # carries the specific rejected value per fixture.
+                owner_fragment = {
+                    "shizuku-ok-disabled": "got 'false'",
+                    "shizuku-ok-enabled-ref": "got '@0x7f010000'",
+                    "shizuku-ok-enabled-missing": "the merged attribute is missing",
+                }[xmltree_mode]
+                self.assertIn(owner_fragment, result.stderr)
+
+        # (2) The officially declared surface must carry the EXACT binder
+        # authority. Message assertions pin both the "android:authorities"
+        # marker and the expected/found values.
+        wrong_authority = self._run_scanner_cli(
+            apk, "github", xmltree_mode="shizuku-ok-wrong-authority"
+        )
+        self.assertNotEqual(
+            wrong_authority.returncode, 0,
+            wrong_authority.stderr + wrong_authority.stdout,
+        )
+        self.assertIn("android:authorities", wrong_authority.stderr)
+        self.assertIn("dev.librepocket.agent.github.shizuku", wrong_authority.stderr)
+        self.assertIn("dev.librepocket.agent.github.notshizuku", wrong_authority.stderr)
+
+        # (3) authorities ABSENT: the name heuristic still fires, and the
+        # authorities presence minimum fails closed first (exact pin never
+        # reached when the attribute is missing).
+        authority_missing = self._run_scanner_cli(
+            apk, "github", xmltree_mode="shizuku-ok-authority-missing"
+        )
+        self.assertNotEqual(
+            authority_missing.returncode, 0,
+            authority_missing.stderr + authority_missing.stdout,
+        )
+        self.assertIn("android:authorities", authority_missing.stderr)
+
+        # (4) Exact-value, not a suffix/prefix test: a multi-authority list
+        # carrying the real channel is an exact-string violation; the
+        # message carries the full found value.
+        authority_extra = self._run_scanner_cli(
+            apk, "github", xmltree_mode="shizuku-ok-authority-extra"
+        )
+        self.assertNotEqual(
+            authority_extra.returncode, 0,
+            authority_extra.stderr + authority_extra.stdout,
+        )
+        self.assertIn("android:authorities", authority_extra.stderr)
+        self.assertIn(
+            "dev.librepocket.agent.github.shizuku;dev.librepocket.agent.github.extra",
+            authority_extra.stderr,
+        )
+
+        # (5)-(6) Renamed DEX-evidenced subclasses whose authority ends in
+        # .shizuku are heuristic-detected too, so the exact-authority check
+        # applies there as well: exactly the real channel passes, a foreign
+        # package is rejected. Both declare the full attribute contract and
+        # the .Bridge spelling (resolves to dev.librepocket.agent.github.
+        # Bridge under the merged package); the DEX evidence is
+        # Ldev/librepocket/agent/github/Bridge; extending
+        # Lrikka/shizuku/ShizukuProvider;.
+        in_package_dex = minimal_dex(
+            class_definitions=(
+                (
+                    "Ldev/librepocket/agent/github/Bridge;",
+                    "Lrikka/shizuku/ShizukuProvider;",
+                ),
+            )
+        )
+        in_package_apk = complete_apk(
+            self.tmp / "github-bridge-authority.apk", in_package_dex
+        )
+        # (5) Authority EXACTLY <package>.shizuku: gated at both layers,
+        # both pass -> exit 0, exactly one surface.
+        bridge_exact = self._run_scanner_cli(
+            in_package_apk, "github",
+            xmltree_mode="shizuku-bridge-compliant-authority-exact",
+            expect_provider="required",
+        )
+        self.assertEqual(
+            bridge_exact.returncode, 0,
+            bridge_exact.stderr + bridge_exact.stdout,
+        )
+        # (6) Authority ends .shizuku but claims a foreign package:
+        # heuristic-detected -> the exact-authority check fires -> RED.
+        bridge_wrong_package = self._run_scanner_cli(
+            in_package_apk, "github",
+            xmltree_mode="shizuku-bridge-compliant-shizuku-suffix-wrong-package",
+            expect_provider="required",
+        )
+        self.assertNotEqual(
+            bridge_wrong_package.returncode, 0,
+            bridge_wrong_package.stderr + bridge_wrong_package.stdout,
+        )
+        self.assertIn("android:authorities", bridge_wrong_package.stderr)
+        self.assertIn("com.other.agent.shizuku", bridge_wrong_package.stderr)
+
+        # (7) Arbitrary-authority renamed subclass (authorities =
+        # dev.librepocket.agent.github.bridge, no .shizuku suffix): the
+        # heuristic does NOT fire and the DEX path leaves authorities
+        # unconstrained by design ("the contract is the permission, not the
+        # name") -> stays green with exactly one surface. Pinned by the
+        # existing shizuku-bridge-compliant fixture to lock the design site.
+        internal_bridge_dex = minimal_dex(
+            class_definitions=(
+                (
+                    "Lcom/librepocket/internal/Bridge;",
+                    "Lrikka/shizuku/ShizukuProvider;",
+                ),
+            )
+        )
+        internal_bridge_apk = complete_apk(
+            self.tmp / "github-bridge-arbitrary-authority.apk",
+            internal_bridge_dex,
+        )
+        arbitrary = self._run_scanner_cli(
+            internal_bridge_apk, "github",
+            xmltree_mode="shizuku-bridge-compliant",
+            expect_provider="required",
+        )
+        self.assertEqual(
+            arbitrary.returncode, 0,
+            arbitrary.stderr + arbitrary.stdout,
+        )
+
+        # (8) DEX-evidenced renamed subclass with the FULL attribute contract
+        # EXCEPT android:enabled => RED, and the failure owner is the
+        # enabled check itself: the name/authority heuristic does not fire
+        # (".Bridge", arbitrary non-.shizuku authority), so only the DEX
+        # path reaches the shared validator - and that call site relies on
+        # the validator's default require_enabled=True. Every other attr is
+        # compliant, so this goes red iff the DEX call site ever sets
+        # require_enabled=False (or the enabled check is dropped).
+        with self.subTest(enabled_dex_case="shizuku-bridge-dex-missing-enabled"):
+            dex_missing_enabled = self._run_scanner_cli(
+                in_package_apk, "github",
+                xmltree_mode="shizuku-bridge-dex-missing-enabled",
+                expect_provider="required",
+            )
+            self.assertNotEqual(
+                dex_missing_enabled.returncode, 0,
+                dex_missing_enabled.stderr + dex_missing_enabled.stdout,
+            )
+            self.assertIn("android:enabled", dex_missing_enabled.stderr)
+            self.assertIn("enabled", dex_missing_enabled.stderr)
+            self.assertIn(
+                "the merged attribute is missing", dex_missing_enabled.stderr
+            )
 
     # -- merged-manifest networkSecurityConfig binding (artifact authority) --
 
@@ -3982,11 +6898,16 @@ class BackupRulesValidator(unittest.TestCase):
         '        <exclude domain="database" path="librepocket_vault-shm" />\n'
         '        <exclude domain="file" path="librepocket_keysets" />\n'
         '        <exclude domain="sharedpref" path="assistant_role.xml" />\n'
-        # Device-bound (finding #3 [P3]): always required alongside the five
-        # key entries, in EVERY checked scope (both extraction branches).
+        '        <exclude domain="file" path="datastore/librepocket_privilege_bridge.preferences_pb" />\n'
+        '        <exclude domain="file" path="datastore/librepocket_privilege_bridge.preferences_pb.tmp" />\n'
+        '        <exclude domain="file" path="datastore/librepocket_shizuku_grant.preferences_pb" />\n'
+        '        <exclude domain="file" path="datastore/librepocket_shizuku_grant.preferences_pb.tmp" />\n'
+        # Device-bound (finding #3 [P3] + #136-B1 grant lifecycle): always
+        # required alongside the five key entries, in EVERY checked scope
+        # (both extraction branches).
     )
 
-    # REQUIRED (5 key) + DEVICE-BOUND (1) total expected in every scope.
+    # REQUIRED (5 key) + DEVICE-BOUND (5) total expected in every scope.
     _TOTAL_EXCLUDES = len(backup_rules_check.REQUIRED_EXCLUDES) + len(
         backup_rules_check.REQUIRED_DEVICE_BOUND_EXCLUDES
     )
@@ -4343,6 +7264,10 @@ class BackupRulesValidator(unittest.TestCase):
             '    <exclude domain="database" path="librepocket_vault-shm" />\n'
             '    <exclude domain="file" path="librepocket_keysets" />\n'
             '    <exclude domain="sharedpref" path="assistant_role.xml" />\n'
+            '    <exclude domain="file" path="datastore/librepocket_privilege_bridge.preferences_pb" />\n'
+            '    <exclude domain="file" path="datastore/librepocket_privilege_bridge.preferences_pb.tmp" />\n'
+            '    <exclude domain="file" path="datastore/librepocket_shizuku_grant.preferences_pb" />\n'
+            '    <exclude domain="file" path="datastore/librepocket_shizuku_grant.preferences_pb.tmp" />\n'
             "    -->\n"
         )
         path = self._write(
@@ -4351,7 +7276,7 @@ class BackupRulesValidator(unittest.TestCase):
         errors = self._check(path)
         self.assertEqual(
             len(errors), 2 * self._TOTAL_EXCLUDES, errors
-        )  # 6 per branch; comments ignored
+        )  # 8 per branch; comments ignored
         self.assertTrue(
             all("<cloud-backup>" in e or "<device-transfer>" in e for e in errors),
             errors,
@@ -4416,7 +7341,7 @@ class BackupRulesValidator(unittest.TestCase):
             len(errors),
             self._TOTAL_EXCLUDES + 1,
             errors,
-        )  # 6 missing per branch + 1 unknown-element (<rule>)
+        )  # 8 missing per branch + 1 unknown-element (<rule>)
         self.assertTrue(all("<device-transfer>" in e for e in errors), errors)
         self.assertTrue(
             any("unknown element <rule>" in e for e in errors), errors
@@ -4464,7 +7389,7 @@ class BackupRulesValidator(unittest.TestCase):
     def test_exclude_moved_into_duplicate_section_fails_gate(self) -> None:
         # Splitting the required excludes across duplicate cloud-backup
         # sections must not satisfy the gate: every occurrence must carry the
-        # full six-exclude set (5 key + 1 device-bound).
+        # full ten-exclude set (5 key + 5 device-bound).
         split = (
             "    <cloud-backup>\n"
             '        <exclude domain="sharedpref" path="librepocket_keys.xml" />\n'
@@ -4483,8 +7408,8 @@ class BackupRulesValidator(unittest.TestCase):
         )
         path = self._write("data_extraction_rules.xml", body)
         errors = self._check(path)
-        # First occurrence misses 5 (4 key + device-bound), second misses 2
-        # (keys + device-bound; sharedpref key covered there, first misses
+        # First occurrence misses 9 (4 key + 5 device-bound), second misses 6
+        # (keys + 5 device-bound; sharedpref key covered there, first misses
         # it) — every occurrence must be complete.
         self.assertTrue(
             any("missing exclude domain=database path=librepocket_vault" in e for e in errors),
@@ -4617,7 +7542,7 @@ class BackupRulesValidator(unittest.TestCase):
     def test_exact_excludes_mode_flags_set_differences(self) -> None:
         # Artifact-level authority: `exact_excludes=True` (the compiled-bytes
         # scan) demands the exact REQUIRED + DEVICE-BOUND set (5 key +
-        # 1 device-bound, single-sourced as the allowlist) - a missing entry
+        # 5 device-bound, single-sourced as the allowlist) - a missing entry
         # fails as usual AND an unexpected extra is a set difference too,
         # order-free. Source-level default stays presence-only (over-shielding
         # tolerated at source: the exact-set pin is deliberately compiled-byte
@@ -4667,9 +7592,9 @@ class BackupRulesValidator(unittest.TestCase):
         )
 
     def test_exact_excludes_allows_required_device_bound_entry(self) -> None:
-        # Finding #3 [P3] positive control: the allowlisted device-bound entry
-        # (assistant_role.xml) is REQUIRED, not merely tolerated - the exact
-        # six-entry set (5 key + 1 device-bound) passes with zero errors and
+        # Finding #3 [P3] + #136-B1 positive control: all allowlisted
+        # device-bound entries are REQUIRED, not merely tolerated - the exact
+        # ten-entry set (5 key + 5 device-bound) passes with zero errors and
         # is reported as NEITHER missing NOR unexpected (no double-report).
         tree = ET.fromstring(self._full_backup(self._ALL_EXCLUDES))
         self.assertEqual(
@@ -4778,6 +7703,313 @@ class BackupRulesValidator(unittest.TestCase):
             ),
             errors,
         )
+
+    def test_exact_excludes_rejects_missing_privilege_bridge_grant(self) -> None:
+        # #136-B1 grant lifecycle: missing privilege bridge DataStore exclude
+        # must fail exact_excludes=True in full-backup-content and both
+        # data-extraction-rules branches without double-reporting unexpected.
+        grant_path = "datastore/librepocket_privilege_bridge.preferences_pb"
+        without_grant = self._ALL_EXCLUDES.replace(
+            f'        <exclude domain="file" path="{grant_path}" />\n',
+            "",
+        )
+        self.assertNotEqual(without_grant, self._ALL_EXCLUDES)
+        tree = ET.fromstring(self._full_backup(without_grant))
+        errors = backup_rules_check.validate_tree(
+            tree, "x", backup_rules_check.EXPECTED_ROOT_BACKUP_RULES, exact_excludes=True
+        )
+        self.assertTrue(
+            any(f"missing exclude domain=file path={grant_path}" in e for e in errors),
+            errors,
+        )
+        self.assertFalse(any("unexpected exclude" in e for e in errors), errors)
+
+        for branch, cloud, device in (
+            ("<cloud-backup>", without_grant, self._ALL_EXCLUDES),
+            ("<device-transfer>", self._ALL_EXCLUDES, without_grant),
+        ):
+            with self.subTest(branch=branch):
+                branch_tree = ET.fromstring(self._data_extraction(cloud, device))
+                branch_errors = backup_rules_check.validate_tree(
+                    branch_tree,
+                    "x",
+                    backup_rules_check.EXPECTED_ROOT_DATA_EXTRACTION,
+                    exact_excludes=True,
+                )
+                self.assertTrue(
+                    any(
+                        f"{branch} missing exclude domain=file path={grant_path}" in e
+                        for e in branch_errors
+                    ),
+                    branch_errors,
+                )
+                self.assertFalse(
+                    any("unexpected exclude" in e for e in branch_errors), branch_errors
+                )
+
+    def test_exact_excludes_rejects_missing_shizuku_grant(self) -> None:
+        # #136-B1 grant lifecycle: missing Shizuku grant DataStore exclude
+        # must fail exact_excludes=True in full-backup-content and both
+        # data-extraction-rules branches without double-reporting unexpected.
+        grant_path = "datastore/librepocket_shizuku_grant.preferences_pb"
+        without_grant = self._ALL_EXCLUDES.replace(
+            f'        <exclude domain="file" path="{grant_path}" />\n',
+            "",
+        )
+        self.assertNotEqual(without_grant, self._ALL_EXCLUDES)
+        tree = ET.fromstring(self._full_backup(without_grant))
+        errors = backup_rules_check.validate_tree(
+            tree, "x", backup_rules_check.EXPECTED_ROOT_BACKUP_RULES, exact_excludes=True
+        )
+        self.assertTrue(
+            any(f"missing exclude domain=file path={grant_path}" in e for e in errors),
+            errors,
+        )
+        self.assertFalse(any("unexpected exclude" in e for e in errors), errors)
+
+        for branch, cloud, device in (
+            ("<cloud-backup>", without_grant, self._ALL_EXCLUDES),
+            ("<device-transfer>", self._ALL_EXCLUDES, without_grant),
+        ):
+            with self.subTest(branch=branch):
+                branch_tree = ET.fromstring(self._data_extraction(cloud, device))
+                branch_errors = backup_rules_check.validate_tree(
+                    branch_tree,
+                    "x",
+                    backup_rules_check.EXPECTED_ROOT_DATA_EXTRACTION,
+                    exact_excludes=True,
+                )
+                self.assertTrue(
+                    any(
+                        f"{branch} missing exclude domain=file path={grant_path}" in e
+                        for e in branch_errors
+                    ),
+                    branch_errors,
+                )
+                self.assertFalse(
+                    any("unexpected exclude" in e for e in branch_errors), branch_errors
+                )
+
+    def test_exact_excludes_rejects_unexpected_include(self) -> None:
+        # #166 item 11 mirror of the unexpected-exclude pin: the compiled
+        # rule bytes are include-free; re-adding an <include> at file scope
+        # (the exact lever an overlay/merger rewrite would use to widen the
+        # restore surface) must FAIL the exact-set authority. Source-level
+        # semantics stay unchanged (includes are legal source rule tags).
+        tree = ET.fromstring(
+            self._full_backup(
+                self._ALL_EXCLUDES
+                + '        <include domain="file" path="extra.xml" />\n'
+            )
+        )
+        self.assertEqual(
+            backup_rules_check.validate_tree(
+                tree, "x", "full-backup-content"
+            ),
+            [],
+        )
+        errors = backup_rules_check.validate_tree(
+            tree, "x", "full-backup-content", exact_excludes=True
+        )
+        self.assertTrue(
+            any(re.search(r"unexpected <include>", e) for e in errors), errors
+        )
+        self.assertTrue(
+            any("domain='file' path='extra.xml'" in e for e in errors), errors
+        )
+
+    def test_exact_excludes_rejects_include_nested_in_exclude_any_depth(self) -> None:
+        # Any-depth detection: an <include> buried inside an <exclude>
+        # sub-tree still trips the include-free contract (the bounded walk
+        # recurses through include/exclude children).
+        nested = self._ALL_EXCLUDES.replace(
+            '        <exclude domain="file" path="librepocket_keysets" />\n',
+            '        <exclude domain="file" path="librepocket_keysets">\n'
+            '            <include domain="file" path="nested.xml" />\n'
+            "        </exclude>\n",
+        )
+        self.assertNotEqual(nested, self._ALL_EXCLUDES)
+        tree = ET.fromstring(self._full_backup(nested))
+        errors = backup_rules_check.validate_tree(
+            tree, "x", "full-backup-content", exact_excludes=True
+        )
+        self.assertTrue(
+            any(re.search(r"unexpected <include>", e) for e in errors), errors
+        )
+        self.assertTrue(
+            any("domain='file' path='nested.xml'" in e for e in errors), errors
+        )
+
+    def test_exact_excludes_rejects_include_in_both_extraction_branches(self) -> None:
+        # Both gated sections of data-extraction-rules are covered: an
+        # <include> in EITHER branch is red, and the message names the
+        # branch (branch label) alongside domain/path.
+        include_line = '        <include domain="sharedpref" path="sneak.xml" />\n'
+        for branch, cloud, device in (
+            ("cloud-backup", self._ALL_EXCLUDES + include_line, self._ALL_EXCLUDES),
+            ("device-transfer", self._ALL_EXCLUDES, self._ALL_EXCLUDES + include_line),
+        ):
+            with self.subTest(branch=branch):
+                tree = ET.fromstring(self._data_extraction(cloud, device))
+                errors = backup_rules_check.validate_tree(
+                    tree,
+                    "x",
+                    backup_rules_check.EXPECTED_ROOT_DATA_EXTRACTION,
+                    exact_excludes=True,
+                )
+                self.assertTrue(
+                    any(re.search(r"unexpected <include>", e) for e in errors),
+                    errors,
+                )
+                self.assertTrue(
+                    any(f"<{branch}>" in e for e in errors), errors
+                )
+                self.assertTrue(
+                    any("domain='sharedpref' path='sneak.xml'" in e for e in errors),
+                    errors,
+                )
+
+    def test_exact_excludes_rejects_root_level_include_in_data_extraction_rules(self) -> None:
+        # #166-D-WARN: an <include> sitting DIRECTLY under
+        # <data-extraction-rules> - outside both gated sections, where the
+        # per-section include walk never looks - must FAIL the exact-set
+        # authority too (mirrors the full-backup-content branch). Both
+        # sections are fully compliant, so the root-level <include> is the
+        # ONLY violation.
+        root_include = (
+            '<?xml version="1.0" encoding="utf-8"?>\n'
+            "<data-extraction-rules>\n"
+            '    <include domain="file" path="root-include.xml" />\n'
+            "    <cloud-backup>\n"
+            f"{self._ALL_EXCLUDES}    </cloud-backup>\n"
+            "    <device-transfer>\n"
+            f"{self._ALL_EXCLUDES}    </device-transfer>\n"
+            "</data-extraction-rules>\n"
+        )
+        tree = ET.fromstring(root_include)
+        errors = backup_rules_check.validate_tree(
+            tree,
+            "x",
+            backup_rules_check.EXPECTED_ROOT_DATA_EXTRACTION,
+            exact_excludes=True,
+        )
+        self.assertTrue(
+            any(re.search(r"unexpected <include>", e) for e in errors), errors
+        )
+        self.assertTrue(any("root-include.xml" in e for e in errors), errors)
+
+    def test_exact_excludes_include_gate_accepts_device_bound_set(self) -> None:
+        # No false positive: the required device-bound entries (and the
+        # five key entries) pass the include-free gate cleanly, in the
+        # full-backup-content root and in both extraction branches.
+        tree = ET.fromstring(self._full_backup(self._ALL_EXCLUDES))
+        self.assertEqual(
+            backup_rules_check.validate_tree(
+                tree, "x", "full-backup-content", exact_excludes=True
+            ),
+            [],
+        )
+        branch_tree = ET.fromstring(
+            self._data_extraction(self._ALL_EXCLUDES, self._ALL_EXCLUDES)
+        )
+        self.assertEqual(
+            backup_rules_check.validate_tree(
+                branch_tree,
+                "x",
+                backup_rules_check.EXPECTED_ROOT_DATA_EXTRACTION,
+                exact_excludes=True,
+            ),
+            [],
+        )
+
+    def test_exact_excludes_rejects_missing_privilege_tmp_siblings(self) -> None:
+        # #136-B1 grant lifecycle: the DataStore FileStorageConnection writes
+        # <name>.preferences_pb.tmp before rename; the exact-set gate demands
+        # the .tmp siblings too (5 key + 5 device-bound).
+        for grant_path in (
+            "datastore/librepocket_privilege_bridge.preferences_pb.tmp",
+            "datastore/librepocket_shizuku_grant.preferences_pb.tmp",
+        ):
+            with self.subTest(missing=grant_path):
+                without_tmp = self._ALL_EXCLUDES.replace(
+                    f'        <exclude domain="file" path="{grant_path}" />\n',
+                    "",
+                )
+                self.assertNotEqual(without_tmp, self._ALL_EXCLUDES)
+                tree = ET.fromstring(self._full_backup(without_tmp))
+                errors = backup_rules_check.validate_tree(
+                    tree,
+                    "x",
+                    backup_rules_check.EXPECTED_ROOT_BACKUP_RULES,
+                    exact_excludes=True,
+                )
+                self.assertTrue(
+                    any(f"missing exclude domain=file path={grant_path}" in e for e in errors),
+                    errors,
+                )
+                self.assertFalse(any("unexpected exclude" in e for e in errors), errors)
+
+                for branch, cloud, device in (
+                    ("<cloud-backup>", without_tmp, self._ALL_EXCLUDES),
+                    ("<device-transfer>", self._ALL_EXCLUDES, without_tmp),
+                ):
+                    with self.subTest(branch=branch):
+                        branch_tree = ET.fromstring(self._data_extraction(cloud, device))
+                        branch_errors = backup_rules_check.validate_tree(
+                            branch_tree,
+                            "x",
+                            backup_rules_check.EXPECTED_ROOT_DATA_EXTRACTION,
+                            exact_excludes=True,
+                        )
+                        self.assertTrue(
+                            any(
+                                f"{branch} missing exclude domain=file path={grant_path}" in e
+                                for e in branch_errors
+                            ),
+                            branch_errors,
+                        )
+                        self.assertFalse(
+                            any("unexpected exclude" in e for e in branch_errors),
+                            branch_errors,
+                        )
+
+    def test_source_level_requires_privilege_grant_excludes(self) -> None:
+        # #136-B1 grant lifecycle at the source face: missing either
+        # privilege grant DataStore fails backup_rules_check.validate() across
+        # backup_rules.xml and both branches of data_extraction_rules.xml.
+        for grant_path in (
+            "datastore/librepocket_privilege_bridge.preferences_pb",
+            "datastore/librepocket_shizuku_grant.preferences_pb",
+        ):
+            without_grant = self._ALL_EXCLUDES.replace(
+                f'        <exclude domain="file" path="{grant_path}" />\n',
+                "",
+            )
+            self.assertNotEqual(without_grant, self._ALL_EXCLUDES)
+            with self.subTest(file="backup_rules.xml", missing=grant_path):
+                p = self._write("backup_rules.xml", self._full_backup(without_grant))
+                errors = self._check(p)
+                self.assertTrue(
+                    any(f"missing exclude domain=file path={grant_path}" in e for e in errors),
+                    errors,
+                )
+            for branch, cloud, device in (
+                ("<cloud-backup>", without_grant, self._ALL_EXCLUDES),
+                ("<device-transfer>", self._ALL_EXCLUDES, without_grant),
+            ):
+                with self.subTest(file="data_extraction_rules.xml", branch=branch, missing=grant_path):
+                    p = self._write(
+                        "data_extraction_rules.xml",
+                        self._data_extraction(cloud, device),
+                    )
+                    errors = self._check(p)
+                    self.assertTrue(
+                        any(
+                            f"{branch} missing exclude domain=file path={grant_path}" in e
+                            for e in errors
+                        ),
+                        errors,
+                    )
 
     def test_validate_tree_matches_validate_on_representative_shapes(self) -> None:
         # The artifact scanner runs validate_tree directly; the file loader
@@ -5541,6 +8773,36 @@ class BackupAnchorSync(unittest.TestCase):
                 r"^(sharedpref|database|file|device_root)/.+$",
                 f"non-literal or malformed entry in BackupPolicy: {literal}",
             )
+
+
+class GitHubProviderGateWiring(unittest.TestCase):
+    """Pin the staging lanes so the github vehicle demands its provider."""
+
+    def test_github_lane_passes_expect_provider_required(self) -> None:
+        # The github artifact lane must invoke apk_policy_inspect.py with
+        # --expect-provider required (release/debug gate fail-closed on a
+        # missing/stripped ShizukuProvider); the foss/play lanes must NOT
+        # carry the flag (GitHub-only contract).
+        text = POLICY_CHECK.read_text(encoding="utf-8")
+        lines = text.splitlines()
+        guard = next(
+            i
+            for i, line in enumerate(lines)
+            if 'if [ "$MODE" = github ]; then' in line
+        )
+        else_idx = next(
+            i for i in range(guard + 1, len(lines)) if lines[i].strip() == "else"
+        )
+        fi_idx = next(
+            i for i in range(else_idx + 1, len(lines)) if lines[i].strip() == "fi"
+        )
+        github_block = "\n".join(lines[guard:else_idx])
+        other_block = "\n".join(lines[else_idx:fi_idx])
+        self.assertIn("--expect-provider required", github_block)
+        self.assertNotIn("--expect-provider", other_block)
+        # foss/play lanes carry no expect-provider flag anywhere in the gate:
+        # exactly one occurrence in file scope.
+        self.assertEqual(text.count("--expect-provider required"), 1)
 
 
 class BackupRulesGateWiring(unittest.TestCase):
@@ -7115,6 +10377,10 @@ class BackupRulesGateEndToEnd(unittest.TestCase):
             "    <exclude domain=\"database\" path=\"librepocket_vault-shm\" />\n"
             "    <exclude domain=\"file\" path=\"librepocket_keysets\" />\n"
             "    <exclude domain=\"sharedpref\" path=\"assistant_role.xml\" />\n"
+            "    <exclude domain=\"file\" path=\"datastore/librepocket_privilege_bridge.preferences_pb\" />\n"
+            "    <exclude domain=\"file\" path=\"datastore/librepocket_privilege_bridge.preferences_pb.tmp\" />\n"
+            "    <exclude domain=\"file\" path=\"datastore/librepocket_shizuku_grant.preferences_pb\" />\n"
+            "    <exclude domain=\"file\" path=\"datastore/librepocket_shizuku_grant.preferences_pb.tmp\" />\n"
             "</full-backup-content>\n",
             encoding="utf-8",
         )
@@ -7128,6 +10394,10 @@ class BackupRulesGateEndToEnd(unittest.TestCase):
             "        <exclude domain=\"database\" path=\"librepocket_vault-shm\" />\n"
             "        <exclude domain=\"file\" path=\"librepocket_keysets\" />\n"
             "        <exclude domain=\"sharedpref\" path=\"assistant_role.xml\" />\n"
+            "        <exclude domain=\"file\" path=\"datastore/librepocket_privilege_bridge.preferences_pb\" />\n"
+            "        <exclude domain=\"file\" path=\"datastore/librepocket_privilege_bridge.preferences_pb.tmp\" />\n"
+            "        <exclude domain=\"file\" path=\"datastore/librepocket_shizuku_grant.preferences_pb\" />\n"
+            "        <exclude domain=\"file\" path=\"datastore/librepocket_shizuku_grant.preferences_pb.tmp\" />\n"
             "    </cloud-backup>\n"
             "    <device-transfer>\n"
             "        <exclude domain=\"sharedpref\" path=\"librepocket_keys.xml\" />\n"
@@ -7136,6 +10406,10 @@ class BackupRulesGateEndToEnd(unittest.TestCase):
             "        <exclude domain=\"database\" path=\"librepocket_vault-shm\" />\n"
             "        <exclude domain=\"file\" path=\"librepocket_keysets\" />\n"
             "        <exclude domain=\"sharedpref\" path=\"assistant_role.xml\" />\n"
+            "        <exclude domain=\"file\" path=\"datastore/librepocket_privilege_bridge.preferences_pb\" />\n"
+            "        <exclude domain=\"file\" path=\"datastore/librepocket_privilege_bridge.preferences_pb.tmp\" />\n"
+            "        <exclude domain=\"file\" path=\"datastore/librepocket_shizuku_grant.preferences_pb\" />\n"
+            "        <exclude domain=\"file\" path=\"datastore/librepocket_shizuku_grant.preferences_pb.tmp\" />\n"
             "    </device-transfer>\n"
             "</data-extraction-rules>\n",
             encoding="utf-8",
@@ -7232,6 +10506,10 @@ class BackupRulesGateEndToEnd(unittest.TestCase):
                 "        <exclude domain=\"database\" path=\"librepocket_vault-shm\" />\n"
                 "        <exclude domain=\"file\" path=\"librepocket_keysets\" />\n"
                 "        <exclude domain=\"sharedpref\" path=\"assistant_role.xml\" />\n"
+                "        <exclude domain=\"file\" path=\"datastore/librepocket_privilege_bridge.preferences_pb\" />\n"
+                "        <exclude domain=\"file\" path=\"datastore/librepocket_privilege_bridge.preferences_pb.tmp\" />\n"
+                "        <exclude domain=\"file\" path=\"datastore/librepocket_shizuku_grant.preferences_pb\" />\n"
+                "        <exclude domain=\"file\" path=\"datastore/librepocket_shizuku_grant.preferences_pb.tmp\" />\n"
                 "    </cloud-backup>\n"
                 "    <device-transfer>\n"
                 "        <exclude domain=\"sharedpref\" path=\"librepocket_keys.xml\" />\n"
@@ -7240,6 +10518,10 @@ class BackupRulesGateEndToEnd(unittest.TestCase):
                 "        <exclude domain=\"database\" path=\"librepocket_vault-shm\" />\n"
                 "        <exclude domain=\"file\" path=\"librepocket_keysets\" />\n"
                 "        <exclude domain=\"sharedpref\" path=\"assistant_role.xml\" />\n"
+                "        <exclude domain=\"file\" path=\"datastore/librepocket_privilege_bridge.preferences_pb\" />\n"
+                "        <exclude domain=\"file\" path=\"datastore/librepocket_privilege_bridge.preferences_pb.tmp\" />\n"
+                "        <exclude domain=\"file\" path=\"datastore/librepocket_shizuku_grant.preferences_pb\" />\n"
+                "        <exclude domain=\"file\" path=\"datastore/librepocket_shizuku_grant.preferences_pb.tmp\" />\n"
                 "    </device-transfer>\n"
                 "</data-extraction-rules>\n",
                 encoding="utf-8",
@@ -7265,6 +10547,10 @@ class BackupRulesGateEndToEnd(unittest.TestCase):
                 "    <exclude domain=\"database\" path=\"librepocket_vault-shm\" />\n"
                 "    <exclude domain=\"file\" path=\"librepocket_keysets\" />\n"
                 "    <exclude domain=\"sharedpref\" path=\"assistant_role.xml\" />\n"
+                "    <exclude domain=\"file\" path=\"datastore/librepocket_privilege_bridge.preferences_pb\" />\n"
+                "    <exclude domain=\"file\" path=\"datastore/librepocket_privilege_bridge.preferences_pb.tmp\" />\n"
+                "    <exclude domain=\"file\" path=\"datastore/librepocket_shizuku_grant.preferences_pb\" />\n"
+                "    <exclude domain=\"file\" path=\"datastore/librepocket_shizuku_grant.preferences_pb.tmp\" />\n"
                 "</full-backup-content>\n",
                 encoding="utf-8",
             )
@@ -7280,6 +10566,10 @@ class BackupRulesGateEndToEnd(unittest.TestCase):
                 "        <exclude domain=\"database\" path=\"librepocket_vault-shm\" />\n"
                 "        <exclude domain=\"file\" path=\"librepocket_keysets\" />\n"
                 "        <exclude domain=\"sharedpref\" path=\"assistant_role.xml\" />\n"
+                "        <exclude domain=\"file\" path=\"datastore/librepocket_privilege_bridge.preferences_pb\" />\n"
+                "        <exclude domain=\"file\" path=\"datastore/librepocket_privilege_bridge.preferences_pb.tmp\" />\n"
+                "        <exclude domain=\"file\" path=\"datastore/librepocket_shizuku_grant.preferences_pb\" />\n"
+                "        <exclude domain=\"file\" path=\"datastore/librepocket_shizuku_grant.preferences_pb.tmp\" />\n"
                 "    </cloud-backup>\n"
                 "    <device-transfer>\n"
                 "        <exclude domain=\"sharedpref\" path=\"librepocket_keys.xml\" />\n"
@@ -7288,6 +10578,10 @@ class BackupRulesGateEndToEnd(unittest.TestCase):
                 "        <exclude domain=\"database\" path=\"librepocket_vault-shm\" />\n"
                 "        <exclude domain=\"file\" path=\"librepocket_keysets\" />\n"
                 "        <exclude domain=\"sharedpref\" path=\"assistant_role.xml\" />\n"
+                "        <exclude domain=\"file\" path=\"datastore/librepocket_privilege_bridge.preferences_pb\" />\n"
+                "        <exclude domain=\"file\" path=\"datastore/librepocket_privilege_bridge.preferences_pb.tmp\" />\n"
+                "        <exclude domain=\"file\" path=\"datastore/librepocket_shizuku_grant.preferences_pb\" />\n"
+                "        <exclude domain=\"file\" path=\"datastore/librepocket_shizuku_grant.preferences_pb.tmp\" />\n"
                 "    </device-transfer>\n"
                 "</data-extraction-rules>\n",
                 encoding="utf-8",
@@ -7319,6 +10613,10 @@ class BackupRulesGateEndToEnd(unittest.TestCase):
                 "        <exclude domain=\"database\" path=\"librepocket_vault-shm\" />\n"
                 "        <exclude domain=\"file\" path=\"librepocket_keysets\" />\n"
                 "        <exclude domain=\"sharedpref\" path=\"assistant_role.xml\" />\n"
+                "        <exclude domain=\"file\" path=\"datastore/librepocket_privilege_bridge.preferences_pb\" />\n"
+                "        <exclude domain=\"file\" path=\"datastore/librepocket_privilege_bridge.preferences_pb.tmp\" />\n"
+                "        <exclude domain=\"file\" path=\"datastore/librepocket_shizuku_grant.preferences_pb\" />\n"
+                "        <exclude domain=\"file\" path=\"datastore/librepocket_shizuku_grant.preferences_pb.tmp\" />\n"
                 "    </cloud-backup>\n"
                 "    <device-transfer>\n"
                 "        <exclude domain=\"sharedpref\" path=\"librepocket_keys.xml\" />\n"
@@ -7327,6 +10625,10 @@ class BackupRulesGateEndToEnd(unittest.TestCase):
                 "        <exclude domain=\"database\" path=\"librepocket_vault-shm\" />\n"
                 "        <exclude domain=\"file\" path=\"librepocket_keysets\" />\n"
                 "        <exclude domain=\"sharedpref\" path=\"assistant_role.xml\" />\n"
+                "        <exclude domain=\"file\" path=\"datastore/librepocket_privilege_bridge.preferences_pb\" />\n"
+                "        <exclude domain=\"file\" path=\"datastore/librepocket_privilege_bridge.preferences_pb.tmp\" />\n"
+                "        <exclude domain=\"file\" path=\"datastore/librepocket_shizuku_grant.preferences_pb\" />\n"
+                "        <exclude domain=\"file\" path=\"datastore/librepocket_shizuku_grant.preferences_pb.tmp\" />\n"
                 "    </device-transfer>\n"
                 "</data-extraction-rules>\n",
                 encoding="utf-8",
@@ -7996,6 +11298,10 @@ class BackupRulesGateEndToEnd(unittest.TestCase):
                 '        <exclude domain="database" path="librepocket_vault-shm" />\n'
                 '        <exclude domain="file" path="librepocket_keysets" />\n'
                 '        <exclude domain="sharedpref" path="assistant_role.xml" />\n'
+                '        <exclude domain="file" path="datastore/librepocket_privilege_bridge.preferences_pb" />\n'
+                '        <exclude domain="file" path="datastore/librepocket_privilege_bridge.preferences_pb.tmp" />\n'
+                '        <exclude domain="file" path="datastore/librepocket_shizuku_grant.preferences_pb" />\n'
+                '        <exclude domain="file" path="datastore/librepocket_shizuku_grant.preferences_pb.tmp" />\n'
                 "    </cloud-backup>\n"
                 "    <device-transfer>\n"
                 '        <exclude domain="sharedpref" path="librepocket_keys.xml" />\n'
@@ -8004,6 +11310,10 @@ class BackupRulesGateEndToEnd(unittest.TestCase):
                 '        <exclude domain="database" path="librepocket_vault-shm" />\n'
                 '        <exclude domain="file" path="librepocket_keysets" />\n'
                 '        <exclude domain="sharedpref" path="assistant_role.xml" />\n'
+                '        <exclude domain="file" path="datastore/librepocket_privilege_bridge.preferences_pb" />\n'
+                '        <exclude domain="file" path="datastore/librepocket_privilege_bridge.preferences_pb.tmp" />\n'
+                '        <exclude domain="file" path="datastore/librepocket_shizuku_grant.preferences_pb" />\n'
+                '        <exclude domain="file" path="datastore/librepocket_shizuku_grant.preferences_pb.tmp" />\n'
                 "    </device-transfer>\n"
                 "</data-extraction-rules>\n",
                 encoding="utf-8",
@@ -8012,6 +11322,71 @@ class BackupRulesGateEndToEnd(unittest.TestCase):
             self.assertNotIn("expected root", proc.stderr, proc.stderr)
             self.assertNotIn("deep-scan", proc.stderr, proc.stderr)
             self._assert_source_stage_clean_then_tool_stage_failure(proc)
+
+    def test_missing_privilege_grant_exclude_fails_at_source_stage(self) -> None:
+        # #136-B1 grant lifecycle: dropping either privilege grant DataStore
+        # exclude from backup_rules.xml or data_extraction_rules.xml (<device-transfer>)
+        # fails the real shell gate before the tool/artifact stage.
+        for grant_path in (
+            "datastore/librepocket_privilege_bridge.preferences_pb",
+            "datastore/librepocket_shizuku_grant.preferences_pb",
+        ):
+            with self.subTest(file="backup_rules.xml", missing=grant_path):
+                with tempfile.TemporaryDirectory() as tmp:
+                    root = self._minimal_tree(tmp)
+                    rules_file = (
+                        root / "app" / "src" / "main" / "res" / "xml" / "backup_rules.xml"
+                    )
+                    original = rules_file.read_text(encoding="utf-8")
+                    updated = original.replace(
+                        f'    <exclude domain="file" path="{grant_path}" />\n',
+                        "",
+                    )
+                    self.assertNotEqual(updated, original)
+                    rules_file.write_text(updated, encoding="utf-8")
+                    proc = self._run_gate(root)
+                    self.assertEqual(proc.returncode, 1, proc.stderr)
+                    self.assertIn(
+                        f"missing exclude domain=file path={grant_path}",
+                        proc.stderr,
+                    )
+                    self.assertNotIn("required Android build-tools", proc.stderr)
+
+            with self.subTest(
+                file="data_extraction_rules.xml",
+                branch="device-transfer",
+                missing=grant_path,
+            ):
+                with tempfile.TemporaryDirectory() as tmp:
+                    root = self._minimal_tree(tmp)
+                    extraction_file = (
+                        root
+                        / "app"
+                        / "src"
+                        / "main"
+                        / "res"
+                        / "xml"
+                        / "data_extraction_rules.xml"
+                    )
+                    original = extraction_file.read_text(encoding="utf-8")
+                    marker = "    <device-transfer>\n"
+                    head, sep, tail = original.partition(marker)
+                    self.assertEqual(sep, marker)
+                    updated_tail = tail.replace(
+                        f'        <exclude domain="file" path="{grant_path}" />\n',
+                        "",
+                    )
+                    self.assertNotEqual(updated_tail, tail)
+                    updated = head + sep + updated_tail
+                    self.assertNotEqual(updated, original)
+                    extraction_file.write_text(updated, encoding="utf-8")
+                    proc = self._run_gate(root)
+                    self.assertEqual(proc.returncode, 1, proc.stderr)
+                    self.assertIn(
+                        f"<device-transfer> missing exclude domain=file path={grant_path}",
+                        proc.stderr,
+                    )
+                    self.assertNotIn("required Android build-tools", proc.stderr)
 
     def test_nsc_alias_without_config_segment_is_deep_scanned(self) -> None:
         # The NSC deep scan was widened from the exact

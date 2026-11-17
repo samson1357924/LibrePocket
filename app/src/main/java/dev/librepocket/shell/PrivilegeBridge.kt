@@ -11,7 +11,7 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.TimeoutException
 import java.util.concurrent.atomic.AtomicInteger
 
-/** 致命集合（與 MainScreen 兩個 rethrow 分支同集合）：[VirtualMachineError] ∪ [ThreadDeath]。 */
+/** 致命集合（與 PrivilegeRevoke／executePrivilegeRevoke 致命集合同集合）：[VirtualMachineError] ∪ [ThreadDeath]。 */
 private fun isFatal(t: Throwable?): Boolean = t is VirtualMachineError || t is ThreadDeath
 
 /**

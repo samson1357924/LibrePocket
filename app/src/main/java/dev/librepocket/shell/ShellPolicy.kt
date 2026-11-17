@@ -25,7 +25,7 @@ import java.nio.file.attribute.BasicFileAttributes
  */
 object ShellPolicy {
 
-    /** 致命集合（與 MainScreen 兩個 rethrow 分支同集合）：[VirtualMachineError] ∪ [ThreadDeath]。 */
+    /** 致命集合（與 PrivilegeRevoke／executePrivilegeRevoke 致命集合同集合）：[VirtualMachineError] ∪ [ThreadDeath]。 */
     private fun isFatal(t: Throwable?): Boolean = t is VirtualMachineError || t is ThreadDeath
 
     /** 允許執行的二進位（basename 比對，均為無副作用的查詢/列目類）。 */

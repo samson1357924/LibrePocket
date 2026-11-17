@@ -153,7 +153,7 @@ object ElevatedWiring {
     /** [POLICY_TIMEOUT_MS] 的 monotonic deadline 對應值（System.nanoTime 口徑，見兩處 policy 評估的超限門）。 */
     private const val POLICY_TIMEOUT_NANOS: Long = POLICY_TIMEOUT_MS * 1_000_000L
 
-    /** 致命集合（與 MainScreen 兩個 rethrow 分支同集合）：[VirtualMachineError] ∪ [ThreadDeath]。 */
+    /** 致命集合（與 PrivilegeRevoke／executePrivilegeRevoke 致命集合同集合）：[VirtualMachineError] ∪ [ThreadDeath]。 */
     private fun isFatal(t: Throwable?): Boolean = t is VirtualMachineError || t is ThreadDeath
 
     /** freezeCtx 上限：userSwitches 筆數（超限即 fail-closed null）。 */

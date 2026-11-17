@@ -35,7 +35,7 @@ private fun safeLogW(tag: String, msg: String, e: Throwable? = null) {
  *   被取消，結構化取消未發生。
  * - 真正的外部取消（[isScopeActive]() == false）：CE 原樣上拋（不回 banner）。
  * - isScopeActive()==false 時無法區分內部 CE 與外部取消，一律 CE-first 上拋（與 NonCancellable 對整個 revoke 本體的實際取消語義一致）。
- * - VirtualMachineError／ThreadDeath：原樣上拋（致命；與 MainScreen 兩個 rethrow 分支同集合）。
+ * - VirtualMachineError／ThreadDeath：原樣上拋（致命；與 PrivilegeRevoke／executePrivilegeRevoke 致命集合同集合）。
  * - 其餘 Throwable：Log.w（不含可識別秘密；例外訊息為第三方程式庫原文，僅含 I/O 細節，不含主金鑰／token）後回傳 true。
  */
 internal suspend fun executePrivilegeRevoke(

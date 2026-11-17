@@ -338,8 +338,10 @@ object ElevatedWiring {
      * - argv 重凍結面：hostile list 的 CE 於 `copyArgvBounded` 內即收斂為 null → Denied
      *   （fail-closed、恰一筆 DENY），見 `reverifyArgvRecheckCancellationDeniedZeroSpawnPin`；
      *   `frozenOrNull` 的 blocking get 不觀察呼叫方取消，取消最遲於本函式下一掛起點生效；
-     * - 上列「恰一筆審計」僅保證非 CancellationException、非致命（VirtualMachineError／ThreadDeath）
-     *   路徑；致命路徑一律重拋、不寫審計（不承諾審計列）。
+     * - 上列「恰一筆審計」僅保證非 CancellationException、非致命路徑；wiring 各
+     *   掛起點致命路徑一律重拋、不寫審計（不承諾審計列）；runner 自身致命錯誤由
+     *   工具層記 FAILED 一筆後重拋（ShellExecTool 契約，pin：
+     *   `runnerVirtualMachineErrorPropagatesWithSingleFailedAudit`）。
      */
     suspend fun execute(
         argv: List<String>,

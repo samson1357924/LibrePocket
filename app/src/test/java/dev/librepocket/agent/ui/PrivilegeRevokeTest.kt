@@ -19,7 +19,7 @@ import dev.librepocket.shell.PrivilegeBridgeStore
  * 「一鍵收回」核心 [executePrivilegeRevoke] 單測（Stage 2，Re-review #5 Finding 2）：
  * 撤權失敗（含存取層 CancellationException）必須回傳 true 讓呼叫端顯示
  * 「收回失敗」banner 並允許重試；只有真正的外部取消
- * （[isScopeActive]() == false 的 CE）與 VirtualMachineError 才上拋。
+ * （[isScopeActive]() == false 的 CE）與 VirtualMachineError／ThreadDeath 才上拋。
  *
  * Store 假件：純記憶體 DataStore（updateData 無 I/O），測試完全在
  * runBlocking 真實時鐘內確定性完成——**不**用 runTest 的理由：
@@ -166,6 +166,26 @@ class PrivilegeRevokeTest {
         }
 
         assertEquals("simulated oom", error.message)
+    }
+
+    @Test fun threadDeath_isRethrown() {
+        // store.clear() 拋 ThreadDeath ⇒ 原樣上拋（致命；與 VMError 同集合）。
+        val store = bridgeStore(ThreadDeath())
+        val state = newState()
+
+        val error = assertThrows(ThreadDeath::class.java) {
+            runBlocking {
+                executePrivilegeRevoke(
+                    privilegeState = state,
+                    privilegeStore = store,
+                    withdraw = {},
+                    isScopeActive = { true },
+                )
+            }
+        }
+
+        assertTrue("ThreadDeath 必上拋（不 banner）", error is ThreadDeath)
+        assertFalse(state.bridgeGranted)
     }
 
     @Test fun withdrawCancellation_withActiveScope_returnsTrue() = runBlocking {

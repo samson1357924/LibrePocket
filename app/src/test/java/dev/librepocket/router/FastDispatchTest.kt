@@ -3214,6 +3214,9 @@ class FastDispatchTest {
             "symbols 符號符號" to "符號符號",
             "查 symbols 符號符號" to "符號符號",
             "symbols Foo符號xyz" to "Foo符號xyz",
+            "查 symbols Foo符號xyz" to "Foo符號xyz",
+            // stage-12.1 名前置殘餘（EN-delimited 判讀，READ-only）：CJK tail 但被 EN cue 消費 ⇒ verbatim 保留：
+            "查 symbols Foo符號等法務簽核" to "Foo符號等法務簽核",
             // Step D（CJK/EN 共用之邊緣類）剝離尾端 `。`；en-delimited 分支同樣適用。
             "symbols Foo符號。" to "Foo符號",
             // #19 B3 stage-8.3 翻轉 pins（原 NEED_CLARIFICATION——EN 劃定語意校正）：
@@ -3449,6 +3452,9 @@ class FastDispatchTest {
         // EN 側（`after i approve` 等）不變、not 觸動——本 stage 僅 CJK arm H/I；stage-10.1 僅 CJK arm J/K 與 arm H 動詞核擴充。
         // stage-11.1（Re-review #11 A1 [P1]）：arm L（person-anchored wait nucleus 等|待|直到|直至×人稱字，31 個）／arm M（cardinal-time-expression nucleus 基數詞＋時間單位＋後|后），
         // 皆任意位置、同一 PERMISSION_CONDITIONAL_CLAUSE clause gate；不再依賴 consent 動詞識別、不枚舉端點/延後動詞。arm K over-deny 之 P2 acknowledgment 見 KDoc。
+        // stage-12.1（Re-review #12 A1 [P1/BLOCKER]）：terminal-position rule——最後一個 `符號|符号` 之後仍含 \p{L}|\p{N} 碼點 ⇒ extraction 硬失敗
+        // （[finishSymbolQueryExtraction] 非 EN-delimited 相；加性 deny-only；CJK 分支及 EN fallback 之非-enDelimited 相皆生效；
+        // 識別字含 CJK 者必須止於 cue；suffix 僅非 L/N（標點／空白／emoji）仍 FAST by design；suffix 含 L/N（如 `，一下`，`一` `下` 皆 \p{L}）⇒ 澄清）。
         // stage-10.1（Re-review #10 A1 [P1]）：arm J（wait/until＋completion nucleus 等|待|直到|直至×放行|結束|完成|完畢|通過|核准|批准|確認|同意|回覆|通知）／
         // arm K（bare temporal nucleus 明早|明晚|明天|明日|後天|后天|大後天|大后天|下週|下星期|下周|下下週|下下周|下個月|下个月|月底|年底|日後|日后|幾天後|几天后|過幾天|过几天|稍後|稍后|晚點|晚点|等下|待會|待会|待會兒|待会儿|回頭|回头|隔天|隔日|次日|翌日|翌週|翌周|翌年，41 顆粒）／
         // arm H 動詞核擴充至 20 個 Lo 動詞（＋通知|告訴|通報|報告|匯報|彙報|回信|提醒），皆任意位置、同一 PERMISSION_CONDITIONAL_CLAUSE clause gate。
@@ -3572,6 +3578,16 @@ class FastDispatchTest {
             "查Foo符號隔天再跑",
             "查Foo符號次日再跑",
             "查Foo符號翌日再檢",
+            // #19 B3 stage-12.1 新增 terminal-position rule 負向釘（Re-review #12 A1 [P1/BLOCKER]，deny-by-fail-closed extraction）：
+            // 最後一個 `符號|符号` 之後綴仍含 \p{L}|\p{N} 碼點 ⇒ 一律 DENIED/澄清（非 EN-delimited 相；additive deny-only）。
+            // 未列舉 consent 名詞／星期／工作天偏移／隨時／以後 等 CJK 延後／同意／條件／後續子句，由此一條規則閉合（不再封閉枚舉身分／日期）：
+            "查Foo符號等法務簽核",
+            "查Foo符號等同事核對",
+            "查Foo符號週五啟動",
+            "查Foo符號三個工作天後啟動",
+            "查Foo符號隨時可以",   // L-suffix；stage-12.1 之前為 FAST 級（隨時 非 arm K 顆粒）
+            "查Foo符號以後再做",   // L-suffix；裸 `以後` 尾帶其他文字（arm H `再做` 亦命中，雙臂）
+            "查Foo符號，一下",       // `一`/`下` 皆 \p{L}（Lo） ⇒ DENIED（stage-12.1 KDoc 所記 accepted over-deny，固化 pin）
         )) {
             val d = decide(text)
             assertEquals(text, RouteKind.DENIED, d.route)

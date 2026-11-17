@@ -537,6 +537,9 @@ class FastRouter(
         // fullwidth-English tests). The prefilter fires in the symbol front
         // gate (see matchTemplate), never inside the RULES loop.
         private val SYMBOL_HINTS = listOf(r("符號"), r("符号"), r("\\bsymbols?\\b"))
+        // #19 B3 stage-12.1（Re-review #12 A1）：terminal-position rule suffix 掃描（抽取層 [finishSymbolQueryExtraction]；僅非 EN-delimited 相）。
+        // 僅對最後一個 CJK cue 之後的短尾綴呼叫一次，O(suffix)；Java Regex 依碼點比對，補充平面表意字亦正確命中。
+        private val LETTER_OR_NUMBER = Regex("[\\p{L}\\p{N}]")
         // #19 B3 stage-1（affirmative-command admission model，取代 A2 lookup-marker
         // 准入）: symbol 前閘僅收**命令式肯定語句**（explicit lookup command）。
         // 准入條件（isAffirmativeSymbolCommand；全部成立才滿足前閘）：
@@ -731,6 +734,8 @@ class FastRouter(
                 // 平坦字面交替、零量化；無巢狀量化、無災難性回溯。
                 // 【接受之 fail-safe 過度否決（記錄，不得「收回」）】：尾綴裸 `等我`（如 `查Foo符號等我`）及識別字本身含 等|待|直到|直至＋人稱字（如 `查 等我 符號`）一律 DENIED——
                 // 黏合 CJK 識別字 vs 等待句無法僅憑語法分離（與 arm H/I/J/K 同一接受類；識別字若不可查，使用者可改寫查詢）。
+                // stage-12.1 起：cue 之後的尾綴（`等我簽核` 類）已由 terminal-position rule 嚴格 subsumed——本 arm 保留為防禦縱深；
+                // 對 EN opener 夾帶 CJK cue（如 `symbols …等我…`）仍為主要否決依據（terminal-position rule 不適用 EN 側）。
                 "|(?:等|待|直到|直至)(?:我|你|您|他|她|我們|我们|你們|你们|您們|您们|他們|他们|她們|她们|妳|妳們|妳们|大家|全員|全员|各位|老闆|經理|主管|主任|總監|副理|董事|總經理|執行長)" + // arm L：person-anchored wait nucleus（stage-11.1；Re-review #11 A1 [P1]）——任意位置 CJK 等|待|直到|直至＋緊接人稱字 ⇒ clause gate 否決（識別字含核者一律 DENIED，accepted fail-safe）
                 // #19 B3 stage-10.1（Re-review #10 A1，[P1]）：arm K——bare temporal nucleus（任意位置，CJK）。
                 // 文中任意位置出現裸時間顆粒（明早|明晚|明天|明日|後天|后天|大後天|大后天|下週|下星期|下周|下下週|下下周|下個月|下个月|月底|年底|日後|日后|幾天後|几天后|過幾天|过几天|稍後|稍后|晚點|晚点|等下|待會|待会|待會兒|待会儿|回頭|回头|隔天|隔日|次日|翌日|翌週|翌周|翌年，41 個）即否決（clause gate at admission）。
@@ -748,7 +753,21 @@ class FastRouter(
                 // 【接受之 fail-safe 過度否決（記錄，不得「收回」）】：識別字本身含基數時間表達式（如 `查 三天後 符號`）一律 DENIED——
                 // 時間表達式 vs 識別字無法僅憑語法分離（與 arm H/I/J/K/L 同一接受類；識別字若不可查，使用者可改寫查詢）。
                 // 裸 `之後|以後|之後再`（無基數詞＋時間單位前綴）不納入；帶前綴之 `之|以` 後綴已由 `之|以` infix 收錄。
+                // stage-12.1 起：cue 之後的尾綴（`三個工作天後啟動` 類）已由 terminal-position rule 嚴格 subsumed——本 arm 保留為防禦縱深；
+                // 對 EN opener 夾帶 CJK cue（如 `symbols …三天後…`）仍為主要否決依據（terminal-position rule 不適用 EN 側）。
                 "|(?:(?:[0-9０-９一二兩两三四五六七八九十廿卅百零幾几千萬万]{1,5}|半)(?:個|多)?(?:天|日|週|周|星期|礼拜|禮拜|個月|个月|月|年|小時|小时|鐘頭|钟头|分鐘|分钟|秒|時|时|點|点|點鐘|点钟)(?:之|以)?(?:後|后))" + // arm M：cardinal-time-expression nucleus（stage-11.1；Re-review #11 A1 [P1]）——任意位置 CJK 基數詞＋時間單位＋後|后 ⇒ clause gate 否決（識別字含核者一律 DENIED，accepted fail-safe）
+                // #19 B3 stage-12.1（Re-review #12 A1，[P1/BLOCKER]）：terminal-position rule（於抽取層 [finishSymbolQueryExtraction] 落地，非本 clause gate 之臂）。
+                // 僅非-EN-delimited（CJK 優先相）適用；EN-delimited 分支豁免（stage-8.3 verbatim 契約：
+                // `查 symbols Foo符號xyz`／`查 symbols Foo符號`／`symbols Foo符號xyz` 皆 FAST verbatim）。
+                // CJK-leading 話語中，最後一個 `符號`|`符号` 之後若含任一 \p{L}|\p{N} 碼點詞碼（additive deny-only）⇒ extraction 硬失敗 ⇒ 否決／澄清。
+                // 此規則對 CJK-leading/non-enDelimited 話語嚴格 subsumes arms H/I/J/K/L/M 之「cue 之後尾綴」殘餘類——
+                // 未列舉 consent 名詞（`等法務簽核`／`等同事核對`）／星期（`週五啟動`）／工作天偏移（`三個工作天後啟動`）／
+                // 隔天／週末／隨時／`以後再做` 等（裸 `之後|以後` 尾帶其他文字，如 `查Foo符號以後再做`）皆由此一規則閉合，
+                // 不再封閉枚舉身分／日期詞彙。arm K/L/M 在 CJK-leading 話語中對尾綴之有效角色收窄至防禦縱深；
+                // EN opener 夾帶 CJK cue 之話語（如 `symbols Foo符號等我核對`）則仍由本 clause gate 之臂 L 否決。
+                // cue 之前命中的 arm H/K（如 `查明天做 Foo符號` 之 arm K `明天`）不受影響，仍由本 clause gate 否決；
+                // arm I/J 於 EN opener 話語（如 `symbols Foo符號如果我同意`／`symbols …等審核結束`）仍為主要否決依據——terminal-position rule 不適用於 EN 側。
+                // 識別字含 CJK 者必須止於 cue；僅 `[\s，,]*`-類尾綴（Step C 消化）或 Step D 剝離後不重露 cue 者仍 FAST；其餘非 L/N 尾綴（`。`、ZWSP、emoji）皆 DENIED（Step E／歧義守衛；fail-closed，非本規則）。詳見抽取層 KDoc。
                 "|只有.{0,8}才" +
                 "|只許.{0,8}才|只许.{0,8}才" +
                 "|只允.{0,8}才",
@@ -850,6 +869,52 @@ class FastRouter(
          * The terminator set is closed and deliberately minimal; gaps are
          * backstopped by the extraction particles rule (a particle anywhere in the
          * remainder denies) and the whitespace gate — never by execution.
+         *
+         * Gate 2.5 — terminal-position rule (#19 B3 stage-12.1; Re-review #12 A1, [P1/BLOCKER];
+         * any branch, at extraction, not here). This rule runs inside [finishSymbolQueryExtraction]
+         * (above on the CJK-preferred/EN two‑phase helper), not inside this affirmative gate: if the
+         * last occurrence of either CJK symbol cue (`符號` / `符号`) in the remainder is followed by
+         * ANY \p{L}|\p{N} code point (CJK ideographs, Kana, Hangul, Latin letters, fullwidth/halfwidth
+         * digits), extraction RETURNS \"\" (hasSymbolQuery=false ⇒ missingQuestionFor ⇒
+         * [DenyReason.NEED_CLARIFICATION]; never executes, never FAST). Rationale: a CJK
+         * `查<identifier>符號` is a complete affirmative command plus a unique identifier — trailing
+         * content with any letter/digit is never part of that shape, it is a deferral/consent/condition/
+         * follow-up clause (`查Foo符號等法務簽核`／`查Foo符號等同事核對`／`查Foo符號週五啟動`／
+         * `查Foo符號三個工作天後啟動`／`查Foo符號隨時可以`／`查Foo符號以後再做` 皆澄清）. This ONE
+         * structural rule closes the whole CJK-leading trailing-clause residual class — unlisted consent nouns,
+         * weekday names, work-day offsets, 隔天／週末／隨時, and bare `之後|以後` with trailing text —
+         * without another closed synonym enumeration of identities/dates. It fires only in the CJK-preferred/
+         * non-enDelimited extraction phase (CJK-leading utterances without EN consumption). The EN-delimited
+         * branches are exempt by the stage-8.3 verbatim contract (`查 symbols Foo符號xyz`，`查 symbols Foo符號`，`查 find 符號` 皆 FAST verbatim).
+         * Named residual (EN-delimited verbatim, READ-only): `查 symbols Foo符號等法務簽核` processes as CJK phase
+         * rejects suffix `等法務簽核` (L) ⇒ falls through to EN phase, CMD consumes `symbols `, enDelimited=true
+         * ⇒ rule exempt ⇒ Step E passes ⇒ FAST verbatim query=`Foo符號等法務簽核` — an open-world accepted
+         * EN-delimited residual, READ-only, same class as every `symbols <CJK-token>` verbatim; named explicitly
+         * here (documented, pinned, not closed) so the rule is never overclaimed as closing EN-side. The dual-phase fallthrough on CJK-led
+         * utterances WITHOUT EN consumption (`查Foo符號等法務簽核`) still double-rejects (CJK fails suffix rule,
+         * EN re-runs the same helper with enDelimited=false ⇒ same rule ⇒ `""` ⇒ NEED_CLARIFICATION).
+         * It is additive deny-only: it can only flip previously-FAST utterances to DENIED/NEED_CLARIFICATION,
+         * never the reverse. Negation/interrogative/extraction existing NEED_CLARIFICATION semantics
+         * are preserved (extraction now fails earlier, in the same fail-closed direction as the particles rule).
+         *
+         * Interaction with arms H–M of [PERMISSION_CONDITIONAL_CLAUSE]: those arms remain as
+         * defense in depth. The arms fire at admission; the rule fires later in extraction. For
+         * CJK-leading/non-enDelimited utterances the rule is the decisive reject for unenumerated
+         * trailing nuclei; arms reject cue-PRECEDING nuclei (e.g. `查明天做 Foo符號` — arm K `明天`) and, on the EN side,
+         * EN-opener utterances carrying CJK cues before they reach extraction (e.g. `symbols 等我簽核`
+         * — admission arms deny before extraction ever runs).
+         *
+         * Over-deny (accepted, by design): any L/N after the final cue is rejected regardless
+         * of semantics — identifiers containing CJK must end at the cue. `查 使用者(符號)`
+         * (suffix `)`) and `查 get(符號)` (suffix `)`) stay FAST; a suffix of ONLY non-L/N
+         * (punctuation/whitespace) tails that Step C peels (`[\s，,]*`) or Step D removes without re-exposing a cue stay FAST; other non-L/N tails (`。`, ZWSP, emoji) DENY via Step E/ambiguity guards (fail-closed — this is the very reason `查Foo符號。` clarifies) (recorded
+         * residual); a suffix containing L/N is denied (`查Foo符號，一下` — `一`/`下` are \p{L}
+         * ⇒ DENIED).
+         *
+         * EN is deliberately untouched: the EN single-word command form `symbols <operand>`
+         * admits open-world operand vocabulary, and the terminal-position rule does not apply
+         * to EN openers even when the utterance carries a CJK cue — EN behaviour is unchanged
+         * (recorded; EN remains open-world, no terminal-position constraint is introduced).
          *
          * Any gate failure falls through to the RULES loop, then to no-match
          * DENIED (reasonCode null) when nothing matches, or to the matching
@@ -1809,6 +1874,24 @@ class FastRouter(
          */
         private fun finishSymbolQueryExtraction(s0: String, enDelimited: Boolean): String {
             var s = s0
+            // #19 B3 stage-12.1（Re-review #12 A1，[P1/BLOCKER]）：terminal-position rule（非-enDelimited 抽取相適用；
+            // 位於抽取層、非准入閘及任何 arm；deny-by-fail-closed，永不執行；EN-delimited 相不適用——見下）。
+            // 取最後一個 symbol cue（符號|符号）之位置；其後（suffix）若含任一 \p{L}/\p{N} 碼點，整串即非單一
+            // complete affirmative command＋唯一識別字（尾綴即附帶的非查詢子句／延後／批准／時間條件／
+            // 後續動作——如 `等法務簽核`／`週五啟動`／`三個工作天後啟動`／`隨時可以`／`以後再做`），
+            // extraction 硬失敗 ⇒ hasSymbolQuery=false ⇒ missingQuestionFor ⇒ NEED_CLARIFICATION；永不執行。
+            // 識別字含 CJK 者必須止於 cue：`查 使用者(符號)`（suffix `)`）／`查 get(符號)`（suffix `)`）不被本規則否決；
+            // （識別字含 CJK 必須止於 cue；僅 `[\s，,]*` 尾綴或被 Step D 剝離後不重露 cue 者仍 FAST；其餘非 L/N 尾綴皆 DENIED；fail-closed，記錄）。
+            // 只否決、不改寫；admit 方向不變；negation/extraction 之既有 NEED_CLARIFICATION 語義保留不變；
+            // EN-delimited 分支豁免（stage-8.3 verbatim 契約——`symbols Foo符號xyz` ⇒ `Foo符號xyz`
+            // 原樣綁定；`查 symbols Foo符號` ⇒ `Foo符號` 原樣綁定；兩者 皆釘住（pinned）FAST）。
+            // CJK-leading 純中文殘餘（`查Foo符號等法務簽核` 等；無 EN 消費）在雙相中均被拒（CJK 相與 EN 相 enDelimited=false 重新觸發同一條規則）；admission gate 不動。
+            if (!enDelimited) {
+                val lastCueIdx = maxOf(s.lastIndexOf("符號"), s.lastIndexOf("符号"))
+                if (lastCueIdx >= 0 && LETTER_OR_NUMBER.containsMatchIn(s.substring(lastCueIdx + 2))) {
+                    return ""
+                }
+            }
             if (!enDelimited) {
                 s = SYMBOL_CJK_KEYWORD_SUFFIX.replaceFirst(s, "").trim()
                 // Ambiguity guard (stage-7.3, A3): after the ONE peel, if the remainder

@@ -11,6 +11,9 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.TimeoutException
 import java.util.concurrent.atomic.AtomicInteger
 
+/** 致命集合（與 MainScreen 兩個 rethrow 分支同集合）：[VirtualMachineError] ∪ [ThreadDeath]。 */
+private fun isFatal(t: Throwable?): Boolean = t is VirtualMachineError || t is ThreadDeath
+
 /**
  * 提權子進程預留介面（BACKLOG D05/D09，矩陣 §3）。
  *
@@ -96,13 +99,14 @@ internal object ElevatedSnapshotPool {
         },
     )
 
-    /** 忙即 null（fail-closed，不抛，零新 thread）。 */
+    /** 忙即 null（fail-closed，零新 thread；致命 VMError/ThreadDeath 重拋）。 */
     fun <T> trySubmit(block: () -> T): Future<T>? = try {
         pool.submit(block)
     } catch (_: RejectedExecutionException) {
         null
-    } catch (_: Throwable) {
-        // 起线程失败（资源枯竭）同样 fail-closed。
+    } catch (t: Throwable) {
+        // 起线程失败（资源枯竭）同样 fail-closed；致命（VMError/ThreadDeath）重拋。
+        if (isFatal(t)) throw t
         null
     }
 
@@ -145,13 +149,14 @@ internal object ElevatedSupplierPool {
         },
     )
 
-    /** 忙即 null（fail-closed，不抛，零新 thread）。 */
+    /** 忙即 null（fail-closed，零新 thread；致命 VMError/ThreadDeath 重拋）。 */
     fun <T> trySubmit(block: () -> T): Future<T>? = try {
         pool.submit(block)
     } catch (_: RejectedExecutionException) {
         null
-    } catch (_: Throwable) {
-        // 起线程失败（资源枯竭）同样 fail-closed。
+    } catch (t: Throwable) {
+        // 起线程失败（资源枯竭）同样 fail-closed；致命（VMError/ThreadDeath）重拋。
+        if (isFatal(t)) throw t
         null
     }
 }
@@ -167,7 +172,7 @@ internal object ElevatedSupplierPool {
  *   （worker 仍未退出即池內殘留，全域上界 [ElevatedSupplierPool.POOL_SIZE]）；
  * - caller 被中斷 → 復位 interrupt flag、`cancel(true)`、回 null；
  * - supplier 抛 [kotlinx.coroutines.CancellationException] → 重拋（取消語義
- *   不得被吞）；其餘例外 → null（fail-closed）。
+ *   不得被吞）；supplier 抛 VirtualMachineError / ThreadDeath → 重拋（致命不得偽裝成授權拒絕；CE 同樣重拋）；其餘 Exception / AssertionError → null（fail-closed）。
  */
 internal fun <T> boundedSupplierCall(
     block: () -> T,
@@ -194,10 +199,14 @@ internal fun <T> boundedSupplierCall(
         future.cancel(true)
         null
     } catch (e: ExecutionException) {
+        // supplier 致命失敗：ExecutionException 解包，VMError/ThreadDeath/CE 原樣重拋。
         val cause = e.cause
         if (cause is kotlinx.coroutines.CancellationException) throw cause
+        if (cause != null && isFatal(cause)) throw cause
         null
-    } catch (_: Throwable) {
+    } catch (t: Throwable) {
+        // CE 於此不可達（CE 為 ExecutionException 包裝後於上臂解包）；致命一律重拋（防禦縱深）。
+        if (t is kotlinx.coroutines.CancellationException || isFatal(t)) throw t
         null
     }
 }
@@ -222,6 +231,8 @@ internal fun <T> boundedSupplierCall(
  * （零 spawn；池忙即时回 null，零新 thread；中斷後仍存活即池內殘留，全域上界
  * [ElevatedSnapshotPool.POOL_SIZE]，見上殘餘聲明）。提交失敗（池滿／起線程失敗）
  * 同樣回 null（資源枯竭／飽和 fail-closed）。
+ *
+ * 拷貝 worker 以 VirtualMachineError / ThreadDeath 拋出即原樣重拋（不做 DENY 映射）。
  */
 internal fun ElevatedRequest.frozenOrNull(): ElevatedRequest? {
     val future = ElevatedSnapshotPool.trySubmit { ShellPolicy.copyArgvBounded(argv) }
@@ -245,8 +256,15 @@ internal fun ElevatedRequest.frozenOrNull(): ElevatedRequest? {
         Thread.currentThread().interrupt()
         future.cancel(true)
         return null
-    } catch (_: Throwable) {
-        // 拷貝抛（理论不可达，copyArgvBounded 内已全收敛）即 fail-closed。
+    } catch (e: ExecutionException) {
+        // 拷貝 worker 致命失敗：ExecutionException 解包，VMError/ThreadDeath 原樣重拋（不做 DENY 映射）。
+        val cause = e.cause
+        if (cause != null && isFatal(cause)) throw cause
+        // 拷貝致命失敗（VMError/ThreadDeath）已於上臂重拋；其餘普通失敗即 fail-closed。
+        return null
+    } catch (t: Throwable) {
+        if (isFatal(t)) throw t
+        // 拷貝普通失敗（CME／自訂 List 抛 Exception）即 fail-closed；致命已由上臂先攔。
         return null
     }
     if (copy == null) return null

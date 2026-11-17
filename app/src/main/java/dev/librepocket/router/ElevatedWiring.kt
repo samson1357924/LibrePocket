@@ -27,7 +27,7 @@ import kotlin.coroutines.coroutineContext
  * `shell.elevated` 接線形狀（#136-B3，JVM 可驗收部分；裝置 E2E 明確不做）。
  *
  * - executor 綁定：執行一律經 [ElevatedDispatch]（門禁先行＋凍結＋審計必行——除
- *   CancellationException／Error 外恰一筆）；
+ *   CancellationException／致命（VirtualMachineError／ThreadDeath）外恰一筆）；
  *   本對象只做接線形狀（每次 call 重新投影＋fresh policy＋ASK 確認＋不可變快照＋
  *   確認後 spawn 前重驗），不自建子進程、不碰真 Binder／su；
  * - 每次 call 重新投影：[ctxSupplier] 每次新鮮求值（flavor＋開關＋授權），
@@ -150,6 +150,9 @@ object ElevatedWiring {
     /** [POLICY_TIMEOUT_MS] 的 monotonic deadline 對應值（System.nanoTime 口徑，見兩處 policy 評估的超限門）。 */
     private const val POLICY_TIMEOUT_NANOS: Long = POLICY_TIMEOUT_MS * 1_000_000L
 
+    /** 致命集合（與 MainScreen 兩個 rethrow 分支同集合）：[VirtualMachineError] ∪ [ThreadDeath]。 */
+    private fun isFatal(t: Throwable?): Boolean = t is VirtualMachineError || t is ThreadDeath
+
     /** freezeCtx 上限：userSwitches 筆數（超限即 fail-closed null）。 */
     private const val MAX_FROZEN_SWITCHES: Int = 64
 
@@ -160,7 +163,8 @@ object ElevatedWiring {
     private const val MAX_FROZEN_STRING_BYTES: Int = 128
 
     /**
-     * Off-caller-thread bounded supplier eval; timeout/failure => null (fail-closed), CE rethrown.
+     * Off-caller-thread bounded supplier eval; timeout/failure => null (fail-closed), CE rethrown;
+     * VirtualMachineError/ThreadDeath rethrown (fatal never maps to deny).
      * Supplier 走有界專用池（[ElevatedSupplierPool]），caller 恆有界（get ≤ ~1.2s：get 1s＋grace 200ms）；
      * 池滿／起線程失敗即時回 null；忽略 interrupt 的區塊殘留有界（全域 ≤2）。
      */
@@ -176,7 +180,8 @@ object ElevatedWiring {
             }
         } catch (e: CancellationException) {
             throw e
-        } catch (_: Throwable) {
+        } catch (t: Throwable) {
+            if (isFatal(t)) throw t
             null
         }
     }
@@ -214,7 +219,8 @@ object ElevatedWiring {
      *
      * 任何失敗（迭代抛 [java.util.ConcurrentModificationException]、類型不符、超限、
      * 池滿／逾時）→ null：呼叫方 fail-closed 拒（零 spawn、一筆 DENY 審計）。
-     * CE 一律重拋（不轉 null、不寫 DENY 審計）。
+     * CE 一律重拋（不轉 null、不寫 DENY 審計）。致命（VirtualMachineError／ThreadDeath）
+     * 亦一律重拋（不轉 null、不寫 DENY 審計）。
      */
     private suspend fun freezeCtx(ctx: ProjectionContext): ProjectionContext? = try {
         withContext(Dispatchers.IO) {
@@ -227,7 +233,8 @@ object ElevatedWiring {
         }
     } catch (e: CancellationException) {
         throw e
-    } catch (_: Throwable) {
+    } catch (t: Throwable) {
+        if (isFatal(t)) throw t
         null
     }
 
@@ -265,7 +272,8 @@ object ElevatedWiring {
             )
         } catch (e: CancellationException) {
             throw e
-        } catch (_: Throwable) {
+        } catch (t: Throwable) {
+            if (isFatal(t)) throw t
             null
         }
     }
@@ -274,10 +282,11 @@ object ElevatedWiring {
     private fun argvMatchesSnapshot(current: List<String>, snapshotArgv: List<String>): Boolean {
         val recheck = try {
             ElevatedRequest(current, "").frozenOrNull()
-        } catch (_: Throwable) {
-            // frozenOrNull 內不丟 CancellationException（全 catch Throwable→null；
-            // timeout/interrupt 皆已收斂），CE 於此路徑不可達；外層 `: Throwable → false`
-            // 即 fail-closed，hostile list 的 CE 亦在 copyArgvBounded 內收斂為 null。
+        } catch (t: Throwable) {
+            // frozenOrNull 內 CE 全收斂（拷貝 worker 的 CE 為 ExecutionException 包裝，於
+            // frozenOrNull 內映 null）；致命（VMError/ThreadDeath）於 frozenOrNull 內重拋，
+            // 此處原樣重拋不映 false（不寫 DENY）；其餘 Throwable → null → false（fail-closed）。
+            if (isFatal(t)) throw t
             null
         } ?: return false
         return recheck.argv == snapshotArgv
@@ -317,11 +326,13 @@ object ElevatedWiring {
      * DENY 審計；任何拒絕一律零 spawn）。取消語義如實分述：
      * - supplier／policy／freeze／projection 面：[CancellationException] 一律重拋
      *   （不轉 `Denied`、不寫 DENY 審計；測試 pin：`cancellationPropagatesWithoutDenyAudit`）；
+     * - 致命面：[VirtualMachineError]／[ThreadDeath] 於 supplier／policy／gate／projection／
+     *   freeze／argv 重驗各掛起點一律重拋（不轉 `Denied`、不寫 DENY 審計、零 spawn）；
      * - argv 重凍結面：hostile list 的 CE 於 `copyArgvBounded` 內即收斂為 null → Denied
      *   （fail-closed、恰一筆 DENY），見 `reverifyArgvRecheckCancellationDeniedZeroSpawnPin`；
      *   `frozenOrNull` 的 blocking get 不觀察呼叫方取消，取消最遲於本函式下一掛起點生效；
-     * - 上列「恰一筆審計」僅保證非 CancellationException、非 Error 路徑；Error 路徑之受控
-     *   掛起點（projection／policy／gate）已收斂為 Denied＋一筆 DENY，其餘 Error 不承諾審計。
+     * - 上列「恰一筆審計」僅保證非 CancellationException、非致命（VirtualMachineError／ThreadDeath）
+     *   路徑；致命路徑一律重拋、不寫審計（不承諾審計列）。
      */
     suspend fun execute(
         argv: List<String>,
@@ -399,18 +410,20 @@ object ElevatedWiring {
                 tool.project(frozenCtx0)
             } catch (e: CancellationException) {
                 throw e
-            } catch (_: Throwable) {
+            } catch (t: Throwable) {
+                if (isFatal(t)) throw t
                 val denied = ShellResult.Denied(ShellDeny.NOT_WHITELISTED, "projection unavailable (fail-closed, no spawn)")
                 audit.record(emptyList(), safeReason(reasonCode), PrivilegeAuditLog.verdictName(denied))
                 return denied
             }
-            // check 本身不得令 Throwable 逃逸：CE 重拋；其餘 Throwable（含 require(toolName) IAE）
-            // fail-closed → Denied＋一筆 DENY（fail-closed，no spawn）。
+            // check 本身不得令致命逃逸進 DENY：CE 重拋；致命（VMError/ThreadDeath）重拋；
+            // 其餘 Throwable（含 require(toolName) IAE）fail-closed → Denied＋一筆 DENY（fail-closed，no spawn）。
             val gate = try {
                 PrivilegeGate.check(tool, false, projection0, mapOf("reasonCode" to reasonCode))
             } catch (e: CancellationException) {
                 throw e
-            } catch (_: Throwable) {
+            } catch (t: Throwable) {
+                if (isFatal(t)) throw t
                 val denied = ShellResult.Denied(ShellDeny.NOT_WHITELISTED, "privilege gate evaluation failed (fail-closed, no spawn)")
                 audit.record(emptyList(), safeReason(reasonCode), PrivilegeAuditLog.verdictName(denied))
                 return denied
@@ -457,7 +470,8 @@ object ElevatedWiring {
             tool.project(frozenCtx1)
         } catch (e: CancellationException) {
             throw e
-        } catch (_: Throwable) {
+        } catch (t: Throwable) {
+            if (isFatal(t)) throw t
             val denied = ShellResult.Denied(ShellDeny.NOT_WHITELISTED, "projection unavailable (fail-closed, no spawn)")
             audit.record(emptyList(), safeReason(reasonCode), PrivilegeAuditLog.verdictName(denied))
             return denied
@@ -474,7 +488,7 @@ object ElevatedWiring {
         // monotonic deadline 才是權威超限門：
         // block 即使已 RETURN 且 verdict==ALLOW，elapsed 嚴格大於 POLICY_TIMEOUT_MS 一律
         // 視為 TIMEOUT（阻塞中的工作可能殘留，但絕不可授權；等於預算仍視為在限內）。
-        // CE 語義不變（重拋、不寫審計）；Throwable→null 語義不變。
+        // CE 語義不變（重拋、不寫審計）；致命（VMError/ThreadDeath）重拋、不寫審計；Throwable→null 語義不變（僅非致命）。
         var verdict1Timeout = false
         val policyEvalStartNanos = System.nanoTime()
         val verdict1 = try {
@@ -487,7 +501,8 @@ object ElevatedWiring {
             }
         } catch (e: CancellationException) {
             throw e
-        } catch (_: Throwable) {
+        } catch (t: Throwable) {
+            if (isFatal(t)) throw t
             null
         }
         val policyEvalElapsedNanos = System.nanoTime() - policyEvalStartNanos
@@ -515,7 +530,8 @@ object ElevatedWiring {
             PrivilegeGate.check(tool, confirmed, projection1, mapOf("reasonCode" to reasonCode))
         } catch (e: CancellationException) {
             throw e
-        } catch (_: Throwable) {
+        } catch (t: Throwable) {
+            if (isFatal(t)) throw t
             val denied = ShellResult.Denied(ShellDeny.NOT_WHITELISTED, "privilege gate evaluation failed (fail-closed, no spawn)")
             audit.record(emptyList(), safeReason(reasonCode), PrivilegeAuditLog.verdictName(denied))
             return denied
@@ -584,14 +600,15 @@ object ElevatedWiring {
         }
         // F3: bounded/safe recheck of untrusted argv (no uncontrolled equals/iterator on adversarial list)
         // 入口凍結後，此比對涵蓋入口起任意時點的突變（含 pre-snapshot 供應器窗口）；形狀不變、覆蓋面加寬。
-        // 註：argvMatchesSnapshot 為非掛起函式且 frozenOrNull 全收斂 Throwable→null，此處 CE catch 為
-        // 防禦縱深（現況下不可達——frozenOrNull 全收斂 Throwable→null）；hostile list 的 CE 已於
-        // copyArgvBounded 內收斂為 null → argvMatchesSnapshot 回 false → Denied，見 reverifyArgvRecheckCancellationDeniedZeroSpawnPin。
+        // 註：argvMatchesSnapshot 為非掛起函式；frozenOrNull 於 CE 全收斂為 false（fail-closed，
+        // Denied＋一筆 DENY；hostile list 的 CE 已於 copyArgvBounded 內收斂為 null → Denied），
+        // 致命（VMError/ThreadDeath）一律原樣重拋（不映 false、不寫 DENY），見 reverifyArgvRecheckCancellationDeniedZeroSpawnPin。
         val argvOk = try {
             argvMatchesSnapshot(argv, snapshot.argv)
         } catch (e: CancellationException) {
             throw e
-        } catch (_: Throwable) {
+        } catch (t: Throwable) {
+            if (isFatal(t)) throw t
             false
         }
         if (!argvOk) {
@@ -611,7 +628,8 @@ object ElevatedWiring {
             tool.project(frozenCtx2)
         } catch (e: CancellationException) {
             throw e
-        } catch (_: Throwable) {
+        } catch (t: Throwable) {
+            if (isFatal(t)) throw t
             val denied = ShellResult.Denied(ShellDeny.NOT_WHITELISTED, "reverify projection unavailable (fail-closed, no spawn)")
             audit.record(snapshot.argv, safeReason(snapshot.reasonCode), PrivilegeAuditLog.verdictName(denied))
             return denied
@@ -626,7 +644,7 @@ object ElevatedWiring {
         // withTimeoutOrNull 回 null 且 block 未返回＝逾時 → verdict=TIMEOUT；block 返回 null（Java-null verdict）或任何例外／Error → verdict=ERROR。
         // monotonic deadline 同前驗：block 即使已返回 ALLOW，elapsed 嚴格大於
         // POLICY_TIMEOUT_MS 一律視為 TIMEOUT（阻塞中的工作可能殘留，但絕不可授權）；
-        // CE 語義不變（重拋、不寫審計）；Throwable→null 語義不變。
+        // CE 語義不變（重拋、不寫審計）；致命（VMError/ThreadDeath）重拋、不寫審計；Throwable→null 語義不變（僅非致命）。
         var verdict2Timeout = false
         val policyEval2StartNanos = System.nanoTime()
         val verdict2 = try {
@@ -639,7 +657,8 @@ object ElevatedWiring {
             }
         } catch (e: CancellationException) {
             throw e
-        } catch (_: Throwable) {
+        } catch (t: Throwable) {
+            if (isFatal(t)) throw t
             null
         }
         val policyEval2ElapsedNanos = System.nanoTime() - policyEval2StartNanos
@@ -702,14 +721,15 @@ object ElevatedWiring {
         // grantCheck／bridgeGranted supplier 可能於 grant2 評估期間竄改 caller 原始 argv——
         // 再做一次受監督比對，封閉「確認→改→spawn」語義缺口。入口凍結後，此比對與重驗入口點
         // 一起涵蓋入口起任意時點的突變（含 pre-snapshot 供應器執行窗口、grant2 評估窗口），
-        // 形狀不變、覆蓋面加寬。與重驗入口同形：CE 重拋；
+        // 形狀不變、覆蓋面加寬。與重驗入口同形：CE 重拋、致命（VMError/ThreadDeath）重拋；
         // 其餘 Throwable→false（fail-closed，零 spawn）。runner 只吃不可變快照
         // [ElevatedSnapshot.argv]，此比對針對呼叫方原始 list 的竄改面（見檔頂 KDoc 兩重驗點）。
         val argvOkFinal = try {
             argvMatchesSnapshot(argv, snapshot.argv)
         } catch (e: CancellationException) {
             throw e
-        } catch (_: Throwable) {
+        } catch (t: Throwable) {
+            if (isFatal(t)) throw t
             false
         }
         if (!argvOkFinal) {

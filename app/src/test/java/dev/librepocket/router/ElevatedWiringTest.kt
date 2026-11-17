@@ -266,6 +266,17 @@ class ElevatedWiringTest {
                 }
         }
 
+    /** userSwitches entries iterator 拋 [err] 的 hostile Map（致命不映 DENY 測針）。 */
+    private fun oomThrowingSwitches(err: OutOfMemoryError): Map<String, Boolean> =
+        object : AbstractMap<String, Boolean>() {
+            override val entries: MutableSet<MutableMap.MutableEntry<String, Boolean>>
+                get() = object : AbstractSet<MutableMap.MutableEntry<String, Boolean>>() {
+                    override val size: Int get() = 1
+                    override fun iterator(): MutableIterator<MutableMap.MutableEntry<String, Boolean>> =
+                        throw err
+                }
+        }
+
     /** userSwitches entries iterator 拋 ConcurrentModificationException 的 hostile Map。 */
     private fun cmeThrowingSwitches(): Map<String, Boolean> =
         object : AbstractMap<String, Boolean>() {
@@ -2970,5 +2981,316 @@ class ElevatedWiringTest {
         assertEquals(1, audit.size())
         assertEquals(mapOf("DENY" to 1), audit.countByVerdict())
         assertEquals(PrivilegeAuditLog.argvHash(listOf("id")), audit.snapshot().single().argvHash)
+    }
+
+    // --- 致命注入（VirtualMachineError ∪ ThreadDeath）：重拋、零 DENY 審計、零 spawn ---
+    // （VMError/ThreadDeath 為致命，不得映 Denied、不得寫 DENY 審計；Ordinary AssertionError 不受影響，見下方兩針。）
+
+    @Test fun fatalNotDeniedCtxSupplierOomPropagatesUnwrappedZeroAuditZeroSpawn() = runBlocking {
+        // ctxSupplier 直拋 OutOfMemoryError（fetchCtx→evalBounded→boundedSupplierCall 致命解包）→
+        // execute() 原樣重拋 OOM（型別＋message；kotlinx 跨掛起點會拷貝等價實例，故不斷言 assertSame）、零審計、零 spawn。
+        val boom = OutOfMemoryError("ctx-oom")
+        val runner = SpawnCounter()
+        val audit = PrivilegeAuditLog()
+        var caught: Throwable? = null
+        try {
+            ElevatedWiring.execute(
+                argv = listOf("id"),
+                reasonCode = "B3-T",
+                confirmed = true,
+                ctxSupplier = { throw boom },
+                policyStore = allowPolicy(),
+                runner = runner,
+                audit = audit,
+                grantCheck = { validGrant() },
+                bridgeGranted = { true },
+            )
+        } catch (t: Throwable) {
+            caught = t
+        }
+        // 註：堆棧恢復（kotlinx RECOVER_STACK_TRACES，單測預設 -ea 開啟）會對跨掛起點
+        // 傳播的 OOM 做等價拷貝（String ctor 可建構），同類別、同 message、不同實例；
+        // 故此路徑斷言型別＋message，不要求 assertSame（入口凍結／重驗等無拷貝路徑見下方兩針）。
+        assertTrue("caught must be the OOM itself (not a Denied), got $caught", caught is OutOfMemoryError)
+        assertEquals("ctx-oom", (caught as OutOfMemoryError).message)
+        assertEquals(0, runner.calls)
+        assertEquals(0, audit.size())
+        assertTrue(audit.countByVerdict().isEmpty())
+    }
+
+    @Test fun fatalNotDeniedCtxSupplierThreadDeathPropagatesUnwrappedZeroAuditZeroSpawn() = runBlocking {
+        // ctxSupplier 直拋 ThreadDeath：同一形狀（致命集合含 ThreadDeath）。
+        val boom = ThreadDeath()
+        val runner = SpawnCounter()
+        val audit = PrivilegeAuditLog()
+        var caught: Throwable? = null
+        try {
+            ElevatedWiring.execute(
+                argv = listOf("id"),
+                reasonCode = "B3-T",
+                confirmed = true,
+                ctxSupplier = { throw boom },
+                policyStore = allowPolicy(),
+                runner = runner,
+                audit = audit,
+                grantCheck = { validGrant() },
+                bridgeGranted = { true },
+            )
+        } catch (t: Throwable) {
+            caught = t
+        }
+        // 註：跨掛起點傳播的致命異常可能被堆棧恢復拷貝（同類別、不同實例），見 ctx OOM 針註釋。
+        assertTrue("caught must be the ThreadDeath itself (not a Denied), got $caught", caught is ThreadDeath)
+        assertEquals(0, runner.calls)
+        assertEquals(0, audit.size())
+        assertTrue(audit.countByVerdict().isEmpty())
+    }
+
+    @Test fun fatalNotDeniedGrantCheckOomPropagatesUnwrappedZeroAuditZeroSpawn() = runBlocking {
+        // grantCheck 直拋 OOM（grant1 前驗路徑 evalBounded）→ 原樣重拋、零審計、零 spawn。
+        val boom = OutOfMemoryError("grant-oom")
+        val runner = SpawnCounter()
+        val audit = PrivilegeAuditLog()
+        var caught: Throwable? = null
+        try {
+            ElevatedWiring.execute(
+                argv = listOf("id"),
+                reasonCode = "B3-T",
+                confirmed = true,
+                ctxSupplier = { elevatedCtx() },
+                policyStore = allowPolicy(),
+                runner = runner,
+                audit = audit,
+                grantCheck = { throw boom },
+                bridgeGranted = { true },
+            )
+        } catch (t: Throwable) {
+            caught = t
+        }
+        // 註：跨掛起點傳播的致命異常會被堆棧恢復拷貝（同類別、同 message、不同實例，時序相依），見 ctx 針註釋。
+        assertTrue("caught must be the OOM itself (not a Denied), got $caught", caught is OutOfMemoryError)
+        assertEquals("grant-oom", (caught as OutOfMemoryError).message)
+        assertEquals(0, runner.calls)
+        assertEquals(0, audit.size())
+        assertTrue(audit.countByVerdict().isEmpty())
+    }
+
+    @Test fun fatalNotDeniedBridgeGrantedOomPropagatesUnwrappedZeroAuditZeroSpawn() = runBlocking {
+        // bridgeGranted 直拋 OOM（bridge1 前驗路徑 evalBounded）→ 原樣重拋、零審計、零 spawn。
+        val boom = OutOfMemoryError("bridge-oom")
+        val runner = SpawnCounter()
+        val audit = PrivilegeAuditLog()
+        var caught: Throwable? = null
+        try {
+            ElevatedWiring.execute(
+                argv = listOf("id"),
+                reasonCode = "B3-T",
+                confirmed = true,
+                ctxSupplier = { elevatedCtx() },
+                policyStore = allowPolicy(),
+                runner = runner,
+                audit = audit,
+                grantCheck = { validGrant() },
+                bridgeGranted = { throw boom },
+            )
+        } catch (t: Throwable) {
+            caught = t
+        }
+        // 註：跨掛起點傳播的致命異常會被堆棧恢復拷貝（同類別、同 message、不同實例，時序相依），見 ctx 針註釋。
+        assertTrue("caught must be the OOM itself (not a Denied), got $caught", caught is OutOfMemoryError)
+        assertEquals("bridge-oom", (caught as OutOfMemoryError).message)
+        assertEquals(0, runner.calls)
+        assertEquals(0, audit.size())
+        assertTrue(audit.countByVerdict().isEmpty())
+    }
+
+    @Test fun fatalNotDeniedPolicyEvaluateFreshOomPropagatesUnwrappedZeroAuditZeroSpawn() = runBlocking {
+        // policyStore.evaluateFresh 直拋 OOM（前驗 withTimeoutOrNull 內非 CE 傳播）→
+        // 原樣重拋、零審計（不寫 DENY）、零 spawn。
+        val boom = OutOfMemoryError("policy-oom")
+        val oomPolicy = object : PolicyStore by allowPolicy() {
+            override suspend fun evaluateFresh(action: String, resource: String): PolicyDecision =
+                throw boom
+        }
+        val runner = SpawnCounter()
+        val audit = PrivilegeAuditLog()
+        var caught: Throwable? = null
+        try {
+            ElevatedWiring.execute(
+                argv = listOf("id"),
+                reasonCode = "B3-T",
+                confirmed = true,
+                ctxSupplier = { elevatedCtx() },
+                policyStore = oomPolicy,
+                runner = runner,
+                audit = audit,
+                grantCheck = { validGrant() },
+                bridgeGranted = { true },
+            )
+        } catch (t: Throwable) {
+            caught = t
+        }
+        // 註：跨掛起點傳播的 OOM 會被堆棧恢復拷貝（同類別、同 message、不同實例），見 ctx 針註釋。
+        assertTrue("caught must be the OOM itself (not a Denied), got $caught", caught is OutOfMemoryError)
+        assertEquals("policy-oom", (caught as OutOfMemoryError).message)
+        assertEquals(0, runner.calls)
+        assertEquals(0, audit.size())
+        assertTrue(audit.countByVerdict().isEmpty())
+    }
+
+    @Test fun fatalNotDeniedFreezeSwitchesIteratorOomPropagatesUnwrappedZeroAuditZeroSpawn() = runBlocking {
+        // 投影凍結面（freezeCtx→doFreeze）：hostile userSwitches entries iterator 拋 OOM →
+        // 致命原樣重拋（不收斂為 null→Denied）、零審計、零 spawn。
+        // （registry tool.project 本體為純函數、輸入已全凍結，無注入面；本針覆蓋投影路徑上
+        //   唯一可注入的 untrusted-容器致命面。）
+        val boom = OutOfMemoryError("freeze-oom")
+        val hostileMap = oomThrowingSwitches(boom)
+        val runner = SpawnCounter()
+        val audit = PrivilegeAuditLog()
+        var caught: Throwable? = null
+        try {
+            ElevatedWiring.execute(
+                argv = listOf("id"),
+                reasonCode = "B3-T",
+                confirmed = true,
+                ctxSupplier = { elevatedCtx().copy(userSwitches = hostileMap) },
+                policyStore = allowPolicy(),
+                runner = runner,
+                audit = audit,
+                grantCheck = { validGrant() },
+                bridgeGranted = { true },
+            )
+        } catch (t: Throwable) {
+            caught = t
+        }
+        // 註：跨掛起點傳播的 OOM 會被堆棧恢復拷貝（同類別、同 message、不同實例），見 ctx 針註釋。
+        assertTrue("caught must be the OOM itself (not a Denied), got $caught", caught is OutOfMemoryError)
+        assertEquals("freeze-oom", (caught as OutOfMemoryError).message)
+        assertEquals(0, runner.calls)
+        assertEquals(0, audit.size())
+        assertTrue(audit.countByVerdict().isEmpty())
+    }
+
+    @Test fun fatalNotDeniedAssertionErrorCtxSupplierStillDeniedZeroSpawnOneDeny() = runBlocking {
+        // AssertionError（非 CE、非致命）⇒ 既有 fail-closed： Denied("projection unavailable")＋一筆 DENY、零 spawn。
+        val runner = SpawnCounter()
+        val audit = PrivilegeAuditLog()
+        val r = ElevatedWiring.execute(
+            argv = listOf("id"),
+            reasonCode = "B3-T",
+            confirmed = true,
+            ctxSupplier = { throw AssertionError("ctx-assert") },
+            policyStore = allowPolicy(),
+            runner = runner,
+            audit = audit,
+            grantCheck = { validGrant() },
+            bridgeGranted = { true },
+        )
+        assertTrue("$r", r is ShellResult.Denied)
+        assertTrue("$r", (r as ShellResult.Denied).message.contains("projection unavailable"))
+        assertEquals(0, runner.calls)
+        assertEquals(1, audit.size())
+        assertEquals(mapOf("DENY" to 1), audit.countByVerdict())
+    }
+
+    @Test fun fatalNotDeniedAssertionErrorPolicyStillDeniedZeroSpawnOneDeny() = runBlocking {
+        // AssertionError 於 evaluateFresh（非致命）⇒ 既有 fail-closed：verdict=null → Denied（verdict=ERROR）＋一筆 DENY、零 spawn。
+        // （與致命 OOM 針區分：AssertionError 仍映 DENY，見 policyAssertionErrorFailsClosedWithDenyAudit。）
+        val assertPolicy = object : PolicyStore by allowPolicy() {
+            override suspend fun evaluateFresh(action: String, resource: String): PolicyDecision =
+                throw AssertionError("boom")
+        }
+        val runner = SpawnCounter()
+        val audit = PrivilegeAuditLog()
+        val r = ElevatedWiring.execute(
+            argv = listOf("id"),
+            reasonCode = "B3-T",
+            confirmed = true,
+            ctxSupplier = { elevatedCtx() },
+            policyStore = assertPolicy,
+            runner = runner,
+            audit = audit,
+            grantCheck = { validGrant() },
+            bridgeGranted = { true },
+        )
+        assertTrue("$r", r is ShellResult.Denied)
+        assertTrue("$r", (r as ShellResult.Denied).message.contains("policy denied (verdict=ERROR"))
+        assertEquals(0, runner.calls)
+        assertEquals(1, audit.size())
+        assertEquals(mapOf("DENY" to 1), audit.countByVerdict())
+    }
+
+    @Test fun fatalNotDeniedEntryFrozenArgvIteratorOomPropagatesUnwrappedZeroAuditZeroSpawn() = runBlocking {
+        // 入口凍結面（frozenOrNull→copyArgvBounded）：untrusted argv 的 iterator() 直拋 OOM →
+        // 致命原樣重拋（不映 Denied(BLACKLISTED)）、零審計、零 spawn。
+        val boom = OutOfMemoryError("entry-freeze-oom")
+        val argv = object : AbstractList<String>() {
+            override val size: Int get() = 1
+            override fun get(index: Int): String = "id"
+            override fun iterator(): MutableIterator<String> = throw boom
+        }
+        val runner = SpawnCounter()
+        val audit = PrivilegeAuditLog()
+        var caught: Throwable? = null
+        try {
+            ElevatedWiring.execute(
+                argv = argv,
+                reasonCode = "B3-T",
+                confirmed = true,
+                ctxSupplier = { elevatedCtx() },
+                policyStore = allowPolicy(),
+                runner = runner,
+                audit = audit,
+                grantCheck = { validGrant() },
+                bridgeGranted = { true },
+            )
+        } catch (t: Throwable) {
+            caught = t
+        }
+        // 註：跨掛起點傳播的致命異常會被堆棧恢復拷貝（同類別、同 message、不同實例，時序相依），見 ctx 針註釋。
+        assertTrue("caught must be the OOM itself (not a Denied), got $caught", caught is OutOfMemoryError)
+        assertEquals("entry-freeze-oom", (caught as OutOfMemoryError).message)
+        assertEquals(0, runner.calls)
+        assertEquals(0, audit.size())
+        assertTrue(audit.countByVerdict().isEmpty())
+    }
+
+    @Test fun fatalNotDeniedArgvRecheckIteratorOomPropagatesUnwrappedZeroAuditZeroSpawn() = runBlocking {
+        // argv 重驗面（argvMatchesSnapshot→frozenOrNull 第二次拷貝）：第一次 iterator()（入口）正常，
+        // 第二次（重驗點）拋 OOM → 致命原樣重拋（不映 false→Denied）、零審計、零 spawn。
+        val boom = OutOfMemoryError("recheck-oom")
+        var iteratorCalls = 0
+        val argv = object : AbstractList<String>() {
+            override val size: Int get() = 1
+            override fun get(index: Int): String = "id"
+            override fun iterator(): MutableIterator<String> {
+                if (++iteratorCalls >= 2) throw boom
+                return mutableListOf("id").iterator()
+            }
+        }
+        val runner = SpawnCounter()
+        val audit = PrivilegeAuditLog()
+        var caught: Throwable? = null
+        try {
+            ElevatedWiring.execute(
+                argv = argv,
+                reasonCode = "B3-T",
+                confirmed = true,
+                ctxSupplier = { elevatedCtx() },
+                policyStore = allowPolicy(),
+                runner = runner,
+                audit = audit,
+                grantCheck = { validGrant() },
+                bridgeGranted = { true },
+            )
+        } catch (t: Throwable) {
+            caught = t
+        }
+        // 註：跨掛起點傳播的致命異常會被堆棧恢復拷貝（同類別、同 message、不同實例，時序相依），見 ctx 針註釋。
+        assertTrue("caught must be the OOM itself (not a Denied), got $caught", caught is OutOfMemoryError)
+        assertEquals("recheck-oom", (caught as OutOfMemoryError).message)
+        assertEquals(0, runner.calls)
+        assertEquals(0, audit.size())
+        assertTrue(audit.countByVerdict().isEmpty())
     }
 }

@@ -2248,9 +2248,17 @@ def _check_provider_attrs(
     ``expected_authority`` pins the merged-APK ``android:authorities``
     value EXACTLY (not a suffix, not a set): pass
     ``f"{merged_package}.shizuku"`` for the officially declared binder
-    channel, or ``None`` to leave authorities recorded-but-unconstrained
-    (the DEX-evidenced arbitrary-authority design - the contract is the
-    permission, not the name). ``require_enabled`` gates the
+    channel, or ``None`` to leave the authority VALUE
+    recorded-but-unconstrained (the DEX-evidenced arbitrary-authority
+    design - the contract is the permission, not the name). ``None`` never
+    waives PRESENCE: every provider checked through this function -
+    official-FQN detected and DEX-evidenced alike - must carry at least one
+    non-empty, semicolon-separated, post-trim authority segment (a missing
+    attribute, ``""``, or a delimiter-only ``";; ; "`` value fails closed
+    with a dedicated PolicyError). Values beyond that presence minimum
+    remain unconstrained by design on the DEX-evidenced arbitrary-authority
+    path, and the official path's exact pin is unchanged (it subsumes the
+    presence check). ``require_enabled`` gates the
     ``android:enabled`` check; it defaults to True and every current caller
     keeps the default - both the manifest-detected and the DEX-evidenced
     paths prove the same binder channel, which cannot reach a disabled
@@ -2284,11 +2292,12 @@ def _check_provider_attrs(
     desired behavior: the gate never guesses what an unresolved resource
     resolves to.
 
-    The two binder-channel contract checks (enabled, then authority) run
-    LAST, after every pre-existing attribute check: pre-existing
-    contract failures keep their original, specifically-asserted error
-    messages, and the new checks fire only once the rest of the attribute
-    contract already holds.
+    The binder-channel contract checks (enabled, then the authorities
+    presence minimum, then - only when ``expected_authority`` is given -
+    the exact-authority pin) run LAST, after every pre-existing attribute
+    check: pre-existing contract failures keep their original,
+    specifically-asserted error messages, and the new checks fire only
+    once the rest of the attribute contract already holds.
     """
     perm = decoded.get("permission")
     if perm != _SHIZUKU_PROVIDER_PERMISSION:
@@ -2355,6 +2364,26 @@ def _check_provider_attrs(
                 f"android:enabled=true (Shizuku binder channel contract; "
                 f"got {enabled!r})"
             )
+    # -- authority presence minimum (Re-review #12 Finding 2) --
+    # Android's <provider> spec pins android:authorities as MANDATORY:
+    # no default exists and at least one authority MUST be declared. The
+    # shared decode carries "" whenever the attribute line is absent, so
+    # this is the one authority-level requirement the DEX-evidenced
+    # arbitrary-authority design adds on top of the attribute contract:
+    # AT LEAST ONE non-empty, semicolon-separated, post-trim segment.
+    # Segments with surrounding spaces are tolerated as long as at least
+    # one trimmed segment is non-empty; nothing about the VALUE is
+    # constrained beyond presence here. (Exact matching for the official
+    # path is unchanged - it subsumes presence - and the arbitrary-authority
+    # design keeps value-unconstrained authorities.)
+    authorities = decoded.get("authorities", "")
+    segments = [segment.strip() for segment in authorities.split(";")]
+    if not any(segments):
+        raise PolicyError(
+            f"github APK {label} must declare at least one non-empty "
+            "android:authorities value; the merged attribute is missing, "
+            "empty, or delimiter-only"
+        )
     if expected_authority is not None:
         # The Shizuku binder channel looks the provider up by the authority
         # ``<merged package>.shizuku`` (the official Shizuku provider
@@ -2374,7 +2403,6 @@ def _check_provider_attrs(
         # authority CLAIMS the binder-channel suffix it must equal the real
         # channel. (The arbitrary-authority design stays for the
         # DEX-evidenced path, which passes ``expected_authority=None``.)
-        authorities = decoded.get("authorities", "")
         if authorities != expected_authority:
             raise PolicyError(
                 f"github APK {label} must declare android:authorities "
@@ -2899,6 +2927,18 @@ def _check_github_dex_shizuku_providers(
     never consume, because under canonical resolution there is no suffix
     matching at all.
 
+    Uniqueness (exact): ONE evidenced java name matched by MORE than one
+    merged-manifest provider block fails closed as a PolicyError naming the
+    java name and the block count (``android:name`` values are reconstructed
+    for the message). Canonical component-name resolution collapses alias
+    spellings onto the same match set (``.Bridge`` and ``Bridge`` under one
+    package are one canonical class), so alias duplicates fail identically.
+    The uniqueness gate fires in BOTH optional and required modes and runs
+    BEFORE any per-match attribute-contract check, so the failure is always
+    the duplicate itself, deterministically - never a half-validated
+    duplicate pair, and never collapsed into one surface by the returned
+    set.
+
     Semantic note (exact): a single compliant provider that happens to be a
     renamed DEX-evidenced ShizukuProvider subclass is allowed through ONLY if
     it carries the full attribute contract (INTERACT_ACROSS_USERS_FULL base
@@ -2927,6 +2967,32 @@ def _check_github_dex_shizuku_providers(
                 f"github DEX-evidenced ShizukuProvider subclass {java_name} "
                 "is not declared in the merged manifest"
             )
+        # -- uniqueness for the DEX-evidenced class (Re-review #12 Finding 1) --
+        # One evidenced java name matched by MORE than one merged-manifest
+        # provider block is not one surface: the blocks cannot all bind, and
+        # the artifact gate refuses duplicate provider declarations. Canonical
+        # component-name resolution already collapsed alias spellings into
+        # ``matches`` (``.Bridge`` and ``Bridge`` both resolve to
+        # ``<package>.Bridge``), so the rule covers every alias spelling.
+        # Uniqueness is an artifact-level validity check, not a
+        # required-only accounting gate: it fires in BOTH optional and
+        # required modes and regardless of the attribute contract, and it is
+        # detected FIRST for the class - before any per-match contract
+        # check - so the failure is always the duplicate, never a
+        # half-validated duplicate pair. The error names the evidenced java
+        # name and the count; ``dex_java_names`` must never collapse two
+        # declarations into one surface.
+        if len(matches) > 1:
+            names = ", ".join(
+                sorted(str(decoded.get("name", "")) for decoded, _child_tags in matches)
+            )
+            raise PolicyError(
+                f"github merged manifest declares {len(matches)} provider "
+                f"blocks for DEX-evidenced ShizukuProvider subclass {java_name} "
+                f"(android:name spellings: {names}) - duplicate "
+                "provider declarations cannot all bind, and the artifact gate "
+                "refuses them"
+            )
         matched_java_names.add(java_name)
         for decoded, child_tags in matches:
             _check_provider_attrs(
@@ -2935,7 +3001,9 @@ def _check_github_dex_shizuku_providers(
                 f"DEX-evidenced ShizukuProvider subclass {java_name}",
                 # Arbitrary authorities stay unconstrained on this path by
                 # design ("the contract is the permission, not the name"):
-                # authorities are recorded but never equality-pinned here.
+                # authorities are recorded and equality-unpinned here (the
+                # shared presence minimum - at least one non-empty authority
+                # - still applies inside ``_check_provider_attrs``).
                 # The official-FQN/name heuristic path
                 # (``_check_github_shizuku_provider``) pins
                 # ``<package>.shizuku`` exactly. When the matched provider is

@@ -1385,8 +1385,9 @@ class ApkPolicyHarness(unittest.TestCase):
             "            '      A: android:authorities(0x01010018)=\"dev.librepocket.agent.github.notshizuku\" (Raw: \"dev.librepocket.agent.github.notshizuku\")' ;;\n"
             "        shizuku-ok-authority-missing)\n"
             "          # Re-review #10 Finding 3: authority attribute ABSENT - the name\n"
-            "          # heuristic still detects the provider, so the exact-authority\n"
-            "          # check fires and fails closed.\n"
+            "          # heuristic still detects the provider, so the authorities\n"
+            "          # presence minimum must fire first and fails closed\n"
+            "          # (official exact pin is never reached for the missing case).\n"
             "          printf '%s\\n' 'E: manifest' \\\n"
             "            '  A: android:versionCode(0x0101021b)=(type 0x10)0x1' \\\n"
             "            '  E: application' \\\n"
@@ -1518,6 +1519,152 @@ class ApkPolicyHarness(unittest.TestCase):
             "            '      A: android:exported(0x01010010)=(type 0x12)0xffffffff' \\\n"
             "            '      A: android:multiprocess(0x01010013)=(type 0x12)0x0' \\\n"
             "            '      A: android:authorities(0x01010018)=\"dev.librepocket.agent.github.bridge\" (Raw: \"dev.librepocket.agent.github.bridge\")' ;;\n"
+            "        shizuku-bridge-duplicate-arbitrary)\n"
+            "          # Re-review #12 Finding 1 pin: TWO merged-manifest\n"
+            "          # provider blocks BOTH named\n"
+            "          # com.librepocket.internal.Bridge (the DEX-evidenced\n"
+            "          # renamed ShizukuProvider subclass), with ARBITRARY\n"
+            "          # non-.shizuku authorities and the FULL attribute\n"
+            "          # contract on BOTH blocks (INTERACT_ACROSS_USERS_FULL,\n"
+            "          # enabled/exported exactly true, multiprocess false).\n"
+            "          # The manifest name/authority heuristic cannot see\n"
+            "          # either block; only DEX evidence reveals the class.\n"
+            "          # The uniqueness gate must fail closed on the\n"
+            "          # duplicate - required-provider accounting is never\n"
+            "          # reached, and both blocks are otherwise contract-\n"
+            "          # compliant so the duplicate message is provably the\n"
+            "          # failure owner.\n"
+            "          printf '%s\\n' 'E: manifest' \\\n"
+            "            '  A: android:versionCode(0x0101021b)=(type 0x10)0x1' \\\n"
+            "            '  E: application' \\\n"
+            "            '    A: android:fullBackupContent(0x010104eb)=@0x7f010000' \\\n"
+            "            '    A: android:dataExtractionRules(0x0101063e)=@0x7f010001' \\\n"
+            "            '    A: android:networkSecurityConfig(0x01010527)=@0x7f010002' \\\n"
+            "            '    E: provider (line=4)' \\\n"
+            "            '      A: android:name(0x01010003)=\"com.librepocket.internal.Bridge\" (Raw: \"com.librepocket.internal.Bridge\")' \\\n"
+            "            '      A: android:permission(0x01010006)=\"android.permission.INTERACT_ACROSS_USERS_FULL\" (Raw: \"android.permission.INTERACT_ACROSS_USERS_FULL\")' \\\n"
+            "            '      A: android:enabled(0x0101000e)=(type 0x12)0xffffffff' \\\n"
+            "            '      A: android:exported(0x01010010)=(type 0x12)0xffffffff' \\\n"
+            "            '      A: android:multiprocess(0x01010013)=(type 0x12)0x0' \\\n"
+            "            '      A: android:authorities(0x01010018)=\"dev.librepocket.agent.github.bridge1\" (Raw: \"dev.librepocket.agent.github.bridge1\")' \\\n"
+            "            '    E: provider (line=5)' \\\n"
+            "            '      A: android:name(0x01010003)=\"com.librepocket.internal.Bridge\" (Raw: \"com.librepocket.internal.Bridge\")' \\\n"
+            "            '      A: android:permission(0x01010006)=\"android.permission.INTERACT_ACROSS_USERS_FULL\" (Raw: \"android.permission.INTERACT_ACROSS_USERS_FULL\")' \\\n"
+            "            '      A: android:enabled(0x0101000e)=(type 0x12)0xffffffff' \\\n"
+            "            '      A: android:exported(0x01010010)=(type 0x12)0xffffffff' \\\n"
+            "            '      A: android:multiprocess(0x01010013)=(type 0x12)0x0' \\\n"
+            "            '      A: android:authorities(0x01010018)=\"dev.librepocket.agent.github.bridge2\" (Raw: \"dev.librepocket.agent.github.bridge2\")' ;;\n"
+            "        shizuku-bridge-duplicate-arbitrary-alias)\n"
+            "          # Re-review #12 Finding 1 pin, alias spelling pair:\n"
+            "          # '.Bridge' and 'Bridge' under the plain merged-\n"
+            "          # manifest package dev.librepocket.agent.github. Both\n"
+            "          # canonicalize to dev.librepocket.agent.github.Bridge\n"
+            "          # - the DEX-evidenced java name - so the uniqueness\n"
+            "          # gate must fail closed naming the FQN; the attribute\n"
+            "          # contract cannot keep the pair apart (authorities\n"
+            "          # arbitrary non-.shizuku; both blocks carry the FULL\n"
+            "          # contract).\n"
+            "          printf '%s\\n' 'E: manifest' \\\n"
+            "            '  A: package=\"dev.librepocket.agent.github\"' \\\n"
+            "            '  E: application' \\\n"
+            "            '    A: android:fullBackupContent(0x010104eb)=@0x7f010000' \\\n"
+            "            '    A: android:dataExtractionRules(0x0101063e)=@0x7f010001' \\\n"
+            "            '    A: android:networkSecurityConfig(0x01010527)=@0x7f010002' \\\n"
+            "            '    E: provider (line=3)' \\\n"
+            "            '      A: android:name(0x01010003)=\".Bridge\" (Raw: \".Bridge\")' \\\n"
+            "            '      A: android:permission(0x01010006)=\"android.permission.INTERACT_ACROSS_USERS_FULL\" (Raw: \"android.permission.INTERACT_ACROSS_USERS_FULL\")' \\\n"
+            "            '      A: android:enabled(0x0101000e)=(type 0x12)0xffffffff' \\\n"
+            "            '      A: android:exported(0x01010010)=(type 0x12)0xffffffff' \\\n"
+            "            '      A: android:multiprocess(0x01010013)=(type 0x12)0x0' \\\n"
+            "            '      A: android:authorities(0x01010018)=\"dev.librepocket.agent.github.bridge1\" (Raw: \"dev.librepocket.agent.github.bridge1\")' \\\n"
+            "            '    E: provider (line=4)' \\\n"
+            "            '      A: android:name(0x01010003)=\"Bridge\" (Raw: \"Bridge\")' \\\n"
+            "            '      A: android:permission(0x01010006)=\"android.permission.INTERACT_ACROSS_USERS_FULL\" (Raw: \"android.permission.INTERACT_ACROSS_USERS_FULL\")' \\\n"
+            "            '      A: android:enabled(0x0101000e)=(type 0x12)0xffffffff' \\\n"
+            "            '      A: android:exported(0x01010010)=(type 0x12)0xffffffff' \\\n"
+            "            '      A: android:multiprocess(0x01010013)=(type 0x12)0x0' \\\n"
+            "            '      A: android:authorities(0x01010018)=\"dev.librepocket.agent.github.bridge2\" (Raw: \"dev.librepocket.agent.github.bridge2\")' ;;\n"
+            "        shizuku-bridge-authority-missing-dex)\n"
+            "          # Re-review #12 Finding 2 pin: the DEX-evidenced renamed\n"
+            "          # subclass declares NO android:authorities anywhere -\n"
+            "          # the attribute line is ABSENT entirely. The name\n"
+            "          # heuristic cannot see the block; the DEX path's\n"
+            "          # expected_authority=None used to pass it. The shared\n"
+            "          # verifier's authorities presence minimum must fail\n"
+            "          # closed (Android's <provider> spec pins authorities\n"
+            "          # as MANDATORY; no default exists).\n"
+            "          printf '%s\\n' 'E: manifest' \\\n"
+            "            '  A: android:versionCode(0x0101021b)=(type 0x10)0x1' \\\n"
+            "            '  E: application' \\\n"
+            "            '    A: android:fullBackupContent(0x010104eb)=@0x7f010000' \\\n"
+            "            '    A: android:dataExtractionRules(0x0101063e)=@0x7f010001' \\\n"
+            "            '    A: android:networkSecurityConfig(0x01010527)=@0x7f010002' \\\n"
+            "            '    E: provider (line=4)' \\\n"
+            "            '      A: android:name(0x01010003)=\"com.librepocket.internal.Bridge\" (Raw: \"com.librepocket.internal.Bridge\")' \\\n"
+            "            '      A: android:permission(0x01010006)=\"android.permission.INTERACT_ACROSS_USERS_FULL\" (Raw: \"android.permission.INTERACT_ACROSS_USERS_FULL\")' \\\n"
+            "            '      A: android:enabled(0x0101000e)=(type 0x12)0xffffffff' \\\n"
+            "            '      A: android:exported(0x01010010)=(type 0x12)0xffffffff' \\\n"
+            "            '      A: android:multiprocess(0x01010013)=(type 0x12)0x0' ;;\n"
+            "        shizuku-bridge-authority-empty-dex)\n"
+            "          # Re-review #12 Finding 2 pin: android:authorities present\n"
+            "          # but DECODES TO \"\" - no authority at all. Same red\n"
+            "          # shape as the missing-attribute case; the DEX path must\n"
+            "          # not treat the empty string as a proven authority list.\n"
+            "          printf '%s\\n' 'E: manifest' \\\n"
+            "            '  A: android:versionCode(0x0101021b)=(type 0x10)0x1' \\\n"
+            "            '  E: application' \\\n"
+            "            '    A: android:fullBackupContent(0x010104eb)=@0x7f010000' \\\n"
+            "            '    A: android:dataExtractionRules(0x0101063e)=@0x7f010001' \\\n"
+            "            '    A: android:networkSecurityConfig(0x01010527)=@0x7f010002' \\\n"
+            "            '    E: provider (line=4)' \\\n"
+            "            '      A: android:name(0x01010003)=\"com.librepocket.internal.Bridge\" (Raw: \"com.librepocket.internal.Bridge\")' \\\n"
+            "            '      A: android:permission(0x01010006)=\"android.permission.INTERACT_ACROSS_USERS_FULL\" (Raw: \"android.permission.INTERACT_ACROSS_USERS_FULL\")' \\\n"
+            "            '      A: android:enabled(0x0101000e)=(type 0x12)0xffffffff' \\\n"
+            "            '      A: android:exported(0x01010010)=(type 0x12)0xffffffff' \\\n"
+            "            '      A: android:multiprocess(0x01010013)=(type 0x12)0x0' \\\n"
+            "            '      A: android:authorities(0x01010018)=\"\"' ;;\n"
+            "        shizuku-bridge-authority-delimiter-only-dex)\n"
+            "          # Re-review #12 Finding 2 pin: android:authorities carries\n"
+            "          # ONLY separators and whitespace - no non-empty,\n"
+            "          # post-trim authority segment exists. Same red shape;\n"
+            "          # the presence minimum must refuse delimiter-only\n"
+            "          # values even though the attribute is present.\n"
+            "          printf '%s\\n' 'E: manifest' \\\n"
+            "            '  A: android:versionCode(0x0101021b)=(type 0x10)0x1' \\\n"
+            "            '  E: application' \\\n"
+            "            '    A: android:fullBackupContent(0x010104eb)=@0x7f010000' \\\n"
+            "            '    A: android:dataExtractionRules(0x0101063e)=@0x7f010001' \\\n"
+            "            '    A: android:networkSecurityConfig(0x01010527)=@0x7f010002' \\\n"
+            "            '    E: provider (line=4)' \\\n"
+            "            '      A: android:name(0x01010003)=\"com.librepocket.internal.Bridge\" (Raw: \"com.librepocket.internal.Bridge\")' \\\n"
+            "            '      A: android:permission(0x01010006)=\"android.permission.INTERACT_ACROSS_USERS_FULL\" (Raw: \"android.permission.INTERACT_ACROSS_USERS_FULL\")' \\\n"
+            "            '      A: android:enabled(0x0101000e)=(type 0x12)0xffffffff' \\\n"
+            "            '      A: android:exported(0x01010010)=(type 0x12)0xffffffff' \\\n"
+            "            '      A: android:multiprocess(0x01010013)=(type 0x12)0x0' \\\n"
+            "            '      A: android:authorities(0x01010018)=\";;  ; \"' ;;\n"
+            "        shizuku-bridge-authority-spaced-list-dex)\n"
+            "          # Re-review #12 Finding 2 follow-up pin: android:authorities\n"
+            "          # carries TWO arbitrary segments with spaces AROUND the\n"
+            "          # semicolon separator. The authorities presence minimum\n"
+            "          # is presence-only and post-trim (surrounding spaces on\n"
+            "          # each semicolon-separated segment are TOLERATED as long\n"
+            "          # as at least one trimmed segment is non-empty);\n"
+            "          # the values themselves remain unconstrained by design.\n"
+            "          # This GREEN fixture pins that tolerance - a regression\n"
+            "          # that rejects surrounding spaces would fail here.\n"
+            "          printf '%s\\n' 'E: manifest' \\\n"
+            "            '  A: android:versionCode(0x0101021b)=(type 0x10)0x1' \\\n"
+            "            '  E: application' \\\n"
+            "            '    A: android:fullBackupContent(0x010104eb)=@0x7f010000' \\\n"
+            "            '    A: android:dataExtractionRules(0x0101063e)=@0x7f010001' \\\n"
+            "            '    A: android:networkSecurityConfig(0x01010527)=@0x7f010002' \\\n"
+            "            '    E: provider (line=4)' \\\n"
+            "            '      A: android:name(0x01010003)=\"com.librepocket.internal.Bridge\" (Raw: \"com.librepocket.internal.Bridge\")' \\\n"
+            "            '      A: android:permission(0x01010006)=\"android.permission.INTERACT_ACROSS_USERS_FULL\" (Raw: \"android.permission.INTERACT_ACROSS_USERS_FULL\")' \\\n"
+            "            '      A: android:enabled(0x0101000e)=(type 0x12)0xffffffff' \\\n"
+            "            '      A: android:exported(0x01010010)=(type 0x12)0xffffffff' \\\n"
+            "            '      A: android:multiprocess(0x01010013)=(type 0x12)0x0' \\\n"
+            "            '      A: android:authorities(0x01010018)=\"dev.librepocket.agent.github.bridge ;  dev.librepocket.agent.github.extra\" (Raw: \"dev.librepocket.agent.github.bridge ;  dev.librepocket.agent.github.extra\")' ;;\n"
             "        shizuku-bridge-dex-missing-enabled)\n"
             "          # DEX-evidenced renamed subclass (.Bridge resolves to\n"
             "          # <merged package>.Bridge) carrying the FULL attribute\n"
@@ -1666,7 +1813,9 @@ class ApkPolicyHarness(unittest.TestCase):
             "          # dev.librepocket.agent.github.Bridge, so the duplicate-identity\n"
             "          # guard in the required-provider total must fail closed with the\n"
             "          # canonical FQN - the attribute contract cannot keep the two\n"
-            "          # canonical-equal blocks apart.\n"
+            "          # canonical-equal blocks apart. The pinning test DEX carries\n"
+            "          # NO ShizukuProvider subclass class_def, so only the heuristic\n"
+            "          # detects the blocks (see the test's comment).\n"
             "          printf '%s\\n' 'E: manifest' \\\n"
             "            '  E: application' \\\n"
             "            '    A: android:fullBackupContent(0x010104eb)=@0x7f010000' \\\n"
@@ -1691,6 +1840,8 @@ class ApkPolicyHarness(unittest.TestCase):
             "          # the full 'dev.librepocket.agent.github.Bridge' FQN - again\n"
             "          # two spellings of the SAME canonical class, both compliant;\n"
             "          # the canonical duplicate-identity guard must fail closed.\n"
+            "          # The pinning test DEX carries NO ShizukuProvider subclass\n"
+            "          # class_def, so only the heuristic detects the blocks.\n"
             "          printf '%s\\n' 'E: manifest' \\\n"
             "            '  E: application' \\\n"
             "            '    A: android:fullBackupContent(0x010104eb)=@0x7f010000' \\\n"
@@ -4392,17 +4543,16 @@ class ApkPolicyHarness(unittest.TestCase):
         # blocks are otherwise fully contract-compliant (INTERACT_ACROSS_
         # USERS_FULL, enabled/exported exactly true, multiprocess false,
         # authorities exactly dev.librepocket.agent.github.shizuku), so the
-        # canonical duplicate-identity guard is the first gate that raises
-        # on these fixtures (both attribute contracts pass; the heuristic
-        # contract would run after the total).
-        bridge_dex = minimal_dex(
-            class_definitions=(
-                (
-                    "Ldev/librepocket/agent/github/Bridge;",
-                    "Lrikka/shizuku/ShizukuProvider;",
-                ),
-            )
-        )
+        # canonical duplicate-identity guard in the required-provider total
+        # is the gate under test. NOTE (Re-review #12 Finding 1): the
+        # DEX-evidenced uniqueness gate fires FIRST for classes defined as
+        # ShizukuProvider subclasses - so to keep this test pinning the
+        # required-total canonical duplicate-identity guard (heuristic
+        # route), the DEX below intentionally carries NO ShizukuProvider
+        # subclass class_def; only the name/authority heuristic detects the
+        # two blocks. The DEX-evidenced duplicate pair is pinned separately
+        # by test_github_dex_only_duplicate_provider_fails_closed.
+        bridge_dex = minimal_dex(type_descriptors=("Ljava/lang/Object;",))
         for mode in ("shizuku-alias-dot-and-dotfree", "shizuku-alias-dot-and-fqn"):
             with self.subTest(xmltree_mode=mode):
                 apk = complete_apk(
@@ -4423,6 +4573,174 @@ class ApkPolicyHarness(unittest.TestCase):
                     "dev.librepocket.agent.github.Bridge",
                     result.stderr,
                 )
+
+    def test_github_dex_only_duplicate_provider_fails_closed(self) -> None:
+        # Re-review #12 Finding 1 pin: TWO merged-manifest provider blocks
+        # both resolving to ONE DEX-evidenced renamed ShizukuProvider subclass
+        # are NOT one surface - the uniqueness gate fails closed on the
+        # duplicate declaration before required-provider accounting ever
+        # runs. The manifest name/authority heuristic cannot see either
+        # block (arbitrary non-.shizuku authorities), and BOTH blocks carry
+        # the FULL attribute contract (INTERACT_ACROSS_USERS_FULL, enabled/
+        # exported exactly true, multiprocess false), so all else being
+        # equal the duplicate message is provably the failure owner.
+        # Uniqueness is universal (both optional and required modes), not a
+        # required-only accounting rule. The existing
+        # shizuku-bridge-compliant fixture (single arbitrary-authority
+        # DEX-only subclass) remains the green positive control, unchanged.
+        same_fqn_dex = minimal_dex(
+            class_definitions=(
+                (
+                    "Lcom/librepocket/internal/Bridge;",
+                    "Lrikka/shizuku/ShizukuProvider;",
+                ),
+            )
+        )
+        same_fqn_apk = complete_apk(self.tmp / "github-dup-same-fqn.apk", same_fqn_dex)
+        # (1) Same raw FQN twice (arbitrary, non-.shizuku authorities):
+        # red in BOTH required and optional modes - uniqueness is not a
+        # required-only rule.
+        for expect in ("required", "optional"):
+            with self.subTest(expect_provider=expect):
+                result = self._run_scanner_cli(
+                    same_fqn_apk,
+                    "github",
+                    xmltree_mode="shizuku-bridge-duplicate-arbitrary",
+                    expect_provider=expect,
+                )
+                self.assertNotEqual(
+                    result.returncode, 0, result.stderr + result.stdout
+                )
+                self.assertIn(
+                    "github merged manifest declares 2 provider blocks "
+                    "for DEX-evidenced ShizukuProvider subclass "
+                    "com.librepocket.internal.Bridge",
+                    result.stderr,
+                )
+                self.assertIn("2", result.stderr)
+        # (2) Alias pair ('.Bridge' and dot-free 'Bridge' under the merged
+        # package): both canonicalize to dev.librepocket.agent.github.Bridge,
+        # so the uniqueness gate fails closed naming the evidenced java
+        # name; red in BOTH modes as well.
+        alias_dex = minimal_dex(
+            class_definitions=(
+                (
+                    "Ldev/librepocket/agent/github/Bridge;",
+                    "Lrikka/shizuku/ShizukuProvider;",
+                ),
+            )
+        )
+        alias_apk = complete_apk(self.tmp / "github-dup-alias.apk", alias_dex)
+        for expect in ("required", "optional"):
+            with self.subTest(alias_expect_provider=expect):
+                result = self._run_scanner_cli(
+                    alias_apk,
+                    "github",
+                    xmltree_mode="shizuku-bridge-duplicate-arbitrary-alias",
+                    expect_provider=expect,
+                )
+                self.assertNotEqual(
+                    result.returncode, 0, result.stderr + result.stdout
+                )
+                self.assertIn(
+                    "github merged manifest declares 2 provider blocks "
+                    "for DEX-evidenced ShizukuProvider subclass "
+                    "dev.librepocket.agent.github.Bridge",
+                    result.stderr,
+                )
+                self.assertIn("2", result.stderr)
+        # (3) Positive control (unchanged): the single arbitrary-authority
+        # DEX-only subclass stays green under required - the duplicate
+        # uniqueness gate never weakens the single-compliant case.
+        result = self._run_scanner_cli(
+            same_fqn_apk,
+            "github",
+            xmltree_mode="shizuku-bridge-compliant",
+            expect_provider="required",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        # (4) Attribute-contract regression intact: the same compliant
+        # fixture remains green, untouched by the duplicate gate (its
+        # single block still flows through the full contract and the
+        # optional-mode gate).
+        result = self._run_scanner_cli(
+            same_fqn_apk,
+            "github",
+            xmltree_mode="shizuku-bridge-compliant",
+            expect_provider="optional",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+
+    def test_github_dex_evidenced_authority_minimum(self) -> None:
+        # Re-review #12 Finding 2 pin: the DEX-evidenced arbitrary-authority
+        # path no longer accepts a missing, empty, or delimiter-only
+        # android:authorities - Android's <provider> spec pins authorities
+        # as MANDATORY (no default; at least one authority required). The
+        # arbitrary-authority VALUES stay unconstrained by design; the
+        # presence minimum (at least one non-empty, semicolon-separated,
+        # post-trim segment) is the ONLY authority-level addition on the
+        # arbitrary-authority path. The official path's exact pin is
+        # unchanged and subsumes presence. The existing
+        # shizuku-bridge-compliant fixture stays the green positive control.
+        bridge_dex = minimal_dex(
+            class_definitions=(
+                (
+                    "Lcom/librepocket/internal/Bridge;",
+                    "Lrikka/shizuku/ShizukuProvider;",
+                ),
+            )
+        )
+        apk = complete_apk(self.tmp / "github-authority-minimum.apk", bridge_dex)
+        # (1) Missing / empty / delimiter-only authorities on the
+        # DEX-evidenced renamed subclass: red in BOTH required and optional
+        # modes - the presence minimum lives in the shared verifier.
+        for mode in (
+            "shizuku-bridge-authority-missing-dex",
+            "shizuku-bridge-authority-empty-dex",
+            "shizuku-bridge-authority-delimiter-only-dex",
+        ):
+            with self.subTest(xmltree_mode=mode):
+                for expect in ("required", "optional"):
+                    with self.subTest(expect_provider=expect):
+                        result = self._run_scanner_cli(
+                            apk,
+                            "github",
+                            xmltree_mode=mode,
+                            expect_provider=expect,
+                        )
+                        self.assertNotEqual(
+                            result.returncode, 0, result.stderr + result.stdout
+                        )
+                        self.assertIn("android:authorities", result.stderr)
+                        self.assertIn("at least one", result.stderr)
+                        self.assertIn(
+                            "must declare at least one non-empty "
+                            "android:authorities value",
+                            result.stderr,
+                        )
+        # (2) Positive control (unchanged): the valid arbitrary authority
+        # (dev.librepocket.agent.github.bridge) stays green under required.
+        result = self._run_scanner_cli(
+            apk,
+            "github",
+            xmltree_mode="shizuku-bridge-compliant",
+            expect_provider="required",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        # (3) Spaced multi-authority list stays green under required: the
+        # presence minimum tolerates surrounding spaces (post-trim per
+        # segment, at least one non-empty segment); the arbitrary VALUES
+        # remain unconstrained by design. Pinned via the
+        # shizuku-bridge-authority-spaced-list-dex fixture - the comment
+        # there records the post-trim, segments>=1 tolerance being pinned.
+        with self.subTest(spaced_list_authority_green="whitespace-tolerated-segments"):
+            result = self._run_scanner_cli(
+                apk,
+                "github",
+                xmltree_mode="shizuku-bridge-authority-spaced-list-dex",
+                expect_provider="required",
+            )
+            self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
 
     def test_github_dex_evidenced_renamed_shizuku_subclass(self) -> None:
         # #166-D-WARN repro: com.librepocket.internal.Bridge extends
@@ -5019,8 +5337,9 @@ class ApkPolicyHarness(unittest.TestCase):
         self.assertIn("dev.librepocket.agent.github.shizuku", wrong_authority.stderr)
         self.assertIn("dev.librepocket.agent.github.notshizuku", wrong_authority.stderr)
 
-        # (3) authorities ABSENT: the name heuristic still detects the
-        # official provider, so the exact-authority check must fire.
+        # (3) authorities ABSENT: the name heuristic still fires, and the
+        # authorities presence minimum fails closed first (exact pin never
+        # reached when the attribute is missing).
         authority_missing = self._run_scanner_cli(
             apk, "github", xmltree_mode="shizuku-ok-authority-missing"
         )

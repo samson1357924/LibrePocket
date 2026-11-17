@@ -169,9 +169,29 @@ class SafeToolSlice(
          */
         const val RAW_BACKEND_FIELD_MAX_CHARS = MAX_STRING_CHARS * 4
         /** Per-input cap for model-controlled `query` / `pathPrefix` (fail-closed). */
+        // Dual-tracked bound: FastRouter.kt's MAX_INTENT_CHARS pins the same 4096 here — keep both in sync.
         const val MAX_INPUT_CHARS = 4096
         /** Total cap for serialized tool result JSON (fail-closed continuation budget). */
         const val MAX_RESULT_CHARS = 20_000
+
+        /**
+         * Envelope metadata reserve subtracted from the shrink-loop budget in
+         * BOTH Ok pipelines (this class's `ok()` and the fast lane's
+         * `projectOkResult`): the shared effective budget both shrink loops
+         * decide on is `MAX_RESULT_CHARS - RESULT_METADATA_RESERVE`. The
+         * slice appends `,"clockMillis":<13-digit>` only AFTER the shrink
+         * decision, so the loop measures a candidate WITHOUT it — same shape
+         * the fast lane measures — and the two pipelines select identical
+         * symbol sets by construction, regardless of clock value. The
+         * reservation is what pays for the appended field (~28 bytes:
+         * 15-byte `,"clockMillis":` wrapper + 13-digit epoch millis).
+         * 64 keeps a >2× margin; 13-digit millis hold until epoch 10^13 ms
+         * (late 2286), after which millis render wider — the FINAL
+         * `MAX_RESULT_CHARS` backstop after emission (unchanged, in both
+         * places) still fails closed, so the reserve need not track the
+         * widest possible Long. internal: pinned by SymbolReceiptParityTest.
+         */
+        internal const val RESULT_METADATA_RESERVE: Int = 64
 
         /**
          * Length of the deterministic pairing suffix appended to an
@@ -218,6 +238,10 @@ class SafeToolSlice(
          * Scans by code point so supplementary-plane format characters
          * (surrogate pairs whose individual halves report SURROGATE) are
          * properly recognized.
+         *
+         * Shared with LspSymbolsExecutor (single source, #19 B3 stage-4) —
+         * the fast-lane executor calls this implementation; [FastDispatch]
+         * no longer carries a copy.
          */
         internal fun containsFormatCodePoint(s: String): Boolean {
             var i = 0
@@ -251,6 +275,9 @@ class SafeToolSlice(
          * walk back can only extend it, never split a pair that was not
          * already malformed. Work is bounded by `[cap]` (≤ `cap+1` in the
          * split case counting the marker afterwards).
+         *
+         * Shared with LspSymbolsExecutor (single source, #19 B3 stage-4) —
+         * the fast-lane [FastDispatch] no longer carries a copy.
          */
         internal fun cappedTake(value: String, cap: Int): String {
             if (value.length <= cap) return value
@@ -288,6 +315,10 @@ class SafeToolSlice(
          * one pairing key (which would silently drop the second execution).
          * The 128-bit suffix keeps collision probability negligible even for
          * adversarial inputs. The result never exceeds [MAX_STRING_CHARS].
+         *
+         * Shared with LspSymbolsExecutor (single source, #19 B3 stage-4) —
+         * the fast-lane [FastDispatch] no longer carries a copy (the former
+         * FD port now calls this).
          */
         internal fun boundedRedactedId(callId: String): String {
             val redacted = dev.librepocket.redact.Redactor.redact(callId).text
@@ -448,8 +479,16 @@ class SafeToolSlice(
          *  even inspected (its shape must not influence the output). */
         private fun secretValueReceipt(): JsonElement = JsonPrimitive(SECRET_VALUE_RECEIPT)
 
-        /** Computes max JSON nesting depth while ignoring string contents. */
-        private fun jsonNestingDepth(s: String): Int {
+        /**
+         * Computes max JSON nesting depth while ignoring string contents.
+         *
+         * Shared with LspSymbolsExecutor (single source, #19 B3 stage-4) —
+         * the fast-lane executor calls this implementation; [FastDispatch]
+         * no longer carries a copy. The pinned kotlinx-serialization 1.12.0
+         * also enforces its own 400-layer limit; this pre-scan is the
+         * shared fan-close both parse paths apply before parsing.
+         */
+        internal fun jsonNestingDepth(s: String): Int {
             var depth = 0
             var max = 0
             var inStr = false
@@ -469,6 +508,99 @@ class SafeToolSlice(
             }
             return max
         }
+
+        /**
+         * Effective item cap shared by [ok] (this slice) and the fast-lane
+         * executor's `okResult` (LspSymbolsExecutor): the requested limit
+         * clamped into 1..[LspTools.MAX_LIMIT]; a null request means
+         * "unspecified" and mirrors the parse-stage default
+         * ([LspTools.DEFAULT_LIMIT], itself clamped).
+         *
+         * Shared with LspSymbolsExecutor (single source, #19 B3 stage-4) —
+         * do not re-inline the clamp.
+         */
+        internal fun effectiveLimitOf(requested: Int?): Int =
+            (requested ?: LspTools.DEFAULT_LIMIT).coerceIn(1, LspTools.MAX_LIMIT)
+
+        /**
+         * Fail-closed scope guard, single shared predicate (no duplicated inline
+         * re-checks): no traversal markers (`..`), no absolute scope form (leading
+         * `/` after trimming), no backslash, NUL, ISO-control chars, or
+         * percent-escapes; `:` additionally rejects scheme/drive-absolute scope
+         * forms (`file:/etc`, `c:/Users`) so a scope can never name another root
+         * namespace.
+         *
+         * Unicode FORMAT code points (U+200B ZWSP, U+202E RLO, U+FEFF BOM,
+         * U+200E/200F LRM/RLM, …) are rejected outright: they are invisible
+         * (or reorder the visible text) and `trimStart()` does NOT remove them,
+         * so `\u200B/etc/passwd` would otherwise pass the leading-`/` check and
+         * name an absolute scope while looking like a relative one. The check is
+         * on the code point's general category (`Character.FORMAT`), so it also
+         * covers format code points that are not whitespace at all. Iteration is
+         * BY CODE POINT (not by UTF-16 char): a supplementary-plane format
+         * character (U+E0001 LANGUAGE TAG, U+E0020 TAG SPACE — a surrogate
+         * PAIR) reports `SURROGATE` for each half, so a char-level scan would
+         * let it slip through and hide the same absolute scope behind an
+         * invisible tag. This is deliberately wider than the bypass needs
+         * (over-rejection of a scope that merely contains a zero-width mark is
+         * the safe direction).
+         *
+         * Filesystem-shaped scope input only — the model-controlled
+         * `query` deliberately keeps its own narrower check (a search string may
+         * contain `..`/`%`/`:` and stays allowed).
+         *
+         * Shared with LspSymbolsExecutor (single source, #19 B3 stage-4) —
+         * the fast-lane [FastDispatch] no longer carries a copy.
+         */
+        internal fun isSafeInput(v: String): Boolean {
+            if (v.contains("..")) return false
+            // Reject any Unicode FORMAT code point outright so it cannot bypass
+            // the leading-`/` check (U+200B/U+202E/U+FEFF etc.). Code-point
+            // iteration: a supplementary-plane format character is a surrogate
+            // pair whose halves report SURROGATE, never FORMAT.
+            if (containsFormatCodePoint(v)) return false
+            if (v.trimStart().startsWith("/")) return false
+            if (v.contains("\\")) return false
+            if (v.contains("\u0000")) return false
+            if (v.contains("%")) return false
+            if (v.contains(":")) return false
+            if (v.any { it.isISOControl() }) return false
+            return true
+        }
+
+        /**
+         * Bounded echo of a backend-controlled (or query) field: over-cap
+         * values are capped surrogate-safely and given a `…[truncated N→cap]`
+         * marker so the model can tell echo from input.
+         *
+         * Shared with LspSymbolsExecutor (single source, #19 B3 stage-4) —
+         * the fast-lane [FastDispatch] no longer carries a copy (identical
+         * logic and marker format).
+         */
+        internal fun cappedEcho(value: String): String =
+            if (value.length > MAX_STRING_CHARS) {
+                cappedTake(value, MAX_STRING_CHARS) + "…[truncated ${value.length}→$MAX_STRING_CHARS]"
+            } else {
+                value
+            }
+
+        /**
+         * Pre-redaction bound for backend-owned strings (see [RAW_BACKEND_FIELD_MAX_CHARS]).
+         * Over-bound values are replaced whole by a fixed receipt: a truncated
+         * prefix could defeat suffix-anchored redaction rules.
+         *
+         * The receipt is FIXED (`[backend field omitted]`, no length): the
+         * omitted length is MODEL/BACKEND-controlled information, and echoing it
+         * back tells the model how much data it fed in — a free side channel
+         * (and an unnecessary leak) on a receipt whose only job is to say
+         * "something was dropped here".
+         *
+         * Shared with LspSymbolsExecutor (single source, #19 B3 stage-4) —
+         * the fast-lane [FastDispatch] no longer carries a copy.
+         */
+        internal fun boundedRawBackendField(value: String): String =
+            if (value.length <= RAW_BACKEND_FIELD_MAX_CHARS) value
+            else "[backend field omitted]"
     }
 
     /**
@@ -895,7 +1027,7 @@ class SafeToolSlice(
         coroutineContext.ensureActive()
         return when (outcome) {
             is LspTools.SymbolsOutcome.Ok -> try {
-                ok(call, args.query, outcome)
+                ok(call, args.query, outcome, args.limit)
             } catch (e: CancellationException) {
                 throw e
             } catch (_: Exception) {
@@ -972,49 +1104,6 @@ class SafeToolSlice(
     }
 
     /**
-     * Fail-closed scope guard, single shared predicate (no duplicated inline
-     * re-checks): no traversal markers (`..`), no absolute scope form (leading
-     * `/` after trimming), no backslash, NUL, ISO-control chars, or
-     * percent-escapes; `:` additionally rejects scheme/drive-absolute scope
-     * forms (`file:/etc`, `c:/Users`) so a scope can never name another root
-     * namespace.
-     *
-     * Unicode FORMAT code points (U+200B ZWSP, U+202E RLO, U+FEFF BOM/BOM,
-     * U+200E/200F LRM/RLM, …) are rejected outright: they are invisible
-     * (or reorder the visible text) and `trimStart()` does NOT remove them,
-     * so `\u200B/etc/passwd` would otherwise pass the leading-`/` check and
-     * name an absolute scope while looking like a relative one. The check is
-     * on the code point's general category (`Character.FORMAT`), so it also
-     * covers format code points that are not whitespace at all. Iteration is
-     * BY CODE POINT (not by UTF-16 char): a supplementary-plane format
-     * character (U+E0001 LANGUAGE TAG, U+E0020 TAG SPACE — a surrogate
-     * PAIR) reports `SURROGATE` for each half, so a char-level scan would
-     * let it slip through and hide the same absolute scope behind an
-     * invisible tag. This is deliberately wider than the bypass needs
-     * (over-rejection of a scope that merely contains a zero-width mark is
-     * the safe direction).
-     *
-     * Filesystem-shaped scope input only — the model-controlled
-     * `query` deliberately keeps its own narrower check (a search string may
-     * contain `..`/`%`/`:` and stays allowed).
-     */
-    private fun isSafeInput(v: String): Boolean {
-        if (v.contains("..")) return false
-        // Reject any Unicode FORMAT code point outright so it cannot bypass
-        // the leading-`/` check (U+200B/U+202E/U+FEFF etc.). Code-point
-        // iteration: a supplementary-plane format character is a surrogate
-        // pair whose halves report SURROGATE, never FORMAT.
-        if (containsFormatCodePoint(v)) return false
-        if (v.trimStart().startsWith("/")) return false
-        if (v.contains("\\")) return false
-        if (v.contains("\u0000")) return false
-        if (v.contains("%")) return false
-        if (v.contains(":")) return false
-        if (v.any { it.isISOControl() }) return false
-        return true
-    }
-
-    /**
      * Typed denial receipt for [call].
      *
      * [wireId] is the id that rides the wire (the bounded redacted form of
@@ -1053,36 +1142,35 @@ class SafeToolSlice(
         return ToolResult(call.id, call.name, json, denied = true, denyCode = code)
     }
 
-    private fun cappedEcho(value: String): String =
-        if (value.length > MAX_STRING_CHARS) {
-            cappedTake(value, MAX_STRING_CHARS) + "…[truncated ${value.length}→$MAX_STRING_CHARS]"
-        } else {
-            value
-        }
-
-    /** Pre-redaction bound for backend-owned strings (see [RAW_BACKEND_FIELD_MAX_CHARS]).
-     *  Over-bound values are replaced whole by a fixed receipt: a truncated
-     *  prefix could defeat suffix-anchored redaction rules.
+    /**
+     * The slice's success-receipt pipeline; the fast-lane executor's
+     * `okResult` ([LspSymbolsExecutor]) mirrors this projection by hand
+     * (item-cap clamp via the shared [effectiveLimitOf], the effective
+     * limit, `omittedCount`/`truncated` computation) — SymbolReceiptParityTest
+     * (router test suite) pins the two Ok receipts byte-/semantic-identical modulo the documented
+     * asymmetries (this receipt's `clockMillis`, the tool echo rule, key
+     * order). Shared helpers live in this companion (single source, #19 B3
+     * stage-4); never re-copy them into [FastDispatch].
      *
-     *  The receipt is FIXED (`[backend field omitted]`, no length): the
-     *  omitted length is MODEL/BACKEND-controlled information, and echoing it
-     *  back tells the model how much data it fed in — a free side channel
-     *  (and an unnecessary leak) on a receipt whose only job is to say
-     *  "something was dropped here". */
-    private fun boundedRawBackendField(value: String): String =
-        if (value.length <= RAW_BACKEND_FIELD_MAX_CHARS) value
-        else "[backend field omitted]"
-
+     * Budget accounting is shared with the fast lane: both shrink loops
+     * decide against `MAX_RESULT_CHARS - RESULT_METADATA_RESERVE`, and this
+     * receipt's `clockMillis` is appended by the envelope AFTER the shrink
+     * loop (paid for by that reservation, not measured by it), so both
+     * pipelines cut identically regardless of clock value; the FINAL
+     * backstop that rejects an over-[MAX_RESULT_CHARS] JSON stays unchanged.
+     */
     private fun ok(
         call: ToolCall,
         query: String,
         outcome: LspTools.SymbolsOutcome.Ok,
+        requestedLimit: Int,
     ): ToolResult {
         // Snapshot the bounded projection ONCE inside the typed-error
         // boundary: a backend List with a throwing size/iterator/get is a
         // backend failure (EXEC_ERROR), never an escaped turn crash. Both the
         // redaction pass and the raw-field pass share this snapshot, and a
-        // backend returning more than MAX_LIMIT (contract violation) is not
+        // backend returning more than the REQUESTED limit (contract violation;
+        // the absolute cap is MAX_LIMIT) is not
         // iterated twice.
         val available: List<LspTools.Symbol>
         val limitOmitted: Int
@@ -1090,7 +1178,8 @@ class SafeToolSlice(
         val redactedSymbols: List<Triple<String, String, String>>
         val anyFieldTruncated: Boolean
         try {
-            available = outcome.symbols.take(LspTools.MAX_LIMIT)
+            val effectiveLimit = effectiveLimitOf(requestedLimit)
+            available = outcome.symbols.take(effectiveLimit)
             limitOmitted = (outcome.symbols.size - available.size).coerceAtLeast(0)
             redactedQuery = dev.librepocket.redact.Redactor.redact(query).text
             // Truncation is decided on the POST-redaction lengths: redaction
@@ -1125,7 +1214,10 @@ class SafeToolSlice(
                 put("line", s.line)
             }
         }
-        fun build(chosen: List<kotlinx.serialization.json.JsonObject>, omittedCount: Int, truncated: Boolean): kotlinx.serialization.json.JsonObject =
+        // `includeClockMillis=false` is used ONLY by the shrink loop below: it
+        // measures the shared-envelope-budget candidate (no clockMillis); the
+        // FINAL receipt is emitted with clockMillis (the envelope's field).
+        fun build(chosen: List<kotlinx.serialization.json.JsonObject>, omittedCount: Int, truncated: Boolean, includeClockMillis: Boolean = true): kotlinx.serialization.json.JsonObject =
             buildJsonObject {
                 put("denied", false)
                 put("tool", cappedTake(dev.librepocket.redact.Redactor.redact(call.name).text, MAX_STRING_CHARS))
@@ -1136,22 +1228,27 @@ class SafeToolSlice(
                 put("omittedCount", omittedCount)
                 put("truncated", truncated)
                 put("fromStub", outcome.fromStub)
-                put("clockMillis", clock.millis())
+                if (includeClockMillis) put("clockMillis", clock.millis())
             }
         val chosen = ArrayList(symbolJsons)
         // Worst case accepted deliberately: the scan-down shrink re-serializes
         // per dropped symbol (O(n²) in symbol count), but the input is
-        // pre-bounded by the LspTools.MAX_LIMIT item cap and the per-field
-        // MAX_STRING_CHARS cap, so the quadratic component is constant-bounded
-        // — perf, not correctness.
+        // pre-bounded by the effective item cap (≤ MAX_LIMIT) and the
+        // per-field MAX_STRING_CHARS cap, so the quadratic component is
+        // constant-bounded — perf, not correctness.
         while (chosen.size > 1) {
             val omittedCount = limitOmitted + (symbolJsons.size - chosen.size)
             val truncated = anyFieldTruncated || omittedCount > 0
-            val candidate = build(chosen, omittedCount, truncated).toString()
-            if (candidate.length <= MAX_RESULT_CHARS) break
+            // Shrink against the SHARED envelope budget: the candidate carries
+            // no clockMillis (the envelope appends it after the loop, paid for
+            // by RESULT_METADATA_RESERVE) — same measured shape as the fast
+            // lane, so cut points cannot diverge between the two pipelines.
+            val candidate = build(chosen, omittedCount, truncated, includeClockMillis = false).toString()
+            if (candidate.length <= MAX_RESULT_CHARS - RESULT_METADATA_RESERVE) break
             chosen.removeAt(chosen.lastIndex)
         }
-        // A backend returning more than MAX_LIMIT is over the item cap even
+        // A backend returning more than the effective item cap (min of the
+        // requested limit and MAX_LIMIT) is over-cap even
         // when the serialized result fits: report both cap drops and
         // shrink-loop drops in omittedCount, and mark truncated.
         val omittedCount = limitOmitted + (symbolJsons.size - chosen.size)

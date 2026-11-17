@@ -95,6 +95,28 @@ class FastRouterDecisionTest {
         assertTrue(d.fallbackMessage!!.contains("FLAVOR_BLOCKED"))
     }
 
+    // stage-8.5（Re-review #8 A4）反向 pin：bare `自動操作`／`自動填表` 無 symbol
+    // hint、非命令式 symbol 查詢 ⇒ symbol 前閘不成立 ⇒ SLOW automation descriptor ⇒
+    // play 投影 FLAVOR_BLOCKED（接線前 play 上絕不執行）；header.toolName 綁
+    // SLOW_TOOL_NAME、toolCall 為 null——不得綁 lsp.symbols、不得 FAST。
+    @Test fun bareAutoOperationSlowHintDeniedFlavorBlocked() {
+        val d = decide("自動操作")
+        assertEquals(RouteKind.DENIED, d.route)
+        assertEquals(DenyReason.FLAVOR_BLOCKED, d.reasonCode)
+        assertNull(d.toolCall)
+        assertEquals(ToolRegistry.SLOW_TOOL_NAME, d.header.toolName)
+        assertTrue(d.fallbackMessage!!.contains(ToolRegistry.SLOW_TOOL_NAME))
+    }
+
+    @Test fun bareAutoFillFormSlowHintDeniedFlavorBlocked() {
+        val d = decide("自動填表")
+        assertEquals(RouteKind.DENIED, d.route)
+        assertEquals(DenyReason.FLAVOR_BLOCKED, d.reasonCode)
+        assertNull(d.toolCall)
+        assertEquals(ToolRegistry.SLOW_TOOL_NAME, d.header.toolName)
+        assertTrue(d.fallbackMessage!!.contains(ToolRegistry.SLOW_TOOL_NAME))
+    }
+
     @Test fun slowIntentOnSelfInstallWithAutomationDeniedUntilWired() {
         for (flavor in listOf(Flavor.FOSS, Flavor.GITHUB)) {
             val ctx = ProjectionContext(
@@ -206,19 +228,22 @@ class FastRouterDecisionTest {
         }
     }
 
-    @Test fun negationDoesNotMisFireOnPartialMatch() {
-        // 「特別」含「別」但非否定：不得誤判為澄清，仍走接線門 USER_DISABLED。
+    @Test fun specialZheIsOverClarifiedByNegationGate() {
+        // A1 之後（any-presence 閘）：「特別」含「別」⇒ 轉澄清，不再走接線門。
+        // 過度澄清為 fail-safe 方向（與「特別找」殘餘同類），取代舊的
+        // 「裸 別 不誤判」精度——封閉動詞表不完整，不猜。
         val d = decide("特別想聽音樂，播放周杰倫的歌")
         assertEquals(RouteKind.DENIED, d.route)
-        assertEquals(DenyReason.USER_DISABLED, d.reasonCode)
+        assertEquals(DenyReason.NEED_CLARIFICATION, d.reasonCode)
         assertTrue(d.fallbackMessage!!.contains("music.control"))
     }
 
-    @Test fun negationDoesNotMisFireOnSimplifiedPartialMatch() {
-        // 簡體「别人」含「别」但非否定：不得誤判為澄清，仍走接線門 USER_DISABLED。
+    @Test fun bieRenIsOverClarifiedByNegationGate() {
+        // A1 之後（any-presence 閘）：簡體「别人」含「别」⇒ 轉澄清；
+        // 與「特別」同類已知過度澄清（安全方向），不另設例外。
         val d = decide("别人想聽音樂，播放周杰倫的歌")
         assertEquals(RouteKind.DENIED, d.route)
-        assertEquals(DenyReason.USER_DISABLED, d.reasonCode)
+        assertEquals(DenyReason.NEED_CLARIFICATION, d.reasonCode)
         assertTrue(d.fallbackMessage!!.contains("music.control"))
     }
 
@@ -304,6 +329,61 @@ class FastRouterDecisionTest {
         assertEquals("NEED_CLARIFICATION", d.header.reasonCode)
     }
 
+    @Test fun outOfRangeAlarmTimeNeedsClarification() {
+        // 明確但超出範圍的時間值（hour>23、minute>59，含 `:` 形式）：
+        // 一律轉補參澄清，絕不 coerceIn 夾值後執行（`25點` 不是 23 點、
+        // `7點99分` 不是 7:59）。
+        for (text in listOf(
+            "鬧鐘 25點叫我",
+            "鬧鐘 7點99分叫我",
+            "鬧鐘 7:99叫我",
+            "鬧鐘 23點60分叫我",
+        )) {
+            val d = decide(text)
+            assertEquals(text, RouteKind.DENIED, d.route)
+            assertEquals(text, DenyReason.NEED_CLARIFICATION, d.reasonCode)
+            assertNull(text, d.toolCall)
+            assertTrue(text, d.fallbackMessage!!.contains("alarm.create"))
+            assertTrue(text, d.fallbackMessage!!.contains("NEED_CLARIFICATION"))
+            assertEquals(text, "NEED_CLARIFICATION", d.header.reasonCode)
+        }
+    }
+
+    @Test fun adjacentDigitAlarmTimeNeedsClarification() {
+        // 時間 token 緊鄰數字（`7點123分`／`123點`）一律視為「無明確時間」⇒
+        // 缺參澄清，絕不以鄰接數字截出靜默錯誤的時間（守衛 `(?<!\d)`／`(?!\d)`：
+        // `7點123分` 不是 7:12、`123點` 不是 23 點，兩者皆不 matching ⇒ 澄清）。
+        for (text in listOf(
+            "鬧鐘 7點123分叫我",
+            "鬧鐘 123點叫我",
+        )) {
+            val d = decide(text)
+            assertEquals(text, RouteKind.DENIED, d.route)
+            assertEquals(text, DenyReason.NEED_CLARIFICATION, d.reasonCode)
+            assertNull(text, d.toolCall)
+            assertTrue(text, d.fallbackMessage!!.contains("alarm.create"))
+            assertTrue(text, d.fallbackMessage!!.contains("NEED_CLARIFICATION"))
+            assertEquals(text, "NEED_CLARIFICATION", d.header.reasonCode)
+        }
+    }
+
+    @Test fun inRangeTwoDigitAlarmTimeStillAdmittedToWiringGate() {
+        // 合法的完整兩位分鐘（7點30分／7點59分）通過缺參門（`(?!\d)` 守衛不誤傷，
+        // 與 alarmIntentDeniedUntilWired 對齊），落接線門：alarm.create 未 ready ⇒
+        // USER_DISABLED（答應而非執行），不轉澄清。
+        for (text in listOf(
+            "鬧鐘 7點30分叫我",
+            "鬧鐘 7點59分叫我",
+        )) {
+            val d = decide(text)
+            assertEquals(text, RouteKind.DENIED, d.route)
+            assertEquals(text, DenyReason.USER_DISABLED, d.reasonCode)
+            assertNull(text, d.toolCall)
+            assertTrue(text, d.fallbackMessage!!.contains("alarm.create"))
+            assertEquals(text, "USER_DISABLED", d.header.reasonCode)
+        }
+    }
+
     @Test fun negationWithMissingGrantStaysNoPrivilege() {
         // 遮罩順序：投影 UNAVAILABLE（無授權）優先於否定澄清；否定句在無授權
         // 下仍回 NO_PRIVILEGE，絕不被誤讀為補參澄清。
@@ -370,6 +450,26 @@ class FastRouterDecisionTest {
         // 關掉開關後快照同步收斂（快照是 registry 視圖，不是固定清單）。
         val off = play.copy(userSwitches = mapOf("lsp" to false))
         assertFalse(decide("幫我截圖", off).header.visibleTools.contains("lsp.symbols"))
+    }
+
+    @Test fun fastLaneNegativeVerbsDenyZeroBackend() {
+        // Adversarial symbol-negation probes (plain decide(), no dispatcher):
+        // none of these may fabricate a template match, so each must be a
+        // DENIED decision with a null tool call — zero backend reach. The
+        // exact denial path (no-match vs clarification) is not pinned here;
+        // only the DENIED + toolCall == null contract is.
+        for (text in listOf(
+            "別查 Foo 符號",
+            "別查詢 Foo 符號",
+            "not symbols Foo",
+            "do not find symbol Foo",
+            "never search symbols Foo",
+            "別 tìm symbol Foo",
+        )) {
+            val d = decide(text)
+            assertEquals(text, RouteKind.DENIED, d.route)
+            assertNull("$text must not fabricate a tool call", d.toolCall)
+        }
     }
 
     @Test fun phoneCandidateFirstMaxTieBreakIsDeterministic() {

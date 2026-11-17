@@ -198,6 +198,6 @@ object BackupCodec {
 
     private fun sha256Hex(s: String): String {
         val d = MessageDigest.getInstance("SHA-256").digest(s.toByteArray(Charsets.UTF_8))
-        return d.joinToString("") { "%02x".format(it) }
+        return d.joinToString("") { "%02x".format(java.util.Locale.ROOT, it) }
     }
 }

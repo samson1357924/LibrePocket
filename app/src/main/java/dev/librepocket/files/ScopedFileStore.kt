@@ -865,7 +865,7 @@ class ScopedFileStore(val root: File) {
         /** 內容雜湊（呼叫方做去重/審計指紋用）。 */
         fun sha256Hex(bytes: ByteArray): String {
             val digest = MessageDigest.getInstance("SHA-256").digest(bytes)
-            return digest.joinToString("") { "%02x".format(it) }
+            return digest.joinToString("") { "%02x".format(java.util.Locale.ROOT, it) }
         }
 
         private fun canonicalOrAbsolute(dir: File): String =

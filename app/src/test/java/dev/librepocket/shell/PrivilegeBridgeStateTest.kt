@@ -1577,7 +1577,7 @@ class PrivilegeBridgeStateTest {
         val lockHoldRelease = java.util.concurrent.CountDownLatch(1)
         val saveCalls = java.util.concurrent.atomic.AtomicInteger(0)
         val fatal = ThreadDeath()
-        val oomDs = object : DataStore<Preferences> by backing {
+        val fatalDs = object : DataStore<Preferences> by backing {
             override suspend fun updateData(transform: suspend (t: Preferences) -> Preferences): Preferences {
                 // 第一次 updateData 為 grant 落庫：掛住直到測試於 revoke 逾時後放行；
                 // clear 路徑的 edit 直接拋 ThreadDeath（不 hang）。
@@ -1589,7 +1589,7 @@ class PrivilegeBridgeStateTest {
                 throw fatal
             }
         }
-        val store = PrivilegeBridgeStore(oomDs)
+        val store = PrivilegeBridgeStore(fatalDs)
         val state = PrivilegeBridgeState(
             bridgeSwitchOn = true,
             bridgeGranted = true,
@@ -2295,6 +2295,49 @@ class PrivilegeBridgeStateTest {
         } finally {
             state.grantCommitHookForTest = null
             hangLatch.countDown()
+        }
+    }
+
+    @Test(timeout = 30_000L)
+    fun failGrantRevokedConcurrently_compensationClearThreadDeath_propagatesFatal() = runBlocking {
+        // 補償清庫（epilogue best-effort clear）於第二次起 updateData 拋 ThreadDeath：
+        // Stage-7B arm(a) 對 VMError∪ThreadDeath 皆須原樣上拋（不得淪為 logcat-only）——
+        // grant() 必以 ThreadDeath 上拋（不合成 PRIVILEGE_GRANT_REVOKED_CONCURRENTLY ISE 覆蓋 fatal），
+        // 併發撤銷 claim 的 ISE 以 suppressed 保留；旗標 false、審計清空。
+        // harness 同 grantEpilogueCompensationClearHangs_grantDoesNotHang：
+        // 第一次 updateData 為 grant 落庫（成功）；其後（補償清庫）拋 ThreadDeath。
+        val backing = PreferenceDataStoreFactory.create(scope = scope) {
+            File(dir, "grant_epilogue_clear_threaddeath.preferences_pb")
+        }
+        val saveCalls = java.util.concurrent.atomic.AtomicInteger(0)
+        val fatal = ThreadDeath()
+        val flakyDs = object : DataStore<Preferences> by backing {
+            override suspend fun updateData(transform: suspend (t: Preferences) -> Preferences): Preferences {
+                if (saveCalls.getAndIncrement() == 0) {
+                    return backing.updateData(transform)
+                }
+                throw fatal
+            }
+        }
+        val store = PrivilegeBridgeStore(flakyDs)
+        val state = PrivilegeBridgeState(
+            bridgeSwitchOn = true,
+            bridgeGranted = true,
+        )
+        state.audit.record(listOf("id"), "B1-comp-clear-td", "DENY")
+        state.grantCommitHookForTest = { state.revokeInMemoryForTest() }
+        try {
+            val error = assertThrows(ThreadDeath::class.java) {
+                runBlocking { state.grant(store, "preset:openai", 1L) }
+            }
+            assertTrue(
+                "例外鏈上必含 IllegalStateException(PRIVILEGE_GRANT_REVOKED_CONCURRENTLY)（claim 碼保留），實際=${throwableChain(error)}",
+                throwableChain(error).any { it is IllegalStateException && it.message == "PRIVILEGE_GRANT_REVOKED_CONCURRENTLY" },
+            )
+            assertFalse("commit 窗口並發撤銷 ⇒ 旗標必 false", state.bridgeGranted)
+            assertEquals("撤權（hook）後審計表必已清空", 0, state.auditCount())
+        } finally {
+            state.grantCommitHookForTest = null
         }
     }
 

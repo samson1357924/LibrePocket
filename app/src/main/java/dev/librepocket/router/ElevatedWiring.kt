@@ -69,20 +69,16 @@ import kotlin.coroutines.coroutineContext
  * （`RootSuRunner`／`ShizukuShellRunner`，每次新鮮供給 `bridgeGranted`／
  * `grantCheck`，見各 runner KDoc）；本層只消費 supplier，不自建快取。
  *
- * 依賴 #166（B1）先合併：grant 持久真相源（`PrivilegeBridgeStore`＋
- * `ShizukuGrantStore`）由 B1 落定；本層以最小抽象 [ElevatedGrant] 佔位
- * （github 側 `GrantCheck.Valid／Invalid` 對映，rebase 後以 B1 持久版為準）。
+ * grant 持久真相源由 B1（#166）落定：`PrivilegeBridgeStore`（DataStore，
+ * 撤權 journal／pending marker）為準；持久收回為
+ * `PrivilegeBridgeState.revoke(store, withdrawScope)`（記憶體先落、有界清庫、
+ * 鎖外有界 withdrawScope；github 側經 `FlavorPrivilegeScope.withdraw`
+ * 傳入 detach＋`ShizukuGrantStore.clear()`，本 main 源集不引用 github 類）。
+ * #168 早期的 two-step 撤權佔位（記憶體佔位 Store、最小 clear 介面、
+ * 彙整重拋入口）已隨 rebase 刪除，全數以 B1 持久版承接。
  *
- * Rebase 註記（#166，寫進 PR 描述用）：
- * TODO(#166): rebase 時依本「Rebase 註記」區塊處置（刪 InMemoryPrivilegeRevokeStore、withdrawScope 注入 ShizukuGrantStore.clear()、持久寫入失敗重試 UI）；翻旗硬門檻待裝置 E2E。
- * - B1 的 `PrivilegeBridgeStore`（DataStore）實現
- *   [dev.librepocket.shell.PrivilegeRevokeStore]（rebase 時加
- *   `: PrivilegeRevokeStore`），並刪除本分支的重複 overload／佔位
- *   `InMemoryPrivilegeRevokeStore`（改用 B1 持久版；見
- *   [dev.librepocket.shell.PrivilegeBridgeState] KDoc）；
- * - grant 有效性以 B1 `PrivilegeGrantCheck.check()`（現 B1 實作：
- *   `ShizukuGrantPolicy.check`／`ShizukuGrantStore.check`，rebase 時對齊命名）
- *   為準，本層 [ElevatedGrant.Valid] 僅為接線形狀的身份快照佔位。
+ * - grant 有效性以 B1 `PrivilegeGrantCheck.check()` 為準，
+ *   本層 [ElevatedGrant.Valid] 僅為接線形狀的身份快照佔位。
  * - [ElevatedGrant.Invalid] 的 supplier reason 不回顯於 Denied message（可能夾帶綁定錯誤細節）：
  *   message 固定為 `grant invalid (fail-closed, no spawn)`，審計面本來就只有 hash。
  *

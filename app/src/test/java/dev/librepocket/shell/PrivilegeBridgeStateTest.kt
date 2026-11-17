@@ -1322,6 +1322,301 @@ class PrivilegeBridgeStateTest {
         assertFalse(state.bridgeGranted)
     }
 
+    // #136-B3 → #166 移植（#168）：B3 的 two-step 撤權 API 已被 B1 持久版 supersede；
+    // 以下測試為等效語義移植（成功路徑 exactly-once、caller-cancel 非同步清理），
+    // 以及 Stage-7B uniform fatal precedence 對 ThreadDeath 的覆蓋（VMError ∪ ThreadDeath）。
+    // 與 B3 的差異：B1 的 revoke 為記憶體先落＋鎖內有界 store.clear()＋鎖外有界
+    // withdrawScope；例外跨 coroutine 邊界會被複製（message 保留、suppressed 不可觀測），
+    // 故 pin type（＋可觀測時 message），不釘 identity／suppressed 圖。
+    @Test fun persistentRevokeClearsStoreScopeAndMemory() = runBlocking {
+        val audit = PrivilegeAuditLog()
+        audit.record(listOf("id"), "B3-x", "DENY")
+        val state = PrivilegeBridgeState(audit, bridgeSwitchOn = true, bridgeGranted = true)
+        val store = store()
+        var scopeCalls = 0
+
+        val cleared = state.revoke(store) { scopeCalls++ }
+
+        assertEquals(1, cleared)
+        assertEquals(1, scopeCalls)
+        assertFalse(state.bridgeSwitchOn)
+        assertFalse(state.bridgeGranted)
+        assertEquals(0, state.auditCount())
+        assertNull("store.clear 已落地，持久授權必已撤銷", store.load())
+    }
+
+    @Test(timeout = 30_000L) fun persistentRevokeSurvivesCallerCancellationNonCancellable() = runBlocking {
+        // caller 協程在 store.clear() 掛起期間被取消：NonCancellable 清理區不隨 caller
+        // 取消而提前返回或撕裂——caller 取消後放行 clear，兩個清除動作（store.clear 與
+        // withdrawScope）仍各自跑到完成；記憶體閘早已同步關閉（memory-first）。
+        // 以 CompletableDeferred 精確控制 clear 的完成點，並額外斷言「取消後、放行前」
+        // 清理尚未提前完成（scope 未被呼叫、job 未完成）。
+        val audit = PrivilegeAuditLog()
+        audit.record(listOf("id"), "B3-x", "DENY")
+        val backing = PreferenceDataStoreFactory.create(scope = scope) {
+            File(dir, "persistent_revoke_caller_cancel.preferences_pb")
+        }
+        val entered = kotlinx.coroutines.CompletableDeferred<Unit>()
+        val release = kotlinx.coroutines.CompletableDeferred<Unit>()
+        val clearCalls = java.util.concurrent.atomic.AtomicInteger(0)
+        val gatedDs = object : DataStore<Preferences> by backing {
+            override suspend fun updateData(transform: suspend (t: Preferences) -> Preferences): Preferences {
+                // 第一次 updateData（journal 寫入）進入即掛起直至放行；其後照常落盤。
+                if (clearCalls.getAndIncrement() == 0) {
+                    entered.complete(Unit)
+                    release.await()
+                }
+                return backing.updateData(transform)
+            }
+        }
+        val store = PrivilegeBridgeStore(gatedDs)
+        val state = PrivilegeBridgeState(audit, bridgeSwitchOn = true, bridgeGranted = true)
+        var scopeCalls = 0
+        val job = launch {
+            state.revoke(store) { scopeCalls++ }
+        }
+        withTimeout(2_000) { entered.await() }
+        job.cancel()
+        assertEquals("取消不得提前觸發 withdrawScope", 0, scopeCalls)
+        assertFalse("取消不得提前撕裂清理區", job.isCompleted)
+        assertTrue(job.isCancelled)
+        release.complete(Unit)
+        withTimeout(5_000) { job.join() }
+        assertEquals(1, scopeCalls)
+        assertFalse(state.bridgeSwitchOn)
+        assertFalse(state.bridgeGranted)
+        assertEquals(0, state.auditCount())
+        assertNull("store.clear 已落地，持久授權必已撤銷", store.load())
+    }
+
+    @Test(timeout = 30_000L)
+    fun revokeStoreClearIoExceptionThenWithdrawScopeThreadDeath_FatalPrecedence() = runBlocking {
+        // store.clear() 拋 IOException＋withdrawScope 拋 ThreadDeath：
+        // 第二腿 fatal 不得淪為 suppressed——拋出的例外必為 ThreadDeath。
+        val backing = PreferenceDataStoreFactory.create(scope = scope) {
+            File(dir, "clear_ioe_scope_threaddeath.preferences_pb")
+        }
+        val clearIoFailure = java.io.IOException("simulated clear")
+        val failingStore = PrivilegeBridgeStore(object : DataStore<Preferences> by backing {
+            override suspend fun updateData(transform: suspend (t: Preferences) -> Preferences): Preferences {
+                throw clearIoFailure
+            }
+        })
+        val state = PrivilegeBridgeState(
+            bridgeSwitchOn = true,
+            bridgeGranted = true,
+        )
+        state.audit.record(listOf("id"), "B1-clear-ioe-scope-threaddeath", "DENY")
+
+        val error = assertThrows(ThreadDeath::class.java) {
+            runBlocking { state.revoke(failingStore) { throw ThreadDeath() } }
+        }
+        assertFalse(state.bridgeSwitchOn)
+        assertFalse(state.bridgeGranted)
+        assertEquals("撤權後審計表必已清空", 0, state.auditCount())
+    }
+
+    @Test(timeout = 30_000L)
+    fun revokeClearLegThreadDeathVsScopeLegVirtualMachineError_FatalPrecedence_firstFatalWins() = runBlocking {
+        // 兩腿皆 fatal：clear 腿 ThreadDeath 先到、scope 腿 OOM 後到——
+        // first-fatal-wins：clear 腿的 ThreadDeath 留 primary，scope 腿 OOM 反向掛入。
+        val backing = PreferenceDataStoreFactory.create(scope = scope) {
+            File(dir, "clear_threaddeath_scope_oom.preferences_pb")
+        }
+        val failingStore = PrivilegeBridgeStore(object : DataStore<Preferences> by backing {
+            override suspend fun updateData(transform: suspend (t: Preferences) -> Preferences): Preferences {
+                throw ThreadDeath()
+            }
+        })
+        val state = PrivilegeBridgeState(
+            bridgeSwitchOn = true,
+            bridgeGranted = true,
+        )
+        state.audit.record(listOf("id"), "B1-clear-td-scope-oom", "DENY")
+
+        val error = assertThrows(ThreadDeath::class.java) {
+            runBlocking { state.revoke(failingStore) { throw OutOfMemoryError("scope leg OOM") } }
+        }
+        // pin：首個 fatal（clear 腿 ThreadDeath）為主失敗；若 scope 腿 OOM 取代之，本斷言必紅。
+        assertFalse(state.bridgeSwitchOn)
+        assertFalse(state.bridgeGranted)
+        assertEquals("撤權後審計表必已清空", 0, state.auditCount())
+    }
+
+    @Test(timeout = 30_000L)
+    fun revokeClearLegVirtualMachineErrorVsScopeLegThreadDeath_FatalPrecedence_firstFatalWins() = runBlocking {
+        // 兩腿皆 fatal：clear 腿 OOM 先到、scope 腿 ThreadDeath 後到——
+        // first-fatal-wins：clear 腿的 OOM 留 primary（message 未被替換為 scope 腿）。
+        val backing = PreferenceDataStoreFactory.create(scope = scope) {
+            File(dir, "clear_oom_scope_threaddeath.preferences_pb")
+        }
+        val failingStore = PrivilegeBridgeStore(object : DataStore<Preferences> by backing {
+            override suspend fun updateData(transform: suspend (t: Preferences) -> Preferences): Preferences {
+                throw OutOfMemoryError("clear leg OOM")
+            }
+        })
+        val state = PrivilegeBridgeState(
+            bridgeSwitchOn = true,
+            bridgeGranted = true,
+        )
+        state.audit.record(listOf("id"), "B1-clear-oom-scope-td", "DENY")
+
+        val error = assertThrows(OutOfMemoryError::class.java) {
+            runBlocking { state.revoke(failingStore) { throw ThreadDeath() } }
+        }
+        assertEquals("clear leg OOM", error.message)
+        assertFalse(state.bridgeSwitchOn)
+        assertFalse(state.bridgeGranted)
+        assertEquals("撤權後審計表必已清空", 0, state.auditCount())
+    }
+
+    @Test(timeout = 30_000L)
+    fun revokeClearLegThreadDeathWithScopeCancellation_FatalPrecedence_clearLegPrimary() = runBlocking {
+        // clear 腿 ThreadDeath（fatal primary）＋scope 腿 CE（非 fatal）：
+        // CE 以 suppressed 附加（不取代 fatal）；fatal 留 primary。
+        val backing = PreferenceDataStoreFactory.create(scope = scope) {
+            File(dir, "clear_threaddeath_scope_ce.preferences_pb")
+        }
+        val failingStore = PrivilegeBridgeStore(object : DataStore<Preferences> by backing {
+            override suspend fun updateData(transform: suspend (t: Preferences) -> Preferences): Preferences {
+                throw ThreadDeath()
+            }
+        })
+        val state = PrivilegeBridgeState(
+            bridgeSwitchOn = true,
+            bridgeGranted = true,
+        )
+        state.audit.record(listOf("id"), "B1-clear-td-scope-ce", "DENY")
+
+        val error = assertThrows(ThreadDeath::class.java) {
+            runBlocking { state.revoke(failingStore) { throw CancellationException("simulated scope CE") } }
+        }
+        assertFalse(state.bridgeSwitchOn)
+        assertFalse(state.bridgeGranted)
+        assertEquals("撤權後審計表必已清空", 0, state.auditCount())
+    }
+
+    @Test(timeout = 30_000L)
+    fun revokeCePrimaryWithScopeThreadDeath_FatalPrecedence_fatalPromotes() = runBlocking {
+        // clear 腿拋 CancellationException（primaryFailure=CE）＋withdrawScope 腿拋 ThreadDeath：
+        // uniform fatal precedence——第二腿 fatal 不得淪為 suppressed：
+        // scope 腿的 ThreadDeath 升格為終端外傳例外（既有 CE 反向附加，呼叫端不可觀測）。
+        val backing = PreferenceDataStoreFactory.create(scope = scope) {
+            File(dir, "ce_primary_scope_threaddeath.preferences_pb")
+        }
+        val failingStore = PrivilegeBridgeStore(object : DataStore<Preferences> by backing {
+            override suspend fun updateData(transform: suspend (t: Preferences) -> Preferences): Preferences {
+                throw CancellationException("simulated clear CE")
+            }
+        })
+        val state = PrivilegeBridgeState(
+            bridgeSwitchOn = true,
+            bridgeGranted = true,
+        )
+        val error = assertThrows(ThreadDeath::class.java) {
+            runBlocking { state.revoke(failingStore) { throw ThreadDeath() } }
+        }
+        assertFalse(state.bridgeSwitchOn)
+        assertFalse(state.bridgeGranted)
+    }
+
+    @Test(timeout = 30_000L) fun revokeStoreOkWithdrawScopeThreadDeath_FatalPrecedence_scopeFatalPropagates() = runBlocking {
+        // store 正常＋withdrawScope 拋 ThreadDeath（無既有主失敗）：
+        // scope 腿 fatal 直接成為 primary 並原樣外傳；store.clear 已落地。
+        val backing = PreferenceDataStoreFactory.create(scope = scope) {
+            File(dir, "store_ok_scope_threaddeath.preferences_pb")
+        }
+        val store = PrivilegeBridgeStore(backing)
+        val state = PrivilegeBridgeState(
+            bridgeSwitchOn = true,
+            bridgeGranted = true,
+        )
+        state.audit.record(listOf("id"), "B1-store-ok-scope-td", "DENY")
+
+        val error = assertThrows(ThreadDeath::class.java) {
+            runBlocking { state.revoke(store) { throw ThreadDeath() } }
+        }
+        assertFalse(state.bridgeSwitchOn)
+        assertFalse(state.bridgeGranted)
+        assertEquals("撤權後審計表必已清空", 0, state.auditCount())
+        assertNull("store.clear 已落地，持久授權必已撤銷", store.load())
+    }
+
+    @Test(timeout = 30_000L) fun revokeStoreOkWithdrawScopeOutOfMemory_FatalPrecedence_scopeFatalPropagates() = runBlocking {
+        // store 正常＋withdrawScope 拋 OOM（無既有主失敗）：scope 腿 fatal 原樣外傳；store.clear 已落地。
+        val backing = PreferenceDataStoreFactory.create(scope = scope) {
+            File(dir, "store_ok_scope_oom.preferences_pb")
+        }
+        val store = PrivilegeBridgeStore(backing)
+        val state = PrivilegeBridgeState(
+            bridgeSwitchOn = true,
+            bridgeGranted = true,
+        )
+        state.audit.record(listOf("id"), "B1-store-ok-scope-oom", "DENY")
+
+        val error = assertThrows(OutOfMemoryError::class.java) {
+            runBlocking { state.revoke(store) { throw OutOfMemoryError("simulated withdraw oom") } }
+        }
+        assertEquals("simulated withdraw oom", error.message)
+        assertFalse(state.bridgeSwitchOn)
+        assertFalse(state.bridgeGranted)
+        assertEquals("撤權後審計表必已清空", 0, state.auditCount())
+        assertNull("store.clear 已落地，持久授權必已撤銷", store.load())
+    }
+
+    @Test(timeout = 30_000L) fun revokeMutexTimeout_bestEffortClearThreadDeath_FatalPrecedence_propagatesFatal() = runBlocking {
+        // 鎖外 best-effort clear 腿（第二腿）拋 ThreadDeath：
+        // fatal 不得淪為 suppressed（uniform fatal precedence；Stage 7B 補齊 ThreadDeath）——
+        // grant 落庫以 latch 持 opMutex，revokeOpTimeoutMs=100 → opMutex 等待逾時 →
+        // 主失敗為 PRIVILEGE_REVOKE_TIMEOUT ISE；鎖外 best-effort clear 的第二次起
+        // updateData 直接拋 ThreadDeath → 補償腿 fatal 成為終端外傳例外（原 ISE 反向附加）。
+        val backing = PreferenceDataStoreFactory.create(scope = scope) {
+            File(dir, "stuck_mutex_best_effort_clear_threaddeath.preferences_pb")
+        }
+        val lockHoldStarted = java.util.concurrent.CountDownLatch(1)
+        val lockHoldRelease = java.util.concurrent.CountDownLatch(1)
+        val saveCalls = java.util.concurrent.atomic.AtomicInteger(0)
+        val fatal = ThreadDeath()
+        val oomDs = object : DataStore<Preferences> by backing {
+            override suspend fun updateData(transform: suspend (t: Preferences) -> Preferences): Preferences {
+                // 第一次 updateData 為 grant 落庫：掛住直到測試於 revoke 逾時後放行；
+                // clear 路徑的 edit 直接拋 ThreadDeath（不 hang）。
+                if (saveCalls.getAndIncrement() == 0) {
+                    lockHoldStarted.countDown()
+                    lockHoldRelease.await(10, TimeUnit.SECONDS)
+                    return backing.updateData(transform)
+                }
+                throw fatal
+            }
+        }
+        val store = PrivilegeBridgeStore(oomDs)
+        val state = PrivilegeBridgeState(
+            bridgeSwitchOn = true,
+            bridgeGranted = true,
+            revokeOpTimeoutMs = 100L,
+        )
+        val grantJob = launch(Dispatchers.IO) {
+            try {
+                state.grant(store, "preset:openai", 1L)
+            } catch (_: Throwable) {
+                // 預期：revoke 搶先推進 epoch → grant 拋 PRIVILEGE_GRANT_REVOKED_CONCURRENTLY
+            }
+        }
+        assertTrue("grant 落庫必已進入臨界區", lockHoldStarted.await(10, java.util.concurrent.TimeUnit.SECONDS))
+
+        val error = try {
+            assertThrows(ThreadDeath::class.java) {
+                runBlocking { state.revoke(store) }
+            }
+        } finally {
+            lockHoldRelease.countDown()
+        }
+        grantJob.join()
+
+        assertFalse(state.bridgeSwitchOn)
+        assertFalse(state.bridgeGranted)
+    }
+
     @Test fun revokeStoreAndWithdrawTimeout_mergedFailure_suppressedScopeTimeout() = runBlocking {
         // store.clear 永久 hang＋withdrawScope 永久 hang：
         // primaryFailure＝ISE(PRIVILEGE_REVOKE_STORE_TIMEOUT)；

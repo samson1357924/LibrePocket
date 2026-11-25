@@ -219,7 +219,7 @@ object AutomationCore {
         }
         val digest = java.security.MessageDigest.getInstance("SHA-256")
         val hex = digest.digest(raw.toByteArray(Charsets.UTF_8)).joinToString("") {
-            "%02x".format(it)
+            "%02x".format(java.util.Locale.ROOT, it)
         }
         return "a11y-v2:$hex"
     }
@@ -230,7 +230,7 @@ object AutomationCore {
         // P1 修正：Input 納全文雜湊，避免同 node 不同 text 碰撞（見 fingerprintFor）。
         is A11yAction.Input -> {
             val h = java.security.MessageDigest.getInstance("SHA-256")
-                .digest(text.toByteArray(Charsets.UTF_8)).joinToString("") { "%02x".format(it) }
+                .digest(text.toByteArray(Charsets.UTF_8)).joinToString("") { "%02x".format(java.util.Locale.ROOT, it) }
                 .take(12)
             "input-$nodeId-$h"
         }
@@ -246,7 +246,7 @@ object AutomationCore {
                 '\n' -> append("\\n")
                 '\r' -> append("\\r")
                 '\t' -> append("\\t")
-                else -> if (ch.isISOControl()) append(String.format("\\u%04x", ch.code)) else append(ch)
+                else -> if (ch.isISOControl()) append(String.format(java.util.Locale.ROOT, "\\u%04x", ch.code)) else append(ch)
             }
         }
         append('"')

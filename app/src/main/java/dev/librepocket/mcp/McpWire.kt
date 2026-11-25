@@ -521,7 +521,7 @@ internal object McpWire {
         if (trimmed.isEmpty()) return false
         val schemeEnd = trimmed.indexOf("://")
         if (schemeEnd <= 0) return false
-        val scheme = trimmed.substring(0, schemeEnd).lowercase(Locale.US)
+        val scheme = trimmed.substring(0, schemeEnd).lowercase(Locale.ROOT)
         if (scheme != "http" && scheme != "https") return false
         val authority = trimmed.substring(schemeEnd + 3)
         val hostEnd = authority.indexOfFirst { it == '/' || it == '?' || it == '#' }
@@ -1238,7 +1238,11 @@ internal object McpWire {
                 // 以 i+=2 消耗——low 無前導 high、high 無後繼 low）：與控制/格式
                 // 字元同待遇轉成 \uXXXX（計入預算）。成對 surrogate 原樣保留。
                 c.isSurrogate() || needsDisplayEscape(c) -> {
-                    val escText = "\\u%04x".format(c.code)
+                    // Keep the escape ASCII-hex in every locale — `format`
+                    // without a locale is digit-localized in some locales, and
+                    // consistency with FastRouter.esc/JevClient is the
+                    // documented contract for this file's escape helpers.
+                    val escText = String.format(java.util.Locale.ROOT, "\\u%04x", c.code)
                     if (escText.length > budget) return sb.toString()
                     sb.append(escText)
                     budget -= escText.length
@@ -1281,7 +1285,7 @@ internal object McpWire {
                 c == '\n' -> sb.append("\\n")
                 c == '\r' -> sb.append("\\r")
                 c == '\t' -> sb.append("\\t")
-                c.code < 0x20 -> sb.append("\\u%04x".format(c.code))
+                c.code < 0x20 -> sb.append(String.format(java.util.Locale.ROOT, "\\u%04x", c.code))
                 // Lone surrogate（無伴的 high/low）：OkHttp/okio 在 UTF-8 encode
                 // 時把孤立 surrogate 靜默換成 `?` (0x3F)（**不是** U+FFFD），
                 // 故上線值會與解析值不同——以確定性 \uXXXX 轉義（與 C0 分支
@@ -1294,7 +1298,7 @@ internal object McpWire {
                         sb.append(c).append(raw[i + 1])
                         i++
                     } else {
-                        sb.append("\\u%04x".format(c.code))
+                        sb.append(String.format(java.util.Locale.ROOT, "\\u%04x", c.code))
                     }
                 }
                 else -> sb.append(c)

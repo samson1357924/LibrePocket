@@ -555,7 +555,7 @@ internal object JevWire {
                 '\t' -> sb.append("\\t")
                 '\b' -> sb.append("\\b")
                 '\u000C' -> sb.append("\\f")
-                else -> if (c < ' ') sb.append("\\u%04x".format(c.code)) else sb.append(c)
+                else -> if (c < ' ') sb.append(String.format(java.util.Locale.ROOT, "\\u%04x", c.code)) else sb.append(c)
             }
         }
         return sb.toString()

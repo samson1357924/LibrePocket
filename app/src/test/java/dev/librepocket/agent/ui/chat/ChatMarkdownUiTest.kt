@@ -2033,10 +2033,11 @@ class ChatMarkdownUiTest {
         // must scale ~linearly (well under the quadratic 4x plus noise headroom),
         // unlike a per-card linear scan over all previous entries.
         //
-        // Hardened: a single-shot timing on a small base can be dominated by CI/JIT/GC
-        // noise. Interleaved rounds measure both sides back to back so machine drift
-        // cancels; per-side medians and warmup stabilize the baseline. Bound 3.5 remains
-        // strictly inside (2, 4), preserving linear (~2) vs quadratic (~4) discrimination.
+        // Hardening history: median-of-samples wall-clock ratios still flaked under CI
+        // load. Issue #176 replaces the ratio with deterministic work counts (one step
+        // per indexed id/content/card/override plus amortized queue pops). The count is
+        // a pure function of K, so runner jitter or an injected delay cannot affect it;
+        // the expected 2x multiplier stays strictly inside linear (2) vs quadratic (4).
         data class Case(
             val prev: List<String>,
             val prevIds: List<String>,
@@ -2053,52 +2054,32 @@ class ChatMarkdownUiTest {
             return Case(prev, prevIds, currIds, curr, currIds.toSet())
         }
 
-        fun timedOnce(case: Case): Long {
-            repeat(5) {
-                alignThinkingOverridesIdentityOnly(
-                    case.prev,
-                    case.prevIds,
-                    case.currIds,
-                    case.curr,
-                    mutableMapOf(),
-                    case.currSet,
-                )
-            }
-            val start = System.nanoTime()
-            repeat(20) {
-                alignThinkingOverridesIdentityOnly(
-                    case.prev,
-                    case.prevIds,
-                    case.currIds,
-                    case.curr,
-                    mutableMapOf(),
-                    case.currSet,
-                )
-            }
-            return System.nanoTime() - start
+        fun stepsFor(case: Case): WorkCounter {
+            val counter = WorkCounter()
+            alignThinkingOverridesIdentityOnly(
+                case.prev,
+                case.prevIds,
+                case.currIds,
+                case.curr,
+                mutableMapOf(),
+                case.currSet,
+                counter,
+            )
+            return counter
         }
 
         val case1 = makeCase(400)
         val case2 = makeCase(800)
-        // Warmup both cases before interleaved sampling.
-        repeat(5) { timedOnce(case1) }
-        repeat(5) { timedOnce(case2) }
-        val samples1 = LongArray(7)
-        val samples2 = LongArray(7)
-        repeat(7) { i ->
-            samples1[i] = timedOnce(case1)
-            samples2[i] = timedOnce(case2)
-        }
-        val t1 = samples1.sorted()[samples1.size / 2]
-        val t2 = samples2.sorted()[samples2.size / 2]
-        val ratio = t2.toDouble() / maxOf(1L, t1).toDouble()
-        // Linear scaling in K should stay near ~2x for a 2x input; O(K^2) trends to ~4x.
-        // Median-of-samples with warmup absorbs CI jitter, but the bound must stay
-        // strictly below quadratic so regressions cannot satisfy it.
+        val counter1 = stepsFor(case1)
+        val counter2 = stepsFor(case2)
+        assertTrue("identity-only step counter must be positive", counter1.steps > 0 && counter2.steps > 0)
+        val ratio = counter2.steps.toDouble() / counter1.steps.toDouble()
+        // Linear scaling in K stays at ~2x for a 2x input; O(K^2) trends to ~4x. Both
+        // counters are deterministic, so no CI timing headroom is needed.
         assertTrue(
-            "identity-only 2x-input ratio $ratio exceeds strict linear-vs-quadratic bound " +
-                "(t1=${t1}ns t2=${t2}ns t1Samples=${samples1.toList()} t2Samples=${samples2.toList()})",
-            ratio < 3.5,
+            "identity-only 2x-input step ratio $ratio outside strict linear-vs-quadratic band " +
+                "(steps1=${counter1.steps} steps2=${counter2.steps})",
+            ratio > 1.5 && ratio < 2.5,
         )
         // Correctness pin: all-different rewrite migrates nothing and prunes stale.
         val prev = listOf("A", "B")

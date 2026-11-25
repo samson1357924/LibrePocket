@@ -11,6 +11,29 @@ import org.junit.Test
 
 class ChatMarkdownParserTest {
 
+    /**
+     * Structural complexity proxy (Issue #176): compare deterministic traversal counts
+     * instead of `System.nanoTime()` ratios. The band is tight around the expected
+     * multiplier for the instrumented O(N) loops (2x linear vs 4x quadratic) and cannot
+     * be perturbed by JVM/GC/runner delay. Scope: it covers the counter sites enumerated
+     * in [WorkCounter]'s KDoc, not an instruction-level complexity proof of the parser.
+     */
+    private fun assertStepRatio(
+        label: String,
+        small: Long,
+        large: Long,
+        lower: Double = 1.5,
+        upper: Double = 2.5,
+    ) {
+        assertTrue("$label step counter must be positive (small=$small large=$large)", small > 0 && large > 0)
+        val ratio = large.toDouble() / small.toDouble()
+        assertTrue(
+            "$label 2x-input step ratio $ratio outside deterministic band ($lower, $upper) " +
+                "(small=$small large=$large)",
+            ratio > lower && ratio < upper,
+        )
+    }
+
     @Test
     fun parse_emptyText_returnsEmptyListOrStreamingBlock() {
         assertTrue(ChatMarkdownParser.parse("").isEmpty())
@@ -1722,47 +1745,63 @@ class ChatMarkdownParserTest {
     // ---- Phase 3 (PR 128) scaling + contract tests (F1-F5) ----
     //
     // These tests complement the existing fixed-timeout bounds tests (which are kept):
-    // each adds a 2x-size time ratio (or explicit iteration/depth bound) so linearity is
-    // proven by scaling rather than by a single fixed timeout.
+    // the scaling tests below assert deterministic work-count ratios (or explicit
+    // iteration/depth bounds), not wall-clock time. They are structural proxies over
+    // the loops listed in WorkCounter's KDoc, not instruction-level complexity proofs.
 
     @Test
     fun scaling_streamingGrowth_prefixReparse_totalBoundedAndSubQuadratic() {
         // F1: ChatMarkdownView re-parses the full prefix per chunk via
         // remember(text, isStreaming). Per-call cost is O(prefix), so M prefixes cost
         // Theta(N^2 / c) cumulatively (c = mean chunk size). This replays that caller
-        // pattern: total time must stay bounded for chat sizes with a scaling ratio
-        // consistent with cumulative quadratic (~4x for 2x N), ruling out
-        // super-quadratic blowup. Incremental/tail re-parse is future work (see KDoc).
+        // pattern with a *deterministic traversal counter* instead of wall-clock time:
+        // counts advance only on instrumented O(N) scan iterations, never on elapsed
+        // time, so CI load or an injected sleep cannot fake a complexity regression
+        // (or hide one). This is a structural proxy over counted loops, not a full
+        // instruction-level proof. Incremental/tail re-parse remains future work.
         val unit = "Hello **world** and `code`! "
-        fun totalFor(repeat: Int, prefixes: Int): Long {
+        fun stepsFor(repeat: Int, prefixes: Int): Pair<Long, List<ChatContentBlock>> {
             val final = unit.repeat(repeat)
             repeat(3) { ChatMarkdownParser.parse(final, isStreaming = true) }
-            val start = System.nanoTime()
+            val counter = WorkCounter()
+            var lastReplay: List<ChatContentBlock> = emptyList()
             for (k in 1..prefixes) {
                 val prefix = final.substring(0, final.length * k / prefixes)
-                ChatMarkdownParser.parse(prefix, isStreaming = true)
+                lastReplay = ChatMarkdownParser.parseWithWorkCounter(prefix, isStreaming = true, counter)
             }
-            return System.nanoTime() - start
+            return counter.steps to lastReplay
         }
         val m = 20
         val smallRepeat = 80
-        val small = totalFor(smallRepeat, m)
-        // Correctness pin: replaying the final prefix equals a direct single parse.
+        val (small, replayed) = stepsFor(smallRepeat, m)
+        // Correctness pin (non-tautological): the result of the *replayed prefix sequence*
+        // must equal a direct single parse of the same final text. Both paths are distinct
+        // entry points (instrumented replay vs plain parse).
         val finalSmall = unit.repeat(smallRepeat)
         val direct = ChatMarkdownParser.parse(finalSmall, isStreaming = true)
-        val replayed = ChatMarkdownParser.parse(finalSmall, isStreaming = true)
         assertEquals(direct.size, replayed.size)
         assertEquals(
             (direct.filterIsInstance<ChatContentBlock.ParagraphBlock>().single().annotatedText.text),
             (replayed.filterIsInstance<ChatContentBlock.ParagraphBlock>().single().annotatedText.text),
         )
-        val large = totalFor(smallRepeat * 2, m)
-        val ratio = large.toDouble() / maxOf(1L, small).toDouble()
+        val (large, _) = stepsFor(smallRepeat * 2, m)
+        // Fixed prefix count: each parse stays linear in its prefix, so doubling the
+        // text length doubles counted steps (not quadruples them).
+        assertStepRatio("streaming-growth fixed-prefix-count", small, large)
+        // Fixed chunk size: doubling N also doubles the number of prefixes, so cumulative
+        // cost trends to ~4x. Only an upper bound is asserted: this test must reject
+        // super-quadratic blowup, not mandate today's exact quadratic multiplier.
+        val (largeFixedChunk, _) = stepsFor(smallRepeat * 2, m * 2)
         assertTrue(
-            "streaming-growth ratio $ratio exceeds cumulative-quadratic bound (small=${small}ns large=${large}ns)",
-            ratio < 10.0,
+            "streaming-growth fixed-chunk steps must be positive (largeFixedChunk=$largeFixedChunk)",
+            largeFixedChunk > 0,
         )
-        assertTrue("streaming-growth total unbounded: ${large}ns", large < 5_000_000_000L)
+        val cumulativeRatio = largeFixedChunk.toDouble() / small.toDouble()
+        assertTrue(
+            "streaming-growth cumulative step ratio $cumulativeRatio exceeds super-quadratic bound 5.0 " +
+                "(small=$small largeFixedChunk=$largeFixedChunk)",
+            cumulativeRatio < 5.0,
+        )
     }
 
     @Test
@@ -1790,29 +1829,25 @@ class ChatMarkdownParserTest {
     @Test
     fun scaling_parseInline_twofoldInput_ratioBounded() {
         // F2: per-call O(N*depth) with small practical depth; doubling N at fixed depth
-        // must scale ~linearly (well under the quadratic 4x plus noise headroom).
+        // must scale ~linearly. The claim is now a deterministic work-count ratio:
+        // counted cursor iterations are a pure function of the input, so a slow runner
+        // or an injected delay cannot turn a correct linear implementation red.
         val unit = "**bold** and *italic* with `code` "
-        // Hardening (PR #170 CI): single-shot flaked on loaded foss runner (ratio 3.845, t1=5.3 ms); interleaved median-of-7 + doubled base; bound unchanged.
-        fun timedOnce(input: String): Long {
-            repeat(3) { ChatMarkdownParser.parseInlineMarkdown(input) }
-            val start = System.nanoTime()
-            repeat(5) { ChatMarkdownParser.parseInlineMarkdown(input) }
-            return System.nanoTime() - start
+        fun stepsFor(input: String): Pair<Long, String> {
+            val counter = WorkCounter()
+            val parsed = ChatMarkdownParser.parseInlineMarkdownWithWorkCounter(input, counter)
+            return counter.steps to parsed.text
         }
         val input1 = unit.repeat(800)
         val input2 = unit.repeat(1600)
-        // Interleaved rounds: each round measures both back to back so machine
-        // drift hits both sides equally; ratio uses per-side medians.
-        val samples1 = LongArray(7)
-        val samples2 = LongArray(7)
-        repeat(7) { i ->
-            samples1[i] = timedOnce(input1)
-            samples2[i] = timedOnce(input2)
-        }
-        val t1 = samples1.sorted()[3]
-        val t2 = samples2.sorted()[3]
-        val ratio = t2.toDouble() / maxOf(1L, t1).toDouble()
-        assertTrue("parseInline 2x-input ratio $ratio exceeds linear bound (t1=${t1}ns t2=${t2}ns)", ratio < 3.5)
+        val (steps1, text1) = stepsFor(input1)
+        val (steps2, text2) = stepsFor(input2)
+        assertStepRatio("parseInline", steps1, steps2)
+        // Correctness pins: both inputs are actually parsed, deterministically and with
+        // exactly doubled rendered content (no dropped/merged style spans).
+        assertEquals(text1.length * 2, text2.length)
+        assertEquals(text1, stepsFor(input1).second)
+        assertEquals(steps1, stepsFor(input1).first)
     }
 
     @Test
@@ -1824,15 +1859,9 @@ class ChatMarkdownParserTest {
         // walkers x k+ qualifiers. Assert words survive, output is deterministic, and
         // doubling k scales ~linearly.
         //
-        // Hardening (Round-6 Phase B): a single-shot timing on a ~12ms base flaked in
-        // CI (2x ratio 3.5242 vs bound 3.5). Median-of-rounds on a doubled base cuts the
-        // noise share; the 3.5 bound still sits strictly inside (2, 4), so the
-        // linear (~2) vs quadratic (~4) discrimination is unchanged — no bound relaxation.
-        //
-        // Hardening 2 (PR #140 CI): median-of-7 still flaked on a loaded foss runner
-        // (2x ratio 3.6039 vs bound 3.5, t1=6.7ms). Interleaved sampling cancels
-        // machine drift between the t1 and t2 phases (each round measures both back
-        // to back, ratio uses per-side medians); base doubled again. Bound unchanged.
+        // Hardening history (PR #128/#140/#170): successive median/interleaved timing
+        // schemes still flaked under runner contention. Issue #176 replaces the timing
+        // ratio with deterministic counters over the instrumented O(N) scans.
         val unit = "**u *a ***x*** **b *c*** "
         val one = ChatMarkdownParser.parseInlineMarkdown(unit)
         for (word in listOf("u", "a", "x", "b", "c")) {
@@ -1842,26 +1871,30 @@ class ChatMarkdownParserTest {
             one.text,
             ChatMarkdownParser.parseInlineMarkdown(unit).text,
         )
-        fun timedOnce(input: String): Long {
-            repeat(5) { ChatMarkdownParser.parseInlineMarkdown(input) }
-            val start = System.nanoTime()
-            repeat(5) { ChatMarkdownParser.parseInlineMarkdown(input) }
-            return System.nanoTime() - start
+        fun stepsFor(input: String): WorkCounter {
+            val counter = WorkCounter()
+            ChatMarkdownParser.parseInlineMarkdownWithWorkCounter(input, counter)
+            return counter
         }
         val input1 = unit.repeat(1200)
         val input2 = unit.repeat(2400)
-        // Interleaved rounds: each round measures both back to back so machine
-        // drift hits both sides equally; ratio uses per-side medians.
-        val samples1 = LongArray(7)
-        val samples2 = LongArray(7)
-        repeat(7) { i ->
-            samples1[i] = timedOnce(input1)
-            samples2[i] = timedOnce(input2)
-        }
-        val t1 = samples1.sorted()[samples1.size / 2]
-        val t2 = samples2.sorted()[samples2.size / 2]
-        val ratio = t2.toDouble() / maxOf(1L, t1).toDouble()
-        assertTrue("shared-triple 2x ratio $ratio exceeds linear bound (t1=${t1}ns t2=${t2}ns)", ratio < 3.5)
+        assertStepRatio("shared-triple", stepsFor(input1).steps, stepsFor(input2).steps)
+
+        // F1 (review): the shape above resolves closers via the first-run fast path, so
+        // it never enters the skip chain. This shape does: `*a**`***\n` puts an italic
+        // opener at the second star of a `**` run (text[i+1] is a backtick, so the italic
+        // branch is reached while preprocessing still records openBold[t] = opener < i+1);
+        // the backtick also defeats hasStarsOrTicks(), leaving close == -1. The newline
+        // separators keep each unit independent. Verified with a standalone control-flow
+        // simulation: k units produce exactly k skip links (k=1200 -> 1200, k=2400 -> 2400).
+        val skipUnit = "*a**`***\n"
+        val skipCounter1 = stepsFor(skipUnit.repeat(1200))
+        val skipCounter2 = stepsFor(skipUnit.repeat(2400))
+        assertTrue(
+            "skip chain must be exercised, got skips=${skipCounter1.amortizedSkips}",
+            skipCounter1.amortizedSkips > 0,
+        )
+        assertStepRatio("shared-triple skip-chain", skipCounter1.amortizedSkips, skipCounter2.amortizedSkips)
     }
 
     @Test
@@ -1874,9 +1907,11 @@ class ChatMarkdownParserTest {
         // head re-scan per card costs Theta(K^2) (the last K cards each re-skip K consumed
         // entries), while cursor consumption is amortized O(K). Doubling K must therefore
         // scale ~linearly (bound strictly inside (2, 4)).
-        // 與 shared-triple scaling test（884fce1b，#140）相同的 interleaved sampling：
-        // 每輪 back-to-back 量測 k 與 2k，drift 為 common-mode，比值由 per-side median 決定；bound 維持 3.5。
-        // CI 43679602842（github flavor）t2 相位遭遇 runner 爭用，ratio 4.10 > 3.5（t1=9.4ms, t2=38.5ms）。
+        // Hardening history (#140/#170) used interleaved wall-clock medians but still
+        // flaked under runner contention (CI 43679602842: 4.10 > 3.5). Issue #176 replaces
+        // the ratio with deterministic work counts: one step per indexed prev id, per
+        // prev content, per curr card, per stale override, plus one per amortized queue
+        // pop. These are pure control-flow events — an injected delay cannot change them.
         val prev1 = List(4000) { "same-dup-content" }
         val prevIds1 = List(4000) { "prev-$it" }
         val curr1 = List(8000) { "same-dup-content" }
@@ -1887,36 +1922,28 @@ class ChatMarkdownParserTest {
         val currIds2 = List(16000) { "curr-$it" }
         val currSet1 = currIds1.toSet()
         val currSet2 = currIds2.toSet()
-        fun timedOnce(
+        fun stepsFor(
             prev: List<String>,
             prevIds: List<String>,
             currIds: List<String>,
             curr: List<String>,
             currSet: Set<String>,
-        ): Long {
-            repeat(5) {
-                alignThinkingOverridesIdentityOnly(prev, prevIds, currIds, curr, mutableMapOf(), currSet)
-            }
-            val start = System.nanoTime()
-            repeat(10) {
-                alignThinkingOverridesIdentityOnly(prev, prevIds, currIds, curr, mutableMapOf(), currSet)
-            }
-            return System.nanoTime() - start
+        ): WorkCounter {
+            val counter = WorkCounter()
+            alignThinkingOverridesIdentityOnly(
+                prev, prevIds, currIds, curr, mutableMapOf(), currSet, counter,
+            )
+            return counter
         }
-        // Interleaved rounds: each round measures both back to back so machine
-        // drift hits both sides equally; ratio uses per-side medians.
-        val samples1 = LongArray(7)
-        val samples2 = LongArray(7)
-        repeat(7) { i ->
-            samples1[i] = timedOnce(prev1, prevIds1, currIds1, curr1, currSet1)
-            samples2[i] = timedOnce(prev2, prevIds2, currIds2, curr2, currSet2)
-        }
-        val t1 = samples1.sorted()[samples1.size / 2]
-        val t2 = samples2.sorted()[samples2.size / 2]
-        val ratio = t2.toDouble() / maxOf(1L, t1).toDouble()
+        val counter1 = stepsFor(prev1, prevIds1, currIds1, curr1, currSet1)
+        val counter2 = stepsFor(prev2, prevIds2, currIds2, curr2, currSet2)
+        assertStepRatio("identity-only duplicate", counter1.steps, counter2.steps)
+        // Amortization pin: every previous index leaves its content queue at most once,
+        // so the whole 2K-card pass performs at most K skips (a head re-scan per card
+        // would be Theta(K^2) and break this bound).
         assertTrue(
-            "identity-only duplicate 2x-input ratio $ratio exceeds linear bound (t1=${t1}ns t2=${t2}ns)",
-            ratio < 3.5,
+            "identity-only skips ${counter2.amortizedSkips} exceed previous-card count ${prev2.size}",
+            counter2.amortizedSkips <= prev2.size.toLong(),
         )
         // Correctness pin (pure-function layer): cursor consumes earliest-first, so the
         // first K curr cards inherit prev values in document order (alternating values

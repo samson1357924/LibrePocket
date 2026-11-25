@@ -23,6 +23,7 @@ import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.selects.select
 import kotlinx.coroutines.withTimeout
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
@@ -1574,24 +1575,48 @@ class NetworkPolicyTest {
       assertEquals("suspend-boom", e.message)
     }
 
-    // worker 內第二通 nanoClock() 拋例外時亦須透過 Result.failure 乾淨傳回，不可掛死協程
+    // worker 內第二通 nanoClock() 拋例外時亦須透過 Result.failure 乾淨傳回，不可掛死協程。
+    // Issue #176 + review F3: 順序由信號決定（clock 第二次呼叫時先 complete deferred
+    // 才拋例外），2s withTimeout 只是 liveness bound，不是 complexity ratio，也不是
+    // 用時間證明正確性。它保證 hung worker 會失敗而非無限等待，且與 10s deadline
+    // 不再有舊的 ~1ms/2s 競賽。
     val clockCalls = AtomicInteger(0)
-    try {
-      withTimeout(2_000) {
+    val workerReachedSecondClock = CompletableDeferred<Unit>()
+    val settled = CompletableDeferred<Throwable?>()
+    val call = launch {
+      try {
         NetworkPolicy.runPreflightSuspend(
-          // 10s：消除 ~1ms withTimeoutOrNull 與 worker 排程的競賽（CI run 43665097579, play flavor）
           deadlineNs = 10_000_000_000L,
           nanoClock = {
-            if (clockCalls.incrementAndGet() == 1) 0L else throw IllegalStateException("clock-boom")
+            if (clockCalls.incrementAndGet() == 1) {
+              0L
+            } else {
+              workerReachedSecondClock.complete(Unit)
+              throw IllegalStateException("clock-boom")
+            }
           },
         ) {
           "never"
         }
+        settled.complete(null)
+      } catch (t: Throwable) {
+        settled.complete(t)
       }
-      fail("worker nanoClock exception must propagate")
-    } catch (e: IllegalStateException) {
-      assertEquals("clock-boom", e.message)
     }
+    val propagated = withTimeout(2_000) {
+      val reachedWorker = select<Boolean> {
+        workerReachedSecondClock.onAwait { true }
+        // 若結算先抵達，只有在 clock 信號也已成立時才算走到 exception 路徑；
+        // 兩者同時 ready 時兩個 clause 都回 true，避免 select 隨機選到 false。
+        settled.onAwait { workerReachedSecondClock.isCompleted }
+      }
+      assertTrue("worker must reach its second nanoClock call", reachedWorker)
+      settled.await()
+    } as? IllegalStateException
+    assertTrue("worker nanoClock exception must propagate, got $propagated", propagated != null)
+    assertEquals("clock-boom", propagated!!.message)
+    assertEquals(2, clockCalls.get())
+    call.join()
   }
 
   @Test fun preflightSuspendEarlyCancelOrExpiredCleanupClearsWorkerInterruptFlag() = runBlocking {

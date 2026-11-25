@@ -8,6 +8,40 @@ import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
 
 /**
+ * Deterministic work-count seam for complexity tests (Issue #176).
+ *
+ * An instance is created by a test and passed through an internal `...WithWorkCounter`
+ * entry point; production callers never create one. Counts advance only on control-flow
+ * events (loop iterations and amortized queue pops), never on elapsed wall-clock time,
+ * so injected delays or CI jitter cannot change them. `amortizedSkips` separately pins
+ * the shared-triple skip chain and the amortized-O(1) candidate consumption in
+ * identity-only alignment.
+ *
+ * Coverage contract: `step()` is recorded once per iteration of every O(N) scan in
+ * [ChatMarkdownParser.parseInline] / `segments` and their helpers, and once per indexed
+ * id/content/card/override in [alignThinkingOverridesIdentityOnly]. This is a structural
+ * proxy over the instrumented loops — not a full instruction-count proof of complexity.
+ * **Maintenance requirement:** whenever an alignment or parse loop is added, removed, or
+ * changed (including a helper called from those loops), update the counter sites to keep
+ * the proxy aligned, or the ratio assertions will no longer describe the changed code.
+ */
+internal class WorkCounter {
+    var steps: Long = 0
+        private set
+    var amortizedSkips: Long = 0
+        private set
+
+    fun step(count: Int = 1) {
+        steps += count.toLong()
+    }
+
+    fun skip(count: Int = 1) {
+        amortizedSkips += count.toLong()
+        steps += count.toLong()
+    }
+}
+
+/**
  * Structured content block parsed from chat turn text.
  * Each block provides a [key] structural identity anchor used by Compose
  * (via `key(block.key)`) to maintain UI state (such as expansion in [ThinkingBlock]
@@ -431,10 +465,11 @@ object ChatMarkdownParser {
 
     // Backslashes are preserved in output. An odd-length run escapes an inline
     // opener, but backslashes inside a code span cannot escape its closer.
-    private fun escapedBackticks(text: String): BooleanArray {
+    private fun escapedBackticks(text: String, workCounter: WorkCounter? = null): BooleanArray {
         val escaped = BooleanArray(text.length)
         var oddBackslashes = false
         for (i in text.indices) {
+            workCounter?.step()
             if (text[i] == '\\') {
                 oddBackslashes = !oddBackslashes
             } else {
@@ -447,13 +482,15 @@ object ChatMarkdownParser {
 
     // Preserve legacy inline fence openers, but do not treat an indented-code
     // line (four spaces or a tab before the fence) as a fenced block opener.
-    private fun invalidIndentedFenceOpeners(text: String): BooleanArray {
+    private fun invalidIndentedFenceOpeners(text: String, workCounter: WorkCounter? = null): BooleanArray {
         val invalid = BooleanArray(text.length)
         var lineStart = 0
         while (lineStart < text.length) {
+            workCounter?.step()
             var pos = lineStart
             var tab = false
             while (pos < text.length && (text[pos] == ' ' || text[pos] == '\t')) {
+                workCounter?.step()
                 if (text[pos] == '\t') tab = true
                 pos++
             }
@@ -467,23 +504,28 @@ object ChatMarkdownParser {
 
     // Index the starts of exact-length backtick runs for constant-time span lookup.
     // Inline spans support one or two backticks; longer runs remain fence syntax.
-    private fun inlineTickRuns(text: String): Array<IntArray> {
+    private fun inlineTickRuns(text: String, workCounter: WorkCounter? = null): Array<IntArray> {
         val single = IntArray(text.length + 1) { -1 }
         val double = IntArray(text.length + 1) { -1 }
         var pos = 0
         while (pos < text.length) {
+            workCounter?.step()
             if (text[pos] != '`') {
                 pos++
                 continue
             }
             val start = pos
-            while (pos < text.length && text[pos] == '`') pos++
+            while (pos < text.length && text[pos] == '`') {
+                workCounter?.step()
+                pos++
+            }
             when (pos - start) {
                 1 -> single[start] = start
                 2 -> double[start] = start
             }
         }
         for (i in text.length - 1 downTo 0) {
+            workCounter?.step()
             if (single[i] < 0) single[i] = single[i + 1]
             if (double[i] < 0) double[i] = double[i + 1]
         }
@@ -544,10 +586,16 @@ object ChatMarkdownParser {
         val indentColumns: Long = 4L,
     )
 
-    private fun isRangeBlank(text: String, start: Int, end: Int): Boolean {
+    private fun isRangeBlank(
+        text: String,
+        start: Int,
+        end: Int,
+        workCounter: WorkCounter? = null,
+    ): Boolean {
         val s = maxOf(0, start)
         val e = minOf(text.length, end)
         for (i in s until e) {
+            workCounter?.step()
             if (!text[i].isWhitespace()) return false
         }
         return true
@@ -564,14 +612,19 @@ object ChatMarkdownParser {
      * - Streaming mutual exclusion: trailing partial tag prefixes are isolated as [Kind.PARTIAL_TAG]
      *   so that unclosed delimiters do not pollute user-visible text while streaming.
      */
-    private fun segments(text: String, streaming: Boolean): List<Segment> {
+    private fun segments(
+        text: String,
+        streaming: Boolean,
+        workCounter: WorkCounter? = null,
+    ): List<Segment> {
         val result = mutableListOf<Segment>()
         val length = text.length
-        val escaped = escapedBackticks(text)
-        val invalidFence = invalidIndentedFenceOpeners(text)
+        val escaped = escapedBackticks(text, workCounter)
+        val invalidFence = invalidIndentedFenceOpeners(text, workCounter)
         val nextNewline = IntArray(length + 1) { -1 }
-        val ticks = inlineTickRuns(text)
+        val ticks = inlineTickRuns(text, workCounter)
         for (i in length - 1 downTo 0) {
+            workCounter?.step()
             nextNewline[i] = if (text[i] == '\n') i else nextNewline[i + 1]
         }
         var cursor = 0
@@ -584,10 +637,11 @@ object ChatMarkdownParser {
             if (end > plainStart) result.add(Segment(Kind.TEXT, plainStart, end))
         }
         while (cursor < length) {
+            workCounter?.step()
             val atLineStart = cursor == 0 || text[cursor - 1] == '\n'
             val previousBlank = if (atLineStart && cursor > 0) {
                 val prevStart = text.lastIndexOf('\n', cursor - 2) + 1
-                isRangeBlank(text, prevStart, cursor - 1)
+                isRangeBlank(text, prevStart, cursor - 1, workCounter)
             } else {
                 false
             }
@@ -595,6 +649,7 @@ object ChatMarkdownParser {
             var indentColumns = 0L
             if (atLineStart) {
                 while (lineMarker < length && (text[lineMarker] == ' ' || text[lineMarker] == '\t')) {
+                    workCounter?.step()
                     indentColumns = if (text[lineMarker] == '\t') indentColumns + 4L - indentColumns % 4L else indentColumns + 1L
                     lineMarker++
                 }
@@ -603,7 +658,10 @@ object ChatMarkdownParser {
             var listMarkerLength = 0
             if (atLineStart && !blankLine) {
                 var d = lineMarker
-                while (d < length && text[d].isDigit()) d++
+                while (d < length && text[d].isDigit()) {
+                    workCounter?.step()
+                    d++
+                }
                 val numDigits = d - lineMarker
                 if (numDigits in 1..9 && d + 1 < length && text[d] == '.' && (text[d + 1] == ' ' || text[d + 1] == '\t')) {
                     listMarkerLength = numDigits + 1
@@ -615,6 +673,7 @@ object ChatMarkdownParser {
                     var markerCount = 0
                     var onlyMarkersAndSpaces = true
                     for (idx in lineMarker until lineEnd) {
+                        workCounter?.step()
                         val ch = text[idx]
                         if (ch == markerChar) {
                             markerCount++
@@ -633,6 +692,7 @@ object ChatMarkdownParser {
             // Each entry is pushed and removed at most once.
             if (atLineStart && !blankLine) {
                 while (listContentColumns.isNotEmpty() && indentColumns < listContentColumns.last()) {
+                    workCounter?.step()
                     listContentColumns.removeAt(listContentColumns.lastIndex)
                 }
             }
@@ -647,10 +707,14 @@ object ChatMarkdownParser {
                 var end = cursor
                 var line = cursor
                 while (line < length) {
+                    workCounter?.step()
                     val newline = nextNewline[line]
                     val lineEnd = if (newline < 0) length else newline
                     var pos = line
-                    while (pos < lineEnd && (text[pos] == ' ' || text[pos] == '\t' || text[pos] == '\r')) pos++
+                    while (pos < lineEnd && (text[pos] == ' ' || text[pos] == '\t' || text[pos] == '\r')) {
+                        workCounter?.step()
+                        pos++
+                    }
                     val next = if (newline < 0) length else newline + 1
                     if (pos == lineEnd) {
                         line = next
@@ -703,6 +767,7 @@ object ChatMarkdownParser {
                 var closeTagEnd = -1
 
                 while (scan < length) {
+                    workCounter?.step()
                     val nextLt = text.indexOf('<', scan)
                     if (nextLt == -1) break
                     val innerOpen = matchOpenThinkTag(text, nextLt)
@@ -761,12 +826,18 @@ object ChatMarkdownParser {
                 cursor = length
                 plainStart = cursor
             } else if (invalidFence[cursor]) {
-                while (cursor < length && text[cursor] == '`') cursor++
+                while (cursor < length && text[cursor] == '`') {
+                    workCounter?.step()
+                    cursor++
+                }
             } else if (!escaped[cursor] && text.startsWith(CODE_FENCE, cursor)) {
                 listContentColumns.clear()
                 addPlain(cursor)
                 var afterFence = cursor + CODE_FENCE.length
-                while (afterFence < length && text[afterFence] == '`') afterFence++
+                while (afterFence < length && text[afterFence] == '`') {
+                    workCounter?.step()
+                    afterFence++
+                }
                 val fenceLength = afterFence - cursor
                 val newline = nextNewline[afterFence]
                 val headerEnd = if (newline < 0) length else newline
@@ -774,11 +845,15 @@ object ChatMarkdownParser {
                 var inlineClose = -1
                 var inlineCloseEnd = -1
                 while (scan < headerEnd) {
+                    workCounter?.step()
                     if (text[scan] != '`') {
                         scan++
                     } else {
                         val runStart = scan
-                        while (scan < headerEnd && text[scan] == '`') scan++
+                        while (scan < headerEnd && text[scan] == '`') {
+                            workCounter?.step()
+                            scan++
+                        }
                         if (scan - runStart >= fenceLength) {
                             inlineClose = runStart
                             inlineCloseEnd = scan
@@ -803,11 +878,18 @@ object ChatMarkdownParser {
                     var closeEnd = -1
                     var pendingClose = false
                     while (lineStart < length) {
+                        workCounter?.step()
                         var pos = lineStart
-                        while (pos < length && text[pos] == ' ') pos++
+                        while (pos < length && text[pos] == ' ') {
+                            workCounter?.step()
+                            pos++
+                        }
                         if (pos - lineStart <= MAX_FENCE_INDENT_SPACES && pos < length && text[pos] == '`') {
                             var tail = pos
-                            while (tail < length && text[tail] == '`') tail++
+                            while (tail < length && text[tail] == '`') {
+                                workCounter?.step()
+                                tail++
+                            }
                             val runEnd = tail
                             // A short trailing run may still become a closer in the next chunk.
                             if (streaming && runEnd == length && runEnd - pos < fenceLength) {
@@ -815,7 +897,10 @@ object ChatMarkdownParser {
                                 pendingClose = true
                                 break
                             }
-                            while (tail < length && (text[tail] == ' ' || text[tail] == '\t' || text[tail] == '\r')) tail++
+                            while (tail < length && (text[tail] == ' ' || text[tail] == '\t' || text[tail] == '\r')) {
+                                workCounter?.step()
+                                tail++
+                            }
                             // A suffix such as ```Done is ambiguous; preserve it as code,
                             // including any following tags, until a valid closer is found.
                             if (runEnd - pos >= fenceLength && (tail == length || text[tail] == '\n')) {
@@ -881,11 +966,25 @@ object ChatMarkdownParser {
      *                    are flagged with `isStreaming = true` to allow streaming cursor rendering,
      *                    and trailing partial tags are buffered.
      */
-    fun parse(text: String, isStreaming: Boolean = false): List<ChatContentBlock> {
+    fun parse(text: String, isStreaming: Boolean = false): List<ChatContentBlock> =
+        parseImpl(text, isStreaming, workCounter = null)
+
+    /** Test-only entry point exposing the deterministic traversal counter (Issue #176). */
+    internal fun parseWithWorkCounter(
+        text: String,
+        isStreaming: Boolean,
+        workCounter: WorkCounter,
+    ): List<ChatContentBlock> = parseImpl(text, isStreaming, workCounter)
+
+    private fun parseImpl(
+        text: String,
+        isStreaming: Boolean,
+        workCounter: WorkCounter?,
+    ): List<ChatContentBlock> {
         if (text.isEmpty()) {
             return if (isStreaming) listOf(ChatContentBlock.ParagraphBlock(AnnotatedString(""), key = "para_0")) else emptyList()
         }
-        val segments = segments(text, isStreaming)
+        val segments = segments(text, isStreaming, workCounter)
         val codeKeyCounts = HashMap<String, Int>()
         val thinkKeyCounts = HashMap<String, Int>()
         var streamingThinkIndex = 0
@@ -903,7 +1002,7 @@ object ChatMarkdownParser {
                     if (trimmed.isNotBlank()) {
                         blocks.add(
                             ChatContentBlock.ParagraphBlock(
-                                annotatedText = parseInline(formatLists(trimmed)),
+                                annotatedText = parseInline(formatLists(trimmed), workCounter = workCounter),
                                 key = "para_${paraIndex++}",
                             )
                         )
@@ -1543,11 +1642,12 @@ object ChatMarkdownParser {
     /**
      * Replaces unordered list prefixes such as `- `, `* `, or `+ ` at line starts with bullet `• `.
      */
-    private fun formatLists(text: String): String {
+    private fun formatLists(text: String, workCounter: WorkCounter? = null): String {
         if (!text.contains("- ") && !text.contains("* ") && !text.contains("+ ")) return text
         val lines = text.lines()
         val sb = java.lang.StringBuilder(text.length + lines.size * 2)
         for (i in lines.indices) {
+            workCounter?.step()
             val line = lines[i]
             val trimmed = line.trimStart()
             val indent = line.substring(0, line.length - trimmed.length)
@@ -1579,16 +1679,28 @@ object ChatMarkdownParser {
      */
     fun parseInlineMarkdown(rawText: String): AnnotatedString = parseInline(formatLists(rawText))
 
+    /** Test-only entry point exposing the deterministic traversal counter (Issue #176). */
+    internal fun parseInlineMarkdownWithWorkCounter(
+        rawText: String,
+        workCounter: WorkCounter,
+    ): AnnotatedString = parseInline(formatLists(rawText, workCounter), workCounter = workCounter)
+
     /**
      * Single-pass equivalent of `!text.substring(start, end).contains('\n') && isNotBlank()`
      * over the `[start, end)` range: one scan, zero allocation. Returns false for empty
      * ranges and for any range containing `'\n'`; otherwise true iff some char is
      * non-whitespace. Callers only allocate the candidate substring after this passes.
      */
-    private fun isSingleLineNonBlankRange(text: String, start: Int, end: Int): Boolean {
+    private fun isSingleLineNonBlankRange(
+        text: String,
+        start: Int,
+        end: Int,
+        workCounter: WorkCounter? = null,
+    ): Boolean {
         if (start >= end) return false
         var hasNonBlank = false
         for (k in start until end) {
+            workCounter?.step()
             val ch = text[k]
             if (ch == '\n') return false
             if (!ch.isWhitespace()) hasNonBlank = true
@@ -1619,8 +1731,18 @@ object ChatMarkdownParser {
      *   over single (`*`).
      * - Shared Triple Closer Disambiguation: Precomputed lookup arrays (`nextDouble`, `nextTriple`, `openBold`, `openItalic`)
      *   resolve ambiguous closures (such as `**bold *italic***`) in O(1) without exponential backtracking.
+     *
+     * Work-counter scope: when [workCounter] is supplied, one step is recorded per iteration of
+     * every O(N) scan in this function and its helpers (prefix tables, in-code scan, opener
+     * table, skip chain, main cursor walk, range checks) plus one per shared-triple skip link.
+     * It is a structural proxy over those instrumented loops, not an instruction-level proof;
+     * new/changed loops must add or move counter sites (see [WorkCounter] KDoc).
      */
-    internal fun parseInline(text: String, depth: Int = 0): AnnotatedString {
+    internal fun parseInline(
+        text: String,
+        depth: Int = 0,
+        workCounter: WorkCounter? = null,
+    ): AnnotatedString {
         if (depth > MAX_INLINE_NESTING_DEPTH) {
             // Fail-closed depth bound (F2): over-nested styles render literally so
             // adversarial "***...**...*" nesting cannot blow stack or cost O(N*depth)
@@ -1632,27 +1754,33 @@ object ChatMarkdownParser {
         val len = text.length
         val starOrTickCount = IntArray(len + 1)
         for (pos in 0 until len) {
+            workCounter?.step()
             val ch = text[pos]
             starOrTickCount[pos + 1] = starOrTickCount[pos] + if (ch == '*' || ch == '`') 1 else 0
         }
-        val escaped = escapedBackticks(text)
+        val escaped = escapedBackticks(text, workCounter)
         val nextNewline = IntArray(len + 1) { -1 }
-        val ticks = inlineTickRuns(text)
+        val ticks = inlineTickRuns(text, workCounter)
         val nextDouble = IntArray(len + 1) { -1 }
         val nextTriple = IntArray(len + 1) { -1 }
         for (pos in len - 1 downTo 0) {
+            workCounter?.step()
             nextNewline[pos] = if (text[pos] == '\n') pos else nextNewline[pos + 1]
         }
         val inCode = BooleanArray(len)
         var scan = 0
         while (scan < len) {
+            workCounter?.step()
             if (text[scan] != '`' || escaped[scan]) {
                 scan++
                 continue
             }
             // Triple runs left in a paragraph are literal, not inline code spans.
             if (text.startsWith(CODE_FENCE, scan)) {
-                while (scan < len && text[scan] == '`') scan++
+                while (scan < len && text[scan] == '`') {
+                    workCounter?.step()
+                    scan++
+                }
                 continue
             }
             val start = scan
@@ -1663,12 +1791,16 @@ object ChatMarkdownParser {
                 close >= 0 && close < lineEnd -> close + size
                 else -> start + size
             }
-            if (end > start + 1) for (pos in start until end) inCode[pos] = true
+            if (end > start + 1) for (pos in start until end) {
+                workCounter?.step()
+                inCode[pos] = true
+            }
             scan = end
         }
         val nextAsteriskRun = IntArray(len + 1) { -1 }
         val nextSingleCloser = IntArray(len + 1) { -1 }
         for (pos in len - 1 downTo 0) {
+            workCounter?.step()
             nextDouble[pos] = if (!inCode[pos] && text.startsWith("**", pos)) pos else nextDouble[pos + 1]
             nextTriple[pos] = if (!inCode[pos] && text.startsWith("***", pos)) pos else nextTriple[pos + 1]
             nextAsteriskRun[pos] = if (!inCode[pos] && text[pos] == '*' && (pos == 0 || text[pos - 1] != '*')) pos else nextAsteriskRun[pos + 1]
@@ -1686,6 +1818,7 @@ object ChatMarkdownParser {
         var bold = -1
         var pos = 0
         while (pos < len) {
+            workCounter?.step()
             if (text[pos] == '\n') {
                 italic = -1
                 bold = -1
@@ -1697,7 +1830,10 @@ object ChatMarkdownParser {
                 continue
             }
             val start = pos
-            while (pos < len && text[pos] == '*' && !inCode[pos]) pos++
+            while (pos < len && text[pos] == '*' && !inCode[pos]) {
+                workCounter?.step()
+                pos++
+            }
             val size = pos - start
             if (size == 1) {
                 bold = -1
@@ -1725,6 +1861,7 @@ object ChatMarkdownParser {
         }
         val nextSharedTriple = IntArray(len + 1) { -1 }
         for (p in len - 1 downTo 0) {
+            workCounter?.step()
             nextSharedTriple[p] = if (!inCode[p] && text.startsWith("***", p) &&
                 (p + 3 == len || text[p + 3] != '*') &&
                 p > 0 && !text[p - 1].isWhitespace() &&
@@ -1732,12 +1869,14 @@ object ChatMarkdownParser {
         }
 
         while (i < len) {
+            workCounter?.step()
             val c = text[i]
 
             // Inline code: `code`
             if (c == '`' && !escaped[i]) {
                 if (text.startsWith(CODE_FENCE, i)) {
                     while (i < len && text[i] == '`') {
+                        workCounter?.step()
                         builder.append('`')
                         i++
                     }
@@ -1760,7 +1899,10 @@ object ChatMarkdownParser {
                     i = close + size
                     continue
                 }
-                repeat(size) { builder.append('`') }
+                repeat(size) {
+                    workCounter?.step()
+                    builder.append('`')
+                }
                 i += size
                 continue
             }
@@ -1776,9 +1918,9 @@ object ChatMarkdownParser {
                 val close = nextTriple[i + 3]
                 if (close != -1 && !text[close - 1].isWhitespace() &&
                     (nextNewline[i] == -1 || nextNewline[i] > close)) {
-                    if (isSingleLineNonBlankRange(text, i + 3, close)) {
+                    if (isSingleLineNonBlankRange(text, i + 3, close, workCounter)) {
                         val start = builder.length
-                        builder.append(parseInline(text.substring(i + 3, close), depth + 1))
+                        builder.append(parseInline(text.substring(i + 3, close), depth + 1, workCounter))
                         builder.addStyle(
                             SpanStyle(
                                 fontWeight = FontWeight.Bold,
@@ -1810,9 +1952,9 @@ object ChatMarkdownParser {
                 }
                 if (close != -1 && !text[close - 1].isWhitespace() &&
                     (nextNewline[i] == -1 || nextNewline[i] > close)) {
-                    if (isSingleLineNonBlankRange(text, i + 2, close)) {
+                    if (isSingleLineNonBlankRange(text, i + 2, close, workCounter)) {
                         val start = builder.length
-                        builder.append(parseInline(text.substring(i + 2, close), depth + 1))
+                        builder.append(parseInline(text.substring(i + 2, close), depth + 1, workCounter))
                         builder.addStyle(
                             SpanStyle(fontWeight = FontWeight.Bold),
                             start,
@@ -1835,6 +1977,7 @@ object ChatMarkdownParser {
                 if (firstRun in (i + 1) until lineEnd && !hasStarsOrTicks(i + 1, firstRun)) {
                     var runLen = 0
                     while (firstRun + runLen < len && text[firstRun + runLen] == '*' && !inCode[firstRun + runLen]) {
+                        workCounter?.step()
                         runLen++
                     }
                     if (firstRun > 0 && !text[firstRun - 1].isWhitespace()) {
@@ -1864,6 +2007,7 @@ object ChatMarkdownParser {
                     // multiple triple qualifiers chain monotonically (t strictly grows).
                     var t = nextSharedTriple[i + 1]
                     while (t in (i + 1) until lineEnd && openBold[t] < i + 1) {
+                        workCounter?.skip()
                         t = nextSharedTriple[t + 3]
                     }
                     val validS = if (s in (i + 1) until lineEnd) s else -1
@@ -1878,9 +2022,9 @@ object ChatMarkdownParser {
                 }
                 if (close != -1 && !text[close - 1].isWhitespace() &&
                     (nextNewline[i] == -1 || nextNewline[i] > close)) {
-                    if (isSingleLineNonBlankRange(text, i + 1, close)) {
+                    if (isSingleLineNonBlankRange(text, i + 1, close, workCounter)) {
                         val start = builder.length
-                        builder.append(parseInline(text.substring(i + 1, close), depth + 1))
+                        builder.append(parseInline(text.substring(i + 1, close), depth + 1, workCounter))
                         builder.addStyle(
                             SpanStyle(fontStyle = FontStyle.Italic),
                             start,

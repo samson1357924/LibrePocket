@@ -183,6 +183,11 @@ internal fun alignThinkingOverridesAppendOnly(
  * inherit with move semantics, cursor consumption), else default. Never does
  * prefix migration. Stale ids are pruned. Example: `["Plan"]` to
  * `["Planning", "Plan"]` yields `j=0` default, `j=1` content-exact retain.
+ *
+ * Work-counter scope: with [workCounter], one step is recorded per indexed prev id, per
+ * prev content, per curr card, per stale override (filter + removal), and one skip per
+ * consumed queue head. All O(K) loops in this function are covered; new/changed loops
+ * must add counter sites (see [WorkCounter] KDoc).
  */
 internal fun alignThinkingOverridesIdentityOnly(
     prevContents: List<String>,
@@ -191,9 +196,11 @@ internal fun alignThinkingOverridesIdentityOnly(
     currContents: List<String>,
     overrides: MutableMap<String, Boolean>,
     currentIdSet: Set<String>,
+    workCounter: WorkCounter? = null,
 ) {
     val prevIdToIndex = HashMap<String, Int>(prevIds.size)
     for ((index, id) in prevIds.withIndex()) {
+        workCounter?.step()
         if (!prevIdToIndex.containsKey(id)) {
             prevIdToIndex[id] = index
         }
@@ -207,10 +214,12 @@ internal fun alignThinkingOverridesIdentityOnly(
     // last K cards each re-skip K consumed entries).
     val prevContentToIndices = HashMap<String, ArrayDeque<Int>>(prevContents.size)
     for ((index, content) in prevContents.withIndex()) {
+        workCounter?.step()
         prevContentToIndices.getOrPut(content) { ArrayDeque() }.addLast(index)
     }
     val consumed = BooleanArray(prevContents.size)
     for (j in currContents.indices) {
+        workCounter?.step()
         val currId = currIds[j]
         val currContent = currContents[j]
         val exactIndex = prevIdToIndex[currId]
@@ -225,6 +234,7 @@ internal fun alignThinkingOverridesIdentityOnly(
             // leaves the queue at most once: amortized O(1) per card, preserving
             // the earliest-unconsumed order of the previous scan).
             while (candidates.isNotEmpty() && consumed[candidates.first()]) {
+                workCounter?.skip()
                 candidates.removeFirst()
             }
             if (candidates.isNotEmpty()) {
@@ -244,8 +254,12 @@ internal fun alignThinkingOverridesIdentityOnly(
         }
         // Default: no write.
     }
-    val staleKeys = overrides.keys.filter { it !in currentIdSet }
+    val staleKeys = overrides.keys.filter {
+        workCounter?.step()
+        it !in currentIdSet
+    }
     for (stale in staleKeys) {
+        workCounter?.step()
         overrides.remove(stale)
     }
 }

@@ -623,8 +623,8 @@ class WebExtractD4Test {
         val out = svc.extract("https://example.com/bidi", resolver = dns) as WebExtractOutcome.Ok
         for (cp in intArrayOf(0x200E, 0x200F, 0x202E, 0x200B, 0xFEFF, 0x00AD, 0x061C, 0x2066)) {
             val ch = String(Character.toChars(cp))
-            assertFalse("U+%04X 應被清理".format(cp), out.content.snippet.contains(ch))
-            assertFalse("U+%04X 不得進 envelope".format(cp), out.envelope.contains(ch))
+            assertFalse("U+%04X 應被清理".format(java.util.Locale.ROOT, cp), out.content.snippet.contains(ch))
+            assertFalse("U+%04X 不得進 envelope".format(java.util.Locale.ROOT, cp), out.envelope.contains(ch))
         }
         // \n 於 HTML 管線經 Spaces（\s+→" "）收斂為單一空白；Cf 於 cleanField 剝除：
         // 以左右鄰字（E/F/G，單空白相隔）結構完整取代恆真之 contains("\n") 斷言。
@@ -641,8 +641,8 @@ class WebExtractD4Test {
         val out = svc.extract("https://example.com/cc", resolver = dns) as WebExtractOutcome.Ok
         for (cp in intArrayOf(0x1B, 0x07, 0x7F, 0x85, 0x034F, 0x115F, 0x1160, 0x3164, 0xFFA0, 0x2028, 0x2029)) {
             val ch = String(Character.toChars(cp))
-            assertFalse("U+%04X 應被清理".format(cp), out.content.snippet.contains(ch))
-            assertFalse("U+%04X 不得進 envelope".format(cp), out.envelope.contains(ch))
+            assertFalse("U+%04X 應被清理".format(java.util.Locale.ROOT, cp), out.content.snippet.contains(ch))
+            assertFalse("U+%04X 不得進 envelope".format(java.util.Locale.ROOT, cp), out.envelope.contains(ch))
         }
     }
 

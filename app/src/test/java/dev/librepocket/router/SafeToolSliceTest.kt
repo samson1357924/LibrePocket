@@ -562,12 +562,12 @@ class SafeToolSliceTest {
             // rejection").
             for (cp in listOf(0xE0001, 0xE0020)) {
                 assertEquals(
-                    "U+%X must be a FORMAT code point".format(cp),
+                    "U+%X must be a FORMAT code point".format(java.util.Locale.ROOT, cp),
                     Character.FORMAT.toInt(),
                     Character.getType(cp),
                 )
                 assertEquals(
-                    "U+%X high half must be a SURROGATE".format(cp),
+                    "U+%X high half must be a SURROGATE".format(java.util.Locale.ROOT, cp),
                     Character.SURROGATE.toInt(),
                     Character.getType(Character.highSurrogate(cp)),
                 )

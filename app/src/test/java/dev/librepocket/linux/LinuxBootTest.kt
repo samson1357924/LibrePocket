@@ -39,7 +39,7 @@ class LinuxBootTest {
 
     private fun shaOf(bytes: ByteArray): String {
         val d = java.security.MessageDigest.getInstance("SHA-256").digest(bytes)
-        return d.joinToString("") { "%02x".format(it) }
+        return d.joinToString("") { "%02x".format(java.util.Locale.ROOT, it) }
     }
 
     // ---- 佈局：filesDir/linux/{bin,image,cache,containers/<name>/rootfs,tmp} ----

@@ -22,7 +22,7 @@
 
 ## Current：可確認的邊界
 
-> **2026-11-26/27 Health-check wave（branches, not merged）**：本波 16 支分支／PR（#185–#200）全數 OPEN、未合併，`main` 仍 `c5d61a61`。就本波涉及的 tool／外部能力四態而言，main 仍停在 **declared／implemented**（部分 JVM 驗證只存在於分支）；**production wired／device verified 在 main 仍 false**。`FastDispatcher` 維持 `internal`、零 production caller；production composition 維持 `toolSlice = null`（`ProductionChatCompositionTest` 釘死），PR #200 的逐工具四態矩陣亦為分支證據，不視為 main 已更新。既有基礎設施列（Room persistence、provider protocol 等）維持本表原現況，不因本波改寫。唯一 CLOSED 的 issue 是 #177（環境性 charset），不代表任何能力已 wired／verified。分支上的 JVM／Python／裝置結果合併後須在 main 重跑才可作 main gate 證據；詳見 [Architecture](ARCHITECTURE.md) 的 Health-check wave 索引與 [Testing](TESTING.md)。
+> **2026-11-26/27 Health-check wave（歷史分支快照）**：以 `main@c5d61a61` 為比較基底。就本波涉及的工具／外部能力，此基底沒有生產接線或裝置驗證證據；部分 JVM 驗證只在各分支。`FastDispatcher` 在該基底為 `internal` 且無 production caller，production composition 的 `toolSlice` 為 `null`；#200 的四態矩陣仍須按實際受測 SHA 判讀。既有基礎設施列不受此快照影響。詳見 [Architecture](ARCHITECTURE.md) 的歷史分支索引與 [Testing](TESTING.md) 的驗收說明。
 
 | 項目 | Current evidence | 不可推論為 |
 |---|---|---|

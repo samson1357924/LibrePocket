@@ -708,7 +708,10 @@ class ReleaseBuilderHarness(unittest.TestCase):
         self.assertNotIn("READY", result.stdout)
         self.assertEqual(self._output_roots(), [])
         self.assertTrue(self.gradle_log.is_file(), "the rejection must happen after the build")
-        self.assertIn("apksigner", result.stdout.lower())
+        # Match the shim's exact rejection, not a preflight message mentioning
+        # apksigner or a wrapper/fixture error (shim status 91 or 92).
+        self.assertIn("required tool apksigner exited with status 1", result.stdout)
+        self.assertFalse(self.policy_log.exists(), "policy must not run on an unsigned APK")
 
     def test_aab_is_not_a_fallback(self) -> None:
         result = self.run_builder(mode="aab-play")

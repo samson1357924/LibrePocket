@@ -27,9 +27,15 @@ class FastDispatchSurfaceArchitectureTest {
         "LspSymbolsExecutor",
         "FastDispatchOutcome",
         "decideAndDispatch",
+        "dispatchFresh",
+        "decideAndDispatchFresh",
         "FastExecResult",
         "FastLaneResult",
         "FastToolExecutor",
+        "FastConfirmationSnapshot",
+        "FastToolRoomAuditSink",
+        "FastToolAuditSink",
+        "FastToolAuditRecord",
     )
 
     @Test

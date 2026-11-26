@@ -1,5 +1,9 @@
 package dev.librepocket.router
 
+import dev.librepocket.policy.PolicyStore
+import dev.librepocket.policy.Verdict
+import dev.librepocket.session.SessionStore
+import dev.librepocket.session.TranscriptEvent
 import dev.librepocket.tool.CapabilityLevel
 import dev.librepocket.tool.DenyReason
 import dev.librepocket.tool.LspTools
@@ -7,6 +11,7 @@ import dev.librepocket.tool.ProjectionContext
 import dev.librepocket.tool.SideEffect
 import dev.librepocket.tool.ToolDef
 import dev.librepocket.tool.ToolRegistry
+import java.security.MessageDigest
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.ensureActive
@@ -56,13 +61,15 @@ import kotlin.coroutines.coroutineContext
  *    returned tool's name is never interpolated (it may be
  *    attacker-controlled content) — the fixed non-echoing message applies,
  *    like the lookup-failure paths;
- * 4. a dispatch-time re-projection (SAME snapshot the decision saw — NOT a
- *    freshness signal; [decideAndDispatch] re-validates the same
- *    snapshot) must be NATIVE (any non-NATIVE
+ * 4. a dispatch-time re-projection must be NATIVE (any non-NATIVE
  *    projection — UNAVAILABLE or DEGRADED — denies, mirroring the slice's
  *    NATIVE-only rule; DEGRADED tools never execute on the fast lane. The
  *    ready `lsp.symbols` projects NATIVE once its switch is on, so the
- *    pinned suite is unaffected);
+ *    pinned suite is unaffected). In WIRED mode ([dispatchFresh]) this
+ *    projection runs on a FRESH [ProjectionContext] obtained from the
+ *    constructor-injected `ctxSupplier` — never the decision's snapshot;
+ *    in the LEGACY test entry ([dispatch]) the caller's snapshot is reused
+ *    and is explicitly NOT a freshness signal;
  * 5. the tool must be `executionReady` (registry readiness; B3 flips no
  *    flags — today only `lsp.symbols` qualifies);
  * 6. the tool must be [SideEffect.READ] (defense in depth: WRITE/PRIVILEGED
@@ -110,30 +117,268 @@ import kotlin.coroutines.coroutineContext
  *    pass-through → cap + `#`-SHA-256 suffix), never the raw [ToolCall.callId];
  *    Executed carries bounded callId and NO executor denyCode;
  *
- * Explicitly NOT done here (future production wiring PR, per the capability
- * matrix activation prerequisites): fresh `tool.exec` policy evaluation,
- * immutable confirmation snapshots, Android executors, Room audit writes,
- * and device-verified E2E. There is deliberately NO production caller:
- * [dev.librepocket.chat.TurnController] and `ChatSessionFactory` stay
+ * WIRED MODE (issue #178 Stage 1–2, still INTERNAL / UNWIRED): constructed
+ * with `ctxSupplier` + `policy` + `auditSink`, [dispatchFresh] re-projects a
+ * FRESH context, evaluates fresh `tool.exec` policy (ALLOW only — ASK is
+ * never treated as ALLOW), binds an immutable [FastConfirmationSnapshot],
+ * re-verifies authorization immediately before side effects, and writes a
+ * redacted Room-backed audit row before entering the executor (at most one
+ * row per wired dispatch: the ALLOW path and the policy/confirmation/reverify
+ * skips write it; earlier malformed/lookup/projection skips do not). Every
+ * gate failure is a typed skip with zero backend side effects; an audit
+ * write failure on the ALLOW path is a typed `AUDIT_ERROR` skip with zero
+ * execution.
+ * The legacy two-arg [dispatch] / [decideAndDispatch] remain TEST-ONLY
+ * compatibility entries: they run the original gates WITHOUT fresh policy /
+ * confirmation / audit and must never be called from production paths.
+ *
+ * Explicitly NOT done here (later stages / #19 B4): production callers,
+ * Android executors, `executionReady` flips, device-verified E2E, and the
+ * availability/CPU-budget hard gate. There is deliberately NO production
+ * caller: [dev.librepocket.chat.TurnController] and `ChatSessionFactory` stay
  * records-only (`toolSlice = null` pinned), so the matrix stays
  * wired=false/verified=false and `executionReady` keeps its registry-only
  * meaning.
  *
  * Device E2E: PENDING — no device in this environment; coverage is JVM-only
- * (`FastDispatchTest` with fake backends). The wired/verified flips wait for
- * the E2E PR.
+ * (`FastDispatchTest` / `FastDispatchGatesTest` with fake backends). The
+ * wired/verified flips wait for the E2E PR.
  *
- * INTERNAL / UNWIRED EXECUTION PATH — not reachable from production composition; wiring requires the tool.exec ALLOW-only policy + immutable confirmation snapshots + Room audit + device E2E (see docs/CAPABILITY_MATRIX.md §啟用前置). Do not add callers outside this file without a separate security review.
+ * INTERNAL / UNWIRED EXECUTION PATH — not reachable from production composition; wiring still requires device E2E and a separate security review (see docs/CAPABILITY_MATRIX.md §啟用前置). Do not add callers outside this file without a separate security review.
  */
 internal class FastDispatcher(
     executors: Map<String, FastToolExecutor> = emptyMap(),
     private val lookup: (String) -> ToolDef? = { ToolRegistry.find(it) },
+    /**
+     * WIRED 模式三件套：每次 [dispatchFresh] 重新取得 [ProjectionContext]、
+     * 每次重新 [PolicyStore.evaluateFresh]，且副作用前必須寫入一筆 audit。
+     * 三者必須同時提供；只給一部分即 `require` fail-fast，避免半接線的
+     * 「看起來有 policy 但沒有 fresh ctx／audit」狀態。全不給則是 legacy
+     * TEST-ONLY 入口（既有 `FastDispatchTest` 相容性，見 [dispatch]）。
+     */
+    private val ctxSupplier: (() -> ProjectionContext)? = null,
+    private val policy: PolicyStore? = null,
+    private val auditSink: FastToolAuditSink? = null,
 ) {
+    init {
+        val wiredParts = listOf(ctxSupplier, policy, auditSink).count { it != null }
+        require(wiredParts == 0 || wiredParts == 3) {
+            "FastDispatcher requires ctxSupplier + policy + auditSink together (wired mode), got $wiredParts/3"
+        }
+    }
+
     /**
      * 建構期 snapshot（`toMap()` defensive copy）：呼叫端在建構後對傳入 map
      * 的任何 mutation（含移除 executor）都不影響本 dispatcher。
      */
     private val executors: Map<String, FastToolExecutor> = executors.toMap()
+
+    /**
+     * WIRED 模式：每次新鮮取樣。CE／VM fatal 重拋（與 SafeToolSlice 語義一致）；
+     * 其餘故障回 null ⇒ typed skip，永不回音例外訊息。
+     */
+    private fun freshCtx(): ProjectionContext? = try {
+        ctxSupplier?.invoke()
+    } catch (e: CancellationException) {
+        throw e
+    } catch (e: VirtualMachineError) {
+        throw e
+    } catch (e: ThreadDeath) {
+        throw e
+    } catch (_: Throwable) {
+        null
+    }
+
+    /** 每次都是 fresh（DataStore/InMemory store 的 TOCTOU guard），ALLOW-only 由呼叫端判斷。 */
+    private suspend fun freshVerdict(toolName: String): Verdict? = try {
+        policy?.evaluateFresh(SafeToolSlice.POLICY_ACTION, toolName)?.verdict
+    } catch (e: CancellationException) {
+        throw e
+    } catch (e: VirtualMachineError) {
+        throw e
+    } catch (e: ThreadDeath) {
+        throw e
+    } catch (_: Throwable) {
+        null
+    }
+
+    /**
+     * 規則集的穩定指紋（FNV-1a 64 over sorted canonical rules）：作為 confirmation
+     * snapshot 綁定的 policyRevision。任何規則新增／刪除／verdict／priority 變動
+     * 都會推進；用規則內容而非時戳，避免同毫秒 flip 被當成同一版而沿用舊 verdict。
+     * 讀取失敗 ⇒ null ⇒ fail-closed skip。
+     *
+     * FNV-1a **不是安全哈希、也不提供完整性保證**（碰撞不代表授權）：它只用來
+     * 偵測「規則集是否變過」；真正的執行依據永遠是每次 [freshVerdict] 的
+     * `evaluateFresh` ALLOW-only 重查。即使 revision 碰撞也不會放寬 gate。
+     */
+    private suspend fun policyRevision(): Long? = try {
+        val rules = policy?.listRules() ?: return null
+        val canonical = rules.asSequence()
+            .map { "${it.pattern}\u0000${it.verdict.name}\u0000${it.priority}" }
+            .sorted()
+            .joinToString("\u0001")
+        var hash = 14695981039346656037UL
+        for (byte in canonical.toByteArray(Charsets.UTF_8)) {
+            hash = (hash xor (byte.toULong() and 0xFFUL)) * 1099511628211UL
+        }
+        hash.toLong()
+    } catch (e: CancellationException) {
+        throw e
+    } catch (e: VirtualMachineError) {
+        throw e
+    } catch (e: ThreadDeath) {
+        throw e
+    } catch (_: Throwable) {
+        null
+    }
+
+    /**
+     * SHA-256 hex of the canonical operation tuple, used ONLY for snapshot
+     * binding (not a secret / not an authenticator). Locale.ROOT is mandatory
+     * on `%02x` — see issue #175 — so hex formatting is identical on every
+     * device locale (Turkish locale would otherwise break lowercase hex).
+     */
+    private fun sha256Hex(input: String): String =
+        MessageDigest.getInstance("SHA-256")
+            .digest(input.toByteArray(Charsets.UTF_8))
+            .joinToString("") { "%02x".format(java.util.Locale.ROOT, it) }
+
+    private fun paramsHash(
+        tool: String,
+        identity: String,
+        arguments: String,
+        sessionId: String?,
+        turnIndex: Int?,
+        revision: Long,
+    ): String = sha256Hex(
+        listOf(tool, identity, arguments, sessionId ?: "", turnIndex?.toString() ?: "", revision.toString())
+            .joinToString("\u0000"),
+    )
+
+    private fun validIdentity(identity: String): Boolean =
+        identity.isNotBlank() && identity.length <= 256 && identity.none { it.isISOControl() }
+
+    /** confirm 的內部結果：拒絕時帶 audit decision，供 one-call 入口留痕。 */
+    private sealed interface ConfirmResult {
+        data class Ok(val snapshot: FastConfirmationSnapshot) : ConfirmResult
+        data class Denied(val auditDecision: String) : ConfirmResult
+    }
+
+    /**
+     * 建立不可變確認快照（型別本身即 immutable data class；caller 無法 mutation）。
+     * ASK／DENY／故障一律拒 —— ASK 永不默認為 ALLOW；本階段沒有 UI 確認
+     * 管線可鑄造「已明確同意」代幣，故 ASK 直接不放行。[identity] 由呼叫端提供
+     * 並綁入 snapshot／hash，**不是**身份認證機制；正式接線必須傳入已驗證的
+     * session／user identity，本 PR 不新增任何 caller。
+     */
+    suspend fun confirm(decision: RouteDecision, identity: String): FastConfirmationSnapshot? =
+        (confirmWithReason(decision, identity) as? ConfirmResult.Ok)?.snapshot
+
+    private suspend fun confirmWithReason(
+        decision: RouteDecision,
+        identity: String,
+    ): ConfirmResult {
+        if (decision.route != RouteKind.FAST) return ConfirmResult.Denied("DENY:CONFIRMATION")
+        val call = decision.toolCall ?: return ConfirmResult.Denied("DENY:CONFIRMATION")
+        if (!validIdentity(identity)) return ConfirmResult.Denied("DENY:CONFIRMATION")
+        val revision = policyRevision() ?: return ConfirmResult.Denied("DENY:CONFIRMATION")
+        if (freshVerdict(call.toolName) != Verdict.ALLOW) return ConfirmResult.Denied("DENY:POLICY")
+        return ConfirmResult.Ok(
+            FastConfirmationSnapshot(
+                tool = call.toolName,
+                identity = identity,
+                arguments = call.argumentsJson,
+                paramsHash = paramsHash(
+                    call.toolName, identity, call.argumentsJson,
+                    decision.header.sessionId, decision.header.turnIndex, revision,
+                ),
+                policyRevision = revision,
+                sessionId = decision.header.sessionId,
+                turnIndex = decision.header.turnIndex,
+            ),
+        )
+    }
+
+    /**
+     * one-call confirm 拒絕的 best-effort 留痕：sink 故障不改變已 fail-closed 的
+     * skip；CE／fatal 由 [writeAudit] 原樣重拋。malformed／lookup 失敗仍不寫。
+     */
+    private suspend fun auditConfirmDenial(decision: RouteDecision, auditDecision: String) {
+        val call = decision.toolCall ?: return
+        val tool = try {
+            lookup(call.toolName)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Exception) {
+            return
+        } ?: return
+        if (tool.name != call.toolName) return
+        writeAudit(decision, tool, call, auditDecision, -1L, "")
+    }
+
+    private fun verifySnapshot(
+        snapshot: FastConfirmationSnapshot,
+        identity: String,
+        call: ToolCall,
+        header: TranscriptHeader,
+        revision: Long,
+    ): Boolean {
+        if (snapshot.tool != call.toolName || snapshot.arguments != call.argumentsJson) return false
+        if (snapshot.identity != identity || !validIdentity(snapshot.identity)) return false
+        if (snapshot.sessionId != header.sessionId || snapshot.turnIndex != header.turnIndex) return false
+        if (snapshot.policyRevision != revision) return false
+        return snapshot.paramsHash == paramsHash(
+            snapshot.tool, snapshot.identity, snapshot.arguments,
+            snapshot.sessionId, snapshot.turnIndex, snapshot.policyRevision,
+        )
+    }
+
+    /** 每筆 wired dispatch 恰寫一筆（含 skip 決策）；失敗回 false，CE／fatal 重拋。 */
+    private suspend fun writeAudit(
+        decision: RouteDecision,
+        tool: ToolDef,
+        call: ToolCall,
+        auditDecision: String,
+        revision: Long,
+        hash: String,
+    ): Boolean {
+        val sink = auditSink ?: return false
+        val redacted = try {
+            SafeToolSlice.cappedEcho(dev.librepocket.redact.Redactor.redact(call.argumentsJson).text)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: VirtualMachineError) {
+            throw e
+        } catch (e: ThreadDeath) {
+            throw e
+        } catch (_: Throwable) {
+            "[audit redaction failed]"
+        }
+        val record = FastToolAuditRecord(
+            header = decision.header,
+            tool = tool.name,
+            decision = auditDecision,
+            modelVisibleTools = decision.header.visibleTools,
+            projectedTools = decision.header.projectedTools,
+            redactedArguments = redacted,
+            paramsHash = hash,
+            policyRevision = revision,
+            sessionId = decision.header.sessionId,
+            turnIndex = decision.header.turnIndex,
+        )
+        return try {
+            sink.record(record)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: VirtualMachineError) {
+            throw e
+        } catch (e: ThreadDeath) {
+            throw e
+        } catch (_: Throwable) {
+            false
+        }
+    }
 
     /**
      * 固定失敗話術：prefix 一致（`執行` + 可信工具名或 `工具` 占位 + `失敗，請重試或手動操作`）；
@@ -154,16 +399,50 @@ internal class FastDispatcher(
         if (code != null && DENY_CODE_ALLOWLIST.matches(code)) code else "EXEC_ERROR"
 
     /**
-     * Dispatches one [RouteDecision]. Never throws except
-     * [CancellationException] (a cancelled dispatch aborts before the
-     * executor runs; a timeout is NOT a cancel — it maps to a typed
-     * `TIMEOUT` skip), and fatal [Error]s from misbehaving executors also
-     * propagate; executor failures (non-cancel) become [Skipped] with a
-     * fixed message — backend text never rides the outcome.
+     * LEGACY TEST-ONLY compatibility entry (existing `FastDispatchTest`).
+     * Runs the original gates against the caller's [ctx] snapshot; it does
+     * NOT consult fresh policy / confirmation / audit. Production paths must
+     * use [dispatchFresh] on a WIRED-constructed dispatcher.
+     *
+     * Never throws except [CancellationException] (a cancelled dispatch
+     * aborts before the executor runs; a timeout is NOT a cancel — it maps
+     * to a typed `TIMEOUT` skip), and fatal [Error]s from misbehaving
+     * executors also propagate; executor failures (non-cancel) become
+     * [Skipped] with a fixed message — backend text never rides the outcome.
      */
     suspend fun dispatch(
         decision: RouteDecision,
         ctx: ProjectionContext,
+    ): FastDispatchOutcome = dispatchCore(decision, ctx, null, wired = false, identity = null)
+
+    /**
+     * WIRED dispatch: fresh projection + fresh `tool.exec` ALLOW-only policy
+     * + immutable [confirmation] + post-confirm re-verification + a single
+     * audit write BEFORE the executor on the ALLOW path (and on policy /
+     * confirmation / reverify skips). Every failure is a typed skip with
+     * zero backend side effects. There is deliberately no caller-supplied
+     * [ProjectionContext]: freshness comes from the constructor's `ctxSupplier`.
+     */
+    suspend fun dispatchFresh(
+        decision: RouteDecision,
+        confirmation: FastConfirmationSnapshot,
+        identity: String,
+    ): FastDispatchOutcome {
+        val ctx = freshCtx()
+            ?: return FastDispatchOutcome.Skipped(
+                null,
+                fixedFailureMessage(null),
+                denyCode = "PROJECTION_ERROR",
+            )
+        return dispatchCore(decision, ctx, confirmation, wired = true, identity = identity)
+    }
+
+    private suspend fun dispatchCore(
+        decision: RouteDecision,
+        ctx: ProjectionContext,
+        confirmation: FastConfirmationSnapshot?,
+        wired: Boolean,
+        identity: String?,
     ): FastDispatchOutcome {
         val call = decision.toolCall
         if (decision.route != RouteKind.FAST || call == null) {
@@ -234,11 +513,79 @@ internal class FastDispatcher(
             return FastDispatchOutcome.Skipped(null, fixedFailureMessage(tool.name), denyCode = "EXECUTOR_IDENTITY_MISMATCH")
         }
         coroutineContext.ensureActive()
+        if (wired) {
+            // Stage 1: fresh policy（永不沿用 decision 期或上一 turn 的 verdict）。
+            // DENY / ASK / 故障 / unknown 一律 typed skip、零 backend 副作用。
+            val revision = policyRevision()
+            if (revision == null || freshVerdict(tool.name) != Verdict.ALLOW) {
+                val skip = FastDispatchOutcome.Skipped(
+                    null, fixedFailureMessage(tool.name), denyCode = "POLICY_DENIED",
+                )
+                // best-effort audit on a skip: 寫入失敗不改變已 fail-closed 的結果。
+                val hash = confirmation?.paramsHash ?: paramsHash(
+                    tool.name, identity ?: "", call.argumentsJson,
+                    decision.header.sessionId, decision.header.turnIndex, revision ?: -1L,
+                )
+                writeAudit(decision, tool, call, "DENY:POLICY", revision ?: -1L, hash)
+                return skip
+            }
+            val snap = confirmation
+            if (
+                snap == null || identity == null ||
+                !verifySnapshot(snap, identity, call, decision.header, revision)
+            ) {
+                val skip = FastDispatchOutcome.Skipped(
+                    null, fixedFailureMessage(tool.name), denyCode = "CONFIRMATION_INVALID",
+                )
+                writeAudit(decision, tool, call, "DENY:CONFIRMATION", revision, snap?.paramsHash ?: "")
+                return skip
+            }
+            // Stage 2 post-confirm reverify（Ref: ElevatedWiring）：在 confirm 之後、
+            // 任何副作用之前重新取樣 projection + policy + revision。switch／permission／
+            // policy 在兩 turn 之間翻轉，或 cancel／revoke 與 dispatch 競態時，舊
+            // snapshot 一律作廢（typed skip、零 backend）。
+            val ctx2 = freshCtx()
+            val projection2 = if (ctx2 != null) try {
+                tool.project(ctx2)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (_: Exception) {
+                null
+            } else null
+            val verdict2 = freshVerdict(tool.name)
+            val revision2 = policyRevision()
+            if (
+                ctx2 == null || projection2?.level != CapabilityLevel.NATIVE ||
+                verdict2 != Verdict.ALLOW || revision2 != revision ||
+                !verifySnapshot(snap, identity, call, decision.header, revision2)
+            ) {
+                val skip = FastDispatchOutcome.Skipped(
+                    null, fixedFailureMessage(tool.name), denyCode = "CONFIRMATION_STALE",
+                )
+                writeAudit(decision, tool, call, "DENY:REVERIFY", revision, snap.paramsHash)
+                return skip
+            }
+            coroutineContext.ensureActive()
+        }
         // 非正的 per-call budget（0/負值）直接 fail-closed 型別化拒絕：零 backend
         // 呼叫，與切片「非正 budget＝即刻型別化逾時」語義一致（絕不視為無上限）。
         val timeoutMs = tool.annotations.timeoutMs
         if (timeoutMs <= 0) {
             return FastDispatchOutcome.Skipped(null, fixedFailureMessage(tool.name), denyCode = "TIMEOUT")
+        }
+        if (wired) {
+            // Room audit 是執行的前置條件：寫入失敗 ⇒ typed skip、零 executor entry。
+            // 每筆 wired dispatch 只寫一筆（skip 分支已各自寫過）。
+            val snap = confirmation!!
+            val recorded = writeAudit(
+                decision, tool, call, "ALLOW", snap.policyRevision, snap.paramsHash,
+            )
+            if (!recorded) {
+                return FastDispatchOutcome.Skipped(
+                    null, fixedFailureMessage(tool.name), denyCode = "AUDIT_ERROR",
+                )
+            }
+            coroutineContext.ensureActive()
         }
         val result = try {
             withTimeout(timeoutMs) { executor.execute(call, ctx) }
@@ -307,19 +654,10 @@ internal class FastDispatcher(
     }
 
     /**
-     * One-call fast lane: route the intent text, then dispatch the decision.
-     * Convenience for tests and WIRED-WHEN-READY callers only; records-only
-     * builds must not call it in production paths; wiring PR = security
-     * review. Carries no extra semantics
-     * beyond [FastRouter.decide] + [dispatch] with the same [ctx].
-     *
-     * The SAME [ctx] snapshot is passed to both decide and dispatch, so the
-     * gate-4 (dispatch-time re-projection) re-check inside [dispatch] re-validates the same
-     * snapshot the router saw — it is a same-snapshot recheck, NOT a
-     * freshness signal. Freshness still requires the caller to re-read
-     * [ProjectionContext] per call; a future wiring PR owns the
-     * `ctxSupplier` shape (mirroring the slice's constructor-injected
-     * supplier). The API stays unchanged.
+     * LEGACY TEST-ONLY one-call fast lane: route then [dispatch] with the
+     * SAME [ctx] snapshot. The re-check inside [dispatch] is a same-snapshot
+     * recheck, NOT a freshness signal. Production paths must use
+     * [decideAndDispatchFresh] on a WIRED-constructed dispatcher.
      */
     suspend fun decideAndDispatch(
         intentText: String,
@@ -329,6 +667,47 @@ internal class FastDispatcher(
     ): FastLaneResult {
         val decision = FastRouter().decide(intentText, ctx, sessionId, turnIndex)
         return FastLaneResult(decision, dispatch(decision, ctx))
+    }
+
+    /**
+     * WIRED one-call convenience: fresh context for BOTH routing and dispatch,
+     * immutable confirmation, then [dispatchFresh]. Still INTERNAL / UNWIRED —
+     * no production caller is added by issue #178.
+     */
+    suspend fun decideAndDispatchFresh(
+        intentText: String,
+        identity: String,
+        sessionId: String? = null,
+        turnIndex: Int? = null,
+    ): FastLaneResult {
+        check(ctxSupplier != null && policy != null && auditSink != null) {
+            "decideAndDispatchFresh requires a WIRED-constructed FastDispatcher"
+        }
+        val ctx = freshCtx()
+        val decision = FastRouter().decide(
+            intentText, ctx ?: ProjectionContext(), sessionId, turnIndex,
+        )
+        if (ctx == null) {
+            return FastLaneResult(
+                decision,
+                FastDispatchOutcome.Skipped(null, fixedFailureMessage(null), denyCode = "PROJECTION_ERROR"),
+            )
+        }
+        // confirm 拒絕（ASK／DENY／evaluate 故障／revision 讀取失敗）也必須留痕：
+        // 拒絕不是「沒發生」，audit 是 best-effort 且不改變 fail-closed skip。
+        return when (val confirmed = confirmWithReason(decision, identity)) {
+            is ConfirmResult.Ok ->
+                FastLaneResult(decision, dispatchFresh(decision, confirmed.snapshot, identity))
+            is ConfirmResult.Denied -> {
+                auditConfirmDenial(decision, confirmed.auditDecision)
+                FastLaneResult(
+                    decision,
+                    FastDispatchOutcome.Skipped(
+                        null, fixedFailureMessage(null), denyCode = "CONFIRMATION_INVALID",
+                    ),
+                )
+            }
+        }
     }
 
     /**
@@ -359,6 +738,116 @@ internal data class FastLaneResult(
     val decision: RouteDecision,
     val outcome: FastDispatchOutcome,
 )
+
+/**
+ * Immutable confirmation snapshot (issue #178 Stage 2). All fields are
+ * immutable `val`s; [paramsHash] is SHA-256 over
+ * `(tool, identity, arguments, sessionId, turnIndex, policyRevision)`, so any
+ * mutation of the operation — or a policy/identity/turn flip — invalidates it.
+ * Produced only by [FastDispatcher.confirm] with a fresh ALLOW verdict; ASK
+ * never yields a snapshot (no implicit promotion to ALLOW).
+ *
+ * NOT single-use: the same immutable snapshot may be rechecked on a later
+ * dispatch while the bound operation + policy revision still hold; reverify
+ * on EVERY dispatch is what enforces freshness, not consumption of this value.
+ * It is NOT a WRITE/PRIVILEGED confirmation token — the fast lane rejects
+ * non-READ tools before this point; WRITE confirmation belongs to the separate
+ * high-risk pipeline. [identity] is caller-supplied and is NOT authentication:
+ * production wiring must supply an already-verified session/user identity.
+ */
+internal data class FastConfirmationSnapshot(
+    val tool: String,
+    val identity: String,
+    val arguments: String,
+    val paramsHash: String,
+    val policyRevision: Long,
+    val sessionId: String?,
+    val turnIndex: Int?,
+)
+
+/**
+ * One redacted `tool.exec` audit row (not an authority: the transcript DB
+ * remains the persistence path). [header] is the decision's canonical
+ * [TranscriptHeader] projection snapshot; [modelVisibleTools] /
+ * [projectedTools] are audit-only and never proof of what was on the wire
+ * (see [TranscriptHeader] KDoc). [decision] is `ALLOW` or a typed deny code;
+ * [redactedArguments] is redacted + capped before it can reach storage.
+ */
+internal data class FastToolAuditRecord(
+    val header: TranscriptHeader,
+    val tool: String,
+    val decision: String,
+    val modelVisibleTools: List<String>,
+    val projectedTools: List<String>,
+    val redactedArguments: String,
+    val paramsHash: String,
+    val policyRevision: Long,
+    val sessionId: String?,
+    val turnIndex: Int?,
+) {
+    /** Deterministic, bounded, single-line JSON for the transcript `text` column. */
+    internal fun toAuditJson(): String = buildJsonObject {
+        put("marker", "tool.exec")
+        put("tool", tool)
+        put("decision", decision)
+        put("sessionId", sessionId ?: "")
+        put("turnIndex", turnIndex ?: -1)
+        put("route", header.route.name)
+        put("reasonCode", header.reasonCode ?: "")
+        put("visibleTools", buildJsonArray { modelVisibleTools.forEach { add(JsonPrimitive(it)) } })
+        put("projectedTools", buildJsonArray { projectedTools.forEach { add(JsonPrimitive(it)) } })
+        put("redactedArguments", redactedArguments)
+        put("paramsHash", paramsHash)
+        put("policyRevision", policyRevision)
+    }.toString()
+}
+
+/** Audit sink contract: `true` ⇔ durable write succeeded; any failure = false. */
+internal fun interface FastToolAuditSink {
+    suspend fun record(record: FastToolAuditRecord): Boolean
+}
+
+/**
+ * Room-backed sink over the EXISTING [SessionStore] transcript path — no new
+ * DAO, entity, table or migration, and never a new authority. Rows use the
+ * existing `tool` kind and are redacted again by the store's write path.
+ * A session-less record cannot be persisted ⇒ false ⇒ fail-closed skip.
+ * Cancellation is never swallowed.
+ *
+ * Wiring TODO (not done in #178): the `runId` is SYNTHETIC
+ * (`fast-audit-<turnIndex>`), not the real turn/run id. Production wiring must
+ * let the record carry the authoritative runId before activation; this sink
+ * is not installed by any production caller in this PR.
+ */
+internal class FastToolRoomAuditSink(
+    private val store: SessionStore,
+    private val clock: () -> Long = System::currentTimeMillis,
+) : FastToolAuditSink {
+    override suspend fun record(record: FastToolAuditRecord): Boolean {
+        val sessionId = record.sessionId
+        if (sessionId.isNullOrBlank()) return false
+        return try {
+            store.appendEvent(
+                TranscriptEvent(
+                    sessionId = sessionId,
+                    runId = "fast-audit-${record.turnIndex ?: -1}",
+                    kind = "tool",
+                    text = record.toAuditJson(),
+                    createdAt = clock(),
+                ),
+            )
+            true
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: VirtualMachineError) {
+            throw e
+        } catch (e: ThreadDeath) {
+            throw e
+        } catch (_: Throwable) {
+            false
+        }
+    }
+}
 
 /**
  * Typed execution result from a [FastToolExecutor].

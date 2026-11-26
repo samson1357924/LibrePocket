@@ -247,6 +247,51 @@ class VerificationMetadataTest(unittest.TestCase):
             finally:
                 V.METADATA = old
 
+    def test_synthetic_metadata_tamper_negative_control_red_then_green(self):
+        """Tmp-dir synthetic metadata: tamper -> gate red, restore -> gate green.
+
+        Static shape-level proxy for the documented clean-cache control: the
+        reviewed metadata is green, a tampered recorded checksum is rejected
+        with exit 2, and restoring the exact bytes is green again. It never
+        touches a real Gradle cache and does not run Gradle. The validator only
+        checks shape, so a valid-looking (64-hex) but wrong checksum cannot be
+        caught here; byte-level fail-closed needs the maintainer-run clean-cache
+        Gradle control in docs/TESTING.md (runtime log still Proposed).
+        """
+        with tempfile.TemporaryDirectory() as td:
+            meta = Path(td) / "verification-metadata.xml"
+            original = load_metadata()
+            original_bytes = (
+                b'<?xml version="1.0" encoding="UTF-8"?>\n'
+                + ET.tostring(original, encoding="utf-8")
+            )
+            meta.write_bytes(original_bytes)
+            old, V.METADATA = V.METADATA, meta
+            try:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(V.main([]), 0)
+
+                tampered = copy.deepcopy(original)
+                art = _first_comp_artifact(tampered)[1]
+                sha = art.find("v:sha256", NS)
+                value = sha.get("value")
+                sha.set("value", value[:-1])  # one hex digit shorter
+                meta.write_bytes(
+                    b'<?xml version="1.0" encoding="UTF-8"?>\n'
+                    + ET.tostring(tampered, encoding="utf-8")
+                )
+                buf = io.StringIO()
+                with contextlib.redirect_stderr(buf):
+                    rc = V.main([])
+                self.assertEqual(rc, 2)
+                self.assertIn("invalid sha256", buf.getvalue())
+
+                meta.write_bytes(original_bytes)
+                with contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(V.main([]), 0)
+            finally:
+                V.METADATA = old
+
     def test_gradle_properties_whitespace_variants_rejected(self):
         cases = {
             "key=off": "org.gradle.dependency.verification=off\n",

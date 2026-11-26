@@ -79,7 +79,7 @@
   12. 授權閘 E2E（#165）：`webextract` 開關關閉／未授權 → 零網路請求（test server 零連線）；授權後僅限授權範圍；撤權後零新請求；
   未落地前一律維持 NOT wired、NOT device-verified、`executionReady=false`。
 
-`foss` 和 `github` 在某些 source/service 形狀上相似，不代表依賴、bridge 或能力相同。Flavor distribution/source-of-truth 見 [README](../README.md)、[Architecture](ARCHITECTURE.md) 與 [Threat Model](THREAT_MODEL.md)。
+`foss` 和 `github` 在某些 source/service 形狀上相似，不代表依賴、bridge 或能力相同。R8／minification 現況（`isMinifyEnabled=false`，github release APK 仍打包 Azure/Jackson classes；Jackson 已強制 2.18.12）與 Proposed 決策（開啟 R8 與 keep rules 尚待評估）見 [Release](RELEASE.md)；此為現況揭露，非能力或產物乾淨宣稱。Flavor distribution/source-of-truth 見 [README](../README.md)、[Architecture](ARCHITECTURE.md) 與 [Threat Model](THREAT_MODEL.md)。
 
 ### Provider / Chat Adapters 支援矩陣（Structured Outputs 與 Refusal Streaming）
 

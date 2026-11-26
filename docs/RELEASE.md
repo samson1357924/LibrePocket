@@ -25,6 +25,28 @@ Resource limits are deliberate scanner restrictions, not DEX format maxima. Each
 
 The stdlib tests use synthetic ZIP/DEX fixtures and fake native-tool commands. They are useful regression controls, not evidence that a production APK or Android SDK native parser passed. Before relying on this APK-only gate, the release/build maintainer should run the scanner and native tools against fresh debug APKs for all three flavors and retain results tied to the tested commit. That rehearsal does not establish release signing or public-release readiness.
 
+## R8 / minification decision (Current vs Proposed, #132)
+
+**Current:** `app/build.gradle.kts` sets `isMinifyEnabled = false` for release
+builds (debug is not enabled either); R8 is not applied. The `github` release APK therefore still
+packages the Azure Speech SDK classes and their Jackson family classes rather
+than stripping them. Jackson is forced to `2.18.12` via the catalog BOM
+(PR #133 / #159), so any packaged Jackson classes are the patched version —
+this is neither class stripping nor an OSV-clean claim for build-toolchain
+dependencies. The Play/Foss artifact policy gates and the verification-metadata
+checksum gate are unchanged and are not weakened by this state.
+
+**Proposed (not adopted; no code change in this slice):** enable R8 for release
+builds with flavor-scoped keep rules, then require (a) three-flavor debug/release
+assembly plus unit/lint gates, (b) a fresh DEX inventory showing Azure/Jackson
+classes stripped or intentionally kept with an explicit rationale, (c) the
+Play/Foss/Github artifact policy gates on the resulting bytes, and (d) no
+regression in the github pinned-provider/Shizuku contract. The decision (enable
+vs formally defer) remains open under #132. Do not describe R8 as enabled, and
+do not claim the APK is free of those classes until a DEX-level check on fresh
+release bytes is recorded. See [Build Environment](ENV.md#supply-chain-and-dependency-update-policy)
+for the OSV scope boundary and the build-toolchain advisories.
+
 ## Local release identity and staging gate
 
 The local builder implements the identity checks above for staged APK bytes via `scripts/verify_release_apk.py` and `scripts/release_artifact_stage.py`. The standard-library synthetic tests are unit and regression controls, not evidence that a production release APK passed on physical devices or across every SDK toolchain. The verifier uses `apksigner verify --verbose --print-certs -Werr` and `aapt dump badging`, compares against trusted caller-supplied per-flavor identity values (never inferred from the candidate), and rejects missing/ambiguous candidates, identity mismatch, invalid signature, debug signer, or debuggable APK. A unique transaction contains staged APKs, per-artifact identity/checksum records, and an aggregate checksum list; Play/Foss/Github policy checks run on the staged bytes and checksums are rechecked before the one complete transaction is reported.

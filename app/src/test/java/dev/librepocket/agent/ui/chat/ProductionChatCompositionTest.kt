@@ -9,7 +9,9 @@ import dev.librepocket.chat.ChatSession
 import dev.librepocket.keystore.EncryptedPrefsVault
 import dev.librepocket.keystore.InMemoryPrefs
 import dev.librepocket.policy.InMemoryPolicyStore
+import dev.librepocket.policy.PolicyDecision
 import dev.librepocket.policy.PolicyRule
+import dev.librepocket.policy.PolicyStore
 import dev.librepocket.policy.Verdict
 import dev.librepocket.provider.ChatRequest
 import dev.librepocket.provider.LlmProvider
@@ -52,6 +54,8 @@ import java.util.concurrent.atomic.AtomicReference
  *   marker, one provider request (no continuation), and no [tool-result:] marker.
  * - Production has no switch/backend injection seam, so its null slice implies
  *   no tool execution path; only the explicitly injected control counts executions.
+ * - A `tool.exec` ASK verdict is never upgraded to ALLOW by production
+ *   composition: the execution-basis policy is never even evaluated there.
  */
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [33])
@@ -111,6 +115,30 @@ class ProductionChatCompositionTest {
         val policy = InMemoryPolicyStore()
         runBlocking { policy.setRule(PolicyRule("key.read:*", Verdict.ALLOW, 20)) }
         return policy
+    }
+
+    /** Observes both policy entry points; production must never call either for tool.exec. */
+    private class CountingToolExecPolicy(
+        private val delegate: InMemoryPolicyStore,
+    ) : PolicyStore {
+        val toolExecFreshCalls = AtomicInteger(0)
+        val toolExecCalls = AtomicInteger(0)
+
+        override fun evaluate(action: String, resource: String): PolicyDecision {
+            if (action == "tool.exec") toolExecCalls.incrementAndGet()
+            return delegate.evaluate(action, resource)
+        }
+
+        override suspend fun setRule(rule: PolicyRule) = delegate.setRule(rule)
+
+        override suspend fun removeRule(pattern: String) = delegate.removeRule(pattern)
+
+        override suspend fun listRules(): List<PolicyRule> = delegate.listRules()
+
+        override suspend fun evaluateFresh(action: String, resource: String): PolicyDecision {
+            if (action == "tool.exec") toolExecFreshCalls.incrementAndGet()
+            return delegate.evaluateFresh(action, resource)
+        }
     }
 
     @Test
@@ -427,6 +455,76 @@ class ProductionChatCompositionTest {
             assertTrue("must record second tool: $final", final.text.contains("[tool:workspace.symbols"))
             assertFalse("must never emit tool-result: $final", final.text.contains("[tool-result:"))
             assertFalse("store must have no tool-result markers", events.any { it.text.contains("[tool-result:") })
+        }
+    }
+
+    @Test
+    fun productionCompositionNeverUpgradesAskToAllowForToolExec() = runBlocking {
+        val app = ApplicationProvider.getApplicationContext<Application>()
+        val opened = LibrePocketDb.openInMemory(app)
+        db = opened
+        val store: SessionStore = RoomSessionStore(opened) { 1_700_000_000_000L }
+        // ASK is the fail-closed default for tool.exec; production must never
+        // turn it into an implicit ALLOW by attaching a slice or evaluating it.
+        val inner = allowKeyReadPolicy()
+        val askRule = PolicyRule("tool.exec:lsp.symbols", Verdict.ASK, 20)
+        inner.setRule(askRule)
+        // Prove the fixture selects this explicit ASK rule for the exact
+        // tool before installing the observation wrapper and starting the turn.
+        val decision = inner.evaluateFresh("tool.exec", "lsp.symbols")
+        assertEquals(Verdict.ASK, decision.verdict)
+        assertEquals(askRule, decision.matchedRule)
+        val policy = CountingToolExecPolicy(inner)
+        val requests = AtomicInteger(0)
+        val capturedRequest = AtomicReference<ChatRequest?>()
+        val provider = ScriptedProvider { request ->
+            requests.incrementAndGet()
+            capturedRequest.set(request)
+            flow {
+                emit(StreamEvent.ToolDone(0, "call-ask-1", "lsp.symbols", """{"query":"Foo"}"""))
+                emit(StreamEvent.Done("tool_calls"))
+            }
+        }
+
+        val factory = ChatViewModelFactory(
+            app = app,
+            policy = policy,
+            vaultSource = VaultSource {
+                EncryptedPrefsVault(InMemoryPrefs()).apply {
+                    putKey("preset:openai", "test-key-12345678".toCharArray())
+                }
+            },
+            sessionStores = object : SessionStoreSource {
+                override suspend fun store() = store
+            },
+            buildProvider = { _, _ -> provider },
+        )
+        assertNull("production composition toolSlice must be null", factory.sessions.toolSlice)
+
+        val created = factory.sessions.create(
+            endpoint = testEndpoint(),
+            title = "ASK 不升級測試",
+            allowAsk = false,
+            keyIsCurrent = { true },
+        )
+        withSessionCleanup(created.session) {
+            created.session.send("查符號 Foo")
+            assertTrue(created.session.flushDurable(8_000))
+
+            assertEquals("ASK must never continue the turn", 1, requests.get())
+            assertEquals("ASK must never be evaluated as an execution basis", 0, policy.toolExecFreshCalls.get())
+            assertEquals("ASK must never be previewed as an execution basis", 0, policy.toolExecCalls.get())
+            val req = checkNotNull(capturedRequest.get()) { "capturedRequest must not be null" }
+            assertTrue("ASK must never make a tool model-visible", req.tools.isEmpty())
+
+            val events = store.loadEvents(created.sessionId!!, 0, 2000)
+            val finals = events.filter { it.kind == "assistant" && it.isFinal }
+            assertEquals("exactly one durable assistant result", 1, finals.size)
+            assertTrue(
+                "final assistant row must record ToolDone",
+                finals.single().text.contains("[tool:lsp.symbols"),
+            )
+            assertFalse("ASK must never produce a tool result", events.any { it.text.contains("[tool-result:") })
         }
     }
 }

@@ -22,6 +22,8 @@
 
 ## Current：可確認的邊界
 
+> **2026-11-26/27 Health-check wave（歷史分支快照）**：以 `main@c5d61a61` 為比較基底。就本波涉及的工具／外部能力，此基底沒有生產接線或裝置驗證證據；部分 JVM 驗證只在各分支。`FastDispatcher` 在該基底為 `internal` 且無 production caller，production composition 的 `toolSlice` 為 `null`；#200 的四態矩陣仍須按實際受測 SHA 判讀。既有基礎設施列不受此快照影響。詳見 [Architecture](ARCHITECTURE.md) 的歷史分支索引與 [Testing](TESTING.md) 的驗收說明。
+
 | 項目 | Current evidence | 不可推論為 |
 |---|---|---|
 | Chat provider adapters | `Chat Completions`, `Responses`, `Anthropic Messages` adapter 與 factory 存在；`ChatViewModel.restoreOpForFailedSend` 確立 notice-last 不變量並消除跨分支發送競態；`SafeToolSlice` 於預算超限（budget-exceeded）時正規化收據 wire ID；Structured Outputs 與 Refusal streaming 支援狀況詳見「Provider / Chat Adapters 支援矩陣」 | 對每個相容宣稱的 endpoint 均已互通或認證；不可推論為 Structured Outputs 已接線至 UI/ViewModel 或已有裝置端驗證 |

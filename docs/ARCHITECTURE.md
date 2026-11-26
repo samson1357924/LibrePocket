@@ -76,6 +76,34 @@ These are engineering requirements, not claims that the whole Target is complete
 
 No proposal in this section is an Accepted ADR. Decision records should be added only when maintainers actually accept a cross-layer decision.
 
+## 2026-11-26/27 Health-check wave（歷史分支快照）
+
+> **歷史快照（2026-11-26 UTC；檢視基底 `main@c5d61a61`）。** 記錄 #185–#201 當時的審查波次，不追蹤即時 PR 狀態，也不表示分支變更已合併或可上線。各 PR 的 JVM／Python／裝置結果僅適用於各自受測的 commit。#177 已因 charset 環境問題結案；#188 為診斷分支。另有時序測試問題，由 #176 追蹤。請至對應 PR／issue 確認現況。
+
+| Issue | 分支／PR | 本波主題（僅分支證據） |
+|---|---|---|
+| #21 / #134 | `docs/rebaseline-current-contracts`／PR #185 | 薄索引與總索引的 Current 重新基準到 `main@c5d61a61` |
+| #175 | `fix/175-locale-root-pin`／PR #186 | 生產端 hex／escape 格式 pin 到 `Locale.ROOT` |
+| #176 | `fix/176-deterministic-scaling`／PR #187 | deterministic work counter 取代 wall-clock 比值、信號導向 barrier 取代固定 sleep |
+| #177 | `triage/177-repro`／PR #188 | charset 環境診斷（含中文檔名）；issue 已 CLOSED（環境性，非產品邏輯修復） |
+| #179 | `fix/179-fastlane-residual-convergence`／PR #189 | fast-lane 殘餘行為 pin 與 escaper parity |
+| #174 | `fix/174-fastrouter-negation-residuals`／PR #190 | fast-lane 否定殘餘收斂，per-run confusable gate |
+| #178 | `fix/178-fastlane-wiring-gates`／PR #191 | fast-lane fail-closed 接線前置閘 |
+| #20 / #132 | `fix/20-132-supplychain-hygiene`／PR #192 | clean-cache 負向控制與 supply-chain 殘餘範圍文件化 |
+| #135 | `fix/135-a5-egress-optin`／PR #193 | A5 deny-all opt-in store 與 foss/github LAN NSC overlay |
+| #12 | `fix/12-release-publish-gate`／PR #194 | unsigned-as-signed 控制與 signer-pin fail-closed gate |
+| #16 | `fix/16-b3-device-benchmark`／PR #195 | 可重現 B3 benchmark；POCO C65（API 33）diagnostic 量測，門檻 `NOT_ESTABLISHED` |
+| #18 | `fix/18-production-boundary-contracts`／PR #196 | production cancel／policy fail-closed 邊界契約（JVM）與 bounded 裝置 cancel contract source |
+| #137 | `fix/137-assistant-contracts`／PR #197 | C1/C2 flavor 與 prefill contract pins |
+| #138 | `fix/138-d3-web-wiring`／PR #198 | D3 pinned-DNS transport seam 與 gate fixtures |
+| #136 | `fix/136-b4-read-tool-contracts`／PR #199 | B4 首個 READ 工具 prewiring contracts（github root） |
+| #19 | `fix/19-b4-capability-matrix`／PR #200 | 逐工具四態矩陣與 production records-only contract pin |
+| #21 / #134 | `docs/final-index-reconciliation`／PR #201 | 本索引 PR：同步本波分支現況與證據邊界（自身亦為分支證據） |
+
+- 建議於本波其他變更整合後收錄本索引。分支通過不等於 `main` 驗收；合併後須在對應的 `main` SHA 重跑並保存報告。此歷史索引不會隨後續合併改寫成即時狀態。
+- POCO C65 的量測僅為 diagnostic：無數值 gate、token window `TARGET_NOT_IMPLEMENTED`、門檻 `NOT_ESTABLISHED`，不構成 #16 B3 acceptance。
+- `FastDispatcher` 維持 `internal`、零 production caller；production composition 維持 `toolSlice=null`（`ProductionChatCompositionTest` 釘死）。詳見 [Capability matrix](CAPABILITY_MATRIX.md) 的 Current 小節與下方內建工具啟用前置清單。
+
 ## Related documents
 
 - [Capability matrix](CAPABILITY_MATRIX.md) — current status versus declared/scaffolded capability.

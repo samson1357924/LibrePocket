@@ -7,6 +7,8 @@
 - **Source of truth:** `.github/workflows/pr-check.yml`, `.github/workflows/codeql.yml`, `.github/workflows/security-audit.yml`, `.github/workflows/osv-scan.yml`, `scripts/verify_jdk_floor.sh`, `scripts/docs_claim_check.sh`, `scripts/test_docs_claim_check.sh`, `scripts/mcp_scan.py`, `scripts/requirements-docs.txt`, `scripts/apk_policy_inspect.py`, `scripts/play_policy_check.sh`, `scripts/backup_rules_check.py`, `scripts/summarize_junit.py`, `scripts/check_workflow_policy.py`, `scripts/check_python_shadowing.sh`, `scripts/osv_scan.py`, `scripts/verify_verification_metadata.py`, `scripts/tests/test_apk_policy_check.py`, `scripts/tests/test_summarize_junit.py`, `scripts/tests/test_workflow_policy.py`, `scripts/tests/test_gradle_wrapper_checksum.py`, `scripts/tests/test_verify_jdk_floor.py`, `scripts/tests/test_osv_scan.py`, `scripts/tests/test_verification_metadata.py`, `github_bot/.nvmrc`, test source sets, Gradle wrapper/catalog/verification-metadata, and the command results from the exact commit being assessed.
 - **Update trigger:** CI, test source-set, Android SDK/JDK, policy-script, or merge-gate changes. Dependency version changes, `verification-metadata.xml` regeneration, and OSV monitor scope changes additionally trigger a review of the supply-chain Local commands below.
 
+> **2026-11-26/27 Health-check wave 證據邊界：**以 `main@c5d61a61` 為比較基底的 PR #185–#200，其 JVM／device／Python 結果只適用於各自受測的 commit，**不是 main gate**。合併後須對對應的 `main` SHA 重跑並保存報告。索引見 [Architecture](ARCHITECTURE.md) 的歷史分支快照。
+
 ## Current CI scope
 
 `pr-check.yml` triggers on pull requests targeting `main` and pushes to `main`

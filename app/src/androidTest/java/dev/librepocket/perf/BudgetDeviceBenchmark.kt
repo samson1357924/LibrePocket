@@ -149,6 +149,36 @@ class BudgetDeviceBenchmark {
     return tag + "x".repeat(CHARS_PER_ROW - tag.length)
   }
 
+  private data class HydrationWindow(val keptRows: Int, val keptChars: Long, val joinedLength: Long)
+
+  private fun hydrationWindow(
+    newestFirst: Iterable<String>,
+    rowCap: Int,
+    charCap: Int,
+  ): HydrationWindow {
+    val builder = StringBuilder()
+    var keptRows = 0
+    var keptChars = 0L
+    for (text in newestFirst) {
+      val separator = if (keptRows == 0) 0L else 1L
+      if (keptRows >= rowCap || builder.length.toLong() + separator + text.length > charCap.toLong()) {
+        break
+      }
+      if (keptRows > 0) builder.append('\n')
+      builder.append(text)
+      keptChars += text.length.toLong()
+      keptRows++
+    }
+    return HydrationWindow(keptRows, keptChars, builder.length.toLong())
+  }
+
+  @Test fun hydrationWindowCountsAllSeparatorsAtTheBoundary() {
+    val rows = listOf("fg", "de", "abc")
+    // 2 + 2 + 3 text chars fit in 8, but two separators make 9.
+    assertEquals(HydrationWindow(2, 4L, 5L), hydrationWindow(rows, rowCap = 3, charCap = 8))
+    assertEquals(HydrationWindow(3, 7L, 9L), hydrationWindow(rows, rowCap = 3, charCap = 9))
+  }
+
   @Test(timeout = 120_000)
   fun measureCreateResumeHydration() {
     val context: Context = ApplicationProvider.getApplicationContext()
@@ -216,7 +246,7 @@ class BudgetDeviceBenchmark {
       }
       // GATE: fixed input is reproduced exactly, never a timing/heap number.
       assertEquals(ROWS, events.size)
-      assertEquals((ROWS * CHARS_PER_ROW).toLong(), events.sumOf { it.text.length.toLong() })
+      assertEquals((0 until ROWS).map(::syntheticRow), events.map { it.text })
       phases.put(phaseJson("resume", startHeap, endHeap, elapsedNs, frames, JSONObject()))
 
       // ---- hydration: local 200/60k window + join (NOT a tokenizer) ----
@@ -224,38 +254,32 @@ class BudgetDeviceBenchmark {
       startHeap = snapshotHeap(context)
       endHeap = startHeap
       elapsedNs = 0L
-      var keptRows = 0
-      var keptChars = 0L // sum of row text lengths, separators excluded
-      var joinedLength = 0L
+      var window: HydrationWindow? = null
       startFrameSampling()
       try {
         val startNs = System.nanoTime()
-        val builder = StringBuilder()
-        for (event in events.asReversed()) { // newest first, drop oldest
-          val separator = if (keptRows == 0) 0L else 1L
-          val nextWithSeparators = keptChars + separator + event.text.length.toLong()
-          if (keptRows >= WINDOW_ROWS || nextWithSeparators > WINDOW_CHARS.toLong()) break
-          if (builder.isNotEmpty()) builder.append('\n')
-          builder.append(event.text)
-          keptChars += event.text.length.toLong()
-          keptRows++
-        }
-        joinedLength = builder.length.toLong()
+        window = hydrationWindow(
+          events.asReversed().asSequence().map { it.text }.asIterable(),
+          rowCap = WINDOW_ROWS,
+          charCap = WINDOW_CHARS,
+        )
         elapsedNs = System.nanoTime() - startNs
         SystemClock.sleep(FRAME_WINDOW_MS)
         endHeap = snapshotHeap(context)
       } finally {
         frames = finishFrameSampling()
       }
+      val (keptRows, keptChars, joinedLength) = requireNotNull(window)
       val structural = JSONObject().apply {
         put("keptRows", keptRows)
         put("keptChars", keptChars)
         put("joinedLength", joinedLength)
       }
-      // GATE: the local window obeys the honest char-based DEFAULT bounds.
-      assertTrue("window must keep at least one row", keptRows > 0)
-      assertTrue("window rows must be bounded", keptRows <= WINDOW_ROWS)
-      assertTrue("window chars must be bounded", keptChars <= WINDOW_CHARS.toLong())
+      // GATE: the joined char cap includes every separator.
+      val expectedRows = minOf(ROWS, WINDOW_ROWS, (WINDOW_CHARS + 1) / (CHARS_PER_ROW + 1))
+      assertEquals("window must keep the maximum fixed-row prefix that fits", expectedRows, keptRows)
+      assertEquals(keptRows.toLong() * CHARS_PER_ROW, keptChars)
+      assertTrue("joined window chars must be bounded", joinedLength <= WINDOW_CHARS.toLong())
       assertEquals(keptChars + (keptRows - 1).toLong(), joinedLength)
       phases.put(phaseJson("hydration", startHeap, endHeap, elapsedNs, frames, structural))
 

@@ -300,6 +300,22 @@ sys.exit({exit_code})
 
         self.assert_rejected(self.run_verifier(), "exactly one APK")
 
+    def test_signed_named_unsigned_candidate_is_rejected(self) -> None:
+        # Issue #12 negative control: a lone "*signed.apk" filename carries no
+        # signing authority. The fake apksigner reports an unsigned/tampered
+        # APK, so the gate must reject it even though the filename claims a
+        # signed artifact; the staged bytes are still the verification subject.
+        self.add_apk("app-signed.apk")
+        self._write_apksigner(output="synthetic unsigned APK: no verified signature scheme\n", exit_code=1)
+
+        result = self.run_verifier()
+
+        self.assert_rejected(result, "exited with status 1")
+        invocations = self.tool_log.read_text().splitlines()
+        self.assertEqual(len(invocations), 1, invocations)
+        self.assertIn("apksigner verify --verbose --print-certs -Werr", invocations[0])
+        self.assertIn(str(self.stage / "release.apk"), invocations[0])
+
     def test_aab_only_is_rejected_without_fallback(self) -> None:
         (self.candidates / "app-release.aab").write_bytes(b"synthetic bundle")
 

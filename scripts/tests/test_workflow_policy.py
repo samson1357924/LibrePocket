@@ -1861,7 +1861,15 @@ jobs:
         self._assert_rejected("policy filter is missing: .github/workflows/**")
 
     def test_policy_filter_requires_signer_pins_paths(self) -> None:
-        for pattern in ("*signer_pins*", "**/*signer_pins*"):
+        # Review G2: the unconditional committed-pins tripwire accepts both
+        # spellings, so the policy filter must pin both as well. Removing
+        # either layer must fail the workflow policy gate.
+        for pattern in (
+            "*signer_pins*",
+            "**/*signer_pins*",
+            "*signer-pins*",
+            "**/*signer-pins*",
+        ):
             with self.subTest(pattern=pattern):
                 self._reset_workflows()
                 self._write(

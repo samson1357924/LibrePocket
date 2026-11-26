@@ -1,5 +1,23 @@
 name: Release & Distribution (disabled)
 
+# Intentionally fail-closed (Refs #12 only; issue stays open). This is the correct
+# state, not a broken publisher: public distribution stays disabled until a
+# release maintainer completes and records every preflight gate below.
+#   1. Approve per-flavor signer fingerprints (play/foss/github) OUTSIDE the
+#      repo; never commit real pins or fabricate fingerprints.
+#   2. Configure real per-flavor signing secrets in the release environment;
+#      never store keystores, passwords, or tokens in this repo or its logs.
+#   3. Run a REAL signed rehearsal via scripts/build_release.sh --apk with
+#      --tag/--pins, four expected identity values per flavor, final-byte
+#      apksigner/aapt verification, and Play/Foss/Github policy scans.
+#   4. Reproduce the same source SHA with the recorded toolchain and confirm
+#      identical verified artifact identity/checksums for every flavor.
+#   5. Device fresh-install and upgrade smoke for each intended flavor.
+#   6. Generate checksums/SBOM from the exact verified distribution bytes and
+#      recheck them against what is published.
+# These comments document prerequisites only; they do not publish, grant any
+# write permission, or change the single-job exit-1 result below.
+
 on:
   push:
     tags:

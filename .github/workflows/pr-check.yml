@@ -109,9 +109,11 @@ jobs:
               # be able to bypass the gates it edits.
               - '.github/workflows/**'
               - '.github/actions/**'
-              # Signer-pins-shaped basenames flip policy=true (defense-in-depth; enforcement is the workflow-guard tripwire above, unconditional). Marker-named directories do not match these globs; gitignore does not cover them either — the tripwire does.
+              # Signer-pins-shaped basenames flip policy=true (defense-in-depth; enforcement is the workflow-guard tripwire above, unconditional). Both spellings match the tripwire's case-insensitive marker set; these globs stay case-sensitive, so the unconditional tripwire is the authority for case variants. Marker-named directories do not match these globs; gitignore does not cover them either — the tripwire does.
               - '*signer_pins*'
               - '**/*signer_pins*'
+              - '*signer-pins*'
+              - '**/*signer-pins*'
               # Trailing catch-all: the explicit entries above exist for
               # readability/history; this glob defaults new scripts/ harness
               # code (any new checker or script test) into the policy gate

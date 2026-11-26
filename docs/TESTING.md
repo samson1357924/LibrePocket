@@ -47,8 +47,8 @@ with `dorny/paths-filter` into `code` (`app/src/**`,
 `.github/workflows/pr-check.yml`, `.github/workflows/codeql.yml`,
 `.github/workflows/nightly-instrumented.yml`, `.github/workflows/**`,
 `.github/actions/**`,
-`*signer_pins*`, `**/*signer_pins*`, and
-`scripts/**`) outputs. There is no separate `workflow` filter or output:
+`*signer_pins*`, `**/*signer_pins*`, `*signer-pins*`,
+`**/*signer-pins*`, and `scripts/**`) outputs. There is no separate `workflow` filter or output:
 workflow and composite-action edits are policy inputs. The `policy` list
 includes workflow, action, signer-pins, and script catch-alls:
 the explicit entries above mirror the filter in `pr-check.yml`,

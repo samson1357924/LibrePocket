@@ -92,7 +92,7 @@ ALLOWED_WORKFLOW_FILES = frozenset(
 # same reviewed PR as any intentional workflow edit; never in a separate
 # "make CI green" change. This pin is a regression guard, not tamper-proof.
 EXPECTED_WORKFLOW_SHA256 = {
-    "codeql.yml": "b58e40a235a3ea0580d12e902f61ab04e0331cdbaeffdc1e72332055d722c638",
+    "codeql.yml": "706db7c21a67f4fed9c772a3d83c0eae8793d230664f97d3aebe9f111838430c",
     "nightly-instrumented.yml": (
         "a271008743bc51293847d687261f3a30f3fff15af485dd9c764a35be7c5d9b67"
     ),
@@ -2918,12 +2918,19 @@ def check_codeql(path: str, data: dict[Any, Any]) -> list[Finding]:
         findings.append(Finding(path, 1, "codeql.yml is missing the codeql job"))
         return findings
     findings.extend(_check_no_job_or_step_conditions(path, "codeql", job))
+    pins: list[str] = []
     for label, pattern in (
         ("codeql init", CODEQL_INIT_ACTION_RE),
         ("codeql analyze", CODEQL_ANALYZE_ACTION_RE),
     ):
-        action_findings, _step = _require_action_step(path, label, job, pattern)
+        action_findings, step = _require_action_step(path, label, job, pattern)
         findings.extend(action_findings)
+        if step is not None:
+            pins.append(step["uses"].rsplit("@", 1)[1])
+    if len(pins) == 2 and pins[0] != pins[1]:
+        findings.append(
+            Finding(path, 1, "codeql init and analyze must use the same commit SHA")
+        )
     return findings
 
 

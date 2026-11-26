@@ -24,7 +24,7 @@ WORKFLOWS = {
 # Review every workflow change, including new files and indirect invocations.
 # This is a change-detection convention, not a shell/action call-graph analysis.
 WORKFLOW_SNAPSHOTS = {
-    "codeql.yml": "b58e40a235a3ea0580d12e902f61ab04e0331cdbaeffdc1e72332055d722c638",
+    "codeql.yml": "706db7c21a67f4fed9c772a3d83c0eae8793d230664f97d3aebe9f111838430c",
     "nightly-instrumented.yml": "a271008743bc51293847d687261f3a30f3fff15af485dd9c764a35be7c5d9b67",
     "pocketguard.yml": "f8db04a315da8c71b91ab5cb6f6ed575db705b0c1071767d48c775bd47bd0564",
     "pr-check.yml": "8d066d6c1722696e50400cd6253180ba22dcdbba662e48402d700fc38f35aff4",

@@ -312,17 +312,11 @@ internal fun joinEndpoint(base: String, suffixPath: String): String {
 }
 
 /**
- * Escaper triplet cross-ref (asymmetry recorded — one reviewer-visible note,
- * not a behavior change): the repo carries THREE JSON string escapers —
- * dev.librepocket.mcp.McpWire.esc, dev.librepocket.router.FastRouter.esc and
- * this one — each holding its own "control-char rule changes must be made in
- * BOTH or a shared helper extracted" cross-ref with its single partner. The
- * triplet is actually asymmetric twice over: only McpWire.esc escapes lone
- * surrogates losslessly as \uXXXX; FastRouter.esc and this escaper let a lone
- * surrogate ride the raw string (mojibake-only: degraded to U+FFFD at the
- * UTF-8 encode below). Unifying the three into ONE shared helper is the
- * recorded follow-up; until then keep these three postures in lockstep by
- * cross-ref, never by silent divergence.
+ * JSON string escaper for provider payloads. Keep the common escaping rules
+ * aligned with McpWire.esc, FastRouter.esc and JevWire.jsonEscape (covered by
+ * SymbolReceiptParityTest). FastRouter and MCP escape unpaired surrogates;
+ * this helper and JEV preserve those code units in the returned String.
+ * This is an existing distinction, not a guarantee of lossless UTF-8 output.
  */
 internal fun jsonEscape(raw: String): String {
     val sb = StringBuilder(raw.length + 2)

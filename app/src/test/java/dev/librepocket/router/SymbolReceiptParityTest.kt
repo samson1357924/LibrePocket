@@ -5,6 +5,7 @@ import dev.librepocket.mcp.McpWire
 import dev.librepocket.policy.InMemoryPolicyStore
 import dev.librepocket.policy.PolicyRule
 import dev.librepocket.policy.Verdict
+import dev.librepocket.provider.jsonEscape as providerJsonEscape
 import dev.librepocket.provider.ToolCall as ProviderToolCall
 import dev.librepocket.tool.LspTools
 import dev.librepocket.tool.ProjectionContext
@@ -591,9 +592,9 @@ class SymbolReceiptParityTest {
     }
 
     // --------------------------------------- esc() cross-module parity (#179)
-    // FastRouter.esc（private companion）／McpWire.esc／JevWire.jsonEscape
-    // 仍是三份手抄 encoder。下表對「共同語意」做 byte-level 交叉比對，且對
-    // 明確 expected 值比對（避免三者一起漂移還通過）；既有語意差異
+    // FastRouter.esc（private companion）／McpWire.esc／JevWire.jsonEscape／
+    // provider.jsonEscape 仍是四份 encoder。下表對「共同語意」做字元序列比對，且對
+    // 明確 expected 值比對（避免四者一起漂移還通過）；既有語意差異
     //（孤立 surrogate）另以 [escLoneSurrogateDivergenceIsPinnedNotForced] pin 住，
     // 不在本修復中強行改寫 production 編碼行為。
 
@@ -655,6 +656,7 @@ class SymbolReceiptParityTest {
             assertEquals(label, expected, fastRouterEsc(raw))
             assertEquals(label, expected, McpWire.esc(raw))
             assertEquals(label, expected, JevWire.jsonEscape(raw))
+            assertEquals(label, expected, providerJsonEscape(raw))
         }
     }
 
@@ -662,7 +664,7 @@ class SymbolReceiptParityTest {
         // 既有語意差異（刻意不收斂）：FastRouter.esc／McpWire.esc 把無伴
         // surrogate 轉為小寫 \uXXXX（OkHttp/okio 的 UTF-8 encode 會把孤立
         // surrogate 靜默換成 `?`，故上線值必須與解析值一致）；JevWire.jsonEscape
-        // 只處理 C0，孤立 surrogate 原樣輸出。成對者三者皆原樣通過。
+        // 和 provider.jsonEscape 都保留孤立 surrogate。成對者四者皆原樣通過。
         // Kotlin 詞法階段不支援孤立 surrogate 的 `\uXXXX` literal，改以 Char 建構；
         // `U` 用字元拼接出字面 `\u`，避免 formatter pattern 被當成 unicode escape。
         val hi = Char(0xD800).toString()
@@ -682,10 +684,7 @@ class SymbolReceiptParityTest {
             assertEquals("FastRouter lone surrogate", expected, fastRouterEsc(raw))
             assertEquals("McpWire lone surrogate", expected, McpWire.esc(raw))
             assertEquals("JevWire keeps raw lone surrogate", raw, JevWire.jsonEscape(raw))
+            assertEquals("Provider keeps raw lone surrogate", raw, providerJsonEscape(raw))
         }
-        val mixed = pair + hi // 有效 pair + 尾端孤立 high
-        assertEquals(pair + U + "d800", fastRouterEsc(mixed))
-        assertEquals(pair + U + "d800", McpWire.esc(mixed))
-        assertEquals(mixed, JevWire.jsonEscape(mixed))
     }
 }

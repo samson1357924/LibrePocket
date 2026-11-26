@@ -327,7 +327,21 @@ class BudgetDeviceBenchmark {
     val out = File(dir, "budget-device-benchmark.json")
     out.writeText(report.toString(2))
     println("BudgetDeviceBenchmark: wrote ${out.absolutePath} (gitSha=$gitSha)")
-    println(report.toString())
+    // Device logs cap the size of a single entry. Emit metadata and one
+    // tagged phase per line as a fallback if the test package is uninstalled
+    // before the complete file can be retrieved.
+    val metadata = JSONObject(report.toString()).apply { remove("replicates") }
+    println("BudgetDeviceBenchmark META $metadata")
+    for (index in 0 until replicates.length()) {
+      val phases = replicates.getJSONObject(index).getJSONArray("phases")
+      for (phaseIndex in 0 until phases.length()) {
+        val entry = JSONObject().apply {
+          put("replicate", index)
+          put("phase", phases.getJSONObject(phaseIndex))
+        }
+        println("BudgetDeviceBenchmark PHASE $entry")
+      }
+    }
     assertTrue("report must be readable back", JSONObject(out.readText()).getJSONArray("replicates").length() == REPLICATES)
   }
 

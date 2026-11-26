@@ -367,7 +367,7 @@ class McpEnvelopeTest {
             )
             assertEquals(
                 "預算剩 6 = 6：完整轉義收錄（$c）",
-                "a".repeat(194) + "\\u%04x".format(c[0].code),
+                "a".repeat(194) + "\\u%04x".format(java.util.Locale.ROOT, c[0].code),
                 McpWire.escapeControlUnits("a".repeat(194) + c, 200),
             )
         }

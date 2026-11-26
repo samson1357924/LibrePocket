@@ -85,7 +85,7 @@ class BackupRoundTripTest {
         })
         val digest = java.security.MessageDigest.getInstance("SHA-256")
             .digest(strippedPayload.toString().toByteArray(Charsets.UTF_8))
-            .joinToString("") { "%02x".format(it) }
+            .joinToString("") { "%02x".format(java.util.Locale.ROOT, it) }
         val stripped = buildJsonObject {
             put("payload", strippedPayload)
             put("integrity", digest)

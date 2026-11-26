@@ -30,8 +30,6 @@ import org.junit.Test
 class LocaleRootHexRegressionTest {
 
     companion object {
-        private val BASELINE_DEFAULT_LOCALE: Locale = Locale.getDefault()
-
         // 用組字而非直接寫 "\\u0001"：避免 `\u` 在詞法階段被當成 Unicode escape 展開。
         private val U = '\\'.toString() + "u"
 
@@ -67,14 +65,21 @@ class LocaleRootHexRegressionTest {
     }
 
     private lateinit var savedLocale: Locale
+    private lateinit var savedDisplayLocale: Locale
+    private lateinit var savedFormatLocale: Locale
 
     @Before fun saveDefaultLocale() {
         savedLocale = Locale.getDefault()
+        savedDisplayLocale = Locale.getDefault(Locale.Category.DISPLAY)
+        savedFormatLocale = Locale.getDefault(Locale.Category.FORMAT)
     }
 
     /** 每個測試後還原，避免 default locale 外洩成跨測試 flake。 */
     @After fun restoreDefaultLocale() {
+        // Setting the general default also overwrites both category defaults.
         Locale.setDefault(savedLocale)
+        Locale.setDefault(Locale.Category.DISPLAY, savedDisplayLocale)
+        Locale.setDefault(Locale.Category.FORMAT, savedFormatLocale)
     }
 
     private fun assertAscii(label: String, value: String) {
@@ -203,9 +208,19 @@ class LocaleRootHexRegressionTest {
      */
     @Test fun afterHookRestoresDefaultLocale() {
         val hook = javaClass.declaredMethods.single { it.isAnnotationPresent(After::class.java) }
-        Locale.setDefault(Locale.forLanguageTag("fa"))
-        assertEquals(Locale.forLanguageTag("fa"), Locale.getDefault())
-        hook.invoke(this)
-        assertEquals(BASELINE_DEFAULT_LOCALE, Locale.getDefault())
+        val general = Locale.forLanguageTag("tr")
+        val display = Locale.forLanguageTag("ar")
+        val format = Locale.forLanguageTag("fa")
+        Locale.setDefault(general)
+        Locale.setDefault(Locale.Category.DISPLAY, display)
+        Locale.setDefault(Locale.Category.FORMAT, format)
+        // Keep this test's own @Before snapshot intact for the real teardown.
+        val probe = LocaleRootHexRegressionTest()
+        probe.saveDefaultLocale()
+        Locale.setDefault(Locale.ROOT)
+        hook.invoke(probe)
+        assertEquals(general, Locale.getDefault())
+        assertEquals(display, Locale.getDefault(Locale.Category.DISPLAY))
+        assertEquals(format, Locale.getDefault(Locale.Category.FORMAT))
     }
 }

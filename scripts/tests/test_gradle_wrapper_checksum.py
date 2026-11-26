@@ -139,6 +139,43 @@ class GradleWrapperChecksumTest(unittest.TestCase):
                     self.assertNotEqual(result.returncode, 0)
                     self.assertIn(name, result.stderr)
 
+    def test_distribution_checksum_byte_tamper_negative_control(self):
+        """Byte-level red/green control for the documented clean-cache procedure.
+
+        Uses a tmp-dir copy of the wrapper metadata: flipping one hex digit of
+        distributionSha256Sum makes the reviewed-byte checker fail explicitly,
+        and restoring the exact original bytes turns it green again. This pins
+        the checker's fail-closed reaction to tampered distribution bytes; it
+        never touches a real Gradle cache/distribution and does NOT run Gradle
+        or prove a clean-cache build failed (see docs/TESTING.md maintainer-run
+        procedure; the real Gradle failure log remains Proposed).
+        """
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            self.copy_wrapper(root)
+            props = root / FILES[-1]
+            original = props.read_bytes()
+            self.assertEqual(self.run_checker(root).returncode, 0)
+
+            key = b"distributionSha256Sum="
+            prefix, sep, digest_and_tail = original.partition(key)
+            self.assertTrue(sep)
+            digest, newline, tail = digest_and_tail.partition(b"\n")
+            self.assertEqual(len(digest), 64)
+            self.assertTrue(newline)
+            flipped = (b"0" if digest[:1] != b"0" else b"1") + digest[1:]
+            self.assertNotEqual(flipped, digest)
+            props.write_bytes(prefix + key + flipped + newline + tail)
+
+            failed = self.run_checker(root)
+            self.assertEqual(failed.returncode, 1)
+            self.assertIn("SHA-256 mismatch", failed.stderr)
+            self.assertIn(FILES[-1], failed.stderr)
+
+            props.write_bytes(original)
+            self.assertEqual(props.read_bytes(), original)
+            self.assertEqual(self.run_checker(root).returncode, 0)
+
     def test_symlink_and_nonregular_pinned_files_fail(self):
         for name in FILES:
             for mutation in ("symlink", "directory", "fifo"):

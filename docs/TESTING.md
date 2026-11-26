@@ -1048,6 +1048,90 @@ JSON, so the harness runs them on helper-only diffs. The synthetic fixtures
 prove the gate's fail-closed matrix only; they are not real-APK/SDK evidence,
 not a signing/build rehearsal, and not a basis for closing Issue #12.
 
+### Clean-cache negative control (maintainer-run; static proxies pinned)
+
+**Current (offline proxies):** `scripts/tests/test_verification_metadata.py`
+pins a tmp-dir synthetic-metadata tamper case (reviewed metadata green → tampered
+`<sha256>` shape rejected with exit 2 → exact restore green), and
+`scripts/tests/test_gradle_wrapper_checksum.py` pins a byte-level case (tmp-dir
+copy of the wrapper properties with one flipped `distributionSha256Sum` hex
+digit → checker exit 1 and `SHA-256 mismatch` → exact restore exit 0). Both are
+in the wired `policy-harness` command above. **Proposed (not evidenced here):**
+the real Gradle clean-cache runtime failure log. No Gradle build, cache
+deletion, or distribution download was run for this documentation change; the
+static proxies are not proof that a clean-cache Gradle build failed.
+
+**Gradle wrapper cache limitation (why a fresh cache is mandatory):** the
+Wrapper verifies `distributionSha256Sum` only when the configured distribution
+has not been downloaded yet, and later invocations reuse the existing local
+distribution as long as the distribution URL is unchanged. Reusing the cache
+from step 1 for step 2a therefore **silently passes** — changing the checksum
+alone does not re-trigger verification. Official source: Gradle 9.8.2 Wrapper
+Reference, "Verification of Downloaded Gradle Distributions"
+(https://docs.gradle.org/9.8.2/userguide/gradle_wrapper.html#sec:verification)
+and "Using the Gradle Wrapper" (distribution-reuse statement on the same page).
+Each tamper below therefore uses a **brand-new** `GRADLE_USER_HOME`. An
+equivalent alternative is deleting
+`$GRADLE_USER_HOME/wrapper/dists/gradle-9.8.2-bin/<url-hash>/` so the Wrapper
+re-downloads and re-verifies the distribution.
+
+Maintainer-run reproduction — work only in a throwaway copy of the exact
+commit under test; never delete or reuse the machine's real Gradle cache:
+
+```sh
+# Export only the tracked inputs at the exact commit, not local edits,
+# ignored build outputs, or local credential/configuration files.
+COMMIT_UNDER_TEST="$(git rev-parse --verify HEAD)"
+SCRATCH="$(mktemp -d)"
+git worktree add --detach "$SCRATCH/repo" "$COMMIT_UNDER_TEST"
+cd "$SCRATCH/repo"
+git status --short        # must be empty
+
+# 1. Green baseline with its own fresh cache (distribution + artifacts downloaded).
+export GRADLE_USER_HOME="$SCRATCH/gradle-home-baseline"
+mkdir -p "$GRADLE_USER_HOME"
+python3 -P scripts/verify_gradle_wrapper.py --root "$SCRATCH/repo"
+./gradlew --no-daemon --max-workers=1 :app:assemblePlayDebug
+
+# 2a. Distribution-byte tamper on a NEW cache (forces a fresh download/check):
+#     flip ONE hex digit of distributionSha256Sum in
+#     gradle/wrapper/gradle-wrapper.properties here, then:
+export GRADLE_USER_HOME="$SCRATCH/gradle-home-tamper-a"
+mkdir -p "$GRADLE_USER_HOME"
+python3 -P scripts/verify_gradle_wrapper.py --root "$SCRATCH/repo"  # expect exit 1 + SHA-256 mismatch (STATIC byte red only)
+./gradlew --no-daemon --max-workers=1 :app:assemblePlayDebug        # expect Gradle red (the clean-cache runtime evidence)
+git restore --source=HEAD -- gradle/wrapper/gradle-wrapper.properties
+# Confirm green again with a NEW GRADLE_USER_HOME; the mismatched download
+# must not be the source of either the restored or the next negative run.
+
+# 2b. Artifact-byte tamper on ANOTHER NEW cache:
+#     flip ONE hex digit of a <sha256 value="..."> in
+#     gradle/verification-metadata.xml for a component actually resolved by the
+#     chosen task (an unresolved component proves nothing), then:
+export GRADLE_USER_HOME="$SCRATCH/gradle-home-tamper-b"
+mkdir -p "$GRADLE_USER_HOME"
+./gradlew --no-daemon --max-workers=1 :app:assemblePlayDebug  # expect `Dependency verification failed ... checksum mismatch`
+git restore --source=HEAD -- gradle/verification-metadata.xml
+# Confirm green again with a NEW GRADLE_USER_HOME.
+# After recording the logs, leave this directory and remove only the throwaway
+# worktree from the original checkout with git worktree remove "$SCRATCH/repo".
+```
+
+The wrapper checker red in 2a is a **static byte-level** control:
+`scripts/verify_gradle_wrapper.py` never runs Gradle. Only the `./gradlew`
+failure reporting the **expected checksum mismatch** from a brand-new
+`GRADLE_USER_HOME` is clean-cache runtime evidence. A network, SDK, or
+unrelated build failure is inconclusive and does not count as a red control.
+Do **not** claim that editing `verification-metadata.xml` alone re-verifies
+already-cached artifacts: the #145 warm-cache evidence was flipping a cached
+artifact byte under `--offline`, not changing a recorded checksum; the
+warm-cache metadata-change variant is **to-verify**. The static metadata
+validator checks shape only (exactly one childless 64-hex `<sha256>` per
+artifact), so a *valid-looking but wrong* checksum passes it. Record each
+command, exit status and failure text in the PR that lands the runtime
+evidence; until then the clean-cache control stays Proposed (see
+[Build Environment](ENV.md#supply-chain-and-dependency-update-policy)).
+
 The local APK release integration is `scripts/build_release.sh`; it requires `--apk`, explicit per-flavor trusted identity values, explicit SDK parser paths, and an existing output parent before it reaches credential lookup or build. Optional `--tag` and `--pins` preflight flags verify release tag format / Gradle consistency and signer-pin registry values against expected identity fail-closed before reading credentials or invoking Gradle. Python preflight invocations, including the version probe, use `python3 -I`: this ignores Python environment variables such as `PYTHONPATH` and excludes the script/current directory and user site-packages from `sys.path`. Python >= 3.11 remains required. After Gradle, the stage helper instead runs plain `python3` under an `env -i` allowlist; it is not run with `-I` and retains normal script-directory/system site behavior. Gradle and credential lookup are not covered by either Python isolation boundary; neither boundary is a sandbox.
 
 Preflight identity validation for `--tag` and `--pins` is comprehensively tested in `scripts/tests/test_build_release_identity.py` (via `ReleaseBuilderHarness`, `SignerPinRegistryTest`, and `ReleaseTagVersionTest`), covering:

@@ -16,8 +16,12 @@ import kotlinx.coroutines.withTimeoutOrNull
 import okhttp3.Call
 import okhttp3.EventListener
 import okhttp3.OkHttpClient
+import okhttp3.ResponseBody
 import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
+import okio.Buffer
+import okio.ForwardingSource
+import okio.buffer
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
@@ -35,8 +39,8 @@ import org.junit.runner.RunWith
  *
  * 合成資料：MockWebServer（loopback）、假 bearer "local-test-token"、假 body
  * "{}"；不碰 production endpoint、不讀 credential／私人 transcript、不寫檔。
- * 同步完全靠 MockWebServer 的 request 信號 + [CountDownLatch]，沒有固定
- * `Thread.sleep`；3s／2s／1.5s 皆為 liveness 上限，不是用時間證明正確性。
+ * 取消前等待真實 response body 的 read 入口（非只確認 server 收到 request），
+ * 沒有固定 `Thread.sleep`；各等待時間為 liveness 上限，不是排序依據。
  *
  * 此檔是 source contract；本次變更未執行 Gradle／adb，尚未在裝置實跑。
  * 實跑須串行執行並保留 SHA／API／flavor／報告證據。
@@ -49,22 +53,39 @@ class CancelBoundaryInstrumentedTest {
         val web = MockWebServer()
         web.start()
         val cancelled = CountDownLatch(1)
+        val bodyReadEntered = CountDownLatch(1)
         val client: OkHttpClient = McpTransport.defaultHttp().newBuilder()
             .eventListener(object : EventListener() {
                 override fun canceled(call: Call) {
                     cancelled.countDown()
                 }
             })
+            .addInterceptor { chain ->
+                val response = chain.proceed(chain.request())
+                val body = response.body
+                val observed = object : ResponseBody() {
+                    private val observedSource = object : ForwardingSource(body.source()) {
+                        override fun read(sink: Buffer, byteCount: Long): Long {
+                            bodyReadEntered.countDown()
+                            return super.read(sink, byteCount)
+                        }
+                    }.buffer()
+                    override fun contentType() = body.contentType()
+                    override fun contentLength() = body.contentLength()
+                    override fun source() = observedSource
+                }
+                response.newBuilder().body(observed).build()
+            }
             .build()
         val transport = McpTransport(client)
         val outcome = AtomicReference<Result<Pair<Int, String?>?>>()
         try {
-            // Headers 立即到，body 延遲 10s：取消必須中斷讀取而不是等自然超時。
+            // Headers 立即到，body 延遲 15s：取消必須中斷讀取而不是等自然超時。
             web.enqueue(
                 MockResponse()
                     .setResponseCode(200)
                     .setBody("{}")
-                    .setBodyDelay(10, TimeUnit.SECONDS),
+                    .setBodyDelay(15, TimeUnit.SECONDS),
             )
             val job = launch(Dispatchers.IO) {
                 outcome.set(
@@ -82,6 +103,10 @@ class CancelBoundaryInstrumentedTest {
             try {
                 val request = withContext(Dispatchers.IO) { web.takeRequest(5, TimeUnit.SECONDS) }
                 assertNotNull("request must reach the local fake server before cancel", request)
+                assertTrue(
+                    "transport must enter the real response body read before cancel",
+                    withContext(Dispatchers.IO) { bodyReadEntered.await(5, TimeUnit.SECONDS) },
+                )
                 val joined = withTimeoutOrNull(3_000) {
                     job.cancelAndJoin()
                     true

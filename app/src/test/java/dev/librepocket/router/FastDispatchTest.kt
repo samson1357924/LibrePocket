@@ -1599,16 +1599,24 @@ class FastDispatchTest {
         assertEquals(0, backend.invocations.get())
     }
 
-    @Test fun specialFindSymbolIsNoMatchDenied() {
+    @Test fun specialFindSymbolIsNoMatchDenied() = runBlocking {
         // #19 B3 stage-1: 「特別找」非命令式句首（ starts with 特，非 lookup 動詞）
         // ⇒ 不進 symbol 模板 ⇒ no-match DENIED（reasonCode null）——
         // DENIED、toolCall null、絕不執行。
         // （舊行為：`特別找` ⊃ `別找` 過度澄清成 NEED_CLARIFICATION——本 stage
         // 之 affirmative-command 准入取代之，pinned per #19 B3 stage-1。）
-        val d = decide("特別找 Foo 符號")
-        assertEquals(RouteKind.DENIED, d.route)
-        assertNull(d.reasonCode)
-        assertNull(d.toolCall)
+        // #179：issue body 仍寫 NEED_CLARIFICATION；健康檢查確認 Current 為
+        // no-match DENIED。補精確 pin：RouteKind + reasonCode(null) +
+        // toolCall(null) + dispatch Skipped + 後端零呼叫；不改 production。
+        val text = "特別找 Foo 符號"
+        val backend = CountingBackend()
+        val dispatcher = lspDispatcher(backend)
+        val d = decide(text)
+        assertEquals(text, RouteKind.DENIED, d.route)
+        assertNull(text, d.reasonCode)
+        assertNull(text, d.toolCall)
+        skippedOf(dispatcher.dispatch(d, lspOn), text)
+        assertEquals(0, backend.invocations.get())
     }
 
     @Test fun unicodeSurrogateQueriesPinned() {
@@ -2484,6 +2492,28 @@ class FastDispatchTest {
             "I forbid searching for symbol Foo",
             "hold off on symbols",
             "postpone finding symbols",
+        )) {
+            val d = decide(text)
+            assertEquals(text, RouteKind.DENIED, d.route)
+            assertNull(text, d.reasonCode)
+            assertNull(text, d.toolCall)
+            skippedOf(dispatcher.dispatch(d, lspOn), text)
+        }
+        assertEquals(0, backend.invocations.get())
+    }
+
+    @Test fun spokenMetaQuestionAndSpacedInabilityAreNoMatchDenied() = runBlocking {
+        // #179：健康檢查指出這兩句現為 no-match DENIED，但無精確 pin
+        // （「我 沒 辦 法 查 Foo 符號」只在 naturalNegationNeverReachesExecutor
+        // 的 table loop 中；「我可以查 Foo 符號嗎」全 tests 無 pin）。
+        // 非命令式句首（`我`／空格分隔的 `我 沒 辦 法`）不進 symbol 前閘、
+        // 亦不命中任何 RULES ⇒ no-match DENIED、reasonCode null、toolCall null、
+        // dispatch Skipped、後端零呼叫。問句尾標 `嗎` 本就否決准入。
+        val backend = CountingBackend()
+        val dispatcher = lspDispatcher(backend)
+        for (text in listOf(
+            "我 沒 辦 法 查 Foo 符號",
+            "我可以查 Foo 符號嗎",
         )) {
             val d = decide(text)
             assertEquals(text, RouteKind.DENIED, d.route)

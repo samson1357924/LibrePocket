@@ -2455,12 +2455,26 @@ jobs:
             "codeql.yml",
             CODEQL.replace(
                 "        uses: github/codeql-action/init@"
-                "33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3\n",
+                "1bd86f2fdb4b86187fa4059f16f31a3202acc9ea # v4.39.4\n",
                 "        run: 'true'\n",
                 1,
             ),
         )
         self._assert_rejected("codeql init must use exactly one pinned")
+
+    def test_codeql_rejects_mismatched_init_and_analyze_shas(self) -> None:
+        raw, findings = check_workflow_policy.load_yaml("codeql.yml", CODEQL)
+        self.assertEqual([], findings)
+        steps = raw["jobs"]["codeql"]["steps"]
+        analyze = next(step for step in steps if step.get("uses", "").startswith(
+            "github/codeql-action/analyze@"
+        ))
+        analyze["uses"] = "github/codeql-action/analyze@" + "0" * 40
+        findings = check_workflow_policy.check_codeql(".github/workflows/codeql.yml", raw)
+        self.assertIn(
+            "codeql init and analyze must use the same commit SHA",
+            [finding.message for finding in findings],
+        )
 
     def test_security_audit_trigger_is_pinned(self) -> None:
         self._write(

@@ -55,10 +55,9 @@ class ElevatedFlavorBoundaryTest {
             "rikka.shizuku",
             "moe.shizuku",
         )
-        var scanned = 0
         for (flavor in listOf("play", "foss")) {
             val files = sourceFiles(srcDir, flavor)
-            scanned += files.size
+            assertTrue("$flavor source scan found zero files (pin inert)", files.isNotEmpty())
             for (file in files) {
                 val text = file.readText()
                 for (token in forbidden) {
@@ -69,7 +68,6 @@ class ElevatedFlavorBoundaryTest {
                 }
             }
         }
-        assertTrue("play/foss source scan found zero files (pin inert)", scanned > 0)
     }
 
     @Test fun githubElevatedSourcesExistSoTheBoundaryScanIsNonVacuous() {

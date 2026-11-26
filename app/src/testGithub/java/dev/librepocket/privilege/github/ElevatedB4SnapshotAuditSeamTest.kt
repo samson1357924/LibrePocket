@@ -9,6 +9,7 @@ import dev.librepocket.shell.ShellDeny
 import dev.librepocket.shell.ShellResult
 import dev.librepocket.tool.Flavor
 import dev.librepocket.tool.ProjectionContext
+import java.util.Collections
 import kotlinx.coroutines.runBlocking
 import org.junit.After
 import org.junit.Assert.assertEquals
@@ -108,7 +109,7 @@ class ElevatedB4SnapshotAuditSeamTest {
     private fun snapshotOf(live: LiveState) = ReadSnapshot(
         tool = live.tool,
         identity = live.identity,
-        args = live.args,
+        args = Collections.unmodifiableList(ArrayList(live.args)),
         policyRevision = live.policyRevision,
         sessionId = live.sessionId,
         turnIndex = live.turnIndex,
@@ -126,15 +127,7 @@ class ElevatedB4SnapshotAuditSeamTest {
         executions: () -> Unit,
         wiring: suspend () -> ShellResult,
     ): ShellResult {
-        val now = current()
-        val rebound = ReadSnapshot(
-            tool = now.tool,
-            identity = now.identity,
-            args = now.args,
-            policyRevision = now.policyRevision,
-            sessionId = now.sessionId,
-            turnIndex = now.turnIndex,
-        )
+        val rebound = snapshotOf(current())
         if (snapshot != rebound) {
             return ShellResult.Denied(ShellDeny.BLACKLISTED, "stale read snapshot (typed skip, no spawn)")
         }
@@ -230,6 +223,18 @@ class ElevatedB4SnapshotAuditSeamTest {
         val snapshot = snapshotOf(live())
         val (result, spawns) = runWithSeam(snapshot, current = { live().copy(turnIndex = 9) })
         assertTrue("$result", result is ShellResult.Denied)
+        assertEquals(0, spawns)
+    }
+
+    @Test fun snapshotsOwnTheirArgsAfterMint() {
+        val mutableArgs = mutableListOf("id")
+        val current = live().copy(args = mutableArgs)
+        val snapshot = snapshotOf(current)
+        mutableArgs.add("changed")
+        assertEquals(listOf("id"), snapshot.args)
+
+        val (result, spawns) = runWithSeam(snapshot = snapshot, current = { current })
+        assertTrue("changed arguments must not match the frozen snapshot: $result", result is ShellResult.Denied)
         assertEquals(0, spawns)
     }
 

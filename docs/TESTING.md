@@ -1079,10 +1079,13 @@ Maintainer-run reproduction — work only in a throwaway copy of the exact
 commit under test; never delete or reuse the machine's real Gradle cache:
 
 ```sh
+# Export only the tracked inputs at the exact commit, not local edits,
+# ignored build outputs, or local credential/configuration files.
+COMMIT_UNDER_TEST="$(git rev-parse --verify HEAD)"
 SCRATCH="$(mktemp -d)"
-cp -a . "$SCRATCH/repo"   # throwaway copy including .git
+git worktree add --detach "$SCRATCH/repo" "$COMMIT_UNDER_TEST"
 cd "$SCRATCH/repo"
-git status --short        # start from a clean tree
+git status --short        # must be empty
 
 # 1. Green baseline with its own fresh cache (distribution + artifacts downloaded).
 export GRADLE_USER_HOME="$SCRATCH/gradle-home-baseline"
@@ -1097,8 +1100,9 @@ export GRADLE_USER_HOME="$SCRATCH/gradle-home-tamper-a"
 mkdir -p "$GRADLE_USER_HOME"
 python3 -P scripts/verify_gradle_wrapper.py --root "$SCRATCH/repo"  # expect exit 1 + SHA-256 mismatch (STATIC byte red only)
 ./gradlew --no-daemon --max-workers=1 :app:assemblePlayDebug        # expect Gradle red (the clean-cache runtime evidence)
-git checkout -- gradle/wrapper/gradle-wrapper.properties
-# Rerun step 1 to confirm green again.
+git restore --source=HEAD -- gradle/wrapper/gradle-wrapper.properties
+# Confirm green again with a NEW GRADLE_USER_HOME; the mismatched download
+# must not be the source of either the restored or the next negative run.
 
 # 2b. Artifact-byte tamper on ANOTHER NEW cache:
 #     flip ONE hex digit of a <sha256 value="..."> in
@@ -1107,13 +1111,17 @@ git checkout -- gradle/wrapper/gradle-wrapper.properties
 export GRADLE_USER_HOME="$SCRATCH/gradle-home-tamper-b"
 mkdir -p "$GRADLE_USER_HOME"
 ./gradlew --no-daemon --max-workers=1 :app:assemblePlayDebug  # expect `Dependency verification failed ... checksum mismatch`
-git checkout -- gradle/verification-metadata.xml
-# Rerun step 1 to confirm green again.
+git restore --source=HEAD -- gradle/verification-metadata.xml
+# Confirm green again with a NEW GRADLE_USER_HOME.
+# After recording the logs, leave this directory and remove only the throwaway
+# worktree from the original checkout with git worktree remove "$SCRATCH/repo".
 ```
 
 The wrapper checker red in 2a is a **static byte-level** control:
 `scripts/verify_gradle_wrapper.py` never runs Gradle. Only the `./gradlew`
-failure from a brand-new `GRADLE_USER_HOME` is clean-cache runtime evidence.
+failure reporting the **expected checksum mismatch** from a brand-new
+`GRADLE_USER_HOME` is clean-cache runtime evidence. A network, SDK, or
+unrelated build failure is inconclusive and does not count as a red control.
 Do **not** claim that editing `verification-metadata.xml` alone re-verifies
 already-cached artifacts: the #145 warm-cache evidence was flipping a cached
 artifact byte under `--offline`, not changing a recorded checksum; the

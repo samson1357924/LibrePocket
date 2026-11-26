@@ -526,6 +526,36 @@ class ShellPhysicalGateTest {
         }
     }
 
+    @Test fun dotdotExactSegment_pin() {
+        // Issue #177 精確 pin：ShellPolicy.hasDotDotSegment 是 exact `it == ".."`，
+        // 不做 NFKC／不解 %2e／不 trim。故全形 `．．`、尾空格 `.. `、
+        // 字面 `%2e%2e` 都**不是** ASCII `..` 段，不得觸發 DOTDOT deny；
+        // 真正的 ASCII `..` 段仍 fail-closed。此案只釘語義，不改 production。
+        assumeNonWindows()
+        val scope = tempDir("b1-dotdot-exact-pin").canonicalFile
+        try {
+            val ascii = ShellPolicy.validate(
+                listOf("cat", scope.absolutePath + "/sub/../escape.txt"),
+                scope.absolutePath,
+            )
+            assertTrue("ASCII '..' must be denied, got $ascii", ascii is Validation.Denied)
+            assertEquals(ShellDeny.BLACKLISTED, (ascii as Validation.Denied).reason)
+            assertTrue(
+                "message must carry reason code, got ${ascii.message}",
+                ascii.message.contains("DOTDOT"),
+            )
+            for (safe in listOf("．．", ".. ", "%2e%2e")) {
+                val v = ShellPolicy.validate(
+                    listOf("cat", File(scope, "$safe/x.txt").absolutePath),
+                    scope.absolutePath,
+                )
+                assertTrue("'$safe' is not an ASCII '..' segment; must stay allowed, got $v", v is Validation.Allowed)
+            }
+        } finally {
+            scope.deleteRecursively()
+        }
+    }
+
     @Test fun equalsSuffixSymlink_denied() {
         // `=` 後綴同門鎖定：absoluteCandidates 對任何 `--key=/abs` 都抽候選先驗（與鍵無關，
         // 見 checkPathArgs 內 absoluteCandidates 迴圈），故 `--opt=<link>` 走同一 B1 門必須拒。

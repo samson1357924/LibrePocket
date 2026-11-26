@@ -41,6 +41,7 @@ import dev.librepocket.agent.assistant.VoiceHandoffProvider
 import dev.librepocket.agent.ui.setup.EndpointStore
 import dev.librepocket.keystore.EncryptedPrefsVault
 import dev.librepocket.keystore.InMemoryPrefs
+import dev.librepocket.entry.EntryNormalize
 import dev.librepocket.provider.ChatRequest
 import dev.librepocket.provider.LlmProvider
 import dev.librepocket.provider.ProviderProtocol
@@ -356,6 +357,56 @@ class ChatScreenVoiceLaunchTest {
         assertEquals("你好", vm.input.value)
         composeRule.onNodeWithText("你好").assertIsDisplayed()
         assertEquals(0, provider.streamCalls)
+    }
+
+    /**
+     * #137 C2 prefill 契約（合成 RecognizerIntent extras）：超長結果只進輸入框，
+     * 且被截斷至 [EntryNormalize.MAX_TEXT_LENGTH]；AUTO_SEND_AFTER_VOICE=false
+     *（常數另由 AssistantVoiceTest.autoSend_isLockedOff 鎖死），故零 provider 請求、
+     * 零聊天訊息。voice/assist 只委派系統辨識 Activity，結果不直接進 provider request。
+     */
+    @Test
+    fun sttResultOk_syntheticRecognizerExtras_prefillCappedAndNeverReachesProvider() {
+        registerRecognitionService()
+        val provider = VoiceLaunchFakeProvider()
+        val vm = newVm(provider)
+        val registry = RecordingRegistry()
+        val owner = object : ActivityResultRegistryOwner {
+            override val activityResultRegistry: ActivityResultRegistry = registry
+        }
+        val voiceRequested = MutableStateFlow(true)
+
+        composeRule.setContent {
+            val req by voiceRequested.collectAsState()
+            CompositionLocalProvider(LocalActivityResultRegistryOwner provides owner) {
+                ChatScreen(
+                    padding = PaddingValues(0.dp),
+                    viewModel = vm,
+                    userSwitches = mapOf(VoiceTools.SWITCH_INPUT to true),
+                    voiceInputRequested = req,
+                    onVoiceInputConsumed = { voiceRequested.value = false },
+                    voiceSwitchesLoaded = true,
+                )
+            }
+        }
+        composeRule.waitForIdle()
+        assertEquals(1, registry.launchedIntents.size)
+
+        val cap = EntryNormalize.MAX_TEXT_LENGTH
+        val transcript = "a".repeat(cap + 500)
+        val resultIntent = Intent().putStringArrayListExtra(
+            RecognizerIntent.EXTRA_RESULTS,
+            arrayListOf("   ", transcript),
+        )
+        composeRule.runOnIdle {
+            registry.dispatchResult(registry.lastRequestCode, ActivityResult(Activity.RESULT_OK, resultIntent))
+        }
+        composeRule.waitForIdle()
+
+        assertEquals(transcript.take(cap), vm.input.value)
+        assertEquals(cap, vm.input.value.length)
+        assertTrue("prefill 不得建立聊天訊息", vm.messages.value.isEmpty())
+        assertEquals("語音字串只進輸入框，不得發出 provider request", 0, provider.streamCalls)
     }
 
     @Test

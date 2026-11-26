@@ -1,8 +1,11 @@
 package dev.librepocket.router
 
+import dev.librepocket.jev.JevWire
+import dev.librepocket.mcp.McpWire
 import dev.librepocket.policy.InMemoryPolicyStore
 import dev.librepocket.policy.PolicyRule
 import dev.librepocket.policy.Verdict
+import dev.librepocket.provider.jsonEscape as providerJsonEscape
 import dev.librepocket.provider.ToolCall as ProviderToolCall
 import dev.librepocket.tool.LspTools
 import dev.librepocket.tool.ProjectionContext
@@ -18,6 +21,7 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.lang.reflect.Modifier
 import java.time.Clock
 import java.time.Instant
 import java.time.ZoneId
@@ -584,6 +588,103 @@ class SymbolReceiptParityTest {
             c.expectedDepth?.let { assertEquals("depth of ${c.input.take(20)}…", it, SafeToolSlice.jsonNestingDepth(c.input)) }
             c.expectedHasFormat?.let { assertEquals("format of ${c.input.take(20)}…", it, SafeToolSlice.containsFormatCodePoint(c.input)) }
             c.expectedSafeInput?.let { assertEquals("safeInput of ${c.input.take(20)}…", it, SafeToolSlice.isSafeInput(c.input)) }
+        }
+    }
+
+    // --------------------------------------- esc() cross-module parity (#179)
+    // FastRouter.esc（private companion）／McpWire.esc／JevWire.jsonEscape／
+    // provider.jsonEscape 仍是四份 encoder。下表對「共同語意」做字元序列比對，且對
+    // 明確 expected 值比對（避免四者一起漂移還通過）；既有語意差異
+    //（孤立 surrogate）另以 [escLoneSurrogateDivergenceIsPinnedNotForced] pin 住，
+    // 不在本修復中強行改寫 production 編碼行為。
+
+    /**
+     * 反射取用 FastRouter 的 private companion esc：只為測試間接比較，不放寬
+     * production 可見性。JVM target 無 trySetAccessible，故用 isAccessible
+     * （deprecated but available）。Kotlin 可能把它編成 companion instance
+     * method、static bridge 或 outer class 的 `access$esc`，三者皆容忍。
+     */
+    @Suppress("DEPRECATION")
+    private fun fastRouterEsc(raw: String): String {
+        val outer = FastRouter::class.java
+        val companion = outer.getDeclaredField("Companion").apply { isAccessible = true }.get(null)
+        fun isEsc(m: java.lang.reflect.Method): Boolean {
+            val n = m.name
+            val named = n == "esc" || n.startsWith("esc\$") ||
+                n == "access\$esc" || n.startsWith("access\$esc\$")
+            val params = m.parameterTypes
+            return named && params.lastOrNull() == String::class.java &&
+                (params.size == 1 || (params.size == 2 && params[0] == companion.javaClass))
+        }
+        val m = companion.javaClass.declaredMethods.firstOrNull { isEsc(it) }
+            ?: outer.declaredMethods.firstOrNull { isEsc(it) }
+            ?: throw AssertionError(
+                "FastRouter.esc reflection failed; companion=" +
+                    companion.javaClass.declaredMethods.map { it.name } +
+                    " outer=" + outer.declaredMethods.map { it.name },
+            )
+        m.isAccessible = true
+        val args = if (m.parameterTypes.size == 1) arrayOf<Any?>(raw) else arrayOf<Any?>(companion, raw)
+        return m.invoke(if (Modifier.isStatic(m.modifiers)) null else companion, *args) as String
+    }
+
+    @Test fun escParityTable() {
+        val cases = listOf(
+            "" to "",
+            "plain ASCII 123" to "plain ASCII 123",
+            "穩定 CJK" to "穩定 CJK",
+            "\"" to "\\\"",
+            "\\" to "\\\\",
+            "\b" to "\\b",
+            "\u000C" to "\\f",
+            "\n" to "\\n",
+            "\r" to "\\r",
+            "\t" to "\\t",
+            "\u0000" to "\\u0000",
+            "\u0001" to "\\u0001",
+            "\u001f" to "\\u001f",
+            "\u007f" to "\u007f", // DEL 不是 RFC 8259 控制字元，原樣通過
+            "\uD83D\uDE00" to "\uD83D\uDE00", // 成對 surrogate 原樣通過
+            "𠮷" to "𠮷", // astral CJK（成對）原樣通過
+            // `\f` 不是 Kotlin 支援的 escape（ILLEGAL_ESCAPE）：以 `\u000C` 表達同一個
+            // form-feed 碼點；expected 端 `\\f` 是 esc 的輸出字面值，保持不變。
+            "a\"b\\c\b\u000C\u0001\uD83D\uDE00穩定" to
+                "a\\\"b\\\\c\\b\\f\\u0001\uD83D\uDE00穩定",
+        )
+        for ((raw, expected) in cases) {
+            val label = "esc parity for code units ${raw.map { it.code.toString(16) }}"
+            assertEquals(label, expected, fastRouterEsc(raw))
+            assertEquals(label, expected, McpWire.esc(raw))
+            assertEquals(label, expected, JevWire.jsonEscape(raw))
+            assertEquals(label, expected, providerJsonEscape(raw))
+        }
+    }
+
+    @Test fun escLoneSurrogateDivergenceIsPinnedNotForced() {
+        // 既有語意差異（刻意不收斂）：FastRouter.esc／McpWire.esc 把無伴
+        // surrogate 轉為小寫 \uXXXX（OkHttp/okio 的 UTF-8 encode 會把孤立
+        // surrogate 靜默換成 `?`，故上線值必須與解析值一致）；JevWire.jsonEscape
+        // 和 provider.jsonEscape 都保留孤立 surrogate。成對者四者皆原樣通過。
+        // Kotlin 詞法階段不支援孤立 surrogate 的 `\uXXXX` literal，改以 Char 建構；
+        // `U` 用字元拼接出字面 `\u`，避免 formatter pattern 被當成 unicode escape。
+        val hi = Char(0xD800).toString()
+        val lo = Char(0xDC00).toString()
+        val pair = "\uD83D\uDE00"
+        val U = '\\'.toString() + 'u'
+        // 明確配對：只有「無伴」surrogate 才逃逸；成對者（pair）原样通過。
+        // 不能用 generic「逃逸所有 code unit」算出 expected——那會把 pair 也轉掉。
+        val cases = listOf(
+            hi to U + "d800",
+            lo to U + "dc00",
+            (hi + hi) to (U + "d800" + U + "d800"),
+            (lo + hi) to (U + "dc00" + U + "d800"),
+            (pair + hi) to (pair + U + "d800"),
+        )
+        for ((raw, expected) in cases) {
+            assertEquals("FastRouter lone surrogate", expected, fastRouterEsc(raw))
+            assertEquals("McpWire lone surrogate", expected, McpWire.esc(raw))
+            assertEquals("JevWire keeps raw lone surrogate", raw, JevWire.jsonEscape(raw))
+            assertEquals("Provider keeps raw lone surrogate", raw, providerJsonEscape(raw))
         }
     }
 }

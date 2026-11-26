@@ -1144,10 +1144,10 @@ MainScreen wiring 與 Compose 接線（#136-B1 Stage 7C 已補）：helper 級 `
 
 本節記錄 #177「foss 全量 suite 17 個預存失敗」的環境 vs 邏輯判定依據。**Current**：
 JDK 25 下 baseline 全綠；獨立 JDK 25 探針可重現 native-locale 環境失敗，新增的 JUnit
-控制案例待串行實跑確認。以下 `-Dfile.encoding/-Duser.language/-Duser.country` 是**本機實跑環境**
+控制案例已由主 agent 在本分支串行實跑（三 flavor `BUILD SUCCESSFUL`；`CharsetLocaleControlTest` XML `tests=3 skipped=0 failures=0 errors=0`）。以下 `-Dfile.encoding/-Duser.language/-Duser.country` 是**本機實跑環境**
 （由 JUnit XML property／`--info` 取得），**不是 checked-in CI 設定**：版控只有
 `gradle.properties:1` 的 daemon `-Dfile.encoding=UTF-8`，CI 未落實後兩個 flag。
-**Proposed**：maintainer 留下 comment 後 close（尚待控制案例實跑確認）。
+**Current（分支證據）**：控制案例已在本分支實跑且 skip gate 滿足，maintainer 已留 comment 並 close #177；**但這是分支證據，不是 main gate** — #188 合併後須在 merged main 重跑控制案例與 baseline 才能升級為 main 證據。
 
 ### 主 agent 實跑 baseline（可信，base `main@c5d61a61`）
 
@@ -1205,7 +1205,7 @@ CI runner 須使用 UTF-8 **native locale**（`LANG=C.UTF-8`／`LC_ALL=C.utf8`�
 不限於測試），本分支不重複（Refs #176）。**#176 的修正尚未合併進 main（`ff811434` 非 main
 祖先）**：即使 close #177，時序三項在 main 仍存在，須由 #176 持續追蹤，close 不代表那些問題已消失。
 
-限制：本分支依約束未執行 Gradle，故新控制案例的實際 XML 數字待主 agent 串行實跑；亦未重現
+限制：新控制案例已由主 agent 在本分支串行實跑（XML 見上），但仍是**分支證據**，合併後須在 main 重跑；亦未重現
 #177 原本 17 個失敗的 failure message，判定是「baseline 全綠 + 可重現環境控制 + charset 相關
 5 檔無變更」的推論，不是對原失敗日誌的逐條重演。
 

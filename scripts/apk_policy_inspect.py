@@ -51,15 +51,16 @@ out of ``aapt dump xmltree`` of the APK and re-validated with the EXACT rules
 of ``scripts/nsc_check.py``. The source stage greps/validates source XML files,
 but the merged artifact is what ships: a resource overlay, an alias flip, or a
 merger rebind would never be visible at source level. The validation rule set
-is FLAVOR-AWARE (A5): only the foss/github lanes get ``lan`` rules (loopback
-plus explicit RFC1918 host literals, mirroring their flavor NSC overlay); play
-never does. For play the mode is derived fail-closed from the merged
-manifest's own ``android:debuggable`` (attr 0x0101000f) = true (type
-0x12)0xffffffff → debug rules (loopback-only cleartext); anything else
-(absent/false/unparseable) → the release deny-all rules, so a build that
-cannot PROVE it is debuggable is checked with the stricter contract. The
-binding value carries the same proof contract as the backup pair: reference
-form only, and only through the resources table.
+is FLAVOR- AND DEBUGGABLE-AWARE (A5): ``lan`` rules (loopback plus explicit
+RFC1918 host literals, mirroring the flavor NSC overlay) apply ONLY to a
+non-debuggable foss/github artifact; play never gets them, and a debuggable
+artifact of ANY flavor keeps the loopback-only ``debug`` rules. The mode input
+is derived fail-closed from the merged manifest's own ``android:debuggable``
+(attr 0x0101000f) = true (type 0x12)0xffffffff → debug rules; anything else
+(absent/false/unparseable) → release (for foss/github, lan) rules, so a build
+that cannot PROVE it is debuggable is never licensed for debug-only cleartext.
+The binding value carries the same proof contract as the backup pair:
+reference form only, and only through the resources table.
 
 Compiled backup-rules BYTES (third artifact-level authority): the merged
 manifest binding only pins the FILENAMES ``@xml/backup_rules`` /
@@ -1713,13 +1714,17 @@ def _assert_merged_network_security_config(
     compiled resource itself is dumped via ``aapt dump xmltree`` and rebuilt
     by ``_parse_aapt_xmltree`` - a compiled-XML alias cannot differ from
     source undetected - then validated with ``scripts/nsc_check.py
-    .validate_tree``. The rule mode is FLAVOR-AWARE (A5): play always uses the
-    debuggable-derived ``debug``/``release`` deny-all-family rules; foss/github
-    use ``lan`` (loopback + explicit RFC1918 literals), which still refuses
-    public http, CGNAT, metadata and link-local cleartext. This mirroring of
-    the source-set routing prevents the artifact gate from false-killing a
-    legitimate foss/github LAN overlay, while a play artifact carrying that
-    same overlay is rejected by its release/debug rules.
+    .validate_tree``. The rule mode is FLAVOR- AND DEBUGGABLE-AWARE (A5):
+    ``lan`` (loopback + explicit RFC1918 literals) applies ONLY to a
+    non-debuggable (release) foss/github artifact; a debuggable artifact of ANY
+    flavor - foss/github included - stays on the loopback-only ``debug`` rules,
+    mirroring the source stage where ``src/debug/`` is matched before the
+    flavor overlay. play always uses the debuggable-derived ``debug``/
+    ``release`` deny-all-family rules. This prevents the artifact gate from
+    either false-killing a legitimate foss/github release LAN overlay or
+    letting a foss/github DEBUG artifact smuggle RFC1918 cleartext past the
+    loopback-only rule; a play artifact carrying a LAN overlay is rejected by
+    its release/debug rules.
 
     The dumped member path is RESOLVED through ``_compiled_member_resolver``
     for the same reason as the backup pair: release resource-name obfuscation
@@ -1742,14 +1747,15 @@ def _assert_merged_network_security_config(
         resolve_member = _compiled_member_resolver(aapt, apk)
     application_block, app_indent = _application_manifest_block(xmltree)
     debuggable = _network_security_mode(application_block, app_indent) == "debug"
-    # A5: the compiled NSC's allowlist is a function of the flavor whose APK
-    # this is, NOT of a promise in the manifest. play never receives the lan
-    # rule set; foss/github never receive the stricter debug/release one.
-    mode = (
-        "lan"
-        if flavor in ("foss", "github")
-        else ("debug" if debuggable else "release")
-    )
+    # A5: the compiled NSC's allowlist is a function of BOTH the APK's flavor
+    # and its PROVEN debuggable state. lan is a RELEASE-only relaxation for
+    # foss/github; a debuggable artifact of ANY flavor keeps the stricter
+    # loopback-only debug rules (mirroring the source stage, where src/debug/
+    # is matched before the flavor overlay). play never receives lan at all.
+    if flavor in ("foss", "github") and not debuggable:
+        mode = "lan"
+    else:
+        mode = "debug" if debuggable else "release"
     application_attr_anchor = _application_attr_anchor(app_indent)
     match = re.search(
         application_attr_anchor

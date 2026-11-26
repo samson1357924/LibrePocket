@@ -5696,6 +5696,62 @@ class ApkPolicyHarness(unittest.TestCase):
                         (result.stdout or "") + (result.stderr or ""),
                     )
 
+    def test_compiled_nsc_foss_github_debug_artifact_rejects_lan_cleartext(self) -> None:
+        # A5 depth-in-depth: `lan` is a RELEASE-only relaxation. A DEBUGGABLE
+        # foss/github artifact carrying an RFC1918 cleartext domain must be
+        # judged by the loopback-only `debug` rules and rejected - the gate
+        # must not depend on app/src/debug's overlay being merged correctly.
+        apk = complete_apk(
+            self.tmp / "flavor-debug-nsc.apk",
+            minimal_dex(type_descriptors=("Ljava/lang/Object;",)),
+        )
+        for label, result in (
+            ("foss", self.run_policy(
+                apk, foss=True, xmltree_mode="debug", nsc_mode="lan-private"
+            )),
+            ("github", self._run_scanner_cli(
+                apk, "github", xmltree_mode="debug", nsc_mode="lan-private"
+            )),
+        ):
+            with self.subTest(lane=label, case="debug-rfc1918-rejected"):
+                output = (result.stdout or "") + (result.stderr or "")
+                self.assertNotEqual(result.returncode, 0, output)
+                self.assertIn("fails the debug network security rules", output)
+
+        # Positive controls (no gate relaxation): a loopback-only compiled
+        # config stays valid for a debuggable foss/github artifact, and the
+        # legal RFC1918 LAN config stays valid for their RELEASE artifacts.
+        for label, result in (
+            ("foss", self.run_policy(
+                apk, foss=True, xmltree_mode="debug", nsc_mode="loopback-debug"
+            )),
+            ("github", self._run_scanner_cli(
+                apk, "github", xmltree_mode="debug", nsc_mode="loopback-debug"
+            )),
+        ):
+            with self.subTest(lane=label, case="debug-loopback-accepted"):
+                self.assertEqual(
+                    result.returncode, 0,
+                    (result.stdout or "") + (result.stderr or ""),
+                )
+        for label, result in (
+            ("foss", self.run_policy(apk, foss=True, nsc_mode="lan-private")),
+            ("github", self._run_scanner_cli(apk, "github", nsc_mode="lan-private")),
+        ):
+            with self.subTest(lane=label, case="release-rfc1918-accepted"):
+                self.assertEqual(
+                    result.returncode, 0,
+                    (result.stdout or "") + (result.stderr or ""),
+                )
+        # play keeps the deny-all contract in both build types.
+        for xmltree_mode in ("bindings", "debug"):
+            with self.subTest(lane="play", case=f"{xmltree_mode}-rfc1918-rejected"):
+                result = self.run_policy(
+                    apk, xmltree_mode=xmltree_mode, nsc_mode="lan-private"
+                )
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertIn("network security rules", result.stdout)
+
     def test_compiled_nsc_release_rules_for_unproven_debuggable(self) -> None:
         # Without a PROVEN debuggable attr the compiled NSC is checked with the
         # release deny-all rules: the loopback whitelist (legal only for a

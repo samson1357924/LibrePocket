@@ -47,6 +47,66 @@
 | Web search keyed providers (D5, #172 REF #138) | `web/KeyedSearchProviders`（Brave/Tavily/Exa/Firecrawl；keyId 綁定 `web.<id>@<endpoint>` 建構期 fail-fast；credential snapshot 指紋綁定 cache identity、F1 TOCTOU 修復、nested sticky follower 重選退回當前 vault、刪除憑證不重送）＋`WebSearchDispatch`（hosted 優先單一路徑、互斥構造、isReady required suspend）＋`WebSearchService`（cache＋single-flight＋快取按 credential 指紋）；純 JVM、未接線，`ToolDef.executionReady=false`，無 production 呼叫點，THREAT_MODEL 列 D3 接線前閘門 (a)–(f) | 已接線（not wired）；真實 device／consent UX／redirect 政策／傳輸 byteCap／executionReady 皆未開始——勿推論為可用 |
 | MCP 客戶端（D03，#11 Stage2 本 PR 選型，非 Accepted ADR） | declared＋implemented，not wired，not verified（僅 JVM 單測，無裝置實跑）：`McpWire`（tools/list＋tools/call 單頁 POST 子集解析＋envelope 驗證：`jsonrpc=="2.0"`、id 數值相符（固定 list=1/call=2）、`result` XOR `error`、call error 依 code 分類（協議/伺服器碼 -32700/-32600/-32601/-32603 及伺服器保留區間 -32099..-32000 計熔斷；工具業務錯中性：isError=true 且具內容／-32602／未知碼；`message` 必為字串，缺失或非字串即 PROTOCOL 計熔斷、不做預設替換；空／純空白 `message`（含消毒截斷後仍純空白者，S3-R01）填靜態 `jsonrpc error <code>`（Stage3 B-03：伺服器不得以空 message 讓錯誤不可辨識，仍中性不計熔斷）、C0/DEL 控制字元以 `\\uXXXX` 轉義消毒後才進 `errorMessage`（消毒後僅進 `errorMessage`、不進稽核；Stage3 A-02：≤200 UTF-16 units、轉義/surrogate 邊界截斷、不裸露 C0/DEL、C1（U+0080–U+009F，如 U+0085 NEL）、U+2028/2029、bidi 控制（U+061C／U+200E／U+200F／U+202A–U+202E／U+2066–U+2069）與零寬（U+200B–U+200D／U+2060／U+FEFF）——皆以 `\\uXXXX` 轉義（PR #93 F-03）；其餘 Cf（U+00AD、U+180E、U+2061–U+2064、U+206A–U+206F、U+FFF9–U+FFFB、tag U+E0000–E007F 等）仍原樣，屬名混淆／稽核可讀性殘餘而非換行/重排；預算內不靜默丟字）；list error 不分 code 一律 PROTOCOL）、tool name >128 UTF-16 拒＋`mcp.` 保留前綴名**整頁拒**（靜態訊息 `mcp: tool name uses reserved prefix`，常數直接引用 `McpScope.SWITCH_PREFIX` 單一真相、大小寫敏感——`MCP.x` 照收；與授權側 `McpScope.requireBareToolName` 拒用保留前綴同政策，避免「列出但不可用」）＋空白／空名**整頁拒**（靜態訊息 `mcp: tool name is blank`，`isBlank()` 涵蓋全形空白／NBSP；名內含空格如 `my tool` 照收——與保留前綴同政策，避免「列出但不可用」＋未來接線 `map { toToolDef(...) }` 拋未映射 IAE；**代價**：以 `mcp.*` 命名工具或含純空白名工具的伺服器整份 tools/list → PROTOCOL 並計熔斷，屬刻意 fail-closed，接線若需相容須先改名政策）＋同頁重複工具名**整頁拒**（靜態訊息 `mcp: duplicate tool name`，Stage3 B-04：`enabledTools`／scope 以名為鍵、auditMap toolCount 失真，與超限／保留前綴／空白名同政策整頁拒、不採納首支；跨頁不適用——本子集不跟隨 `nextCursor` 分頁）＋出站 `callBody` 對 toolName 對稱拒 C0/DEL（靜態訊息 `mcp: tool name has control chars`，Stage3 A-01：與入站同政策；被拒名仍在 `McpCallResult.auditMap()["tool"]`／`toString()` 供診斷，但只以 `\\uXXXX` 轉義形式出現（C0/DEL、C1、LS/PS、bidi、U+200B–200D／U+2060／U+FEFF 與孤立 surrogate 同轉義——S3-D02／F-03，成對 surrogate 原樣；稽核面 tool 欄只轉義不截斷，無長度上限為已知取捨 S3-D05；`McpListResult.auditMap()["tools"]` 逐名同轉義——RT-03；三個 `toString` 的 serverId 亦同轉義；展示面 `ToolDef.name`／`description`／`Projection.toolName` 的 serverId 與遠端 toolName 同經 `escapeControlUnits`（R2-02／S2-02，授權身份 `switchKey` 仍用原文）；轉義**非單射**——原始 U+2028 與字面 `\\u2028` 顯示相同，授權一律以 `switchKey`（R2-04／S2-04））——裸 CR/LF 偽造稽核列通道關閉）、tools/list description 缺席→空字串、出現即須字串（null/數字/物件/布林 → 整頁拒 `mcp: bad description`，B-05 fail-closed，不降級；nextCursor 例外：顯式 null 同缺席，null/缺席 → hasMorePages=false，非整頁拒）＋`inputSchema` 必備（缺席／非 object／根 type 非 object → PROTOCOL，不合成預設）、endpoint raw-authority fail-closed（authority 由 **scheme 分隔點**界定：正規化後必須為 `<scheme>://…`（第一個 `:` 後緊接 `//`），path/query/fragment 內的 `://` 不得冒充 authority，否則 `mcp: bad endpoint`（R2-01／S2-01）；authority 含 `@`（含空 userinfo `https://@host`）→ `mcp: userinfo not allowed in endpoint`；含 `\`（**先於 `@` 判定**，故 `https://evil\@trusted/mcp` 報 `mcp: bad endpoint`，R2-03）／空 raw authority（`https://`／`https:///`／`https://?x=1` 等）／空 parsed host → `mcp: bad endpoint`；PR #93 F-01/F-02/R2-01/R2-03）＋`nextCursor` 驗證（result 內非空→hasMorePages）＋空 result 拒（content 與 structuredContent 皆缺即 PROTOCOL，含 isError=true 無內容）＋`structuredContent` 保留不丟＋resource 內層 fail-closed（`uri` 非空＋`text`/`blob` 至少一字串，缺席／null／型別錯 → PROTOCOL，`text`/`blob` 並存皆須字串））、`McpTransport`（Bearer 標頭、https-only 預驗＋回環 http 例外、不自動跟隨 redirect＋one-shot POST body（注入 client 亦強制）、response body 原樣透傳（消毒在 `McpWire`）、取消、有界 body、非 JSON 早擋）、`McpServer`（server accounting：HTTP/協議狀態分類——3xx/400/404/405→PROTOCOL、401/403→UNAUTHORIZED **不計熔斷**（C-06：與 vault-miss／Bearer 預檢同待遇，認證錯立即恢復；其餘非 2xx 仍計熔斷）、非空 nextCursor→PARTIAL（保留本頁工具）；SocketTimeoutException→TIMEOUT 且計熔斷（暫態，catch 先於一般 Exception）；InterruptedIOException（OkHttp callTimeout／HTTP-2／Okio 寫入超時）同樣→TIMEOUT 且計熔斷（RT-06）；vault `getKey` 例外（keystore 錯誤／裝置鎖定）→UNAUTHORIZED、不計熔斷、不發送、不外傳；Bearer printable-ASCII 預檢——非空、≤8192、每字元 0x20–0x7E，CR/LF header-injection／非 ASCII／空字串／超長 key 未送即拒、屬設定錯誤不計熔斷；key 於 `String` 拷貝後對 vault 保留 CharArray `fill('\u0000')` 抹除）、`McpScope`／`McpModels`／`McpRegistry`（投影＋確認，預設 WRITE；`check()`／`canExecute()` 收 `ProjectionContext` 並以傳入 config **內部重投影**（C-01 單一投影真相，不收呼叫端 `Projection`）、`sideEffect` 參數**已移除**（`check()`／`canExecute()`／`toToolDef()` 一律按 WRITE 對待、未確認即 `NeedConfirm`——MCP 子集無 sideEffect 宣告，呼叫端不得以 READ 降級；`project()` 亦不收該參數）；`toolName` 形狀 fail-closed（C-02：空白／`mcp.` 已限定名／C0-DEL 控制字元／>128 UTF-16 units → `IllegalArgumentException`，上限直接引用 `McpWire.TOOL_NAME_MAX_CHARS` 不另立魔數；`McpServer.callTool` 同驗 → PROTOCOL、不發送、不碰 vault、不計熔斷）；`toToolDef(config,…)` 收 config 且 `switchDefault` 接 `isToolEnabled`（停用 → 內建投影 UNAVAILABLE；內建路徑可被 ctx 明寫 `userSwitches` 覆寫的殘餘見 gate 清單）並透傳 inputSchema（**本地建構**預設 `{"type":"object"}`，僅直呼叫／測試用，非 wire 端合成）且沿用 `executionReady=false` 雙閘；`McpCallResult.toString()` 隱私覆寫：resultJson／errorMessage 僅 `<N chars>` 佔位（保留 serverId/tool/status/latencyMs；tool 欄 auditMap/toString 以 `\\uXXXX` 轉義輸出被拒名的控制字元，Stage3 A-01），稽核以 `auditMap()` 為準、不含 result/arguments；`McpTool.toString()` 隱私覆寫（Stage3 C-05）：description／inputSchema 僅 `<N chars>` 佔位（name 為合法識別欄位照常輸出——入站已拒 C0/DEL；本地建構場景 name 亦經 `\uXXXX` 轉義，Stage3 S3-D04，equals/copy 不動）；`McpRegistry` 多伺服器彙整、per-server 獨立熔斷＋防禦性複製（Stage3 C-10：建構 `toMap()` 快照、`ids()` 回 `keys.toSet()` 快照——呼叫端事後增刪原 map 或回傳集合不影響內部））；Stage5 P3：C-04 `switchKey` 改形狀分離鍵（`mcp.<len(serverId)>|<serverId>|<toolName>`，對任意輸入單射、跨服不再可能互相覆寫，與 `ToolDef.name=mcp.<id>.<tool>` 展示字串分離，該展示字串殘餘 `.` 歧義以 KDoc 誠實揭露）、C-07 熔斷器到期語義一致（`isOpen()`／`failureCount()` 純唯讀、`now >= openUntilMs` 起即讀為「已清窗」與呼叫順序無關，實際清零只在 `canCall()`／`onFailure()`／`onSuccess()`；無半開態、開窗中 in-flight 失敗延窗——取捨全數寫入 KDoc）、C-08 預設時鐘改單調（`McpClock.kt` 的 `monotonicClockMs()`，nanoTime 基準；`McpServer` 另以 `elapsedMs()` coerce 非負——牆鐘回撥不再產出負 latency／瞬間打開熔斷）、C-09 `toToolDef` `inputSchema` KDoc 收斂為「僅 JSON 形狀層透傳、語義由 provider／遠端負責」（與 `McpWire` 根 `type=="object"` 檢查一致）、B-07 `McpWire.parseList`／`parseListPage`／`parseCall` 移除 `expectedId` 預設值（生產呼叫點顯式傳 `LIST_ID`／`CALL_ID`，測試不再可省略，反射 pin 防回歸）；P2 slice 硬化（#96，本 PR；#93 已合併於 `c3ae01fb`，本分支已完成 rebase）：`McpWire` 的 call 參數於 vault／HTTP 之前以 `parseStrictDoc` fail-closed 驗證（client-arg 錯誤映射 PROTOCOL，零 vault／零發送／零熔斷）、name／description／error 上限採 surrogate-safe 截斷（`truncateUnits`／`escapeControlUnits`），不切開 well-formed surrogate pair；`McpServer` 對畸形／空白 `baseUrl` 在 vault 讀取與 HTTP 之前以 UNAUTHORIZED 拒絕且不計熔斷失敗（DISABLED／已開路 CIRCUIT_OPEN 先行；callTool 畸形 args 仍優先 PROTOCOL）；皆有 JVM 單測；`dev.librepocket.mcp` 外零 production import（僅 KDoc／description 前向提及，未接 dispatcher／副作用；由 `scripts/docs_claim_check.sh` zero-wiring 檢查（D-01 五面 fail-closed：① AndroidManifest 註冊（text grep＋XML 解析）、② Gradle manifest 注入（manifestPlaceholders／srcFile／namespace／applicationId／gradle.properties，含 Unicode escape 解碼）、③ 包內出站 import 白名單／全限定出站引用、④ 全模組 package 分類的包外生產碼引用、⑤ discovery／classification I/O 與歧義即失敗；fixture 自測 `scripts/test_docs_claim_check.sh` 隨 CI docs-guard 運行，D-02）在 `docs-guard` CI job 內 fail-closed（違反即該 job 紅）；`main` 已配置 branch protection 並將 `PR Gate` 列為 required status check，`pr-gate` 在 `docs-guard` 非 success 時失敗，故紅燈會阻擋 merge（`enforce_admins` 未啟用、repository rulesets 為 0、required approving reviews 為 0、未配置 CODEOWNERS——gate scripts／docs／workflows 目前無 CODEOWNERS 覆蓋；此狀態可用 `gh api repos/<owner>/<repo>/branches/main/protection` 複核），見 `docs/TESTING.md`。接線 PR 須刻意更新該閘，見下方「MCP 啟用／接線 gate 清單」）；`2025-11-25`／`2026-07-28`（#11 提及的候選修訂號，repo 內無文本）皆為候選未採納（單一傳輸子集起步，不送 initialize、不接 SSE、不跟隨分頁、不協商 protocolVersion，見 `McpProtocolContractsTest`；本行隨本 PR 更新，餘行核於 `82f2a0a8`） | 投影 NATIVE 可作可用證據；子集綠燈可作修訂相容證據；模型可執行第三方工具 |
 
+### Built-in tools 逐工具四態表（Current；與 ToolRegistry／JVM contract 同步）
+
+本表由目前 production `ToolRegistry.ALL` 的 43 個 `ToolDef` 逐項列出，並由 `BuiltinToolFourStateContractTest`（`app/src/test/java/dev/librepocket/tool/`）從 registry 實際資料產生、逐行對照本節與 `docs/CAPABILITY_MATRIX.md` 的 `FOUR_STATE_TABLE` 區塊；新增工具若未同步更新本表與 contract，測試即紅。
+
+- **Declared**：43 項全部有 `ToolDef`（name／description／jsonSchema）。
+- **Implemented**：`slice` 表示 schema 與 handlers 存在於 `ToolRegistry`／`SafeToolSlice`，但僅為 test-only seam（production composition 永不附掛 slice）；`scaffold` 表示有 production 程式碼或僅投影描述，**未通過 production dispatcher／confirmation／executor 接線**。兩者都不代表 wired。
+- **Wired**：**43 項全部為 false**。production 維持 records-only（`toolSlice = null`，由 `ProductionChatCompositionTest` 釘死），沒有 production tool dispatcher、WRITE 確認 UI 或副作用接線；`router/FastDispatch.kt` 的執行面僅 `internal`、無 production caller（`FastDispatchSurfaceArchitectureTest` 釘死）。
+- **Verified**：**43 項全部為 false**（無指定裝置／API 的 device E2E）。`lsp.symbols` 有 JVM 正負向測試與 fake-backend round-trip，但只達 JVM unit verified，不可宣稱 device-verified。
+- `executionReady` 是獨立的 **registry readiness** 旗標，不是四態的替代：目前僅 `lsp.symbols` 為 `true`，其餘 42 為 `false`；旗標為 false 不代表已就緒，為 true 也不代表已接線或已驗證。
+
+<!-- FOUR_STATE_TABLE_BEGIN -->
+| 工具 | Declared | Implemented | Wired | Verified | executionReady |
+|---|---|---|---|---|---|
+| `navigate` | 是 | scaffold | 否 | 否 | false |
+| `open_app` | 是 | scaffold | 否 | 否 | false |
+| `mail.compose` | 是 | scaffold | 否 | 否 | false |
+| `alarm.create` | 是 | scaffold | 否 | 否 | false |
+| `phone.dial` | 是 | scaffold | 否 | 否 | false |
+| `sms.compose` | 是 | scaffold | 否 | 否 | false |
+| `calendar.create` | 是 | scaffold | 否 | 否 | false |
+| `music.control` | 是 | scaffold | 否 | 否 | false |
+| `volume.set` | 是 | scaffold | 否 | 否 | false |
+| `notification.read` | 是 | scaffold | 否 | 否 | false |
+| `screenshot.capture` | 是 | scaffold | 否 | 否 | false |
+| `shell.exec` | 是 | scaffold | 否 | 否 | false |
+| `shell.elevated` | 是 | scaffold | 否 | 否 | false |
+| `calendar.query` | 是 | scaffold | 否 | 否 | false |
+| `calendar.update` | 是 | scaffold | 否 | 否 | false |
+| `calendar.delete` | 是 | scaffold | 否 | 否 | false |
+| `contact.search` | 是 | scaffold | 否 | 否 | false |
+| `contact.list` | 是 | scaffold | 否 | 否 | false |
+| `contact.get` | 是 | scaffold | 否 | 否 | false |
+| `gui.automate` | 是 | scaffold | 否 | 否 | false |
+| `web.fetch` | 是 | scaffold | 否 | 否 | false |
+| `web.search` | 是 | scaffold | 否 | 否 | false |
+| `db.query` | 是 | scaffold | 否 | 否 | false |
+| `db.exec` | 是 | scaffold | 否 | 否 | false |
+| `lsp.symbols` | 是 | slice | 否 | 否 | true |
+| `lsp.diagnostics` | 是 | scaffold | 否 | 否 | false |
+| `clipboard.read` | 是 | scaffold | 否 | 否 | false |
+| `clipboard.write` | 是 | scaffold | 否 | 否 | false |
+| `file.edit` | 是 | scaffold | 否 | 否 | false |
+| `file.patch` | 是 | scaffold | 否 | 否 | false |
+| `file.search` | 是 | scaffold | 否 | 否 | false |
+| `file.attach` | 是 | scaffold | 否 | 否 | false |
+| `voice.transcribe` | 是 | scaffold | 否 | 否 | false |
+| `voice.speak` | 是 | scaffold | 否 | 否 | false |
+| `voice.speak.azure` | 是 | scaffold | 否 | 否 | false |
+| `voice.speak.openai` | 是 | scaffold | 否 | 否 | false |
+| `linux.boot` | 是 | scaffold | 否 | 否 | false |
+| `linux.exec` | 是 | scaffold | 否 | 否 | false |
+| `linux.pkg` | 是 | scaffold | 否 | 否 | false |
+| `compile.build` | 是 | scaffold | 否 | 否 | false |
+| `decompile.analyze` | 是 | scaffold | 否 | 否 | false |
+| `decompile.repack` | 是 | scaffold | 否 | 否 | false |
+| `web.extract` | 是 | scaffold | 否 | 否 | false |
+<!-- FOUR_STATE_TABLE_END -->
+
+**Target（未達成，仍為 Proposed／未做）**：production dispatcher、WRITE 確認 UI、tool result call ID／角色／錯誤型別於 production continuation 的驗證、三 flavor runtime 接線一致，以及 device E2E——production 接線與 device E2E 仍為 Proposed／未做。不得把 `implemented` 或 `executionReady=true` 讀成 wired 或 verified。
+
 ### D4 `web.extract` D3 接線前置閘（#138／D3；編號對照 WebExtract.kt header「D3 追蹤項」，既存 #1–#7 不重新編號）
 
 - **#8 fence 範圍（hard gate）**：fence 僅涵蓋 capped snippet（含 truncation sentinel）之 `wrap()` 輸出；`content.title/url/siteName/published` 為 marker-free、Cf／Cc 已清、硬上限截斷之 untrusted structured values，**不在 fence 之內**。D3 wiring **不得**將其呈現為 in-fence 內容；模型可見 projection 必須 re-fence **整個序列化 tool-result payload**、或直接丟棄這些欄位（對照 WebExtract.kt header「fence 之範圍」與 `Ok.envelope` KDoc）。
@@ -110,7 +170,7 @@
 
 ### 內建工具啟用前置清單（Built-in Tool Activation Prerequisites Checklist）
 
-所有內建工具目前在生產組合（`ChatViewModelFactory`）中皆未接線（`toolSlice = null`，經由 `ProductionChatCompositionTest` 釘死）。`ToolDef.executionReady` 為 registry readiness 旗標（表示 `ToolRegistry` 與 `SafeToolSlice` 中具備 schema 及 handlers），**不等於端到端生產可執行**。**當前狀態：**`ToolRegistry` 恰 42 個 definitions；恰 1 個（`lsp.symbols`）`executionReady=true`；fast lane `internal`、records-only；production 維持 records-only（`toolSlice = null`，`ProductionChatCompositionTest` 釘死）直至本清單逐項完成；`lsp.symbols` 維持唯一 ready 工具。在任何工具轉為生產可用前，必須滿足以下前置條件清單：
+所有內建工具目前在生產組合（`ChatViewModelFactory`）中皆未接線（`toolSlice = null`，經由 `ProductionChatCompositionTest` 釘死）。`ToolDef.executionReady` 為 registry readiness 旗標（表示 `ToolRegistry` 與 `SafeToolSlice` 中具備 schema 及 handlers），**不等於端到端生產可執行**。**當前狀態：**`ToolRegistry` 恰 43 個 definitions；恰 1 個（`lsp.symbols`）`executionReady=true`，其餘 42 個 `false`（逐工具四態見上方「Built-in tools 逐工具四態表」，Wired／Verified 全數 false）；fast lane `internal`、records-only；production 維持 records-only（`toolSlice = null`，`ProductionChatCompositionTest` 釘死）直至本清單逐項完成；`lsp.symbols` 維持唯一 ready 工具。在任何工具轉為生產可用前，必須滿足以下前置條件清單：
 
 1. **Production Dispatcher 接線**：必須實作正式的生產分派器（production dispatcher），不可直接把測試 slice 迴圈當成生產接線；`ChatViewModelFactory` 必須有顯式、受控的接線路徑。
 2. **不可變確認快照管線（Immutable Confirmation Snapshot Pipeline）**：高風險或非 READ 操作必須經由確認對話框取得使用者授權；確認必須綁定當下的不可變快照 `(tool, identity, arguments)`，在執行副作用前重新評估授權（`ASK` 絕不默認為 `ALLOW`）。

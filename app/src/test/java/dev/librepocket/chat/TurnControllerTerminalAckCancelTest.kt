@@ -133,11 +133,19 @@ class TurnControllerTerminalAckCancelTest {
     }
     val n = AtomicInteger(0)
     val c = controller(provider, SessionTranscriptSink(store, sid), n)
+    val settleWaitEntered = CountDownLatch(1)
+    c.onCancelSettleWaitEnteredForTest = { settleWaitEntered.countDown() }
     try {
       val host = startedHost(c)
       assertTrue("terminal write never entered", store.assistantEntered.await(5, TimeUnit.SECONDS))
       c.cancel()
-      Thread.sleep(300)
+      // 信號同步（取代固定 sleep）：cancel handler 已進入 SUBMITTING settle-wait
+      // 決策點，之後才放行被擋住的 terminal writer，讓 post-wait COMMITTED
+      // 重估（零新增列）被真正釘住，而非賭 300ms 排程。
+      assertTrue(
+        "cancel must enter the settle-wait before the blocked terminal write is released",
+        settleWaitEntered.await(5, TimeUnit.SECONDS),
+      )
       store.assistantGate.complete(Unit)
       joinHost(host)
       flush(c)
@@ -177,6 +185,8 @@ class TurnControllerTerminalAckCancelTest {
     val commits = AtomicInteger(0)
     val committedLatch = CountDownLatch(1)
     val releaseWriter = CountDownLatch(1)
+    val suppressedFinalEntered = CountDownLatch(1)
+    c.onSuppressedFinalFlushEnteredForTest = { suppressedFinalEntered.countDown() }
     c.afterCommitBeforeAckForTest = {
       if (commits.incrementAndGet() == 2) {
         committedLatch.countDown()
@@ -187,7 +197,13 @@ class TurnControllerTerminalAckCancelTest {
       val host = startedHost(c)
       assertTrue("terminal never committed", committedLatch.await(5, TimeUnit.SECONDS))
       c.cancel()
-      Thread.sleep(300)
+      // 信號同步（取代固定 sleep）：host 已觀察 terminal 為 COMMITTED 並進入
+      // suppressed-final 分支，且 writer 的 ack 仍被 holding；因此下面釘的是
+      // 真正的 commit→ack 窗口（零新增列），不是固定延遲後的偶然順序。
+      assertTrue(
+        "cancel must reach the suppressed-final branch with the ack still in flight",
+        suppressedFinalEntered.await(5, TimeUnit.SECONDS),
+      )
       releaseWriter.countDown()
       joinHost(host)
       flush(c)

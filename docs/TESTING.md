@@ -1101,7 +1101,7 @@ is evidence for that run and SHA, not for subsequent changes or other devices.
 While `minSdk` is 33, `targetSdk` is 36, and `compileSdk` is 37 (`app/build.gradle.kts`),
 several open device testing gaps remain:
 - Matrix coverage gaps: API 35 and API 37 emulator lanes are not configured in this workflow; API 36 now rides all three flavors.
-- Journey and lifecycle gaps: Absence of Compose UI end-to-end journey tests and activity process-recreation / configuration-change restoration device tests in `app/src/androidTest` (current instrumented tests cover only Room concurrency, `EncryptedPrefsVault`, and Play permission policy test fixtures).
+- Journey and lifecycle gaps: Absence of Compose UI end-to-end journey tests and activity process-recreation / configuration-change restoration device tests in `app/src/androidTest`. The instrumented classes are Room concurrency, `EncryptedPrefsVault`, Play permission policy fixtures, and (source-only, added for #18) the cancel-path contract below — none of them is a Compose journey or a process-recreation test.
 
 The JVM/Robolectric `app/src/test/java/dev/librepocket/session/SessionListTest.kt`
 has a `Thread.sleep(2)` between session creations, but its injected incrementing
@@ -1110,6 +1110,19 @@ that assertion, not evidence of scheduler-dependent ordering. Other sleeps
 must be evaluated in context; this is not an androidTest sleep finding.
 Additional matrix lanes are Proposed until wired; any configured lane still
 needs run-specific evidence before its execution is claimed.
+
+### Issue #18 現況（2026-11-26，base `main@c5d61a61`）
+
+Current（source／已合併的事實，不代表本次變更已實跑）：
+- Trigger 四事件與 API `[33, 34, 36] × [Play, Foss, Github]` 已修並合併（PR #163/#144）；`WebHttpFetchCancelTest` 四案已落地。詳見上方 matrix 段與現有測試，不重複。
+- Records-only 邊界：`ProductionChatCompositionTest` 釘住 production `toolSlice = null`／不續聊／無 `tool-result:`；`FastDispatchSurfaceArchitectureTest` 靜態掃描所有 production source set，禁止 fast-lane 執行面出現在 router package 之外。
+- 新增 `app/src/test/java/dev/librepocket/agent/ui/chat/ProductionBoundaryContractTest.kt`：production composition root／`ChatViewModelFactory` 的 public constructor 不可注入 `SafeToolSlice`／fast-lane 元件（`ChatSessionFactory` 的 public constructor 仍刻意保留 `toolSlice` test seam，不在本條宣稱範圍）；`key.read` ASK 在 factory 邊界不升級 ALLOW（零 vault／零 provider build）；fresh policy 讀取失敗 fail-closed（stale ALLOW 當負向控制）；取消解除被擋住的 fetch 且不續聊、不產生 tool side effect。
+- 取消競態去時鐘化：`TurnControllerTerminalAckCancelTest` 的 success × commit前／commit後ack前兩格，改用 production seam `onCancelSettleWaitEnteredForTest`／`onSuppressedFinalFlushEnteredForTest` 的 `CountDownLatch` 信號同步，取代固定 `Thread.sleep(300)`；原本的零新增列／單一 assistant／family closed／單次 provider 等 assertion 全數保留。`app/src` 內 `Thread.sleep(` 呼叫數由 HEAD 的 376 降為 374（僅本次兩格），其餘未動。
+- 新增 `app/src/androidTest/java/dev/librepocket/mcp/CancelBoundaryInstrumentedTest.kt`：`McpTransportCancelTest`（JVM）同一 contract 的裝置執行版，刻意重疊場景、不計為新增 contract 覆蓋；合成 MockWebServer + 假 bearer，在真 OkHttp 上驗證取消中斷 blocking body 讀取、觸發 `Call.cancel()`、無殘留 call，取消前以 latch 等到真實 response body 的讀取入口（不是僅等 request 到達；5s／3s／2s／1.5s 皆是 liveness 上限）。**這是測試 source，不是裝置通過證據。**
+
+Proposed（未採納為 gate、未假裝已加 matrix）：API 35／37 lanes；Compose journey 與 process-recreation 裝置測試；Web D3 production OkHttp adapter（其取消 contract 目前只由 fake fetcher 與 MCP transport 覆蓋）。
+
+紅綠裝置證據：issue #18 要求的 boundary bug「先紅後綠、同一 SHA」裝置證據尚未產生；由主 agent 在驗證階段串行跑 Gradle/adb 並記錄 API／flavor／device／report，不得以本機文件變更、historical run 或 debug assembly 代替。本次變更未執行 Gradle／adb。
 
 Device smoke minimal set (Proposed scope, not a gate): when a device pass is
 claimed for a SHA, the minimum is the two API boundaries crossed with the

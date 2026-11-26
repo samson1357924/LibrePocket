@@ -63,16 +63,24 @@ class CharsetLocaleControlTest {
                 builder.environment()["LC_ALL"] = locale
                 builder.environment()["LANG"] = locale
             }
+            val log = File(temp, "probe.log")
             builder.redirectErrorStream(true)
+            builder.redirectOutput(log)
             val process = builder.start()
-            if (!process.waitFor(30, TimeUnit.SECONDS)) {
-                process.destroyForcibly()
-                process.waitFor()
-                throw AssertionError("probe 超過 30s 未結束；已強制終止")
+            try {
+                if (!process.waitFor(30, TimeUnit.SECONDS)) {
+                    throw AssertionError("probe 超過 30s 未結束")
+                }
+                // Use the file so an unexpectedly noisy child cannot block on a pipe.
+                return Result(process.exitValue(), log.readText(Charsets.UTF_8).trim())
+            } finally {
+                if (process.isAlive) {
+                    process.destroyForcibly()
+                    if (!process.waitFor(5, TimeUnit.SECONDS)) {
+                        throw AssertionError("probe 未在強制終止後 5s 內結束")
+                    }
+                }
             }
-            // 先等結束再讀，避免 stdout 管線壓力與 waitFor 互鎖；probe 只輸出一行。
-            val output = process.inputStream.bufferedReader(Charsets.UTF_8).use { it.readText() }
-            return Result(process.exitValue(), output.trim())
         } finally {
             temp.deleteRecursively()
         }

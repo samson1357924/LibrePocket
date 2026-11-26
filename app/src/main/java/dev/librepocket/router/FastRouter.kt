@@ -2162,9 +2162,8 @@ class FastRouter(
         private val NEGATION_CONFUSABLE_JOINED = Regex("[^\\p{L}\\p{Zs}]+|\\p{Lm}+|[\\u115F\\u1160]+")
         private val NEGATION_RUN_SPLIT = Regex("\\p{Zs}+")
 
-        private fun hasConfusableNegationRun(text: String): Boolean {
-            val joined = Normalizer.normalize(text, Normalizer.Form.NFKC)
-                .replace(NEGATION_CONFUSABLE_JOINED, "")
+        private fun hasConfusableNegationRun(nfkc: String): Boolean {
+            val joined = nfkc.replace(NEGATION_CONFUSABLE_JOINED, "")
             return joined.split(NEGATION_RUN_SPLIT).any { run ->
                 var latin = false
                 var confusable = false
@@ -2234,7 +2233,7 @@ class FastRouter(
                 containsAny(removed, NEGATION_MARKERS) ||
                 containsAny(spaced, NEGATION_HINTS) ||
                 containsAny(spaced, NEGATION_MARKERS) ||
-                hasConfusableNegationRun(text)
+                hasConfusableNegationRun(nfkc)
         }
 
         private fun hasExplicitAlarmTime(text: String): Boolean {

@@ -1140,6 +1140,85 @@ Instrumented tests are a separate device-dependent tier. The existing [P1 androi
 
 MainScreen wiring 與 Compose 接線（#136-B1 Stage 7C 已補）：helper 級 `PrivilegeRevokeTest` 9/9 綠；content-level 接線已拆出共用 `PrivilegeRevokeWiring` Composable 並以 Robolectric Compose 覆蓋（`PrivilegeRevokeWiringTest` 2/2：suspend 中 Activity recreate→INFLIGHT 存活、Activity 實銷毀釘測（assertNotSame）、釋放後失敗路徑顯示 ERROR＋成功路徑歸 IDLE、重建後雙擊不重入 revoke）；owner 提升至 Activity 之後（#136-B1 Re-review #9 修復：`PrivilegeRevokeWiring` 以 `findComponentActivity()` ContextWrapper walk 將 `viewModel()` 綁定至宿主 ComponentActivity——無 Activity 環境 fail-loud，絕不回落 Settings 的 NavBackStackEntry；config change 與 destination pop 皆存活），destination-pop 覆蓋亦已補齊：`PrivilegeRevokeNavPopTest` 2/2（真實 NavHost＋抽屜「新對話」pop SETTINGS → 再進 Settings：INFLIGHT 存活、executor 不重入、失敗→ERROR 可重試、成功→IDLE）＋ VM 機器測試 `PrivilegeRevokeViewModelTest` 7/7（成功／失敗／雙擊互斥／錯誤黏性／retry 重路由／executor 極性釘測）。**仍缺全端到端**：`MainScreen → SettingsScreen` 在真 Activity 上的 recreate 路徑（真實 MainScreen 掛載）與相機 lane instrumented 驗證，綁定 #136-B3 activation gate；helper VMError 終端分支已由 `PrivilegeRevokeTest` pin，**VM 的 executor-throws fatal arm 暫無釘測**（kotlinx-coroutines-test 全域 ExceptionCollector 會殘留 poison sibling Compose harness——WARN-2 待 B3 或隔離 JVM pin；helper 層已被覆蓋）。**行程死亡（kill）時 revoke VM 狀態重置為 Idle**（viewModelScope／VM 隨行程滅）；跨重啟後續語義由持久 journal／marker 承接（fail-closed），非 UI 狀態。
 
+## Issue #177 charset/locale triage（Current 證據；Proposed 處置）
+
+本節記錄 #177「foss 全量 suite 17 個預存失敗」的環境 vs 邏輯判定依據。**Current**：
+JDK 25 下 baseline 全綠；獨立 JDK 25 探針可重現 native-locale 環境失敗，新增的 JUnit
+控制案例已由主 agent 在本分支串行實跑（三 flavor `BUILD SUCCESSFUL`；`CharsetLocaleControlTest` XML `tests=3 skipped=0 failures=0 errors=0`）。以下 `-Dfile.encoding/-Duser.language/-Duser.country` 是**本機實跑環境**
+（由 JUnit XML property／`--info` 取得），**不是 checked-in CI 設定**：版控只有
+`gradle.properties:1` 的 daemon `-Dfile.encoding=UTF-8`，CI 未落實後兩個 flag。
+**Current（分支證據）**：控制案例已在本分支實跑且 skip gate 滿足，maintainer 已留 comment 並 close #177；**但這是分支證據，不是 main gate** — #188 合併後須在 merged main 重跑控制案例與 baseline 才能升級為 main 證據。
+
+### 主 agent 實跑 baseline（可信，base `main@c5d61a61`）
+
+- 三 flavor 完整 JVM 單測 **BUILD SUCCESSFUL**；本機實跑環境的 test worker JVM args
+  含 `-Dfile.encoding=UTF-8 -Duser.country=TW -Duser.language=zh`（XML property／`--info`
+  取得；checked-in CI 設定未包含後兩項，見上方說明）。
+- Foss JUnit XML 全綠（failures=0, errors=0）：`FileScopeTest` 13/13、`FileSearchTest` 20/20、
+  `FileAttachTest` 10/10、`FileEditTest` 17/17、`ShellPhysicalGateTest` 21/21、
+  `ChatMarkdownParserTest` 110/110、`NetworkPolicyTest` 73/73、
+  `B2Phase1DispatcherGrantTest` 14/14。舊 XML（2026-10-30）亦全綠；review 查
+  2026-10-29～11-15 窗口，5 個 charset 相關 production/test 檔
+  （`FileScope*`／`FileSearch*`／`FileAttach*`／`FileEdit*`／`ShellPhysicalGate*`）無變更；
+  時序三項另有變更，由 #176 處理（見下方）。
+
+### 可重現控制案例（本分支新增，尚未由本分支執行 Gradle）
+
+`CharsetRoundTripProbe`（sub-JVM helper）與 `CharsetLocaleControlTest`（JUnit4 driver）以
+`ProcessBuilder` 啟動同一個 `java`（`System.getProperty("java.home")` 下的 `bin/java`），在**同一份 production**
+`FileScope.sanitizeRelative` + `File` 邏輯下做「寫入→列出→讀取→比對」，只使用合成中文檔名與暫存目錄：
+
+| 案例 | 環境 | 預期 |
+|---|---|---|
+| `utf8Locale_roundTrip_succeeds` | 繼承宿主 locale，`-Dfile.encoding=UTF-8` | `RESULT=OK`、`listed/content=true`、`sanitizeRelative=中文.txt`，`sun.jnu.encoding=UTF-8` |
+| `fileEncodingOverrideAlone_doesNotBreakRoundTrip` | 同上但 `-Dfile.encoding=ISO-8859-1` | 仍 `RESULT=OK`（負向控制：只改 `file.encoding` 不是 #177 的開關） |
+| `posixLocale_reproducesIssue177_failure` | `LC_ALL=C`／`LANG=C`，分別配 UTF-8 與 ISO-8859-1（並帶 `-Duser.language=zh -Duser.country=TW`） | `listed=false` + `sanitizeRelative=null`（底層 `Paths.get` 拋 `InvalidPathException`，由 production catch）→ `RESULT=ENV_FAILURE`、exit 3；`File.writeText/readText` 走串流，本身不拋該例外 |
+
+三案例的 driver 皆帶 `-Duser.language=zh -Duser.country=TW`（與手動探針一致；不影響 `sun.jnu.encoding`）。
+
+獨立的 JDK 25 手動探針（非 Gradle、非本 PR 測試）實測：UTF-8 locale 下
+`sun.jnu.encoding=UTF-8`、round-trip 成功；`-Dfile.encoding=ISO-8859-1` 單獨作用時
+`sun.jnu.encoding` 仍是 UTF-8、round-trip 仍成功；`LC_ALL=C`（即使同時
+`-Dfile.encoding=UTF-8 -Duser.language=zh -Duser.country=TW`）則
+`sun.jnu.encoding=ANSI_X3.4-1968`，`FileOutputStream` 把中文名寫成 `??.txt`（列出比對失敗），
+底層 `Paths.get("中文.txt")` 丟 `InvalidPathException`、`FileScope.sanitizeRelative` catch 後回
+`null`——正是 #177 所述「拒絕 non-ASCII 檔名」的表徵。
+這與本檔較早的「本機 host-layout 敏感測試與 privilege 子系（#136-B1）」節已記錄的
+`LC_ALL=C` 16 個 locale/CJK 失敗、`C.utf8` 全綠一致。故判定 **環境（native locale／
+`sun.jnu.encoding`），非 `FileScope`／full-width 正規化邏輯缺陷**（推論，見下方限制）；
+`hasDotDotSegment`
+亦由 `ShellPhysicalGateTest.dotdotEncoding_locked` 與新增 `dotdotExactSegment_pin` 釘住
+「exact `..` 才拒，全形 `．．`／`%2e%2e` 放行」的安全方向。
+
+### CI charset 要求（Current 需求，非已完全落實的 gate）
+
+CI runner 須使用 UTF-8 **native locale**（`LANG=C.UTF-8`／`LC_ALL=C.utf8`），使
+`sun.jnu.encoding=UTF-8`；本機實跑另帶 `-Dfile.encoding=UTF-8
+-Duser.language=zh -Duser.country=TW`（目前未寫入 checked-in CI 設定，只有 daemon
+`-Dfile.encoding=UTF-8`）。`file.encoding`／`user.language` 單獨無法補償 POSIX locale；
+新控制案例會在 locale 不是 UTF-8 時失敗並指向本節。
+
+### 時序類與限制／處置
+
+時序類失敗由 #176 處理（`ChatMarkdownParserTest` 比值改計數、`NetworkPolicyTest`／
+`B2Phase1DispatcherGrantTest` 改 barrier + watchdog；#176 也動到 production parser/view，
+不限於測試），本分支不重複（Refs #176）。**#176 的修正尚未合併進 main（`ff811434` 非 main
+祖先）**：即使 close #177，時序三項在 main 仍存在，須由 #176 持續追蹤，close 不代表那些問題已消失。
+
+限制：新控制案例已由主 agent 在本分支串行實跑（XML 見上），但仍是**分支證據**，合併後須在 main 重跑；亦未重現
+#177 原本 17 個失敗的 failure message，判定是「baseline 全綠 + 可重現環境控制 + charset 相關
+5 檔無變更」的推論，不是對原失敗日誌的逐條重演。
+
+**處置（缺一不可）**：
+
+1. close 前必須三 flavor 實跑，且 `CharsetLocaleControlTest` 的 XML 為
+   `tests=3 skipped=0 failures=0 errors=0`，同時 baseline 全綠；於 #177 留 comment 引用本節後
+   close（環境性，非 logic regression）。
+2. 若 `posixLocale_reproducesIssue177_failure` 被 skip（host 無法產生非 UTF-8 的
+   `sun.jnu.encoding`）→ **證據不足，不得 close #177**；JUnit 摘要只檢查 counter、不要求
+   `skipped=0`，故必須自己讀 XML 確認。
+3. 若該案例失敗（非 UTF-8 仍 green）→ 不 close，改列需 further fix 的邏輯面。
+
 ## Open items（#136-B1）
 
 - **WARN-2（VM executor-throws fatal arm 暫無釘測）**：`PrivilegeRevokeViewModelTest` 未覆蓋 `executor` 拋出（executor-throws 路徑的）fatal arm——kotlinx-coroutines-test 全域 ExceptionCollector 會殘留 poison sibling Compose harness（同 JVM 內 sibling Compose 測試被牽連 fail），故未以現有 harness 釘測；helper 層 VMError 終端分支已由 `PrivilegeRevokeTest` pin。**處置：待 B3 或以隔離 JVM（獨立 test JVM／forkEvery）pin 補上。綁定期限：此 pin 不得晚於 #136-B3 activation gate 翻 `true`（見 CAPABILITY_MATRIX #136-B1 行之 B3 前置清單），亦不得在 B3 的 activation PR 合併後補上。**

@@ -876,6 +876,44 @@ counter contradicts its skipped `<testcase>` detail is `INCOMPLETE`. Whether
 the skip count should additionally block an overall green claim is a
 reviewer-side judgment on the report, not an assertion the reporter makes.
 
+## #137 C1/C2 JVM contract pins（Current；非裝置驗證）
+
+#142／#164 已把 C1（三服務＋RoleManager＋fallback）與 C2（RecognizerIntent prefill、
+零新 `RECORD_AUDIO`、`tools:node="remove"`）合併到 production；以下為可回歸的
+source/JVM contract pin，**不新增 production 行為、不改 flavor 邊界**，且全部只用
+合成 intent extras／假快照／源碼 XML；**不發出真實語音／網路請求、不使用真實 credential**
+（既有 `newVm` helper 仍含 endpoint 設定字串，但 `buildProvider` 回 fake、不發請求）：
+
+- `dev.librepocket.agent.assistant.AssistantManifestContractTest`（純 JVM）：
+  靜態解析 `src/main` 與 `play`／`foss`／`github` source-set XML，pin 三服務宣告
+  （exported、`process=":voice"`、binding permission、intent-filter）、
+  `voice_interaction.xml` 的 session/recognition 雙綁定與 `supportsAssist`、
+  flavor overlay 不移除／覆寫共用服務與 app-private handoff provider、
+  `RECORD_AUDIO` remove 錨點唯一且 flavor 不重加、play 六項 policy remove／
+  零 service／零疊加 permission。
+- `dev.librepocket.agent.assistant.AssistantRoleFallbackContractTest`（純 JVM）：
+  RoleManager 不可用（`Unsupported`／`ReadError`／available=false）決策 fail-closed、
+  曾持有後被撤銷為 `REVOKED`、驗證中 request no-op；並以 source pin 限制
+  `createRequestRoleIntent`／`launcher.launch` 只能出現在使用者手勢的 `request`
+  閉包，Effect／composition body 不得背景取得角色。
+- `dev.librepocket.agent.ui.chat.ChatScreenVoiceLaunchTest`（Robolectric Compose，
+  新增合成 extras 案例）：`RecognizerIntent.EXTRA_RESULTS` 超長結果截斷至
+  `EntryNormalize.MAX_TEXT_LENGTH`（4000）、只 prefill 進 `ChatViewModel.input`、
+  零 provider request／零訊息；`AUTO_SEND_AFTER_VOICE=false` 常數由
+  `AssistantVoiceTest.autoSend_isLockedOff` 既有案例鎖死。
+
+互補／交叉驗證（部分重疊）的既有覆蓋：`AssistantRoleRobolectricTest`（三服務解析／`:voice`／stub
+fail-closed）、`AssistantRoleTest`（決策／調和真值表）、`AssistantCardTest`
+（設定卡渲染）、`AssistantVoiceRobolectricTest`（各 flavor merged-manifest
+無 `RECORD_AUDIO` 且 provider lockdown）、`VoiceHandoffContractTest`／
+`VoiceHandoffProviderTest`（identity／TTL／one-shot IPC）。
+
+**現況涇渭**：C1/C2 的 JVM contract＝**Current**（僅 source／JVM 證據，由
+CI 的各 flavor 單測車道執行）；**真機 E2E（授予／撤銷／鎖屏／process death／
+OEM：Samsung OneUI／小米 HyperOS／Pixel）仍為 Proposed**，C3（RECORD_AUDIO／
+microphone FGS／浮窗／螢幕內容）另議。JVM／Robolectric 綠燈不可改寫為已驗證
+的裝置結論。
+
 ## Local commands
 
 Use one Gradle execution at a time on constrained machines. The repo's maintenance guidance requires `--max-workers=1 --no-daemon`; do not run a parallel flavor matrix after an OOM.

@@ -1544,7 +1544,7 @@ jobs:
                 "--ignore-installed --no-deps --only-binary=:all: "
                 "--require-hashes -r scripts/requirements-docs.txt\n"
                 "          python3 -P -c 'import yaml; assert yaml.__version__ == "
-                '"6.0.3", yaml.__version__\'\n',
+                '"6.0.4", yaml.__version__\'\n',
                 "",
                 1,
             ),

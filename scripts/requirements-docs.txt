@@ -1,9 +1,9 @@
-# Pinned docs-guard dependency (PyYAML 6.0.3). Hashes cover the cp310-cp314
+# Pinned docs-guard dependency (PyYAML 6.0.4). Hashes cover the cp310-cp314
 # manylinux x86_64 wheels and the sdist; install with --require-hashes.
-PyYAML==6.0.3 \
-    --hash=sha256:9c7708761fccb9397fe64bbc0395abcae8c4bf7b0eac081e12b809bf47700d0b \
-    --hash=sha256:b8bb0864c5a28024fac8a632c443c87c5aa6f215c0b126c449ae1a150412f31d \
-    --hash=sha256:ba1cc08a7ccde2d2ec775841541641e4548226580ab850948cbfda66a1befcdc \
-    --hash=sha256:0f29edc409a6392443abf94b9cf89ce99889a1dd5376d94316ae5145dfedd5d6 \
-    --hash=sha256:c458b6d084f9b935061bc36216e8a69a7e293a2f1e68bf956dcd9e6cbcd143f5 \
-    --hash=sha256:d76623373421df22fb4cf8817020cbb7ef15c725b9d5e45f17e189bfc384190f
+PyYAML==6.0.4 \
+    --hash=sha256:88a089e6424a8a256321270620d5a4328ad5227fb2061b07d33f596894336914 \
+    --hash=sha256:622aa875fa6533f25fedcffe23079357d65a690d462200afed5d8e9d0e01ebee \
+    --hash=sha256:93bfb2459195406a518e2f487a9bbf01df240175f31e06f5a252ac6734c7bbf0 \
+    --hash=sha256:50588147ab2c6a59b5f990a4905db80899a6c2bd197e046a6201f1e67587e794 \
+    --hash=sha256:c604dc2613c417130479cdd6e55c2faa691b6365aa82b3dafddfcecc2eaf1ac7 \
+    --hash=sha256:e24bf71af8a432d7808fabff134d38dfe16d3cbb41f2873bb4b1e42422de0a1a

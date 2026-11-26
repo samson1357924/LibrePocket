@@ -6808,7 +6808,7 @@ class PolicyCiGateControl(unittest.TestCase):
         )
         self.assertIn(
             "          python3 -P -c 'import yaml; assert yaml.__version__ == "
-            '"6.0.3", yaml.__version__\'\n',
+            '"6.0.4", yaml.__version__\'\n',
             guard_block,
         )
         self.assertIn(

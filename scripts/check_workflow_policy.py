@@ -103,7 +103,7 @@ EXPECTED_WORKFLOW_SHA256 = {
         "f8db04a315da8c71b91ab5cb6f6ed575db705b0c1071767d48c775bd47bd0564"
     ),
     "pr-check.yml": (
-        "8d066d6c1722696e50400cd6253180ba22dcdbba662e48402d700fc38f35aff4"
+        "0398ec375867ad2b0868fb79492e9f84aa17d8088b1810304a941767d1b90d02"
     ),
     "release.yml": (
         "acf8d39620362fce1190f6ffb6d75d088ae19c4d9de636be64af0dcbc0cd7d1f"
@@ -175,7 +175,7 @@ PYYAML_INSTALL_RUN = "\n".join(
         "python3 -m pip install --user --disable-pip-version-check "
         "--ignore-installed --no-deps --only-binary=:all: --require-hashes "
         "-r scripts/requirements-docs.txt",
-        "python3 -P -c 'import yaml; assert yaml.__version__ == \"6.0.3\", "
+        "python3 -P -c 'import yaml; assert yaml.__version__ == \"6.0.4\", "
         "yaml.__version__'",
     )
 )
@@ -3141,7 +3141,7 @@ def check_workflow(
 
 
 EXPECTED_REQUIREMENTS_SHA256 = (
-    "b7078b93108cf8befcc2286b3adea4bc4042ebe9795c7b7dc69a6b7d9b258762"
+    "c5bec68e6dc9e711be21ff9fc7a64e73599b34a829e33f9c5fa55a9d22bf8a8b"
 )
 SHADOW_SUFFIXES = (".py", ".pyc", ".pyd", ".so")
 

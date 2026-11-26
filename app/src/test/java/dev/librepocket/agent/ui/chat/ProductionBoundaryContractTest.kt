@@ -85,8 +85,6 @@ class ProductionBoundaryContractTest {
     fun productionCompositionRootPublicConstructorCannotInjectToolSliceOrFastLane() {
         // Scope: ChatViewModelFactory is the production composition root.
         // ChatSessionFactory intentionally keeps a `toolSlice` test seam.
-        val publicCtors = ChatViewModelFactory::class.java.constructors
-        assertTrue("production factory must expose a public constructor", publicCtors.isNotEmpty())
         val forbiddenNames = listOf(
             SafeToolSlice::class.java.name,
             "dev.librepocket.router.FastDispatcher",
@@ -97,10 +95,12 @@ class ProductionBoundaryContractTest {
         // private primary constructor (parameter mask + DefaultConstructorMarker),
         // including one carrying the test-only `toolSlice` parameter. Filter
         // those out: only real source-level public constructors are in scope.
-        for (ctor in publicCtors.filterNot { ctor ->
+        val publicCtors = ChatViewModelFactory::class.java.constructors.filterNot { ctor ->
             ctor.isSynthetic ||
                 ctor.parameterTypes.lastOrNull()?.name == "kotlin.jvm.internal.DefaultConstructorMarker"
-        }) {
+        }
+        assertTrue("production factory must expose a source-level public constructor", publicCtors.isNotEmpty())
+        for (ctor in publicCtors) {
             for (type in ctor.parameterTypes) {
                 assertTrue(
                     "public production constructor must not inject ${type.name}",

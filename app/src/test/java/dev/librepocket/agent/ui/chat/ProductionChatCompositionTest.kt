@@ -467,7 +467,13 @@ class ProductionChatCompositionTest {
         // ASK is the fail-closed default for tool.exec; production must never
         // turn it into an implicit ALLOW by attaching a slice or evaluating it.
         val inner = allowKeyReadPolicy()
-        inner.setRule(PolicyRule("tool.exec:lsp.symbols", Verdict.ASK, 20))
+        val askRule = PolicyRule("tool.exec:lsp.symbols", Verdict.ASK, 20)
+        inner.setRule(askRule)
+        // Prove the fixture selects this explicit ASK rule for the exact
+        // tool before installing the observation wrapper and starting the turn.
+        val decision = inner.evaluateFresh("tool.exec", "lsp.symbols")
+        assertEquals(Verdict.ASK, decision.verdict)
+        assertEquals(askRule, decision.matchedRule)
         val policy = CountingToolExecPolicy(inner)
         val requests = AtomicInteger(0)
         val capturedRequest = AtomicReference<ChatRequest?>()
@@ -512,7 +518,12 @@ class ProductionChatCompositionTest {
             assertTrue("ASK must never make a tool model-visible", req.tools.isEmpty())
 
             val events = store.loadEvents(created.sessionId!!, 0, 2000)
-            assertTrue("ToolDone must be records-only", events.any { it.text.contains("[tool:lsp.symbols") })
+            val finals = events.filter { it.kind == "assistant" && it.isFinal }
+            assertEquals("exactly one durable assistant result", 1, finals.size)
+            assertTrue(
+                "final assistant row must record ToolDone",
+                finals.single().text.contains("[tool:lsp.symbols"),
+            )
             assertFalse("ASK must never produce a tool result", events.any { it.text.contains("[tool-result:") })
         }
     }

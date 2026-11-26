@@ -15,6 +15,8 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.async
@@ -25,6 +27,8 @@ import kotlinx.coroutines.flow.emptyFlow
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.test.StandardTestDispatcher
+import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.supervisorScope
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
@@ -138,6 +142,7 @@ class TurnControllerCancelAttributionTest {
     sink: TranscriptSink,
     sleeper: suspend (Long) -> Unit = {},
     retry: TurnRetryConfig = TurnRetryConfig(),
+    transcriptDispatcher: CoroutineDispatcher? = null,
   ): TurnController {
     var n = 0
     return TurnController(
@@ -146,6 +151,7 @@ class TurnControllerCancelAttributionTest {
       transcript = sink,
       retryConfig = retry,
       dispatcher = Dispatchers.Default,
+      transcriptDispatcher = transcriptDispatcher,
       sleeper = sleeper,
       newId = { "cancel-${n++}" },
     )
@@ -386,6 +392,32 @@ class TurnControllerCancelAttributionTest {
     } finally {
       release.complete(Unit)
       c.close()
+    }
+  }
+
+  @Test fun flushWaitsForPublishedAdmissionCancelEvenBeforeItEntersTheWriter() = runTest {
+    val sink = CancelAttrSink()
+    val provider = CancelAttrProvider()
+    val c = controller(provider, sink, transcriptDispatcher = StandardTestDispatcher(testScheduler))
+    try {
+      // Cancel after the durable user ack but before admission finalizes. The
+      // orphan drain is dispatched, then the cancelled host is returned.
+      c.beforeAdmissionFinalizeForTest = { c.cancel() }
+      val admission = c.startOrEnqueue("Q-flush")
+      assertTrue(admission is TurnStart.Started && admission.host.isCancelled)
+      assertTrue("the scheduler has not run the orphan drain", sink.cancelled.isEmpty())
+
+      // Run flush inline up to its first suspension, ahead of the scheduled
+      // orphan. Without the job join, the sink's barrier overtakes the terminal.
+      val terminalAtFlush = async(start = CoroutineStart.UNDISPATCHED) {
+        assertTrue("transcript must drain", c.flushTranscript())
+        sink.cancelled.toList()
+      }.await()
+      assertEquals(listOf(sink.started.single().first to ""), terminalAtFlush)
+      assertEquals(0, provider.streamCalls.get())
+    } finally {
+      c.close()
+      c.flushTranscript()
     }
   }
 

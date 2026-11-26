@@ -18,6 +18,7 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertSame
 import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -115,7 +116,21 @@ class FastDispatchGatesTest {
         val ctxCalls = AtomicInteger()
         val audit = RecordingAudit()
         val policy = CountingPolicy(allowPolicy())
-        val d = dispatcher(backend, ctxSupplier = { ctxCalls.incrementAndGet(); lspOn }, policy = policy, audit = audit)
+        val reverifiedCtx = lspOn.copy()
+        val delegate = LspSymbolsExecutor(backend)
+        var executorCtx: ProjectionContext? = null
+        val recordingExecutor = object : FastToolExecutor by delegate {
+            override suspend fun execute(call: ToolCall, ctx: ProjectionContext): FastExecResult {
+                executorCtx = ctx
+                return delegate.execute(call, ctx)
+            }
+        }
+        val d = FastDispatcher(
+            executors = mapOf(LspTools.SYMBOLS_NAME to recordingExecutor),
+            ctxSupplier = { if (ctxCalls.incrementAndGet() == 1) lspOn else reverifiedCtx },
+            policy = policy,
+            auditSink = audit,
+        )
 
         val decision = fastDecision()
         val snap = d.confirm(decision, identity)
@@ -123,6 +138,7 @@ class FastDispatchGatesTest {
         val out = d.dispatchFresh(decision, snap!!, identity)
 
         assertTrue("fresh ALLOW must execute (got $out)", out is FastDispatchOutcome.Executed)
+        assertSame("executor must use the reverified projection context", reverifiedCtx, executorCtx)
         assertEquals(1, backend.invocations.get())
         // fresh ctx at dispatch + fresh ctx at post-confirm reverify (>=2);
         // the decision's own snapshot was built separately by FastRouter.

@@ -513,7 +513,7 @@ internal class FastDispatcher(
             return FastDispatchOutcome.Skipped(null, fixedFailureMessage(tool.name), denyCode = "EXECUTOR_IDENTITY_MISMATCH")
         }
         coroutineContext.ensureActive()
-        if (wired) {
+        val executorCtx = if (wired) {
             // Stage 1: fresh policy（永不沿用 decision 期或上一 turn 的 verdict）。
             // DENY / ASK / 故障 / unknown 一律 typed skip、零 backend 副作用。
             val revision = policyRevision()
@@ -566,6 +566,9 @@ internal class FastDispatcher(
                 return skip
             }
             coroutineContext.ensureActive()
+            ctx2
+        } else {
+            ctx
         }
         // 非正的 per-call budget（0/負值）直接 fail-closed 型別化拒絕：零 backend
         // 呼叫，與切片「非正 budget＝即刻型別化逾時」語義一致（絕不視為無上限）。
@@ -588,7 +591,7 @@ internal class FastDispatcher(
             coroutineContext.ensureActive()
         }
         val result = try {
-            withTimeout(timeoutMs) { executor.execute(call, ctx) }
+            withTimeout(timeoutMs) { executor.execute(call, executorCtx) }
         } catch (e: TimeoutCancellationException) {
             // 逾時是型別化失敗（不等於呼叫端取消）：typed skip，不外拋。
             // 注意此 catch 必須排在 generic CancellationException 之前——

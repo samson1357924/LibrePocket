@@ -297,9 +297,18 @@ for flavor in selected:
     if mode == "debug-cert-" + flavor:
         payload["cert"] = "dd" * 32
         payload["subject"] = "CN=Android Debug, O=Android, C=US"
+    # Issue #12 negative control: a lone APK named *signed.apk with unsigned
+    # content must never satisfy the builder's final-byte gate.
+    signed_named_unsigned = mode == "signed-filename-unsigned-" + flavor
+    if signed_named_unsigned:
+        payload["signed"] = False
     out = root / "app" / "build" / "outputs" / "apk" / flavor / "release"
     out.mkdir(parents=True, exist_ok=True)
-    (out / ("app-" + flavor + "-release.apk")).write_text(
+    candidate_name = (
+        "app-signed.apk" if signed_named_unsigned
+        else "app-" + flavor + "-release.apk"
+    )
+    (out / candidate_name).write_text(
         json.dumps(payload, sort_keys=True), encoding="utf-8"
     )
     if mode == "multiple-" + flavor:
@@ -686,6 +695,20 @@ class ReleaseBuilderHarness(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0, result.stdout)
         self.assertNotIn("READY", result.stdout)
         self.assertEqual(self._output_roots(), [])
+
+    def test_signed_named_unsigned_apk_is_rejected_by_the_builder(self) -> None:
+        # Only one candidate exists and it is named app-signed.apk, but its
+        # content reports unsigned. The builder must reject via apksigner on
+        # the staged bytes, not accept it on the filename's say-so.
+        result = self.run_builder(
+            self.command(("play",)), mode="signed-filename-unsigned-play"
+        )
+
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertNotIn("READY", result.stdout)
+        self.assertEqual(self._output_roots(), [])
+        self.assertTrue(self.gradle_log.is_file(), "the rejection must happen after the build")
+        self.assertIn("apksigner", result.stdout.lower())
 
     def test_aab_is_not_a_fallback(self) -> None:
         result = self.run_builder(mode="aab-play")

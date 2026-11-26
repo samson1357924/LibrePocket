@@ -103,10 +103,10 @@ EXPECTED_WORKFLOW_SHA256 = {
         "f8db04a315da8c71b91ab5cb6f6ed575db705b0c1071767d48c775bd47bd0564"
     ),
     "pr-check.yml": (
-        "8d066d6c1722696e50400cd6253180ba22dcdbba662e48402d700fc38f35aff4"
+        "1ef08cb6a4833a0ca7258cd6b26ba8c906f676ca375065a90b7f923bfac1e2a5"
     ),
     "release.yml": (
-        "acf8d39620362fce1190f6ffb6d75d088ae19c4d9de636be64af0dcbc0cd7d1f"
+        "bec028b92fcb7cee9cfc0795c79175d5a09ba54fc53b52b2094c8b74b2762465"
     ),
     "security-audit.yml": (
         "0b4b9b833a50b61b456e4d4c2064fba5f9c6836867157c4f22b1c5887ee4f176"
@@ -271,10 +271,14 @@ EXPECTED_POLICY_FILTER_PATHS = frozenset(
         "scripts/check_workflow_policy.py",
         "scripts/tests/test_workflow_policy.py",
         "scripts/check_python_shadowing.sh",
-        # Any signer-pins-shaped path (root-level or nested) must flip
-        # policy=true so the never-committed tripwire runs (Issue #12).
+        # Any signer-pins-shaped path (root-level or nested, underscore or
+        # hyphen spelling) must flip policy=true so the never-committed
+        # tripwire runs (Issue #12, review G2 symmetry). Both layers use the
+        # same two markers; the tripwire remains unconditional in CI.
         "*signer_pins*",
         "**/*signer_pins*",
+        "*signer-pins*",
+        "**/*signer-pins*",
         ".github/workflows/pr-check.yml",
         ".github/workflows/codeql.yml",
         ".github/workflows/nightly-instrumented.yml",

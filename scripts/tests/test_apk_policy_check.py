@@ -6579,6 +6579,12 @@ class PolicyCiGateControl(unittest.TestCase):
             ".github/workflows/nightly-instrumented.yml",
             ".github/workflows/**",
             ".github/actions/**",
+            # Both spellings of the signer-pins marker (review G2 symmetry
+            # with the unconditional _forbidden_signer_pins_path tripwire).
+            "*signer_pins*",
+            "**/*signer_pins*",
+            "*signer-pins*",
+            "**/*signer-pins*",
             "gradle/wrapper/**",
             # Trailing catch-all (kept LAST in the yml list): defaults any
             # new scripts/ harness code into the policy gate without a
@@ -6610,6 +6616,12 @@ class PolicyCiGateControl(unittest.TestCase):
             [".github/workflows/codeql.yml"],
             [".github/workflows/nightly-instrumented.yml"],
             [".github/actions/local-check/action.yml"],
+            # A registry-shaped filename anywhere in the diff must flip
+            # policy=true so the committed-pins absence tripwire runs.
+            ["release_signer_pins.json"],
+            ["docs/release_signer_pins.json"],
+            ["docs/signer-pins.yaml"],
+            ["configs/sub/signer-pins.json"],
             ["gradle/wrapper/gradle-wrapper.properties"],
             ["gradle/wrapper/gradle-wrapper.jar"],
         ):

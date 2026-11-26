@@ -178,19 +178,27 @@ class BuiltinToolFourStateContractTest {
         )
         val begin = "<!-- FOUR_STATE_TABLE_BEGIN -->"
         val end = "<!-- FOUR_STATE_TABLE_END -->"
-        val from = text.indexOf(begin)
-        val to = text.indexOf(end)
-        assertTrue("missing $begin in CAPABILITY_MATRIX.md", from >= 0)
-        assertTrue("missing $end in CAPABILITY_MATRIX.md", to > from)
-        val parsed = text.substring(from + begin.length, to).lineSequence()
-            .map { it.trim() }
-            .filter { it.startsWith("| `") }
+        val lines = text.lineSequence().map { it.trim() }.toList()
+        assertEquals("should have one $begin in CAPABILITY_MATRIX.md", 1, lines.count { it == begin })
+        assertEquals("should have one $end in CAPABILITY_MATRIX.md", 1, lines.count { it == end })
+        val from = lines.indexOf(begin)
+        val to = lines.indexOf(end)
+        assertTrue("table must include header and separator", to >= from + 3)
+        assertEquals("| 工具 | Declared | Implemented | Wired | Verified | executionReady |", lines[from + 1])
+        assertEquals("|---|---|---|---|---|---|", lines[from + 2])
+        // Check every line in the table's data section; a malformed or
+        // unquoted tool row must fail rather than being silently skipped.
+        val parsed = lines.subList(from + 3, to)
             .map { line ->
                 val cells = line.split("|").map { it.trim() }
                 assertEquals("unexpected table shape: $line", 8, cells.size)
+                assertTrue(
+                    "expected leading and trailing table separators: $line",
+                    cells.first().isEmpty() && cells.last().isEmpty(),
+                )
                 // cells: ["", "`name`", declared, implemented, wired, verified, ready, ""]
                 RenderedRow(
-                    name = cells[1], // keep the backticks; the expected rows use the same shape
+                    name = cells[1], // the expected rows require the same backtick-quoted names
                     declared = cells[2],
                     impl = cells[3],
                     wired = cells[4],
@@ -202,10 +210,10 @@ class BuiltinToolFourStateContractTest {
         val expected = contract.map {
             RenderedRow(
                 name = "`${it.name}`",
-                declared = "是",
+                declared = if (it.declared) "是" else "否",
                 impl = it.impl.token,
-                wired = "否",
-                verified = "否",
+                wired = if (it.wired) "是" else "否",
+                verified = if (it.verified) "是" else "否",
                 executionReady = it.executionReady.toString(),
             )
         }

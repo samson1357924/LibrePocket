@@ -275,9 +275,10 @@ esac
 # cleartextTrafficPermitted=false 即過」的反例是 base-config false + domain-config
 # true（example.com）——整檔語意已放行明文流量而 gate 仍 PASS。改為結構化 XML
 # 驗證（ElementTree 忽略註解，註解內殘字不滿足釘點），規則集依「來源集歸屬」
-# 分流：debug source set → loopback 白名單規則；其餘 release-bearing source set
-# （main/play/foss/github/未來 release overlay）一律 deny-all（規則表見
-# scripts/nsc_check.py 模組說明）。
+# 分流：debug source set／variant → loopback 白名單規則；foss/github flavor
+# overlay（含 *Release variant）→ RFC1918 lan 白名單；其餘 release-bearing
+# source set（main/play/未來 flavor）一律 deny-all（規則表見
+# scripts/nsc_check.py 模組說明）。play 永不取得 lan 規則。
 # 深掃吞 alias：語意同形檔名一併驗證——`*network*security*.xml` 比「必須含
 # config」的舊比對更寬：dash 拼法（network-security-config.xml）、缺段落別名
 # （network-security.xml）均列入，未來 flavor overlay 以別名新增 NSC 時也不
@@ -294,8 +295,17 @@ NSC_LIST="$(find "$ROOT/app/src" -type f -name '*network*security*.xml')" ||
     fail 'missing app/src/main/res/xml/network_security_config.xml'
 while IFS= read -r nsconfig; do
     [ -n "$nsconfig" ] || continue
+    # A5 來源集→規則集路由（first-match，越嚴格越先）：
+    # - debug buildType／variant（src/debug、*Debug）→ loopback-only debug；
+    # - foss/github flavor overlay（含其 *Release variant）→ RFC1918 lan；
+    # - 其餘 everything else（main、play、playRelease、未來 flavor）→ release
+    #   deny-all。play 沒有也不得取得 lan overlay；此路由只認路徑歸屬，
+    #   任何白名單外的 domain 由 nsc_check.py fail-closed 拒絕。
     case "$nsconfig" in
         "$ROOT/app/src/debug/"*) nsc_mode=debug ;;
+        "$ROOT/app/src/"*Debug/*) nsc_mode=debug ;;
+        "$ROOT/app/src/foss/"*|"$ROOT/app/src/github/"*) nsc_mode=lan ;;
+        "$ROOT/app/src/fossRelease/"*|"$ROOT/app/src/githubRelease/"*) nsc_mode=lan ;;
         *) nsc_mode=release ;;
     esac
     python3 -P "$SCRIPT_DIR/nsc_check.py" --mode "$nsc_mode" "$nsconfig"

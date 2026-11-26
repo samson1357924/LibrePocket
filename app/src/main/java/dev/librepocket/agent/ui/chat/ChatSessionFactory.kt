@@ -618,18 +618,21 @@ class ChatSessionFactory(
      */
     internal val toolSlice: SafeToolSlice? = null,
     /**
-     * S2 (Issue #135 A2): per-endpoint 網路 opt-in 解析。Null（預設）即
-     * deny-all（HTTPS_ONLY）；測試／後續 UI 接線注入 `NetworkOptInStore`
-     *（已 `confirm` 的迴環／LAN endpoint 才放行，變更即失效需重綁）。
-     * Play production 只允許預設建構（`allowTierUpgrade = false`）或 null；
-     * 升級-capable 的 store 屬 foss／github pilot 接線（見 `NetworkOptInStore`）。
+     * S2 (Issue #135 A2)／A5：per-endpoint 網路 opt-in 解析。Null 即
+     * deny-all（HTTPS_ONLY），僅供未接線的測試直接使用本 class；production
+     * 由 [ChatViewModelFactory] 的單一注入點傳入非 null store。
+     * 已 `confirm` 的迴環／LAN endpoint 才放行，變更即失效需重綁。
+     * Play production 一律使用預設建構（`allowTierUpgrade = false`）；
+     * 升級-capable 的 store 屬 foss／github pilot 且仍需明示確認（見
+     * `NetworkOptInStore`）。本參數宣告為 internal 是為了讓 production
+     * composition regression 直接釘住注入的事實，不另開第二個 store。
      *
      * BREAKING（Phase C rollout 決議，#139 起）：既有 debug localhost／
      * http://10.0.2.2 等自 139 起預設拒絕（HTTPS_ONLY，即使 debug NSC 允許；
      * 屬刻意先全禁）；opt-in confirm UI 接線前，需經測試注入 store
      * (allowTierUpgrade=true) 才放行；無遷移（舊本機端點需重新確認）。
      */
-    private val networkOptInStore: NetworkOptInStore? = null,
+    internal val networkOptInStore: NetworkOptInStore? = null,
 ) : ChatSessionProvider {
     init {
         if (toolSlice != null) {
@@ -1161,7 +1164,8 @@ class ChatSessionFactory(
     /**
      * S2 opt-in 解析：經 [networkOptInStore] 查已確認 tier，綁定
      * (`providerId`＋`baseUrl`＋`configRevision`) 全等才放行升級，否則
-     * deny-all。Null store（預設／production 未接 UI 前）即 HTTPS_ONLY。
+     * deny-all。A5 起 production 已注入 store（見 [ChatViewModelFactory]），
+     * 未 confirm 即 HTTPS_ONLY；null 僅是未接線測試的預設。
      * 生命週期：僅記憶體持有，重啟即失；持久化待 EndpointStore metadata
      * 接線（確認本身仍經 confirm 明示 mint）。
      *
@@ -1247,8 +1251,9 @@ class ChatSessionFactory(
     /**
      * Phase B live 接線：[endpoint]＋建時 [config] 快照共同決定 transport 起點；
      * [networkOptInStore] 非 null 時包 [OptInResolvingProvider] 使活躍 session
-     * 每 turn 重解 opt-in（revoke／降級後同一物件再送即被擋）；null 時維持建時
-     * 快照（deny-all 預設）。private 可加參，不影響 public API。
+     * 每 turn 重解 opt-in（revoke／降級後同一物件再送即被擋）；A5 production
+     * 注入後即走此 live 路徑；null 時僅未接線測試維持建時快照（deny-all）。
+     * private 可加參，不影響 public API。
      */
     private fun buildSession(
         endpoint: EndpointConfig,
@@ -2650,6 +2655,13 @@ class ChatViewModelFactory private constructor(
     vaultSource: VaultSource?,
     sessionStores: SessionStoreSource?,
     toolSlice: SafeToolSlice?,
+    /**
+     * A5 (Issue #135): 單一 production opt-in store 注入點。此 store 由
+     * factory 持有並原樣交給 [sessions]（不複製 store 邏輯、不另開實例）。
+     * 預設建構即 `allowTierUpgrade = false`（play deny-all 姿態）：沒有 confirm
+     * UI 之前，任何 private／HTTP endpoint 仍一律 HTTPS_ONLY。
+     */
+    internal val networkOptInStore: NetworkOptInStore,
 ) : ViewModelProvider.Factory {
     /** Production wiring for [ChatViewModel] (records-only pinned; shares the process-singleton endpoint store). */
     constructor(
@@ -2659,7 +2671,11 @@ class ChatViewModelFactory private constructor(
         buildProvider: ((ProviderConfig, KeyProvider) -> LlmProvider)? = null,
         vaultSource: VaultSource? = null,
         sessionStores: SessionStoreSource? = null,
-    ) : this(app, store, policy, buildProvider, vaultSource, sessionStores, toolSlice = null)
+    ) : this(
+        app, store, policy, buildProvider, vaultSource, sessionStores,
+        toolSlice = null,
+        networkOptInStore = NetworkOptInStore(),
+    )
 
     private val effectivePolicy: PolicyStore = policy ?: DataStorePolicyStore(app)
 
@@ -2689,6 +2705,7 @@ class ChatViewModelFactory private constructor(
         buildProvider = buildProvider ?: { cfg, keys -> DefaultProviderFactory(keys).create(cfg) },
         sessionStores = effectiveSessionStores,
         toolSlice = toolSlice, // Records-only invariant pinned in production composition (default null)
+        networkOptInStore = networkOptInStore, // A5: the one injected store; never recreated per session
     )
 
     @Suppress("UNCHECKED_CAST")
@@ -2707,6 +2724,11 @@ class ChatViewModelFactory private constructor(
          *
          * Invariant: when non-null, [toolSlice] must match [effectivePolicy]
          * (reference-identical `===` via [SafeToolSlice.usesPolicy]) to prevent policy split-brain.
+         *
+         * A5: [networkOptInStore] defaults to the same deny-all store production
+         * constructs; tests of the live revoke/upgrade path inject an explicit
+         * upgrade-capable store. This is a test-only seam, not a second
+         * production injection point.
          */
         @VisibleForTesting(otherwise = VisibleForTesting.NONE)
         internal fun forTesting(
@@ -2717,6 +2739,7 @@ class ChatViewModelFactory private constructor(
             vaultSource: VaultSource? = null,
             sessionStores: SessionStoreSource? = null,
             toolSlice: SafeToolSlice? = null,
+            networkOptInStore: NetworkOptInStore = NetworkOptInStore(),
         ): ChatViewModelFactory = ChatViewModelFactory(
             app = app,
             store = store,
@@ -2725,6 +2748,7 @@ class ChatViewModelFactory private constructor(
             vaultSource = vaultSource,
             sessionStores = sessionStores,
             toolSlice = toolSlice,
+            networkOptInStore = networkOptInStore,
         )
     }
 }

@@ -331,6 +331,29 @@ class ApkPolicyHarness(unittest.TestCase):
             "            '    E: domain (line=4)' \\\n"
             "            '      A: includeSubdomains=(type 0x12)0x0' \\\n"
             "            '      C: \"localhost\"' ;;\n"
+            "        lan-private)\n"
+            "          # A5: explicit RFC1918 literal, legal only for the\n"
+            "          # foss/github lan rule set; play must reject the bytes.\n"
+            "          printf '%s\\n' \\\n"
+            "            'E: network-security-config (line=1)' \\\n"
+            "            '  E: base-config (line=2)' \\\n"
+            "            '    A: cleartextTrafficPermitted=(type 0x12)0x0' \\\n"
+            "            '  E: domain-config (line=3)' \\\n"
+            "            '    A: cleartextTrafficPermitted=(type 0x12)0xffffffff' \\\n"
+            "            '    E: domain (line=4)' \\\n"
+            "            '      A: includeSubdomains=(type 0x12)0x0' \\\n"
+            "            '      C: \"192.168.1.20\"' ;;\n"
+            "        lan-cgnat)\n"
+            "          # CGNAT stays denied in every mode, including lan.\n"
+            "          printf '%s\\n' \\\n"
+            "            'E: network-security-config (line=1)' \\\n"
+            "            '  E: base-config (line=2)' \\\n"
+            "            '    A: cleartextTrafficPermitted=(type 0x12)0x0' \\\n"
+            "            '  E: domain-config (line=3)' \\\n"
+            "            '    A: cleartextTrafficPermitted=(type 0x12)0xffffffff' \\\n"
+            "            '    E: domain (line=4)' \\\n"
+            "            '      A: includeSubdomains=(type 0x12)0x0' \\\n"
+            "            '      C: \"100.64.0.1\"' ;;\n"
             "        reviewer)\n"
             "          printf '%s\\n' \\\n"
             "            'E: network-security-config (line=1)' \\\n"
@@ -5632,6 +5655,103 @@ class ApkPolicyHarness(unittest.TestCase):
                 )
                 self.assertNotEqual(result.returncode, 0, result.stdout)
 
+    def test_compiled_nsc_lan_rules_are_flavor_routed(self) -> None:
+        # A5: the same COMPILED bytes are judged by flavor-aware rules. The
+        # foss/github lanes accept an explicit RFC1918 literal (their shipped
+        # overlay), while the play lane rejects those exact bytes with the
+        # deny-all release/debug rules. CGNAT and public domains stay denied
+        # in EVERY lane, including lan.
+        apk = complete_apk(
+            self.tmp / "flavor-nsc.apk",
+            minimal_dex(type_descriptors=("Ljava/lang/Object;",)),
+        )
+        for label, result in (
+            ("foss", self.run_policy(apk, foss=True, nsc_mode="lan-private")),
+            ("github", self._run_scanner_cli(apk, "github", nsc_mode="lan-private")),
+        ):
+            with self.subTest(lane=label, case="rfc1918-accepted"):
+                self.assertEqual(
+                    result.returncode, 0,
+                    (result.stdout or "") + (result.stderr or ""),
+                )
+
+        play_release = self.run_policy(apk, nsc_mode="lan-private")
+        self.assertNotEqual(play_release.returncode, 0, play_release.stdout)
+        self.assertIn("fails the release network security rules", play_release.stdout)
+        play_debug = self.run_policy(
+            apk, xmltree_mode="debug", nsc_mode="lan-private"
+        )
+        self.assertNotEqual(play_debug.returncode, 0, play_debug.stdout)
+        self.assertIn("fails the debug network security rules", play_debug.stdout)
+
+        for nsc_mode in ("lan-cgnat", "reviewer"):
+            for label, result in (
+                ("play", self.run_policy(apk, nsc_mode=nsc_mode)),
+                ("foss", self.run_policy(apk, foss=True, nsc_mode=nsc_mode)),
+                ("github", self._run_scanner_cli(apk, "github", nsc_mode=nsc_mode)),
+            ):
+                with self.subTest(lane=label, case=nsc_mode):
+                    self.assertNotEqual(
+                        result.returncode, 0,
+                        (result.stdout or "") + (result.stderr or ""),
+                    )
+
+    def test_compiled_nsc_foss_github_debug_artifact_rejects_lan_cleartext(self) -> None:
+        # A5 depth-in-depth: `lan` is a RELEASE-only relaxation. A DEBUGGABLE
+        # foss/github artifact carrying an RFC1918 cleartext domain must be
+        # judged by the loopback-only `debug` rules and rejected - the gate
+        # must not depend on app/src/debug's overlay being merged correctly.
+        apk = complete_apk(
+            self.tmp / "flavor-debug-nsc.apk",
+            minimal_dex(type_descriptors=("Ljava/lang/Object;",)),
+        )
+        for label, result in (
+            ("foss", self.run_policy(
+                apk, foss=True, xmltree_mode="debug", nsc_mode="lan-private"
+            )),
+            ("github", self._run_scanner_cli(
+                apk, "github", xmltree_mode="debug", nsc_mode="lan-private"
+            )),
+        ):
+            with self.subTest(lane=label, case="debug-rfc1918-rejected"):
+                output = (result.stdout or "") + (result.stderr or "")
+                self.assertNotEqual(result.returncode, 0, output)
+                self.assertIn("fails the debug network security rules", output)
+
+        # Positive controls (no gate relaxation): a loopback-only compiled
+        # config stays valid for a debuggable foss/github artifact, and the
+        # legal RFC1918 LAN config stays valid for their RELEASE artifacts.
+        for label, result in (
+            ("foss", self.run_policy(
+                apk, foss=True, xmltree_mode="debug", nsc_mode="loopback-debug"
+            )),
+            ("github", self._run_scanner_cli(
+                apk, "github", xmltree_mode="debug", nsc_mode="loopback-debug"
+            )),
+        ):
+            with self.subTest(lane=label, case="debug-loopback-accepted"):
+                self.assertEqual(
+                    result.returncode, 0,
+                    (result.stdout or "") + (result.stderr or ""),
+                )
+        for label, result in (
+            ("foss", self.run_policy(apk, foss=True, nsc_mode="lan-private")),
+            ("github", self._run_scanner_cli(apk, "github", nsc_mode="lan-private")),
+        ):
+            with self.subTest(lane=label, case="release-rfc1918-accepted"):
+                self.assertEqual(
+                    result.returncode, 0,
+                    (result.stdout or "") + (result.stderr or ""),
+                )
+        # play keeps the deny-all contract in both build types.
+        for xmltree_mode in ("bindings", "debug"):
+            with self.subTest(lane="play", case=f"{xmltree_mode}-rfc1918-rejected"):
+                result = self.run_policy(
+                    apk, xmltree_mode=xmltree_mode, nsc_mode="lan-private"
+                )
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertIn("network security rules", result.stdout)
+
     def test_compiled_nsc_release_rules_for_unproven_debuggable(self) -> None:
         # Without a PROVEN debuggable attr the compiled NSC is checked with the
         # release deny-all rules: the loopback whitelist (legal only for a
@@ -9306,6 +9426,77 @@ class NscCheckValidator(unittest.TestCase):
                     errors,
                 )
 
+    def test_lan_allowlist_accepts_only_loopback_and_explicit_rfc1918_literals(self) -> None:
+        # A5 positive controls: the foss/github overlay may enable cleartext
+        # ONLY for loopback aliases or explicitly enumerated RFC1918 host
+        # literals. NSC has no CIDR syntax, so a prefix/domain wildcard is not
+        # accepted as a range; every host must be written out literally.
+        for domain in (
+            "localhost", "127.0.0.1", "10.0.2.2",
+            "10.0.0.1", "172.16.0.1", "192.168.1.20",
+            " 192.168.1.20 ", "172.31.255.254",
+        ):
+            with self.subTest(accepted=domain):
+                path = self._write("nsc.xml", self._config(self._BASE_FALSE + self._loopback_domain(domain)))
+                self.assertEqual(nsc_check.validate(path, "lan"), [])
+        # The same shape is still forbidden in release (play never ships it).
+        path = self._write("nsc.xml", self._config(self._BASE_FALSE + self._loopback_domain("192.168.1.20")))
+        self.assertTrue(
+            any("release pin denies cleartext" in e for e in nsc_check.validate(path, "release"))
+        )
+
+    def test_lan_allowlist_rejects_outside_domains_and_subdomains(self) -> None:
+        # A5 negative controls: public http, CGNAT, link-local/metadata,
+        # wildcard-looking suffixes, and RFC1918-adjacent-but-outside ranges
+        # all fail closed; explicit includeSubdomains="false" is mandatory.
+        for domain in (
+            "example.com", "10.1.2.3.evil.com", "192.168.1.20.evil.com",
+            "100.64.0.1", "169.254.169.254", "8.8.8.8", "172.32.0.1",
+            "0x0a000001", "::1",
+        ):
+            with self.subTest(rejected=domain):
+                path = self._write("nsc.xml", self._config(self._BASE_FALSE + self._loopback_domain(domain)))
+                errors = nsc_check.validate(path, "lan")
+                self.assertTrue(
+                    any("outside the LAN cleartext allowlist" in e and repr(domain.strip()) in e
+                        for e in errors),
+                    errors,
+                )
+        for attr in ("", ' includeSubdomains="true"'):
+            with self.subTest(include_subdomains=attr or "absent"):
+                path = self._write(
+                    "nsc.xml",
+                    self._config(self._BASE_FALSE + self._loopback_domain("192.168.1.20", attr)),
+                )
+                errors = nsc_check.validate(path, "lan")
+                self.assertTrue(any('includeSubdomains="false"' in e for e in errors), errors)
+        # lan never weakens the structural pin: base-config/debug-overrides
+        # true fail in lan just as they do in release and debug.
+        for name, inner in (
+            ("base-true", '  <base-config cleartextTrafficPermitted="true" />\n'),
+            (
+                "debug-overrides-true",
+                self._BASE_FALSE + '  <debug-overrides cleartextTrafficPermitted="true" />\n',
+            ),
+        ):
+            with self.subTest(shape=name):
+                path = self._write("nsc.xml", self._config(inner))
+                self.assertTrue(
+                    any("cleartextTrafficPermitted" in e for e in nsc_check.validate(path, "lan"))
+                )
+
+    def test_lan_cli_exit_codes_and_mode_string(self) -> None:
+        # The probe surface must accept --mode lan and still reject release
+        # cleartext with exit 1 (the legacy single-grep false-PASS repro).
+        path = self._write("nsc.xml", self._config(self._BASE_FALSE + self._loopback_domain("192.168.1.20")))
+        accepted = self._run_cli("--mode", "lan", path)
+        self.assertEqual(accepted.returncode, 0, accepted.stderr)
+        rejected = self._run_cli("--mode", "release", path)
+        self.assertEqual(rejected.returncode, 1, rejected.stderr)
+        self.assertIn("release pin denies cleartext", rejected.stderr)
+        wrong = self._run_cli("--mode", "lanx", path)
+        self.assertEqual(wrong.returncode, 2, wrong.stderr)
+
     def _run_cli(self, *args: str) -> subprocess.CompletedProcess[str]:
         # Run scripts/nsc_check.py through its CLI so the exit-code contract
         # of the probe surface (not only the validate() return list) is pegged.
@@ -10168,26 +10359,26 @@ class NscCheckValidator(unittest.TestCase):
         # `assertIn("usage", buf_err + "usage")`, which is true of EVERY
         # string and therefore pinned nothing).
         for argv, expected in (
-            (["x", bad], "usage: nsc_check.py --mode (release|debug)"),
+            (["x", bad], "usage: nsc_check.py --mode (release|debug|lan)"),
             (["x", "--mode", "staging", bad], "unknown --mode 'staging'"),
             (
                 ["x", "--mode", "release", "--mode", "debug", bad],
                 "duplicate --mode",
             ),
-            (["x", "--mode"], "--mode requires a value (release|debug)"),
+            (["x", "--mode"], "--mode requires a value (release|debug|lan)"),
             (["x", "--root", "x", bad], "unknown option --root"),
             (
                 ["x", "--mode", "release", "--check-manifest", good],
                 "--check-manifest and --mode are mutually exclusive",
             ),
-            (["x", "--require-both", good], "usage: nsc_check.py --mode (release|debug)"),
+            (["x", "--require-both", good], "usage: nsc_check.py --mode (release|debug|lan)"),
             (
                 # With a mode present the hint-free refusal no longer fires,
                 # so this argv is the one that reaches the flag check.
                 ["x", "--mode", "release", "--require-both", good],
                 "--require-both requires --check-manifest",
             ),
-            (["x"], "usage: nsc_check.py (--mode (release|debug)"),
+            (["x"], "usage: nsc_check.py (--mode (release|debug|lan)"),
         ):
             buf_err = io.StringIO()
             with contextlib.redirect_stderr(buf_err):
@@ -10263,6 +10454,21 @@ class NscCheckValidator(unittest.TestCase):
             ),
             [],
         )
+        # A5: the foss/github release overlays are the lan-mode positive
+        # controls; play deliberately has NO overlay and keeps main's deny-all.
+        for flavor in ("foss", "github"):
+            with self.subTest(flavor=flavor):
+                self.assertEqual(
+                    nsc_check.validate(
+                        str(ROOT / "app" / "src" / flavor / "res" / "xml" / "network_security_config.xml"),
+                        "lan",
+                    ),
+                    [],
+                )
+        self.assertFalse(
+            (ROOT / "app" / "src" / "play" / "res" / "xml" / "network_security_config.xml").exists(),
+            "play must never ship an NSC overlay (deny-all from main)",
+        )
 
 
 class NscGateWiring(unittest.TestCase):
@@ -10270,11 +10476,14 @@ class NscGateWiring(unittest.TestCase):
 
     def test_gate_runs_structured_nsc_check_with_mode_routing(self) -> None:
         # Per-file structured validation with the source-set→mode routing
-        # (debug source set → debug rules; everything else → release).
+        # (debug/variant → debug rules; foss/github overlay → lan rules;
+        # everything else, including play → release deny-all).
         text = POLICY_CHECK.read_text(encoding="utf-8")
         self.assertIn('python3 -P "$SCRIPT_DIR/nsc_check.py" --mode "$nsc_mode"', text)
         self.assertIn('case "$nsconfig" in', text)
         self.assertIn('"$ROOT/app/src/debug/"*) nsc_mode=debug ;;', text)
+        self.assertIn('"$ROOT/app/src/"*Debug/*) nsc_mode=debug ;;', text)
+        self.assertIn('"$ROOT/app/src/foss/"*|"$ROOT/app/src/github/"*) nsc_mode=lan ;;', text)
         self.assertIn("*) nsc_mode=release ;;", text)
 
     def test_gate_requires_main_nsc_resource(self) -> None:
@@ -10490,6 +10699,65 @@ class BackupRulesGateEndToEnd(unittest.TestCase):
             self.assertNotIn("must reference @xml/", all_fail_lines, proc.stderr)
             self.assertNotIn("cleartext", all_fail_lines, proc.stderr)
             self.assertNotIn("deep-scan", all_fail_lines, proc.stderr)
+
+    @staticmethod
+    def _lan_nsc(domain: str) -> str:
+        return (
+            '<network-security-config>\n'
+            '    <base-config cleartextTrafficPermitted="false" />\n'
+            '    <domain-config cleartextTrafficPermitted="true">\n'
+            f'        <domain includeSubdomains="false">{domain}</domain>\n'
+            "    </domain-config>\n"
+            "</network-security-config>\n"
+        )
+
+    def test_lan_overlay_source_routing_accepts_rfc1918_and_rejects_outside(self) -> None:
+        # End-to-end on the REAL gate script with a synthetic source tree:
+        # foss/github overlays are validated with --mode lan (RFC1918 accepted,
+        # whitelist-outside domain rejected), while a play NSC overlay is
+        # ALWAYS validated with the release deny-all rules. No APK or build
+        # tools needed — a source-stage FAIL fires before the tool stage.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._minimal_tree(tmp)
+            overlays = {
+                flavor: root / "app" / "src" / flavor / "res" / "xml"
+                for flavor in ("foss", "github")
+            }
+            for res in overlays.values():
+                res.mkdir(parents=True)
+                (res / "network_security_config.xml").write_text(
+                    self._lan_nsc("192.168.1.20"), encoding="utf-8"
+                )
+            proc = self._run_gate(root, "--foss")
+            fail_lines = "\n".join(
+                line for line in proc.stderr.splitlines() if line.startswith("FAIL:")
+            )
+            self.assertNotIn("cleartext", fail_lines, proc.stderr)
+            self._assert_source_stage_clean_then_tool_stage_failure(proc)
+
+            # Negative control: a domain outside the lan allowlist in EITHER
+            # flavor overlay must fail before the tool stage.
+            for flavor, res in overlays.items():
+                (res / "network_security_config.xml").write_text(
+                    self._lan_nsc("example.com"), encoding="utf-8"
+                )
+                proc = self._run_gate(root, "--foss")
+                self.assertIn("outside the LAN cleartext allowlist", proc.stderr)
+                self.assertIn(flavor, proc.stderr)
+                (res / "network_security_config.xml").write_text(
+                    self._lan_nsc("192.168.1.20"), encoding="utf-8"
+                )
+
+            # play never receives the lan rule set: the same bytes under
+            # app/src/play must fail with the release deny-all pin.
+            play_res = root / "app" / "src" / "play" / "res" / "xml"
+            play_res.mkdir(parents=True)
+            (play_res / "network_security_config.xml").write_text(
+                self._lan_nsc("192.168.1.20"), encoding="utf-8"
+            )
+            proc = self._run_gate(root)
+            self.assertIn("release pin denies cleartext", proc.stderr)
+            self.assertIn("app/src/play", proc.stderr)
 
     def test_swapped_main_file_fails_at_source_stage(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

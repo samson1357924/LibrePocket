@@ -1002,7 +1002,7 @@ object ChatMarkdownParser {
                     if (trimmed.isNotBlank()) {
                         blocks.add(
                             ChatContentBlock.ParagraphBlock(
-                                annotatedText = parseInline(formatLists(trimmed), workCounter = workCounter),
+                                annotatedText = parseInline(formatLists(trimmed, workCounter), workCounter = workCounter),
                                 key = "para_${paraIndex++}",
                             )
                         )

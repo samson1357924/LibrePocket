@@ -86,7 +86,7 @@ fail-closed path —, CWD-independent) followed by the static grep + manifest XM
 parse + gradle-injection scan guard `scripts/docs_claim_check.sh` (no Gradle
 execution, no emulator; requires `python3` — stdlib `xml.etree` for the C2
 manifest/XML scan plus PyYAML for workflow YAML validation; CI installs the
-pinned, hash-checked `PyYAML==6.0.3` from `scripts/requirements-docs.txt`
+pinned, hash-checked `PyYAML==6.0.4` from `scripts/requirements-docs.txt`
 (with `--require-hashes`) rather than relying on the runner image; the C2b
 gradle-injection scan decodes Unicode `\uXXXX` escapes, then reads every
 `*.gradle`/`*.gradle.kts`/`gradle.properties` found by `find` — a superset of
@@ -114,7 +114,7 @@ condition. Review the workflow and run results separately.
 
 `workflow-guard` is deliberately unconditional: it has no `needs`, no `if:`,
 and has exactly six steps — pinned checkout, the Python import-shadow
-preflight, the pinned, hash-checked `PyYAML==6.0.3` install from
+preflight, the pinned, hash-checked `PyYAML==6.0.4` install from
 `scripts/requirements-docs.txt` (`--require-hashes --no-deps
 --only-binary=:all:`, `PIP_BREAK_SYSTEM_PACKAGES=1`), the checker and the
 harness, plus the always-on `Pins-absence tripwire (Issue #12)` step that
@@ -455,7 +455,7 @@ drift/bypass guard rather than a tamper-proof policy authority. Closing that
 gap needs CODEOWNERS/required reviewers or an external policy source, neither
 of which is currently configured.
 
-The workflows do **not** run an Android emulator/device matrix on every pull request. The Python APK policy, release-identity, and JDK floor harnesses run in CI as the `policy-harness` job whenever `policy == true`, and `pr-gate` requires its success in that case. The job installs the pinned, hash-checked `PyYAML==6.0.3` from `scripts/requirements-docs.txt` before running `PYTHONPATH="$PWD" PYTHONDONTWRITEBYTECODE=1 python3 -P -m unittest scripts/tests/test_apk_policy_check.py scripts/tests/test_release_artifact_verifier.py scripts/tests/test_build_release_identity.py scripts/tests/test_summarize_junit.py scripts/tests/test_check_test_budgets.py scripts/tests/test_check_junit_durations.py scripts/tests/test_gradle_wrapper_checksum.py scripts/tests/test_verify_jdk_floor.py scripts/tests/test_workflow_policy.py scripts/tests/test_verification_metadata.py scripts/tests/test_osv_scan.py`. The supply-chain static gates (`scripts/tests/test_verification_metadata.py`, fake-server `scripts/tests/test_osv_scan.py`) are part of that CI command (pinned by `EXPECTED_POLICY_HARNESS_RUN` in `scripts/check_workflow_policy.py`), and the same job then runs the production validator itself as `python3 -P scripts/verify_verification_metadata.py` (pinned by `VERIFY_METADATA_RUN`). The real OSV monitor scan against the public OSV API additionally runs on the weekly `osv-scan.yml` schedule (monitor-only; see [Build Environment](ENV.md#supply-chain-and-dependency-update-policy)) and remains runnable locally (see Local commands below). These tests use synthetic APK-like files and fake Gradle/SDK/policy commands; they do not prove real APK or SDK behavior. A green unit/lint/policy workflow is not proof of runtime safety, provider compatibility, signing identity, or physical-device behavior.
+The workflows do **not** run an Android emulator/device matrix on every pull request. The Python APK policy, release-identity, and JDK floor harnesses run in CI as the `policy-harness` job whenever `policy == true`, and `pr-gate` requires its success in that case. The job installs the pinned, hash-checked `PyYAML==6.0.4` from `scripts/requirements-docs.txt` before running `PYTHONPATH="$PWD" PYTHONDONTWRITEBYTECODE=1 python3 -P -m unittest scripts/tests/test_apk_policy_check.py scripts/tests/test_release_artifact_verifier.py scripts/tests/test_build_release_identity.py scripts/tests/test_summarize_junit.py scripts/tests/test_check_test_budgets.py scripts/tests/test_check_junit_durations.py scripts/tests/test_gradle_wrapper_checksum.py scripts/tests/test_verify_jdk_floor.py scripts/tests/test_workflow_policy.py scripts/tests/test_verification_metadata.py scripts/tests/test_osv_scan.py`. The supply-chain static gates (`scripts/tests/test_verification_metadata.py`, fake-server `scripts/tests/test_osv_scan.py`) are part of that CI command (pinned by `EXPECTED_POLICY_HARNESS_RUN` in `scripts/check_workflow_policy.py`), and the same job then runs the production validator itself as `python3 -P scripts/verify_verification_metadata.py` (pinned by `VERIFY_METADATA_RUN`). The real OSV monitor scan against the public OSV API additionally runs on the weekly `osv-scan.yml` schedule (monitor-only; see [Build Environment](ENV.md#supply-chain-and-dependency-update-policy)) and remains runnable locally (see Local commands below). These tests use synthetic APK-like files and fake Gradle/SDK/policy commands; they do not prove real APK or SDK behavior. A green unit/lint/policy workflow is not proof of runtime safety, provider compatibility, signing identity, or physical-device behavior.
 
 Issue #86 Phase C guardrails (Current, gates — only reject/alert, never
 silently downgrade redaction or writes):

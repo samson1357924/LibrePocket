@@ -20,7 +20,7 @@ status=0
 # Pin its raw bytes so a PR cannot add a local wheel/sdist/.pth that executes
 # during `pip install` (or at the next interpreter start) and exits 0 before
 # the checker sees the workflow.
-REQUIREMENTS_SHA256="b7078b93108cf8befcc2286b3adea4bc4042ebe9795c7b7dc69a6b7d9b258762"
+REQUIREMENTS_SHA256="c5bec68e6dc9e711be21ff9fc7a64e73599b34a829e33f9c5fa55a9d22bf8a8b"
 requirements="$ROOT/scripts/requirements-docs.txt"
 if [ ! -f "$requirements" ]; then
     echo "::error::missing scripts/requirements-docs.txt"

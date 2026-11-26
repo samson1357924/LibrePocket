@@ -4139,30 +4139,22 @@ class TurnController(
   }
 
   /**
-   * Suspends until the session ledger is fully settled: first the background
-   * [close] drain (doomed-host settle + admitted drain + seal, all bounded),
-   * then every event admitted so far. Each phase gets its own [timeoutMs]
-   * budget — the [close] shutdown-join first, then the admitted-event drain —
-   * so the total wait is bounded by roughly 2x[timeoutMs], not [timeoutMs]
-   * (true = drained, false = timed out). Send returning already implies
-   * durability for the terminal record (core writes are acked inline); use
-   * this after [close]/[cancel] to await the asynchronous terminal record.
-   * Cancellation of the caller still propagates.
+   * Waits for the published close or orphan-cancel drain, then every event
+   * admitted so far. Each phase has its own [timeoutMs] budget (at most
+   * roughly 2x[timeoutMs]); caller cancellation still propagates. The
+   * orphan-cancel drain may be dispatched but not yet have admitted its
+   * terminal write, so flushing the ordered sink alone can return too soon.
    *
-   * Concurrency: [shutdownJob] is read under the same [lock] that [close]
-   * publishes it with, so a concurrent [flushTranscript] either observes the
-   * drain job or — if it raced ahead of [close] — only flushes admitted
-   * events; call again after [close] returns to await the full drain.
+   * The jobs are captured under the same [lock] used to publish them. Call
+   * again if this snapshot raced ahead of close or admission finalization.
+   * The close job already joins and seals its drain. For a durability proof
+   * (not just a drain/barrier), use [flushDurable].
    */
   suspend fun flushTranscript(timeoutMs: Long = OrderedTranscriptSink.DEFAULT_FLUSH_TIMEOUT_MS): Boolean {
-    val shutdown = synchronized(lock) { shutdownJob }
-    try {
-      if (shutdown != null && withTimeoutOrNull(timeoutMs) { shutdown.join() } == null) return false
-    } catch (e: CancellationException) {
-      throw e
-    } catch (_: Exception) {
-      // Best effort: the drain below still waits for what was admitted.
-    }
+    val settle = synchronized(lock) { shutdownJob ?: orphanDrainJob }
+    if (settle != null && !settle.isCompleted &&
+      withTimeoutOrNull(timeoutMs) { settle.join() } == null
+    ) return false
     return try {
       orderedTranscript.flush(timeoutMs)
     } catch (e: Throwable) {

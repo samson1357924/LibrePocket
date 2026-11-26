@@ -31,7 +31,9 @@ import kotlinx.coroutines.flow.emitAll
 import kotlinx.coroutines.flow.emptyFlow
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.selects.select
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
@@ -47,8 +49,6 @@ import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
 import java.util.concurrent.CopyOnWriteArrayList
-import java.util.concurrent.CountDownLatch
-import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 
@@ -151,8 +151,12 @@ class B2Phase1DispatcherGrantTest {
             try {
                 session.close()
             } finally {
-                val flushed = session.flush(5_000)
-                check(flushed) { "session flush timed out during teardown" }
+                // Issue #176: teardown is a barrier, not a timed assertion. Every caller
+                // has already observed its turn's terminal state (flushDurable or
+                // send-join), so the production flush barrier drains nothing pending;
+                // no test-side 5s budget participates in any contract here.
+                val flushed = session.flush()
+                check(flushed) { "session flush failed during teardown" }
             }
         }
     }
@@ -554,10 +558,13 @@ class B2Phase1DispatcherGrantTest {
         policy.setRule(PolicyRule("tool.exec:lsp.symbols", Verdict.ALLOW, 20))
         val backend = CountingBackend()
         val toolSlice = slice(policy, backend)
-        val entered = CountDownLatch(1)
+        // Issue #176: signal-driven barrier instead of a fixed 8s latch wait.
+        // `entered` completes exactly when execution reaches beforeExecute; if the
+        // send settles first, the "zero side effects" contract is already broken.
+        val entered = CompletableDeferred<Unit>()
         val gate = CompletableDeferred<Unit>()
         toolSlice.beforeExecuteForTest = {
-            entered.countDown()
+            entered.complete(Unit)
             gate.await()
         }
         val requests = AtomicInteger(0)
@@ -574,12 +581,22 @@ class B2Phase1DispatcherGrantTest {
         val created = f.sessions.create(endpoint(), "B2 取消", allowAsk = false, keyIsCurrent = { true })
         try {
             val job = async(Dispatchers.Default) { created.session.send("查 Foo") }
-            assertTrue("execute never entered", entered.await(8, TimeUnit.SECONDS))
+            // Liveness bound (not a complexity ratio): ordering still comes from the
+            // `entered` signal / select, but a broken cancel path must fail instead of
+            // hanging forever. 8s matches the original await(8s) magnitude.
+            val reachedExecute = withTimeout(8_000) {
+                select<Boolean> {
+                    entered.onAwait { true }
+                    // send 先結算代表觀測點未被走到；兩者同時 ready 時不隨機誤判。
+                    job.onJoin { entered.isCompleted }
+                }
+            }
+            assertTrue("execute never entered", reachedExecute)
             created.session.cancel()
             gate.complete(Unit)
             assertTrue(
-                "send did not settle after cancel",
-                withTimeoutOrNull(8_000) { job.join(); true } ?: false,
+                "send did not settle after cancel within 8s",
+                withTimeoutOrNull(8_000) { job.join(); true } != null,
             )
             assertEquals(0, backend.invocations.get())
             assertEquals("cancel must not continue the turn", 1, requests.get())

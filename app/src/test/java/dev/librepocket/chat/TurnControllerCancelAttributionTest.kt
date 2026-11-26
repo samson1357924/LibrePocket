@@ -15,7 +15,10 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.async
 import kotlinx.coroutines.delay
@@ -25,6 +28,9 @@ import kotlinx.coroutines.flow.emptyFlow
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.test.StandardTestDispatcher
+import kotlinx.coroutines.test.runCurrent
+import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.supervisorScope
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
@@ -62,6 +68,7 @@ private class CancelAttrSink : TranscriptSink {
   val cancelled: MutableList<Pair<String, String>> = Collections.synchronizedList(mutableListOf())
   val failed: MutableList<Triple<String, String, String>> = Collections.synchronizedList(mutableListOf())
   var startedGate: (suspend (String) -> Unit)? = null
+  var cancelledGate: (suspend () -> Unit)? = null
   var failSucceededWith: IOException? = null
   override suspend fun onTurnStarted(runId: String, text: String) {
     startedGate?.invoke(text)
@@ -108,6 +115,7 @@ private class CancelAttrSink : TranscriptSink {
   ) = onTurnFailed(runId, partialText, error, parentRunId, attemptIndex, isFinal)
   override suspend fun onTurnRetried(runId: String, attempt: Int, maxAttempts: Int, delayMs: Long) = Unit
   override suspend fun onTurnCancelled(runId: String, partialText: String, hasReasoning: Boolean) {
+    cancelledGate?.invoke()
     cancelled.add(runId to partialText)
   }
   override suspend fun onTurnCancelled(
@@ -138,6 +146,7 @@ class TurnControllerCancelAttributionTest {
     sink: TranscriptSink,
     sleeper: suspend (Long) -> Unit = {},
     retry: TurnRetryConfig = TurnRetryConfig(),
+    transcriptDispatcher: CoroutineDispatcher? = null,
   ): TurnController {
     var n = 0
     return TurnController(
@@ -146,6 +155,7 @@ class TurnControllerCancelAttributionTest {
       transcript = sink,
       retryConfig = retry,
       dispatcher = Dispatchers.Default,
+      transcriptDispatcher = transcriptDispatcher,
       sleeper = sleeper,
       newId = { "cancel-${n++}" },
     )
@@ -386,6 +396,38 @@ class TurnControllerCancelAttributionTest {
     } finally {
       release.complete(Unit)
       c.close()
+    }
+  }
+
+  @OptIn(ExperimentalCoroutinesApi::class)
+  @Test fun flushWaitsForPublishedAdmissionCancelEvenBeforeItEntersTheWriter() = runTest {
+    val terminalGate = CompletableDeferred<Unit>()
+    val sink = CancelAttrSink().apply { cancelledGate = { terminalGate.await() } }
+    val provider = CancelAttrProvider()
+    val c = controller(provider, sink, transcriptDispatcher = StandardTestDispatcher(testScheduler))
+    try {
+      // Cancel after the durable user ack but before admission finalizes. The
+      // orphan drain is dispatched, then the cancelled host is returned.
+      c.beforeAdmissionFinalizeForTest = { c.cancel() }
+      val admission = c.startOrEnqueue("Q-flush")
+      assertTrue(admission is TurnStart.Started && admission.host.isCancelled)
+      assertTrue("the scheduler has not run the orphan drain", sink.cancelled.isEmpty())
+
+      // Run flush inline up to its first suspension, ahead of the scheduled
+      // orphan. Without the job join, the sink's barrier overtakes the terminal.
+      val terminalAtFlush = async(start = CoroutineStart.UNDISPATCHED) {
+        assertTrue("transcript must drain", c.flushTranscript())
+        sink.cancelled.toList()
+      }
+      runCurrent()
+      assertFalse("flush must not pass the blocked terminal write", terminalAtFlush.isCompleted)
+      terminalGate.complete(Unit)
+      assertEquals(listOf(sink.started.single().first to ""), terminalAtFlush.await())
+      assertEquals(0, provider.streamCalls.get())
+    } finally {
+      terminalGate.complete(Unit)
+      c.close()
+      c.flushTranscript()
     }
   }
 

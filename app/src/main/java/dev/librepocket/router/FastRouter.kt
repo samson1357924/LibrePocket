@@ -1,5 +1,6 @@
 package dev.librepocket.router
 
+import androidx.annotation.VisibleForTesting
 import dev.librepocket.tool.CapabilityLevel
 import dev.librepocket.tool.LspTools
 import dev.librepocket.tool.ProjectionContext
@@ -372,7 +373,12 @@ class FastRouter(
             )
         }
 
-        val match = matchTemplate(intentText.trim())
+        // Stage-3 availability gate (#178): one memo per decision. The symbol
+        // extractor is pure but regex-heavy; matchTemplate (symbolArgs) and
+        // missingQuestionFor (hasSymbolQuery) must share ONE result instead of
+        // each re-running the whole extraction on a 4096-char adversarial input.
+        val symbolMemo = SymbolQueryMemo()
+        val match = matchTemplate(intentText.trim(), symbolMemo)
             ?: return RouteDecision(
                 route = RouteKind.DENIED,
                 toolCall = null,
@@ -428,7 +434,7 @@ class FastRouter(
                 header = header(RouteKind.DENIED, tool.name, reason),
             )
         }
-        val missingQuestion = missingQuestionFor(tool.name, trimmed)
+        val missingQuestion = missingQuestionFor(tool.name, trimmed, symbolMemo)
         if (missingQuestion != null) {
             val reason = dev.librepocket.tool.DenyReason.NEED_CLARIFICATION
             return RouteDecision(
@@ -470,7 +476,7 @@ class FastRouter(
 
     private data class TemplateMatch(val toolName: String, val argumentsJson: String)
 
-    private fun matchTemplate(text: String): TemplateMatch? {
+    private fun matchTemplate(text: String, symbolMemo: SymbolQueryMemo): TemplateMatch? {
         if (text.isEmpty()) return null
         // Symbol-naming lookup is checked FIRST (stage-8.5; before SLOW_HINTS):
         // identifiers may embed slow-lane substrings (`自動操作`、`自動填表`), but
@@ -482,7 +488,7 @@ class FastRouter(
         // falls through (never FAST); a question/knowledge/teaching utterance
         // with a lookup verb no longer qualifies (#4).
         if (containsAny(text, SYMBOL_HINTS) && isAffirmativeSymbolCommand(text)) {
-            return TemplateMatch(LspTools.SYMBOLS_NAME, symbolArgs(text))
+            return TemplateMatch(LspTools.SYMBOLS_NAME, symbolArgs(text, symbolMemo))
         }
         // Slow-lane intents resolve to the automation descriptor so projection
         // can deny them honestly (FLAVOR_BLOCKED on play) instead of NO_MATCH.
@@ -1835,6 +1841,31 @@ class FastRouter(
         }
 
         /**
+         * Stage-3 (#178) per-decision memo. Scoped to ONE [decide] call — never
+         * shared across turns, so a stale verdict can never be reused and no
+         * cross-turn cache state exists. Only the last exact text is cached
+         * (1-entry), bounded by [MAX_INTENT_CHARS]. [extractSymbolQuery] is
+         * pure, so returning the same [SymbolExtract] is safe; all guard
+         * ordering / fail-closed branches inside it remain untouched.
+         */
+        private class SymbolQueryMemo {
+            private var cachedText: String? = null
+            private var cached: SymbolExtract? = null
+
+            fun of(text: String): SymbolExtract {
+                if (cached != null && text == cachedText) return cached!!
+                val value = extractSymbolQuery(text)
+                cachedText = text
+                cached = value
+                return value
+            }
+        }
+
+        /** TEST seam only: exact extraction count, pinned per [decide]. */
+        @VisibleForTesting
+        internal val symbolExtractCallsForTest = AtomicLong()
+
+        /**
          * #19 B3 stage-9.2 (Re-review #9 A2, [P2]) — two-phase extraction,
          * CJK-preferred with EN fallback; #19 B3 stage-13.1（Re-review #15 A1 [P1] + P2）型別化。
          * A CJK opener
@@ -1869,6 +1900,7 @@ class FastRouter(
          * `Foo符號等法務簽核`；stage-12.1 之 named residual 已封口）。
          */
         private fun extractSymbolQuery(text: String): SymbolExtract {
+            symbolExtractCallsForTest.incrementAndGet()
             val trimmed = text.trim()
             // #19 B3 stage-9.2 — Phase 1: CJK-preferred pass (only when a CJK
             // opener actually leads). CJK-opener consumption does NOT set
@@ -2097,13 +2129,13 @@ class FastRouter(
          * （hasSymbolQuery=false ⇒ [missingQuestionFor] ⇒ NEED_CLARIFICATION；
          * toolCall 永不綁定）。BMP-Char 錨定語意不變（strictly BMP `isLetterOrDigit()`）。
          */
-        private fun hasSymbolQuery(text: String): Boolean =
-            (extractSymbolQuery(text) as? SymbolExtract.Parsed)?.content?.any { it.isLetterOrDigit() } == true
+        private fun hasSymbolQuery(text: String, memo: SymbolQueryMemo): Boolean =
+            (memo.of(text) as? SymbolExtract.Parsed)?.content?.any { it.isLetterOrDigit() } == true
 
-        private fun symbolArgs(text: String): String {
+        private fun symbolArgs(text: String, memo: SymbolQueryMemo): String {
             // 非 Parsed ⇒ query 綁為空字串；toolCall 永不會以此路徑綁定（hasSymbolQuery=false
             // ⇒ missingQuestionFor 先行 ⇒ NEED_CLARIFICATION；空 query 絕不執行）。
-            val q = (extractSymbolQuery(text) as? SymbolExtract.Parsed)?.content.orEmpty()
+            val q = (memo.of(text) as? SymbolExtract.Parsed)?.content.orEmpty()
             return "{\"query\": \"${esc(q)}\", \"limit\": ${LspTools.DEFAULT_LIMIT}}"
         }
 
@@ -2211,7 +2243,7 @@ class FastRouter(
          *（packageName 模板恆空）同屬空欄位形狀，但本輪不在缺參門內（後續收件者／
          * 包名抽取落地後再收斂）；此二者仍被接線門以 USER_DISABLED 拒絕，絕不執行。
          */
-        private fun missingQuestionFor(toolName: String, text: String): String? = when (toolName) {
+        private fun missingQuestionFor(toolName: String, text: String, memo: SymbolQueryMemo): String? = when (toolName) {
             "alarm.create" ->
                 if (!hasExplicitAlarmTime(text)) "請問要設幾點的鬧鐘？例如「明天早上7點30分叫我」" else null
             "phone.dial" ->
@@ -2221,7 +2253,7 @@ class FastRouter(
             "calendar.create" ->
                 "請問行程的時間是？請補上日期時間，例如「明天下午三點加個行程」需含時間"
             LspTools.SYMBOLS_NAME ->
-                if (!hasSymbolQuery(text)) "請問要查哪個符號？例如「幫我查 Foo 這個符號」" else null
+                if (!hasSymbolQuery(text, memo)) "請問要查哪個符號？例如「幫我查 Foo 這個符號」" else null
             else -> null
         }
 

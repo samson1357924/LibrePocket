@@ -55,7 +55,7 @@ Built-in ToolRegistry: 43 declared definitions; executionReady=true for exactly 
 
 ## 2026-11-26/27 Health-check wave（branches, not merged）
 
-> **全部為 open PR／分支證據，main 未含；merged 後才更新現況。** 基底仍為 `main@c5d61a61`。下表 16 支分支／PR（#185–#200）全數 OPEN、未合併；其中的 JVM／Python／裝置量測結果都是各分支上的結果，不是 main gate，也不代表任何 issue 已 close 或功能已 wired／verified。唯一已 CLOSED 的 issue 是 #177（foss 17 個預存失敗判定為環境／時序性 charset 問題，非功能修復；其 triage 分支 PR #188 仍 OPEN）。其餘 tracking／子 issue（#12、#16、#18、#19、#20、#21、#132、#134、#135、#136、#137、#138、#174、#175、#176、#178、#179）維持 OPEN。
+> **全部為 open PR／分支證據，main 未含；merged 後才更新現況。** 基底仍為 `main@c5d61a61`。下表 17 支分支／PR（#185–#201）全數 OPEN、未合併；其中的 JVM／Python／裝置量測結果都是各分支上的結果，不是 main gate，也不代表任何 issue 已 close 或功能已 wired／verified。本索引 PR（#201）為最後建立的一支，列於表末。唯一已 CLOSED 的 issue 是 #177（foss 17 個預存失敗判定為環境／時序性 charset 問題，非功能修復；其 triage 分支 PR #188 仍 OPEN）。其餘 tracking／子 issue（#12、#16、#18、#19、#20、#21、#132、#134、#135、#136、#137、#138、#174、#175、#176、#178、#179）維持 OPEN。
 
 | Issue | 分支／PR | 本波主題（僅分支證據） |
 |---|---|---|
@@ -75,8 +75,9 @@ Built-in ToolRegistry: 43 declared definitions; executionReady=true for exactly 
 | #138 | `fix/138-d3-web-wiring`／PR #198 | D3 pinned-DNS transport seam 與 gate fixtures |
 | #136 | `fix/136-b4-read-tool-contracts`／PR #199 | B4 首個 READ 工具 prewiring contracts（github root） |
 | #19 | `fix/19-b4-capability-matrix`／PR #200 | 逐工具四態矩陣與 production records-only contract pin |
+| #21 / #134 | `docs/final-index-reconciliation`／PR #201 | 本索引 PR：同步本波分支現況與證據邊界（自身亦為分支證據） |
 
-- 本波 16 支全部為 open PR／分支證據，`main` 仍 `c5d61a61`、未含任何合併；分支上的通過須於合併後在 `main` 重跑並保留 SHA／報告，才可作為 main gate 證據。本文不宣告任何功能已 wired／verified，也不關閉 parent／子 issue（#177 除外，見上）。
+- 本波 17 支全部為 open PR／分支證據，`main` 仍 `c5d61a61`、未含任何合併；分支上的通過須於合併後在 `main` 重跑並保留 SHA／報告，才可作為 main gate 證據。本文不宣告任何功能已 wired／verified，也不關閉 parent／子 issue（#177 除外，見上）。建議本索引 PR 最後合併，合併後立即依自身守則更新現況（含本表與本段）。
 - POCO C65 的量測僅為 diagnostic：無數值 gate、token window `TARGET_NOT_IMPLEMENTED`、門檻 `NOT_ESTABLISHED`，不構成 #16 B3 acceptance。
 - `FastDispatcher` 維持 `internal`、零 production caller；production composition 維持 `toolSlice=null`（`ProductionChatCompositionTest` 釘死）。詳見 [Capability matrix](CAPABILITY_MATRIX.md) 的 Current 小節與下方內建工具啟用前置清單。
 

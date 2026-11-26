@@ -18,6 +18,7 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.async
 import kotlinx.coroutines.delay
@@ -28,6 +29,7 @@ import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.StandardTestDispatcher
+import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.supervisorScope
 import kotlinx.coroutines.withContext
@@ -66,6 +68,7 @@ private class CancelAttrSink : TranscriptSink {
   val cancelled: MutableList<Pair<String, String>> = Collections.synchronizedList(mutableListOf())
   val failed: MutableList<Triple<String, String, String>> = Collections.synchronizedList(mutableListOf())
   var startedGate: (suspend (String) -> Unit)? = null
+  var cancelledGate: (suspend () -> Unit)? = null
   var failSucceededWith: IOException? = null
   override suspend fun onTurnStarted(runId: String, text: String) {
     startedGate?.invoke(text)
@@ -112,6 +115,7 @@ private class CancelAttrSink : TranscriptSink {
   ) = onTurnFailed(runId, partialText, error, parentRunId, attemptIndex, isFinal)
   override suspend fun onTurnRetried(runId: String, attempt: Int, maxAttempts: Int, delayMs: Long) = Unit
   override suspend fun onTurnCancelled(runId: String, partialText: String, hasReasoning: Boolean) {
+    cancelledGate?.invoke()
     cancelled.add(runId to partialText)
   }
   override suspend fun onTurnCancelled(
@@ -395,8 +399,10 @@ class TurnControllerCancelAttributionTest {
     }
   }
 
+  @OptIn(ExperimentalCoroutinesApi::class)
   @Test fun flushWaitsForPublishedAdmissionCancelEvenBeforeItEntersTheWriter() = runTest {
-    val sink = CancelAttrSink()
+    val terminalGate = CompletableDeferred<Unit>()
+    val sink = CancelAttrSink().apply { cancelledGate = { terminalGate.await() } }
     val provider = CancelAttrProvider()
     val c = controller(provider, sink, transcriptDispatcher = StandardTestDispatcher(testScheduler))
     try {
@@ -412,10 +418,14 @@ class TurnControllerCancelAttributionTest {
       val terminalAtFlush = async(start = CoroutineStart.UNDISPATCHED) {
         assertTrue("transcript must drain", c.flushTranscript())
         sink.cancelled.toList()
-      }.await()
-      assertEquals(listOf(sink.started.single().first to ""), terminalAtFlush)
+      }
+      runCurrent()
+      assertFalse("flush must not pass the blocked terminal write", terminalAtFlush.isCompleted)
+      terminalGate.complete(Unit)
+      assertEquals(listOf(sink.started.single().first to ""), terminalAtFlush.await())
       assertEquals(0, provider.streamCalls.get())
     } finally {
+      terminalGate.complete(Unit)
       c.close()
       c.flushTranscript()
     }

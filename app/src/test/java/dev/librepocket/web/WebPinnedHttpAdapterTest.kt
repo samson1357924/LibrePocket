@@ -10,8 +10,11 @@ import java.net.InetAddress
 import java.util.Collections
 import java.util.Random
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.zip.GZIPOutputStream
 import kotlinx.coroutines.runBlocking
+import okhttp3.Call
+import okhttp3.EventListener
 import okhttp3.OkHttpClient
 import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
@@ -145,29 +148,39 @@ class WebPinnedHttpAdapterTest {
         val server = startServer()
         try {
             val url = server.url("/headers").toString()
-            val a = adapter()
+            val dnsCalls = AtomicInteger()
+            val resolver = HostResolver {
+                dnsCalls.incrementAndGet()
+                listOf(loopbackAddress)
+            }
+            val a = adapter(resolver = resolver)
+            val search = WebPinnedHttpAdapter.forSearch(plainOptIn, resolver, consentGranted = { true })
             val forbidden = listOf(
-                "Authorization",
-                "Cookie",
-                "Proxy-Authorization",
-                "X-Api-Key",
-                "X-Subscription-Token",
-                "X-Custom-Trace",
+                mapOf("Authorization" to "private-data"),
+                mapOf("Cookie" to "private-data"),
+                mapOf("Proxy-Authorization" to "private-data"),
+                mapOf("X-Api-Key" to "private-data"),
+                mapOf("X-Subscription-Token" to "private-data"),
+                mapOf("X-Custom-Trace" to "private-data"),
+                mapOf("Accept" to "text/html", "accept" to "application/json"),
             )
-            for (name in forbidden) {
-                val result = runCatching {
-                    a.get(url, mapOf(name to "secret"), emptyList(), WebExtract.DEFAULT_MAX_BYTES)
-                }
-                assertTrue("$name 必須在送出前拒，got ${result.exceptionOrNull()}", result.isFailure)
-                val error = result.exceptionOrNull()!!
-                assertTrue("須為 adapter typed 拒絕，got $error", error is WebPinnedHttpAdapter.Denied)
-                assertTrue(
-                    "須標明 HEADER_NOT_ALLOWED，got ${error.message}",
-                    error.message!!.contains(WebPinnedHttpAdapter.DENIAL_HEADER_NOT_ALLOWED),
+            for (headers in forbidden) {
+                val failures = listOf(
+                    runCatching {
+                        a.get(url, headers, emptyList(), WebExtract.DEFAULT_MAX_BYTES)
+                    }.exceptionOrNull(),
+                    runCatching { search.get(url, headers) }.exceptionOrNull(),
                 )
-                assertFalse("${error.message} 不得攜帶憑證值", error.message!!.contains("secret"))
+                for (failure in failures) {
+                    assertTrue(failure is WebPinnedHttpAdapter.Denied)
+                    assertEquals(
+                        "WEB_PINNED_TRANSPORT_DENIED:${WebPinnedHttpAdapter.DENIAL_HEADER_NOT_ALLOWED}",
+                        failure?.message,
+                    )
+                }
             }
             assertEquals("憑證／自訂標頭案例零連線", 0, server.requestCount)
+            assertEquals("拒絕標頭時不解析 DNS", 0, dnsCalls.get())
 
             // 正向控制：唯一允許的 Accept 仍可送出，allowlist 不是無差別全拒。
             server.enqueue(okHtml())
@@ -184,6 +197,41 @@ class WebPinnedHttpAdapterTest {
     }
 
     // ---- over-cap Location：下一跳零連線、零 DNS（raw 與 resolved 兩臂） ----
+
+    @Test fun suppliedTlsClientDoesNotRetainInterceptorsOrEventObservers() = runBlocking {
+        val server = startServer()
+        try {
+            server.enqueue(okHtml())
+            val callbacks = AtomicInteger()
+            val baseClient = WebPinnedHttpAdapter.defaultBaseClient().newBuilder()
+                .addInterceptor { chain ->
+                    callbacks.incrementAndGet()
+                    chain.proceed(chain.request())
+                }
+                .addNetworkInterceptor { chain ->
+                    callbacks.incrementAndGet()
+                    chain.proceed(chain.request())
+                }
+                .eventListener(object : EventListener() {
+                    override fun callStart(call: Call) {
+                        callbacks.incrementAndGet()
+                    }
+                })
+                .build()
+
+            val result = adapter(baseClient = baseClient).get(
+                server.url("/owned-request").toString(),
+                emptyMap(),
+                emptyList(),
+                WebExtract.DEFAULT_MAX_BYTES,
+            )
+            assertEquals(200, result.code)
+            assertEquals(1, server.requestCount)
+            assertEquals(0, callbacks.get())
+        } finally {
+            server.shutdown()
+        }
+    }
 
     @Test fun overCapLocationHasNoHop2ConnectionAndNoHop2Dns() = runBlocking {
         val server = startServer()

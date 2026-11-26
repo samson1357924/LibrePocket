@@ -20,6 +20,8 @@ import kotlinx.coroutines.withContext
 import okhttp3.Authenticator
 import okhttp3.ConnectionPool
 import okhttp3.CookieJar
+import okhttp3.EventListener
+import okhttp3.Headers
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -147,6 +149,12 @@ internal object WebPinnedHttpAdapter {
         val addresses = if (pinnedAddresses.isEmpty()) approved else pinnedAddresses
         val pinned = PinnedNetworkDns.forHost(host, addresses, resolver)
         return baseClient.newBuilder()
+            .apply {
+                // The fixture seam can supply TLS trust, not request mutations or logging hooks.
+                interceptors().clear()
+                networkInterceptors().clear()
+                eventListener(EventListener.NONE)
+            }
             .dns(pinned)
             .proxy(Proxy.NO_PROXY)
             .connectionPool(ConnectionPool(0, 1, TimeUnit.NANOSECONDS))
@@ -206,18 +214,27 @@ internal object WebPinnedHttpAdapter {
      * fail-closed。transport 自身補上的 `Accept-Encoding: identity` 不經 caller map，
      * 不被 allowlist 過濾（亦不接受 caller 覆寫）。
      */
-    private fun buildRequest(url: String, headers: Map<String, String>): Request {
-        val builder = Request.Builder().url(url).get()
+    private fun validatedHeaders(headers: Map<String, String>): Headers {
+        val validated = Headers.Builder()
+        var seenAccept = false
         for ((name, value) in headers) {
-            if (!name.equals("Accept", ignoreCase = true)) {
-                throw Denied("$DENIAL_HEADER_NOT_ALLOWED:${name.lowercase()}")
+            if (!name.equals("Accept", ignoreCase = true) || seenAccept) {
+                throw Denied(DENIAL_HEADER_NOT_ALLOWED)
             }
-            builder.header(name, value)
+            try {
+                validated.add("Accept", value)
+            } catch (_: IllegalArgumentException) {
+                // OkHttp's validation error can include the rejected value.
+                throw Denied(DENIAL_HEADER_NOT_ALLOWED)
+            }
+            seenAccept = true
         }
         // 阻止 OkHttp 透明 gunzip；raw cap 與 service 的 gunzip cap 因此各自生效。
-        builder.header("Accept-Encoding", "identity")
-        return builder.build()
+        return validated.add("Accept-Encoding", "identity").build()
     }
+
+    private fun buildRequest(url: String, headers: Headers): Request =
+        Request.Builder().url(url).headers(headers).get().build()
 
     private class ExtractPinnedGet(
         private val optIn: EndpointNetworkOptIn,
@@ -234,9 +251,10 @@ internal object WebPinnedHttpAdapter {
         ): WebExtractRawResponse = withContext(Dispatchers.IO) {
             currentCoroutineContext().ensureActive()
             requireConsent(consentGranted)
+            val requestHeaders = validatedHeaders(headers)
             val eval = evaluate(url, optIn, resolver)
             val client = pinnedClient(url, eval, pinnedAddresses, resolver, baseClient)
-            val call = client.newCall(buildRequest(url, headers))
+            val call = client.newCall(buildRequest(url, requestHeaders))
             val cancellation = currentCoroutineContext()[Job]?.invokeOnCompletion(
                 onCancelling = true,
                 invokeImmediately = true,
@@ -282,9 +300,10 @@ internal object WebPinnedHttpAdapter {
             withContext(Dispatchers.IO) {
                 currentCoroutineContext().ensureActive()
                 requireConsent(consentGranted)
+                val requestHeaders = validatedHeaders(headers)
                 val eval = evaluate(url, optIn, resolver)
                 val client = pinnedClient(url, eval, emptyList(), resolver, baseClient)
-                val call = client.newCall(buildRequest(url, headers))
+                val call = client.newCall(buildRequest(url, requestHeaders))
                 val cancellation = currentCoroutineContext()[Job]?.invokeOnCompletion(
                     onCancelling = true,
                     invokeImmediately = true,

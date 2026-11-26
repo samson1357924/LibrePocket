@@ -1348,8 +1348,8 @@ class FastDispatchTest {
         // ASCII-alphanumeric / symbol in-run splitters (visible chars, not
         // separators): NFKC + the removed pass strip them, rejoining the
         // negation hint — DENIED + no-match（stage-1，非命令式句首），never FAST.
-        // （`不一查` 類以可見 CJK 字母/數字夾在否定詞 run 中的情形為 NOT closed
-        // 殘餘，刻意不在此釘住——見 FastRouter KDoc。）
+        // （`不一查` 類以可見 CJK 字母夾在否定詞 run 中的情形，命令式形另由
+        // `visibleLetterSplitter` 釘住——見 FastRouter KDoc。）
         val backend = CountingBackend()
         val dispatcher = lspDispatcher(backend)
         for (text in listOf(
@@ -1364,6 +1364,152 @@ class FastDispatchTest {
             assertNull(text, d.reasonCode)
             assertNull(text, d.toolCall)
             skippedOf(dispatcher.dispatch(d, lspOn), text)
+        }
+        assertEquals(0, backend.invocations.get())
+    }
+
+    @Test fun homoglyphNegationIsPinnedOrFolded() = runBlocking {
+        // #174 (b): Cyrillic lookalikes inside an otherwise ASCII negation word
+        // are NOT NFKC-foldable. Current: the conservative mixed-script run gate
+        // in [FastRouter.isNegated] denies them as NEED_CLARIFICATION (the
+        // ASCII controls below must deny identically). Before that gate these
+        // probes reached FAST — this pin prevents the regression.
+        val backend = CountingBackend()
+        val dispatcher = lspDispatcher(backend)
+        for (text in listOf(
+            "查 n\u0435ver 符號",   // U+0435 CYRILLIC SMALL LETTER IE inside "never"
+            "查 \u0430void 符號",   // U+0430 CYRILLIC SMALL LETTER A inside "avoid"
+            "查 n\u200Dеver 符號",  // U+200D ZWJ (Cf) inside the run; stripped by the in-run probe
+        )) {
+            val d = decide(text)
+            assertEquals(text, RouteKind.DENIED, d.route)
+            assertEquals(text, DenyReason.NEED_CLARIFICATION, d.reasonCode)
+            assertNull(text, d.toolCall)
+            skippedOf(dispatcher.dispatch(d, lspOn), text)
+        }
+        for (ascii in listOf("查 never 符號", "查 avoid 符號")) {
+            val d = decide(ascii)
+            assertEquals(ascii, RouteKind.DENIED, d.route)
+            assertEquals(ascii, DenyReason.NEED_CLARIFICATION, d.reasonCode)
+            assertNull(ascii, d.toolCall)
+            skippedOf(dispatcher.dispatch(d, lspOn), ascii)
+        }
+        assertEquals(0, backend.invocations.get())
+    }
+
+    @Test fun visibleLetterSplitter() = runBlocking {
+        // #174 (a): a visible letter inserted into a negation run. The single
+        // particle 不 is itself a [NEGATION_MARKERS] entry, so this probe is
+        // conservatively clarified (never FAST) even though the closed compound
+        // table cannot be complete. Pin the exact outcome, plus the ASCII
+        // contiguous control.
+        val backend = CountingBackend()
+        val dispatcher = lspDispatcher(backend)
+        for (text in listOf("查 不一查 符號")) {
+            val d = decide(text)
+            assertEquals(text, RouteKind.DENIED, d.route)
+            assertEquals(text, DenyReason.NEED_CLARIFICATION, d.reasonCode)
+            assertNull(text, d.toolCall)
+            skippedOf(dispatcher.dispatch(d, lspOn), text)
+        }
+        val control = decide("查 不查 符號")
+        assertEquals(RouteKind.DENIED, control.route)
+        assertEquals(DenyReason.NEED_CLARIFICATION, control.reasonCode)
+        assertNull(control.toolCall)
+        skippedOf(dispatcher.dispatch(control, lspOn), "查 不查 符號")
+        assertEquals(0, backend.invocations.get())
+    }
+
+    @Test fun englishBestEffortGap() = runBlocking {
+        // #174 (c)/F3: EN negation is best-effort; the newly listed words
+        // (cannot / unwilling / reject / hate / can't) must conservatively clarify
+        // instead of falling through to FAST. The ASCII control is an
+        // already-covered negation word.
+        val backend = CountingBackend()
+        val dispatcher = lspDispatcher(backend)
+        for (text in listOf(
+            "查 cannot 符號",
+            "查 unwilling 符號",
+            "查 reject 符號",
+            "查 hate 符號",
+            "查 Foo 符號 can't",   // #174 F3: can'?t included in the same EN table as don'?t
+        )) {
+            val d = decide(text)
+            assertEquals(text, RouteKind.DENIED, d.route)
+            assertEquals(text, DenyReason.NEED_CLARIFICATION, d.reasonCode)
+            assertNull(text, d.toolCall)
+            skippedOf(dispatcher.dispatch(d, lspOn), text)
+        }
+        val asciiControl = decide("查 never 符號")
+        assertEquals(RouteKind.DENIED, asciiControl.route)
+        assertEquals(DenyReason.NEED_CLARIFICATION, asciiControl.reasonCode)
+        assertNull(asciiControl.toolCall)
+        skippedOf(dispatcher.dispatch(asciiControl, lspOn), "查 never 符號")
+        assertEquals(0, backend.invocations.get())
+    }
+
+    @Test fun fullwidthOnlyCue() = runBlocking {
+        // #174 (d): a fullwidth-only cue never satisfies the raw-text symbol
+        // gate ⇒ no-match DENIED (reasonCode null), never FAST. The canonical
+        // ASCII cue control routes FAST (decide only — backend stays at zero
+        // here), and the ASCII negation control still reaches NEED_CLARIFICATION.
+        val backend = CountingBackend()
+        val dispatcher = lspDispatcher(backend)
+        val d = decide("查 Foo ｓｙｍｂｏｌｓ")
+        assertEquals(RouteKind.DENIED, d.route)
+        assertNull(d.reasonCode)
+        assertNull(d.toolCall)
+        skippedOf(dispatcher.dispatch(d, lspOn), "查 Foo ｓｙｍｂｏｌｓ")
+
+        val cueControl = decide("查 Foo 符號")
+        assertEquals(RouteKind.FAST, cueControl.route)
+        assertNotNull(cueControl.toolCall)
+        assertNull(cueControl.reasonCode)
+
+        val negationControl = decide("查 Foo 符號 不要")
+        assertEquals(RouteKind.DENIED, negationControl.route)
+        assertEquals(DenyReason.NEED_CLARIFICATION, negationControl.reasonCode)
+        assertNull(negationControl.toolCall)
+        skippedOf(dispatcher.dispatch(negationControl, lspOn), "查 Foo 符號 不要")
+        assertEquals(0, backend.invocations.get())
+    }
+
+    @Test fun legitimateGreekIdentifierStaysFast() = runBlocking {
+        // #174 F1: the confusable probe is PER RUN (Zs-delimited), not whole-text.
+        // "find"/"symbol"/"π" are separate runs ⇒ no mixed-script run ⇒ FAST.
+        // Under the old whole-text probe these were over-clarified.
+        val backend = CountingBackend()
+        for (text in listOf("find symbol π", "symbols π")) {
+            val d = decide(text)
+            assertEquals(text, RouteKind.FAST, d.route)
+            assertNull(text, d.reasonCode)
+            assertNotNull(text, d.toolCall)
+        }
+        // Reviewer-proposed CJK examples are DENIED by OTHER, pre-existing gates
+        // (not by the confusable probe), so pin their real outcomes honestly:
+        // `Foo π` is a multi-token remainder ⇒ clarification; `值` has no symbol
+        // hint ⇒ no-match. Neither may drift into FAST through the negation gate.
+        val multiToken = decide("查 Foo π 符號")
+        assertEquals(RouteKind.DENIED, multiToken.route)
+        assertEquals(DenyReason.NEED_CLARIFICATION, multiToken.reasonCode)
+        assertNull(multiToken.toolCall)
+        val noCue = decide("查 Alpha β 值")
+        assertEquals(RouteKind.DENIED, noCue.route)
+        assertNull(noCue.reasonCode)
+        assertNull(noCue.toolCall)
+        // decide-only: the fake backend must never be invoked.
+        assertEquals(0, backend.invocations.get())
+    }
+
+    @Test fun pureConfusableScriptNotFlagged() = runBlocking {
+        // #174 F2 (honest residual): the gate requires Latin AND Cyrillic/Greek in
+        // the SAME run. Pure foreign-script identifiers stay FAST (decide-only).
+        val backend = CountingBackend()
+        for (text in listOf("查 Альфа 符號", "查 αβγ 符號")) {
+            val d = decide(text)
+            assertEquals(text, RouteKind.FAST, d.route)
+            assertNull(text, d.reasonCode)
+            assertNotNull(text, d.toolCall)
         }
         assertEquals(0, backend.invocations.get())
     }

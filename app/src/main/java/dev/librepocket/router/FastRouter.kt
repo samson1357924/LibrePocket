@@ -1007,11 +1007,9 @@ class FastRouter(
          *（不要／不用／…）覆蓋所有模板工具，見 `FastDispatchTest`。本表涵蓋的封閉動詞集為
          * {打設開截播調導發傳幫給查找尋搜詢問寫寄} × {不/別/别/沒/没}（繁簡對稱，
          * 含繁簡交叉混排組合——例如 `別尋`/`别尋`/`沒寻`/`没尋` 四組全列，防禦混排輸入）＋
-         * 通用否定詞＋`\bnever\b`/`\bno\b`/`\bnot\b`/`\brefus\w*\b`/`\bavoid\w*\b`/`\bskip\w*\b`/`\bwithout\b`
-         *（英文否定為 best-effort：`refuses symbols` 已涵蓋；其餘未列動詞仍是殘餘缺口，
-         * 屬 fail-open 候選，監測留待 Phase 2/3）；#3 B3 re-review 另於
-         * [NEGATION_MARKERS] 英文 \b 集擴充明確禁止/順延句族
-         *（`forbid`/`prohibit`/`ban`/`postpone`/`suspend`/`defer`/`den[iy]\w*`/`hold off`），
+         * 通用否定詞＋[EN_NEGATION_BEST_EFFORT]（#174 (c) 單一常數表：原 BASE／
+         * #3 B3 re-review PROHIBITION／新增 `cannot`/`unwilling`/`reject\w*`/`hate\w*`；
+         * 英文否定仍為 best-effort，未列動詞是殘餘，不宣稱 EN 覆蓋完整），
          * 中文複合禁止/順延句族（拒絕/暫緩/延緩/延後/推遲/延遲/延期/推後/寬限/延宕）則載入本表。其他模板動詞（擷／安排／帶／切／靜音）
          * 在其工具把 executionReady 翻轉前補入——不得提前宣稱涵蓋。
          * 否定偵測同時跑在原始文本、NFKC 正規化後「刪除非（非 Lm）字母字元（含所有數字）與 ASCII 英數字」的文本、以及
@@ -1033,22 +1031,30 @@ class FastRouter(
          * - 亦已處理：ASCII-alphanumeric in-run splitter
          *   （`不2查`、`別¹查` 類 NFKC digit、`不™查`、`別½查`）——removed pass
          *   剝離後接合回連續 hint。
-         * - NOT closed（記錄在案，監測）：
-         *   (a) negation run 中可見的非 Lm 字母（含非 Nl 的 CJK 漢字，
-         *       例如 `不一查`）——無法避免（hint 即 letter runs）；
-         *   (b) 混合文字同形字（Cyrillic/Greek lookalikes；例如 `nеver` 用 U+0435）
-         *       未折疊——Phase 2/3 再評估 confusable folding；
-         *   (c) 英文覆蓋為 best-effort，限於列舉動詞
-         *       （`never`/`don'?t`/`do not`/`stop`/`cancel`/`refus\w*`/`avoid\w*`/`skip\w*`/`without`/`no`/`not`
-         *       ＋#3 B3 re-review：`forbid\w*`/`prohibit\w*`/`ban\w*`/`postpone\w*`/`suspend\w*`/`defer\w*`/
-         *       `den[iy]\w*`/`hold\\s*off`）；
-         *       `cannot`/`later`/`afterwards` 類及未列舉動詞不涵蓋；`ban\w*` 會過度涵蓋 `banana` 以及識別字前綴（`BanController`、`BannerLayout`、`DenialOfServiceException`——皆 `\bban\w*\b`/`\bden[iy]\w*\b` 全詞命中，壓成需澄清而非誤執行）
-         *       ——皆過度澄清 fail-safe 方向，接受並記錄；
-         *   (d) 全形-only 符號 hint 不會路由（SYMBOL_HINTS 比對原始文本，安全方向）；
+         * - 已收斂（#174，行為皆釘於 FastDispatchTest）：
+         *   (a) 可見字母插入（`查 不一查 符號`）現由單顆粒 `不` marker 保守澄清
+         *       （pin `visibleLetterSplitter`）；封閉複合詞（取消/拒絕等）中插入可見
+         *       字母且完全沒有單顆粒旗標者仍為開放殘餘（字典不可封閉）；
+         *   (b) Cyrillic/Greek 同形字（`查 nеver 符號`、`查 аvoid 符號`）由
+         *       [hasConfusableNegationRun] 的 mixed-script run 規則保守否決
+         *       （run 以 Zs 空白分界，run 內 ignorable 才剝離；故 `find symbol π`
+         *       之類分開的 Latin/Greek token 仍 FAST），不列 homoglyph 白名單
+         *       （pin `homoglyphNegationIsPinnedOrFolded`／`legitimateGreekIdentifierStaysFast`）。
+         *       已知 residual：純 Cyrillic/Greek-only（全句無拉丁字母，如
+         *       `查 Альфа 符號`／`查 αβγ 符號`）仍不命中——本閘捕獲 mixed-script
+         *       homomorphism，不是外語詞否定（pin `pureConfusableScriptNotFlagged`）；
+         *   (c) EN 清單收斂為 [EN_NEGATION_BEST_EFFORT]，補 `cannot`/`unwilling`/
+         *       `reject\w*`/`hate\w*`/`can'?t`；`later`/`afterwards` 與未列舉動詞
+         *       仍不涵蓋，新詞及既有 `ban\w*`/`den[iy]\w*` 對識別字前綴的
+         *       過度澄清接受（fail-safe）；
+         *   (d) 全形-only cue 不路由已有精確 pin（`fullwidthOnlyCue`）；
          *   (e) `符號是Foo嗎` → no-match（無准入 ⇒ 不進模板，reasonCode null）；
          *       `特別找` 現為 no-match（非命令式句首 ⇒ 不進模板，reasonCode null）；`查 查理 符號` → FAST `查理`（stage-6.3 位置語法，pinned）；
          *       `意思是符號` → no-match（無准入 ⇒ reasonCode null）；
          *   (f) CJK 異體字碼點（查 vs 査）未涵蓋。
+         * - **任何 DESTRUCTIVE 工具翻 `executionReady` 前必須補齊本契約**
+         *   （否定閘、mixed-script 同形字收斂、EN best-effort 清單與對應行為 pins）；
+         *   READ-only 工具不因此被視為 DESTRUCTIVE 已完成。
          * - 命令式肯定語句帶否定顆粒者（如 `查 Foo 符號 不要` 型）才會進模板後閘轉澄清；
          *   非命令式句首者（如 `別問 Foo 符號`、`not symbols`、`我不想查 Foo 符號`）直接
          *   no-match DENIED——皆為 DENIED、絕不執行。
@@ -1065,6 +1071,34 @@ class FastRouter(
          *   KDoc 與 FastDispatchTest pins）；
          *   非 cue 位置的動詞不再剝離（見 extraction KDoc）。
          */
+        // #174 (c) — EN negation corpus, hoisted so [NEGATION_HINTS] and
+        // [NEGATION_MARKERS] cannot drift. BASE = the original best-effort \b set;
+        // PROHIBITION = #3 B3 re-review explicit forbid/postpone family;
+        // BEST_EFFORT adds `cannot`/`unwilling`/`reject\w*`/`hate\w*`/`can'?t`. Each
+        // inclusion is deliberately OVER-CLARIFYING (fail-safe): `reject`/`hate`
+        // with `\w*` also catch identifier prefixes (`RejectController`,
+        // `HateHandler`) and `cannot`/`unwilling` are closed `\b` words.
+        // `\bban\w*\b` likewise over-covers `banana` — accepted fail-safe.
+        // The alternative (leave them out) requires behavior pins in FastDispatchTest
+        // and is unacceptable once a DESTRUCTIVE tool becomes executionReady.
+        // Words NOT in this table (`later`, `afterwards`, unseen verbs) stay an
+        // explicit best-effort residual — never claim EN completeness.
+        private val EN_NEGATION_BASE = listOf(
+            r("\\bnever\\b"), r("\\bnot\\b"), r("\\bno\\b"),
+            r("\\bdon'?t\\b"), r("\\bcan'?t\\b"), r("\\bdo not\\b"), r("\\bstop\\b"), r("\\bcancel\\b"),
+            r("\\brefus\\w*\\b"), r("\\bavoid\\w*\\b"), r("\\bskip\\w*\\b"), r("\\bwithout\\b"),
+        )
+        private val EN_NEGATION_PROHIBITION = listOf(
+            r("\\bforbid\\w*\\b"), r("\\bprohibit\\w*\\b"), r("\\bban\\w*\\b"),
+            r("\\bpostpone\\w*\\b"), r("\\bsuspend\\w*\\b"), r("\\bdefer\\w*\\b"),
+            r("\\bden[iy]\\w*\\b"), r("\\bhold\\s*off\\b"),
+        )
+        private val EN_NEGATION_BEST_EFFORT =
+            EN_NEGATION_BASE + EN_NEGATION_PROHIBITION + listOf(
+                r("\\bcannot\\b"), r("\\bunwilling\\b"),
+                r("\\breject\\w*\\b"), r("\\bhate\\w*\\b"),
+            )
+
         private val NEGATION_HINTS = listOf(
             r("不要"), r("不用"), r("不需要"), r("不必"), r("不需"), r("勿"),
             r("取消"), r("停止"), r("禁止"), r("算了"),
@@ -1110,26 +1144,26 @@ class FastRouter(
             r("沒导"), r("沒发"), r("沒传"), r("沒帮"), r("沒给"), r("沒写"),
             r("没尋"), r("没詢"), r("没問"), r("没設"), r("没開"), r("没調"),
             r("没導"), r("没發"), r("没傳"), r("没幫"), r("没給"), r("没寫"),
-            r("\\bnever\\b"), r("\\bnot\\b"), r("\\bno\\b"),
-            r("\\brefus\\w*\\b"), r("\\bavoid\\w*\\b"), r("\\bskip\\w*\\b"), r("\\bwithout\\b"),
-            r("\\bdon'?t\\b"), r("\\bdo not\\b"), r("\\bstop\\b"), r("\\bcancel\\b"),
+            *(EN_NEGATION_BEST_EFFORT.toTypedArray()),
         )
 
         // Conservative negation/uncertainty gate: ANY presence of a negation word
         // clarifies — phrases are open-ended, so a closed verb table cannot be complete.
         // The two tables are COMPLEMENTARY: [NEGATION_MARKERS]
         // holds the single-particle set （不 沒 没 別 别 勿 莫 嫑 否 無 无 免 未 毋 休） plus the
-        // English \b set — `no`/`not`/`never`/`don'?t`/`do not`/`stop`/`cancel`/`refus\w*`/
-        // `avoid\w*`/`skip\w*`/`without` plus (#3 B3 re-review, explicit prohibition/
-        // postponement): `forbid\w*`/`prohibit\w*`/`ban\w*`/`postpone\w*`/`suspend\w*`/
-        // `defer\w*`/`den[iy]\w*`/`hold\s*off`; [NEGATION_HINTS]
-        // holds the multi-verb compound negations plus general forbiddens, whose unique
-        // load-bearing contribution is {取消,停止,禁止,算了} plus the 18 prohibition/deferral
-        // compounds (拒絕/拒绝/暫緩/暂缓/延緩/延缓/延後/延后/推遲/推迟/延遲/延迟/延期/推後/推后/寬限/宽限/延宕 — none of which
-        // contain a single-particle marker, so they are NOT a subset of this gate). The single-particle set,
-        // those four words and those 18 compounds are all load-bearing and must not be deleted; [isNegated] ORs both
-        // over the same three texts
-        // (raw, NFKC-removed, NFKC-spaced). Over-clarification is the
+        // English \b set ([EN_NEGATION_BEST_EFFORT], shared with [NEGATION_HINTS])
+        // — the original `no`/`not`/`never`/`don'?t`/`do not`/`stop`/`cancel`/`refus\w*`/`avoid\w*`/`skip\w*`/`without`,
+        // #3 B3 re-review prohibition/postponement family, plus #174 (c)
+        // `cannot`/`unwilling`/`reject\w*`/`hate\w*`/`can'?t` (over-clarifies identifiers;
+        // fail-safe). [NEGATION_HINTS] holds the multi-verb compound negations
+        // plus general forbiddens, whose unique load-bearing contribution is
+        // {取消,停止,禁止,算了} plus the 18 prohibition/deferral compounds
+        // (拒絕/拒绝/暫緩/暂缓/延緩/延缓/延後/延后/推遲/推迟/延遲/延迟/延期/推後/推后/寬限/宽限/延宕 —
+        // none of which contain a single-particle marker, so they are NOT a
+        // subset of this gate). The single-particle set, those four words and
+        // those 18 compounds are all load-bearing and must not be deleted;
+        // [isNegated] ORs both over the three texts (raw, NFKC-removed,
+        // NFKC-spaced) plus the #174 (b) confusable-script run. Over-clarification is the
         // fail-safe direction here (the single ready tool is READ-only and this lane
         // dispatches at most one of everything): when in doubt, ask, never execute.
         // Known deliberate over-clarifies (pinned by tests): 「特別」含「別」、
@@ -1142,19 +1176,7 @@ class FastRouter(
             // 否定語氣顆粒——惟「尚未查 Foo 符號」「未曾查 Foo 符號」「毋查 Foo 符號」「休查 Foo 符號」
             // 皆不滿足命令式句首（尚/未/毋/休 非查詢動詞）⇒ no-match DENIED（reasonCode null），否定閘不介入。
             r("無"), r("无"), r("免"), r("未"), r("毋"), r("休"),
-            r("\\bno\\b"), r("\\bnot\\b"), r("\\bnever\\b"), r("\\bdon'?t\\b"), r("\\bdo not\\b"),
-            r("\\bstop\\b"), r("\\bcancel\\b"), r("\\brefus\\w*\\b"), r("\\bavoid\\w*\\b"),
-            r("\\bskip\\w*\\b"), r("\\bwithout\\b"),
-            // 明確禁止/順延EN句族（#3 B3 re-review）：自然語言等價於否定——
-            // 明確詞集：`forbid`／`prohibit`／`ban`／`postpone`／`suspend`／`defer`／`den[iy]\w*`（含 deny/denies/denied/denying）／`hold off`。
-            // `I forbid you to search symbol Foo`／`postpone finding symbols`／
-            // `hold off on symbols`／`suspend lookup` 皆不得落 FAST；模板命中者轉澄清，
-            // 無模板命中者 no-match DENIED——皆為 DENIED、絕不執行。
-            // 註：`\bban\w*\b` 會過度涵蓋 `banana`（`symbols Foo banana` → 澄清）——
-            // 過度澄清為 fail-safe 方向，接受並記錄。
-            r("\\bforbid\\w*\\b"), r("\\bprohibit\\w*\\b"), r("\\bban\\w*\\b"),
-            r("\\bpostpone\\w*\\b"), r("\\bsuspend\\w*\\b"), r("\\bdefer\\w*\\b"),
-            r("\\bden[iy]\\w*\\b"), r("\\bhold\\s*off\\b"),
+            *(EN_NEGATION_BEST_EFFORT.toTypedArray()),
         )
 
         // Shared argument patterns (also hoisted: previously recompiled per
@@ -2127,6 +2149,39 @@ class FastRouter(
         private val NEGATION_REMOVED = Regex("[^\\p{L}]+|\\p{Lm}+|\\p{Nl}+|[A-Za-z0-9]+|[\\u115F\\u1160]+")
         private val NEGATION_SPACED = Regex("[^\\p{L}\\p{N}]+|[\\u30FC\\u115F\\u1160]+")
 
+        // #174 (b): confusable-script backstop. NFKC does NOT fold Cyrillic/Greek
+        // lookalikes back to ASCII, and a homoglyph whitelist can never be complete.
+        // Strip only IN-RUN ignorables (Cc/Cf, digits, punctuation, Lm, Hangul
+        // fillers) while preserving \p{Zs} whitespace as real run boundaries, then
+        // reject a run that MIXES Latin with Cyrillic/Greek — the shape a homoglyph
+        // negation attempt takes (`n\u0435ver`, `\u0430void`, ZWJ-split `n\u200Dеver`).
+        // UnicodeScript is the policy oracle; no per-code-point lookalike table.
+        // Han+Latin runs (`查Foo符號`) stay unaffected (HAN is not confusable here);
+        // separate Latin/Greek tokens (`find symbol π`) stay FAST; pure
+        // Cyrillic/Greek-only runs are NOT flagged (known residual, see KDoc).
+        private val NEGATION_CONFUSABLE_JOINED = Regex("[^\\p{L}\\p{Zs}]+|\\p{Lm}+|[\\u115F\\u1160]+")
+        private val NEGATION_RUN_SPLIT = Regex("\\p{Zs}+")
+
+        private fun hasConfusableNegationRun(text: String): Boolean {
+            val joined = Normalizer.normalize(text, Normalizer.Form.NFKC)
+                .replace(NEGATION_CONFUSABLE_JOINED, "")
+            return joined.split(NEGATION_RUN_SPLIT).any { run ->
+                var latin = false
+                var confusable = false
+                var index = 0
+                while (index < run.length) {
+                    val cp = run.codePointAt(index)
+                    when (Character.UnicodeScript.of(cp)) {
+                        Character.UnicodeScript.LATIN -> latin = true
+                        Character.UnicodeScript.CYRILLIC, Character.UnicodeScript.GREEK -> confusable = true
+                        else -> Unit
+                    }
+                    index += Character.charCount(cp)
+                }
+                latin && confusable
+            }
+        }
+
         /**
          * NFKC + whitelist-normalized negation matching: negation hints are
          * tested against THREE texts —
@@ -2147,7 +2202,9 @@ class FastRouter(
          * (3) the same with non-letter/non-digit runs folded to a single space
          *     (ASCII alphanumerics KEPT so `\b` stays intact: fullwidth-after-
          *     NFKC English and multi-space English match there too —
-         *     belt-and-braces).
+         *     belt-and-braces), plus (4) [hasConfusableNegationRun]: any Zs-delimited
+         *     letter run (in-run ignorables removed) mixing Latin with Cyrillic/Greek
+         *     (#174 b) clarifies; purely Cyrillic/Greek runs are left alone.
          * A blacklist of separator classes can never be complete (Cc/marks/
          * dashes/symbols/Lm/Lo/PUA span ~190k code points), hence the whitelist
          * approach. Both passes push in the fail-safe direction (extra
@@ -2158,12 +2215,11 @@ class FastRouter(
          * The `查詢` compound is covered by substring match of 別查/不查. 「特別找」為 no-match DENIED
          * （非命令式句首、非准入、原因為 no-match，永遠不會 FAST，永遠不會執行）——pinned。
          */
-        // [isNegated] 同命三個文本（raw / NFKCremoved / NFKCspaced）；A1 保守否定閘。
-        // 兩表互補（COMPLEMENTARY），不得刪除單顆粒集或四個通用禁止詞：[NEGATION_MARKERS]
-        // 收單一顆粒集（不 沒 没 別 别 勿 莫 嫑 否 無 无 免 未 毋 休）＋英文 \b 集
-        //（`no`/`not`/`never`/`don'?t`/`do not`/`stop`/`cancel`/`refus\w*`/`avoid\w*`/`skip\w*`/`without`
-        // ＋#3 B3 re-review：`forbid\w*`/`prohibit\w*`/`ban\w*`/`postpone\w*`/`suspend\w*`/`defer\w*`/
-        // `den[iy]\w*`/`hold\s*off`）；[NEGATION_HINTS]
+        // [isNegated] 同命三文本（raw / NFKCremoved / NFKCspaced）＋ mixed-script run
+        // 探針（#174 b）；A1 保守否定閘。兩表互補（COMPLEMENTARY），不得刪除
+        // 單顆粒集或四個通用禁止詞：[NEGATION_MARKERS] 收單一顆粒集
+        //（不 沒 没 別 别 勿 莫 嫑 否 無 无 免 未 毋 休）＋[EN_NEGATION_BEST_EFFORT]
+        //（含 #174 c 新增 cannot/unwilling/reject\w*/hate\w*/can'?t）；[NEGATION_HINTS]
         // 收多動詞複合否定與通用禁止詞，其獨有載荷 = {取消,停止,禁止,算了} + 18 條（拒絕/暫緩/延緩/延後/推遲/延遲/延期/推後/寬限/延宕，
         // 繁簡對稱——皆不含單顆粒旗標，非 MARKERS 子集合；其餘中文複合詞與英文集與 MARKERS 重複，可清理但非必須）。
         // 兩表皆 OR 同命同文本——任何否定詞/不確定詞存在即澄清，絕不執行（封閉表不
@@ -2177,7 +2233,8 @@ class FastRouter(
                 containsAny(removed, NEGATION_HINTS) ||
                 containsAny(removed, NEGATION_MARKERS) ||
                 containsAny(spaced, NEGATION_HINTS) ||
-                containsAny(spaced, NEGATION_MARKERS)
+                containsAny(spaced, NEGATION_MARKERS) ||
+                hasConfusableNegationRun(text)
         }
 
         private fun hasExplicitAlarmTime(text: String): Boolean {

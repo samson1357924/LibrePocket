@@ -3,7 +3,6 @@ package dev.librepocket.agent.assistant
 import java.io.File
 import javax.xml.parsers.DocumentBuilderFactory
 import org.junit.Assert.assertEquals
-import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.w3c.dom.Element
@@ -142,9 +141,12 @@ class AssistantManifestContractTest {
     @Test
     fun mainManifest_declaresAssistantServiceTriadAndVoiceInteractionBinding() {
         val main = parse(manifest("main"))
-        val declared = elements(main, "service")
-            .mapNotNull { it.android("name") }
-            .filter { it.startsWith(".assistant.") }
+        val assistantServices = elements(main, "service")
+            .mapNotNull { service ->
+                assistantComponent(service.android("name"))?.let { it to service }
+            }
+            .filter { (name, _) -> name.startsWith(".assistant.") }
+        val declared = assistantServices.map { (name, _) -> name }
         assertEquals(
             "main manifest 須恰宣告三個助理服務，實際=$declared",
             ASSISTANT_SERVICES.keys.toSet(),
@@ -153,7 +155,7 @@ class AssistantManifestContractTest {
         assertEquals("服務不可重複宣告", ASSISTANT_SERVICES.size, declared.size)
 
         for ((name, action) in ASSISTANT_SERVICES) {
-            val service = elements(main, "service").single { it.android("name") == name }
+            val service = assistantServices.single { (component, _) -> component == name }.second
             assertEquals("$name must stay exported for system binding", "true", service.android("exported"))
             assertEquals("$name must run in :voice", ":voice", service.android("process"))
             val expectedPermission = if (name == ".assistant.LibreRecognitionService") {
@@ -168,8 +170,8 @@ class AssistantManifestContractTest {
             assertEquals("$name intent-filter action", listOf(action), actions)
         }
 
-        val voiceService = elements(main, "service")
-            .single { it.android("name") == ".assistant.LibreVoiceInteractionService" }
+        val voiceService = assistantServices
+            .single { (component, _) -> component == ".assistant.LibreVoiceInteractionService" }.second
         val meta = elements(voiceService, "meta-data").single()
         assertEquals("android.voice_interaction", meta.android("name"))
         assertEquals("@xml/voice_interaction", meta.android("resource"))
@@ -224,6 +226,17 @@ class AssistantManifestContractTest {
                     "remove",
                     permission.tools("node")?.trim(),
                 )
+            }
+        }
+    }
+
+    /** 這些來源集的 permission 白名單不接受出現在條件式宣告中的額外項目。 */
+    @Test
+    fun noSdkConditionalPermissionDeclarationsInReviewedSourceSets() {
+        for (sourceSet in listOf("main") + FLAVORS) {
+            val manifest = parse(manifest(sourceSet))
+            for (tag in listOf("uses-permission-sdk-23", "uses-permission-sdk-m")) {
+                assertTrue("$sourceSet must not declare <$tag>", elements(manifest, tag).isEmpty())
             }
         }
     }

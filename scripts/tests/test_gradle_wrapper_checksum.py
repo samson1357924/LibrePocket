@@ -30,7 +30,7 @@ WORKFLOW_SNAPSHOTS = {
     "pr-check.yml": "8d066d6c1722696e50400cd6253180ba22dcdbba662e48402d700fc38f35aff4",
     "osv-scan.yml": "3f7102cb9d26b8d4cc1c9a2b6da2bbf4c4b6753148f2968137e67eeff0bacdc1",
     "release.yml": "acf8d39620362fce1190f6ffb6d75d088ae19c4d9de636be64af0dcbc0cd7d1f",
-    "security-audit.yml": "0b4b9b833a50b61b456e4d4c2064fba5f9c6836867157c4f22b1c5887ee4f176",
+    "security-audit.yml": "aee04f6f031a5fa182983851de66e608423c8a3a590542b41c6a46759dd576d4",
 }
 
 

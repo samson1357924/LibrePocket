@@ -38,6 +38,16 @@ construction) and enforces:
     characters <= U+0020 (NBSP / full-width spaces survive it - Python's
     ``str.strip()`` would over-normalize, see ``_java_trim``); names outside
     the allowlist after that exact normalization fail the gate;
+  * ``--mode lan``: the same base-config pin, the same runtime-normalized
+    domain comparison, and the same explicit ``includeSubdomains="false"``
+    requirement, but the cleartext allowlist is the loopback dev names PLUS
+    explicit RFC1918 IPv4 host literals in ``10.0.0.0/8`` /
+    ``172.16.0.0/12`` / ``192.168.0.0/16``. Android NSC has NO CIDR syntax:
+    each host must be enumerated literally; prefixes such as ``10.*``, whole
+    domains, CGNAT (``100.64.0.0/10``), link-local, metadata, public IPs and
+    IPv4-mapped IPv6 all fail closed. This mode exists ONLY for the foss/github
+    flavor NSC overlay; play always validates as release/debug and never
+    inherits a LAN allowlist.
   * nested ``<domain-config>`` cleartext inheritance: AOSP
     ``XmlConfigSource#parseConfigEntry`` recurses into an inner
     ``<domain-config>`` with the OUTER domain-config's ``Builder`` as parent
@@ -48,9 +58,9 @@ construction) and enforces:
     entry without its own attribute INHERITS the enclosing chain's effective
     cleartext value; the gate carries that effective value down each nested
     chain and applies the exact same rules to an inherited ``"true"`` as to an
-    explicit one - release refuses cleartext on every entry, debug requires
-    every affected ``<domain>`` to hit the loopback allowlist with its
-    explicit ``includeSubdomains="false"``. An inner entry's own ``"false"``
+    explicit one - release refuses cleartext on every entry, debug/lan require
+    every affected ``<domain>`` to hit their allowlist with its explicit
+    ``includeSubdomains="false"``. An inner entry's own ``"false"``
     (``Builder#setCleartextTrafficPermitted`` overrides the parent) legally
     narrows and stays valid;
 - Android runtime strictness, mirrored from AOSP
@@ -124,8 +134,8 @@ construction) and enforces:
     and are excluded from all attribute checks;
   * debug-overrides policies only apply to debuggable builds, but this gate
     does NOT trust that: a ``debug-overrides``/``<base-config>`` claim of
-    ``cleartextTrafficPermitted="true"`` fails in BOTH modes (release pins
-    deny-all; debug allows the escape only inside a whitelist-eligible
+    ``cleartextTrafficPermitted="true"`` fails in ALL modes (release pins
+    deny-all; debug/lan allow the escape only inside a whitelist-eligible
     ``<domain-config>``);
 - the attr↔resource binding (``--check-manifest``[, ``--require-both``]):
   ``android:networkSecurityConfig`` on the merged-candidate <application> must
@@ -138,7 +148,7 @@ construction) and enforces:
 Exit codes: 0 = valid, 1 = violation/parse error, 2 = usage error.
 Run with:
 
-    python3 scripts/nsc_check.py --mode (release|debug) <config.xml> [...]
+    python3 scripts/nsc_check.py --mode (release|debug|lan) <config.xml> [...]
     python3 scripts/nsc_check.py --check-manifest [--require-both] <manifest.xml> [...]
 """
 
@@ -147,6 +157,7 @@ from __future__ import annotations
 import base64
 import datetime
 import importlib.util
+import ipaddress
 import os
 import stat
 import sys
@@ -156,12 +167,42 @@ import xml.etree.ElementTree as ET
 from typing import Callable
 
 NSC_ROOT = "network-security-config"
-MODES = ("release", "debug")
+MODES = ("release", "debug", "lan")
 
 # Debug-mode loopback cleartext allowlist: exactly the domains
 # LlmProvider.validateBaseUrl accepts for http:// in dev builds. Nothing else
 # may enable cleartext, and never for subdomains (LAN hosts go via adb reverse).
 DEBUG_CLEARTEXT_DOMAINS = frozenset(("localhost", "127.0.0.1", "10.0.2.2"))
+
+# A5 LAN mode (foss/github overlay only): the same loopback names plus EXPLICIT
+# RFC1918 IPv4 host literals. Android NSC has no CIDR/domain-pattern syntax for
+# IP ranges, so the allowlist is a literal membership test, not a prefix match.
+# CGNAT (100.64/10), link-local (169.254/16), metadata, public addresses,
+# IPv4-mapped IPv6 and wildcard-looking names never match.
+LAN_CLEARTEXT_DOMAINS = DEBUG_CLEARTEXT_DOMAINS
+LAN_CLEARTEXT_NETWORKS = tuple(
+    ipaddress.ip_network(cidr)
+    for cidr in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16")
+)
+
+
+def _is_lan_cleartext_domain(name: str | None) -> bool:
+    """True only for the loopback dev names or an explicit RFC1918 host literal.
+
+    ``name`` must already be runtime-normalized (``_normalize_domain``: Java
+    String#trim + lowercase, NOT Python str.strip). Exact match only: no
+    subdomains, no CIDR text, no wildcard prefixes, no DNS names beyond the
+    three loopback/dev aliases.
+    """
+    if name is None:
+        return False
+    if name in LAN_CLEARTEXT_DOMAINS:
+        return True
+    try:
+        address = ipaddress.IPv4Address(name)
+    except ValueError:
+        return False
+    return any(address in network for network in LAN_CLEARTEXT_NETWORKS)
 
 # Source↔runtime manifest binding: the attr must reference exactly this
 # resource (the source-level mirror of the artifact authority in
@@ -657,7 +698,7 @@ def _validate_config_entry(
         if not allow_domains:
             errors.append(
                 f"{path}: {where} sets cleartextTrafficPermitted=\"true\" - "
-                "only a debug-mode loopback <domain-config> may enable cleartext"
+                "only a debug/lan <domain-config> may enable cleartext"
             )
         elif mode == "release":
             errors.append(
@@ -666,11 +707,26 @@ def _validate_config_entry(
             )
         else:
             for name, include_subdomains in domain_entries:
-                if name is None or name not in DEBUG_CLEARTEXT_DOMAINS:
+                if name is None:
+                    allowed = False
+                elif mode == "debug":
+                    allowed = name in DEBUG_CLEARTEXT_DOMAINS
+                else:
+                    allowed = _is_lan_cleartext_domain(name)
+                if not allowed:
+                    if mode == "debug":
+                        detail = (
+                            f"{name!r} outside the debug loopback allowlist "
+                            "(localhost / 127.0.0.1 / 10.0.2.2)"
+                        )
+                    else:
+                        detail = (
+                            f"{name!r} outside the LAN cleartext allowlist "
+                            "(localhost / 127.0.0.1 / 10.0.2.2 / explicit RFC1918 "
+                            "host literals in 10/8, 172.16/12, 192.168/16)"
+                        )
                     errors.append(
-                        f"{path}: {where} sets cleartextTrafficPermitted=\"true\" for domain "
-                        f"{name!r} outside the debug loopback allowlist "
-                        "(localhost / 127.0.0.1 / 10.0.2.2)"
+                        f"{path}: {where} sets cleartextTrafficPermitted=\"true\" for domain {detail}"
                     )
                 elif include_subdomains != "false":
                     errors.append(
@@ -943,7 +999,7 @@ def main(argv: list[str]) -> int:
     while i < len(args):
         if args[i] == "--mode":
             if i + 1 >= len(args):
-                print("FAIL: --mode requires a value (release|debug)", file=sys.stderr)
+                print("FAIL: --mode requires a value (release|debug|lan)", file=sys.stderr)
                 return 2
             if mode is not None:
                 print("FAIL: duplicate --mode", file=sys.stderr)
@@ -951,7 +1007,7 @@ def main(argv: list[str]) -> int:
             mode = args[i + 1]
             if mode not in MODES:
                 print(
-                    f"FAIL: unknown --mode {mode!r} (expected release or debug)",
+                    f"FAIL: unknown --mode {mode!r} (expected release, debug or lan)",
                     file=sys.stderr,
                 )
                 return 2
@@ -970,7 +1026,7 @@ def main(argv: list[str]) -> int:
             i += 1
     if not paths:
         print(
-            "usage: nsc_check.py (--mode (release|debug) <network_security_config.xml> [...] | "
+            "usage: nsc_check.py (--mode (release|debug|lan) <network_security_config.xml> [...] | "
             "--check-manifest [--require-both] <AndroidManifest.xml> [...])",
             file=sys.stderr,
         )
@@ -980,7 +1036,7 @@ def main(argv: list[str]) -> int:
         # rule set applies (the single--"false"-grep false-PASS was the
         # reviewer's original repro; callers must state the mode).
         print(
-            "usage: nsc_check.py --mode (release|debug) <network_security_config.xml> [...] | "
+            "usage: nsc_check.py --mode (release|debug|lan) <network_security_config.xml> [...] | "
             "--check-manifest [--require-both] <AndroidManifest.xml> [...]",
             file=sys.stderr,
         )

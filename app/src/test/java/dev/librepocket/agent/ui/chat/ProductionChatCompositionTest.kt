@@ -9,6 +9,8 @@ import dev.librepocket.chat.ChatSession
 import dev.librepocket.keystore.EncryptedPrefsVault
 import dev.librepocket.keystore.InMemoryPrefs
 import dev.librepocket.policy.InMemoryPolicyStore
+import dev.librepocket.policy.NetworkEgressPolicy
+import dev.librepocket.policy.NetworkOptInStore
 import dev.librepocket.policy.PolicyRule
 import dev.librepocket.policy.Verdict
 import dev.librepocket.provider.ChatRequest
@@ -36,6 +38,8 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertSame
+import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -118,6 +122,40 @@ class ProductionChatCompositionTest {
         val app = ApplicationProvider.getApplicationContext<Application>()
         val factory = ChatViewModelFactory(app)
         assertNull("production composition must pin toolSlice to null", factory.sessions.toolSlice)
+    }
+
+    /**
+     * A5 (#135): production wires ONE [NetworkOptInStore] into every session.
+     * The store stays in the default (play) posture: no confirmed upgrade and
+     * no opt-in UI yet, so a private/HTTP endpoint remains HTTPS_ONLY and a
+     * tier-upgrade confirmation is rejected fail-closed.
+     */
+    @Test
+    fun productionCompositionInjectsOneDenyAllNetworkOptInStore() {
+        val app = ApplicationProvider.getApplicationContext<Application>()
+        val factory = ChatViewModelFactory(app)
+        val optIns = factory.networkOptInStore
+        assertNotNull("production must inject a non-null opt-in store", optIns)
+        assertSame(
+            "sessions must use the factory's single store instance",
+            optIns,
+            factory.sessions.networkOptInStore,
+        )
+        val privateHttp = "http://192.168.1.20/v1"
+        assertEquals(
+            "no confirmation means HTTPS_ONLY even for a private HTTP endpoint",
+            NetworkEgressPolicy.HTTPS_ONLY,
+            optIns.confirmedPolicyFor("preset:openai", privateHttp, 0L),
+        )
+        val rejected = assertThrows(IllegalArgumentException::class.java) {
+            optIns.confirm(
+                "preset:openai",
+                privateHttp,
+                NetworkEgressPolicy.ALLOW_CLEARTEXT_PRIVATE,
+                0L,
+            )
+        }
+        assertEquals("NETWORK_OPTIN_TIER_NOT_ALLOWED", rejected.message)
     }
 
     @Test

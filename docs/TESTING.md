@@ -1129,6 +1129,64 @@ evidence, never a pass.
 
 Instrumented tests are a separate device-dependent tier. The existing [P1 androidTest runbook](specs/P1_ANDROIDTEST_RUNBOOK.md) lists test classes and sample commands, but its device matrix and prior status notes are not current CI evidence. Before treating a device matrix as a merge/release gate, maintainers must name the required API/flavor/device coverage, run it, and retain results tied to the tested SHA. Do not report a device pass when no device was used.
 
+## B3 budget benchmark（heap／frame／latency）— harness Current，已量測（門檻仍未訂）
+
+**現況：已於授權裝置量測一次（見下節），但門檻刻意不訂（`NOT_ESTABLISHED`）、真 token window 仍未實作。** 量測數字是 diagnostic，不構成 gate；不得據此宣稱 B3 已關閉或已訂可接受範圍。
+
+| 項目 | 位置 | GATE vs DIAGNOSTIC |
+|---|---|---|
+| JVM 固定輸入 SweetSpot 取樣（5 組 config × 3 replicate；固定 clock／zone／provider／input） | `TurnControllerBudgetBenchmarkTest.sweetSpotSampling_structuralGatesDeterministicTimingsDiagnostic` | **GATE（結構性）**：char／row 對帳等式、request ≤ `MAX_REQUEST_CHARS`、delta／flush／copy 計數上限、replicate 間結構計數完全相同。**DIAGNOSTIC**：stdout JSON 的 min／median／max ms；永不作為 wall-clock 比值 gate |
+| 裝置端 bounded benchmark（create／resume／hydration） | `app/src/androidTest/java/dev/librepocket/perf/BudgetDeviceBenchmark.kt` | **GATE（結構性）**：固定合成輸入 200×400 chars、resume 讀回全數、local window 200/60k、JSON report 可讀。**DIAGNOSTIC**：native／Java heap delta、`Choreographer` frame 數、elapsed ms；目前沒有任何數值門檻。frame 數只是 main-thread baseline，不是 UI jank 證據；resume 為 warm in-memory 讀取，無 cold-disk I/O |
+| 真 token window | `TurnController.kt:205-212` | **Target／Proposed（未實作）**：目前只有 char-based 近似（約 4 chars/token；CJK／emoji／密集符號偏差大，UTF-16 code units 會讓 surrogate pair 膨脹）；沒有 tokenizer、沒有 token 層級 cap 或帳單保證。不得寫成 implemented／wired／verified |
+
+`HistoryWindowCap.DEFAULT`（200 msgs／60_000 chars）是 B1/B2 已接線的**字元**窗口（create／resume hydration 共用），不是 token 窗口。`BudgetDeviceBenchmark` 的 hydration 階段只是 **hydration-shaped local window／join**，不是完整 `ChatSessionFactory` create／resume 接線證明，也不是 tokenizer 量測。
+
+量測結果的**技術限制必須隨數字一起附註**（report 的每個 `diagnostic` 物件亦含 `note` 欄）：`framesObserved` 是 `Choreographer` 在主執行緒的 baseline frame 數，主要反映 main-thread 空轉與 stop-the-world GC，**不是 UI jank 或工作成本的證據**；`resume` 在同一 replicate 內對 `openInMemory` DB 寫入後立即 `loadTailEvents`，是 **warm in-memory read，不是 cold-disk hydration**；`javaHeapUsedDeltaBytes` 在 end snapshot 前沒有 GC，**含未回收垃圾，diagnostic only**。不得把這三者轉述為真機 UI 流暢度、冷啟動 I/O 或精確配置設定。
+
+### 量測證據（2026-11-26，POCO C65，`QGBYHAXKTC6P898H`）
+
+- 指令：`ANDROID_SERIAL=QGBYHAXKTC6P898H ANDROID_HOME=/home/samson1357924/Android/Sdk ./gradlew connectedFossDebugAndroidTest -Pandroid.testInstrumentationRunnerArguments.class=dev.librepocket.perf.BudgetDeviceBenchmark --max-workers=1 --no-daemon`
+- 結果：`BUILD SUCCESSFUL in 1m`，exit 0；XML `app/build/outputs/androidTest-results/connected/debug/flavors/foss/TEST-2310FPCA4G - 13.xml` 為 `tests=1 failures=0 errors=0 skipped=0`、`time=20.694s`、`property device=QGBYHAXKTC6P898H`。
+- 裝置：model `2310FPCA4G`、API 33、fingerprint `POCO/gust_p_global/gust:13/TP1A.220624.014/V14.0.6.0.TGPTWXM:user/release-keys`、package `dev.librepocket.agent.foss`。**未**對其他連接裝置（POCO F5 Pro ×2、Samsung S23 Ultra）執行任何安裝或測試。
+- 程式狀態：base `main@c5d61a61` + 本 PR 未提交 benchmark slice；此次未帶 `gitSha` 參數，故 report 的 `gitSha=UNSPECIFIED`。帶 `gitSha` 的第二次嘗試被 MIUI 再次要求裝置端確認而未能安裝，故不重跑；不影響此次量測有效性。
+- report 寫入 `/storage/emulated/0/Android/data/dev.librepocket.agent.foss/files/budget-device-benchmark.json`；JUnit 結束後 AGP 解除安裝測試 app，外部資料被清除，故以 logcat `System.out` 的 JSON 為證據（`app/build/outputs/androidTest-results/connected/debug/flavors/foss/2310FPCA4G - 13/logcat-dev.librepocket.perf.BudgetDeviceBenchmark-measureCreateResumeHydration.txt`）。logcat 單行緩衝於 replicate 2 的 create 階段截斷，下表為前 2 個完整 replicate。
+
+| phase | replicate 0（ms / nativeΔ bytes / javaΔ bytes / frames） | replicate 1 |
+|---|---|---|
+| create | 5649.81 / +838544 / +1158200 / 536 | 5593.49 / +680200 / +2103312 / 531 |
+| resume | 34.64 / +101888 / +163840 / 30 | 59.87 / +3488 / +163840 / 32 |
+| hydration | 8.23 / +0 / +221184 / 28（keptRows=149, keptChars=59600, joinedLength=59748） | 5.98 / -416 / +221184 / 28（結構數字相同） |
+
+`thresholds.status=NOT_ESTABLISHED` 與 `tokenWindow.status=TARGET_NOT_IMPLEMENTED` 不變；以上全部是 diagnostic，**不是** gate、不證明 UI jank／冷啟動 I/O／精確配置，也不代表 B3 已訂門檻或已關閉。
+
+### 在授權裝置上量測（POCO C65 only）
+
+唯一授權 serial：`QGBYHAXKTC6P898H`（POCO C65 / gust_p_global / 2310FPCA4G / Android 13, API 33）。**禁止**對其他連接到電腦的裝置（POCO F5 Pro ×2、Samsung S23 Ultra）執行下列任何 adb／instrumented 指令；所有 adb 指令都要帶 `-s QGBYHAXKTC6P898H`，Gradle 前設 `ANDROID_SERIAL=QGBYHAXKTC6P898H`。未經再次明確同意，不安裝／卸載其他裝置的 app、不清除資料。測試資料全為合成字串，不含私人 transcript、production endpoint 或真實憑證。
+
+`connectedFossDebugAndroidTest` 會把 Foss flavor 測試 APK 安裝到上述授權裝置（由驗證者在驗證階段串行執行；一次只跑一個 Gradle process，`--max-workers=1 --no-daemon`）：
+
+```sh
+export ANDROID_SERIAL=QGBYHAXKTC6P898H
+export ANDROID_HOME=/path/to/android-sdk   # 使用驗證環境實際的 SDK 路徑
+SHA="$(git rev-parse HEAD)"
+./gradlew connectedFossDebugAndroidTest \
+  -Pandroid.testInstrumentationRunnerArguments.class=dev.librepocket.perf.BudgetDeviceBenchmark \
+  -Pandroid.testInstrumentationRunnerArguments.gitSha="$SHA" \
+  --max-workers=1 --no-daemon
+```
+
+Report 為 JSON，含 `gitSha`、device build info、每 replicate／phase 的 diagnostic 與 structural 欄位，以及 `thresholds.status = NOT_ESTABLISHED`：
+
+```sh
+adb -s QGBYHAXKTC6P898H pull \
+  /sdcard/Android/data/dev.librepocket.agent.foss/files/budget-device-benchmark.json \
+  ./budget-device-benchmark-"$SHA".json
+```
+
+報告檔名綁 `$SHA`；回報時一併記錄 `git rev-parse HEAD`、JDK／SDK／API 33、serial、實際指令與 exit status。連線測試的 JUnit 結果在 `app/build/outputs/androidTest-results/`（不是 JVM gate 用的 `app/build/test-results/`）；JVM SweetSpot 的 diagnostic JSON 行由 `testFossDebugUnitTest` 的 stdout／HTML report 取得。
+
+**量測後才訂門檻**：先取得至少 3 replicate 的基準數字，再由 reviewer 決定 heap／frame／latency 的可接受範圍；在此之前 benchmark 只報告，不新增或放寬 gate。裝置測試不可由 JVM test 或 debug assembly 代替。
+
 ## 本機 host-layout 敏感測試與 privilege 子系（#136-B1）
 
 本機（非標準 coreutils 佈局／非標準 locale）已知環境失敗——均為環境所致，非測試碼缺陷，亦非 PR 引入。locale 對本機結果影響為機器實測：`files.*` 於 `LC_ALL=C.utf8` 重驗 **123/123 綠**、於 `LC_ALL=C` 仍重現 **16 個** locale／CJK 路徑失敗；`ShellPhysicalGateTest.dotdotEncoding_locked` 於 `LC_ALL=C` 紅、`LC_ALL=C.utf8` 綠（locale 相依，非 PR 引入；CI 佈局全綠）。privilege 子系 target 類已於 2026-11-16 本機以 ANDROID_HOME 實跑綠（見該 bullet）：

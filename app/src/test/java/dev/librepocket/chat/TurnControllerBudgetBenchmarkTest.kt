@@ -818,4 +818,148 @@ class TurnControllerBudgetBenchmarkTest {
       c.close()
     }
   }
+
+  // ---- B3 reproducible SweetSpot sampling -------------------------------
+  // GATE (structural, deterministic): each fixed-input sample is run N times
+  // and MUST publish identical counters plus the exact char/row reconciliation
+  // identities; the shipped request never exceeds MAX_REQUEST_CHARS. No
+  // wall-clock ratio is ever asserted — CI runners have different speed.
+  // DIAGNOSTIC (never a gate): elapsed ms are emitted as JSON lines so a human
+  // can compare shapes; choosing a SweetSpot from a slow machine's timing is
+  // explicitly NOT a pass/fail signal. Device heap/frame/latency thresholds
+  // stay Target until measured (see docs/TESTING.md B3 section).
+  private data class BmSweetSpot(
+    val label: String,
+    val rows: Int,
+    val charsPerRow: Int,
+    val cap: HistoryWindowCap,
+    val capLabel: String,
+    val deltas: Int,
+  )
+
+  private data class BmStructural(
+    val droppedCount: Int,
+    val droppedChars: Long,
+    val trimmedCount: Int,
+    val trimmedChars: Long,
+    val lastRequestChars: Long,
+    val requestRows: Int,
+    val deltaCount: Int,
+    val uiFlushes: Int,
+    val copiedChars: Long,
+  )
+
+  private data class BmSample(val structural: BmStructural, val elapsedNs: Long)
+
+  /** Fixed grid (no random input, fixed clock/zone/provider) around the B1 default. */
+  private fun bmSweetSpotGrid(): List<BmSweetSpot> = listOf(
+    BmSweetSpot("tiny", 8, 64, HistoryWindowCap.DEFAULT, "200/60k", 16),
+    BmSweetSpot("turns50", 50, 200, HistoryWindowCap.DEFAULT, "200/60k", 64),
+    BmSweetSpot("turns100", 100, 400, HistoryWindowCap.DEFAULT, "200/60k", 128),
+    BmSweetSpot("capTight", 100, 400, HistoryWindowCap.Bounded(20, 6_000), "20/6k", 128),
+    BmSweetSpot("capLoose", 100, 400, HistoryWindowCap.Bounded(200, 100_000), "200/100k", 128),
+  )
+
+  private fun runSweetSpotReplicate(sample: BmSweetSpot): BmSample {
+    val fixedClock = Clock.fixed(Instant.parse("2026-10-09T01:41:22Z"), ZoneId.of("UTC"))
+    val fixedZone = { ZoneId.of("UTC") }
+    val history = (0 until sample.rows).map { i ->
+      val role = if (i % 2 == 0) "user" else "assistant"
+      val tag = "h$i:"
+      ChatMessage(role = role, text = tag + "x".repeat(sample.charsPerRow - tag.length))
+    }
+    val provider = BmFakeProvider {
+      flow {
+        repeat(sample.deltas) { emit(StreamEvent.TextDelta(0, 0, "x")) }
+        emit(StreamEvent.Done("stop"))
+      }
+    }
+    val c = controller(provider, history, sample.cap, clock = fixedClock, systemZone = fixedZone)
+    try {
+      val startNs = System.nanoTime()
+      runBlocking { c.send("tail-q") }
+      val elapsedNs = System.nanoTime() - startNs
+      val req = provider.seenRequests.single()
+      // Real production window function + real time block, not re-derived
+      // formulas. buildRequest() UNCONDITIONALLY overwrites both drop cells
+      // on every send with (combined - base), where combined = capped prefix
+      // (the constructor-time seed) + live rows and base = applyHistoryCap
+      // (combined, cap). The construction seed is only observable BEFORE the
+      // first send (contextOmission publishes the full omitted total); never
+      // fall back to it when the send-time window drops nothing.
+      val seed = applyHistoryCap(history, sample.cap)
+      val live = ChatMessage(role = "user", text = "tail-q")
+      val seedAndLive = seed + live
+      val windowed = applyHistoryCap(seedAndLive, sample.cap)
+      val expectedDropped = seedAndLive.size - windowed.size
+      val expectedDroppedChars =
+        seedAndLive.sumOf { it.text.length.toLong() } - windowed.sumOf { it.text.length.toLong() }
+      val timeDelta = ("\n\n" + buildRuntimeTimeContext(
+        clock = fixedClock,
+        userTimezone = null,
+        sessionStart = null,
+        zoneSupplier = fixedZone,
+      )).length.toLong()
+      // GATE 1: both units reconcile exactly under every sampled config.
+      assertEquals(expectedDropped, c.droppedHistoryCount)
+      assertEquals(expectedDroppedChars, c.droppedHistoryChars)
+      assertEquals(
+        seedAndLive.sumOf { it.text.length.toLong() } + timeDelta,
+        c.droppedHistoryChars + c.lastRequestTrimmedChars + c.lastRequestChars,
+      )
+      assertEquals(seedAndLive.size, req.messages.size + c.droppedHistoryCount + c.lastRequestTrimmedCount)
+      // GATE 2: absolute cap + exact final mirror + exact operation counts.
+      assertTrue("request must fit the cap", req.messages.sumOf { it.text.length } <= TurnController.MAX_REQUEST_CHARS)
+      assertEquals(req.messages.sumOf { it.text.length }.toLong(), c.lastRequestChars)
+      assertEquals(sample.deltas, c.streamedTextDeltaCount)
+      assertEquals("x".repeat(sample.deltas), c.uiState.value.messages.filter { it.role == "assistant" }.single().text)
+      assertTrue("flush count must not exceed delta count", c.uiTextUpdateCount <= sample.deltas)
+      // Upper bound from the flush cadence: even a flush-per-delta copy sum
+      // cannot exceed the triangular number (+ one terminal row).
+      assertTrue(
+        "copied chars must stay bounded, got ${c.uiTextCopiedChars}",
+        c.uiTextCopiedChars.toLong() <= (sample.deltas.toLong() * sample.deltas / 2) + sample.deltas,
+      )
+      return BmSample(
+        BmStructural(
+          droppedCount = c.droppedHistoryCount,
+          droppedChars = c.droppedHistoryChars,
+          trimmedCount = c.lastRequestTrimmedCount,
+          trimmedChars = c.lastRequestTrimmedChars,
+          lastRequestChars = c.lastRequestChars,
+          requestRows = req.messages.size,
+          deltaCount = c.streamedTextDeltaCount,
+          uiFlushes = c.uiTextUpdateCount,
+          copiedChars = c.uiTextCopiedChars.toLong(),
+        ),
+        elapsedNs,
+      )
+    } finally {
+      c.close()
+    }
+  }
+
+  @Test(timeout = 60_000) fun sweetSpotSampling_structuralGatesDeterministicTimingsDiagnostic() {
+    val replicates = 3
+    bmSweetSpotGrid().forEach { sample ->
+      val results = (0 until replicates).map { runSweetSpotReplicate(sample) }
+      // GATE 3: identical fixed input + config => identical observable work.
+      results.forEach { assertEquals(results.first().structural, it.structural) }
+      // DIAGNOSTIC only: printed min/median/max, never compared across machines
+      // and never used as a pass/fail ratio. The gate above is the invariant.
+      val ms = results.map { it.elapsedNs / 1_000_000 }.sorted()
+      val s = results.first().structural
+      println(
+        "TurnControllerBudgetBenchmarkSweetSpot DIAGNOSTIC " +
+          "{\"label\":\"${sample.label}\",\"config\":{\"rows\":${sample.rows}," +
+          "\"charsPerRow\":${sample.charsPerRow},\"windowCap\":\"${sample.capLabel}\"," +
+          "\"deltas\":${sample.deltas},\"replicates\":$replicates}," +
+          "\"structural\":{\"droppedCount\":${s.droppedCount},\"droppedChars\":${s.droppedChars}," +
+          "\"trimmedCount\":${s.trimmedCount},\"trimmedChars\":${s.trimmedChars}," +
+          "\"requestRows\":${s.requestRows},\"lastRequestChars\":${s.lastRequestChars}," +
+          "\"deltaCount\":${s.deltaCount},\"uiFlushes\":${s.uiFlushes},\"copiedChars\":${s.copiedChars}}," +
+          "\"diagnosticMs\":{\"min\":${ms.first()},\"median\":${ms[ms.size / 2]},\"max\":${ms.last()}}}",
+      )
+    }
+  }
 }
